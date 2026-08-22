@@ -1,26 +1,27 @@
-// SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2026 The Quint Specs Authors
 //
-// SPDX-License-Identifier: Unlicense
+// SPDX-License-Identifier: MIT
 
 /**
- * portmap.qnt -- a Quint model of chimera's portmap/rpcbind server
- * (src/server/nfs/nfs_portmap.c), used for model-based conformance testing.
+ * portmap.qnt -- a Quint model of a portmap/rpcbind server,
+ * used for model-based conformance testing.
  *
- * Chimera's portmapper is a static registry: the service table is fixed at
+ * The modeled portmapper is a static registry: the service table is fixed at
  * startup and there is no PMAPPROC_SET/UNSET.  Each modeled procedure is a
  * pure request -> reply function; the only state is the last (call, reply)
  * event, which is exactly what the conformance driver replays against a
- * live server (portmap_quint_replay.py).
+ * live server (the replay harness).
  *
  * Modeled procedures:
  *   PMAP v2:      NULL (0), GETPORT (3), DUMP (4)
  *   rpcbind v3/4: GETADDR (3), modeled as the port encoded in the returned
  *                 universal address ("" -> 0)
  *
- * Deliberate chimera semantics captured here (see portmap_lookup_port):
+ * Deliberate semantics captured here (see portmap_lookup_port):
  * GETPORT/GETADDR match the exact (prog, vers, prot) triple or return 0.
  * Classic BSD portmap instead falls back to the port of *some* registered
- * version of the program on a version mismatch; chimera follows the strict
+ * version of the program on a version mismatch; the reference implementation
+ * follows the strict
  * reading of RFC 1833.  The repliesExact invariant and the
  * noVersionFallbackTest run pin that divergence down.
  *
@@ -29,11 +30,11 @@
  *   quint run portmap.qnt --invariant=repliesExact    # random simulation
  *   ./regen_traces.sh                                 # refresh traces/
  *
- * The SERVICES table below must mirror the table chimera builds with
+ * The SERVICES table below must mirror the table the server builds with
  * external_portmap=false and the default lockmgr_port (32803) and NSM port
- * (32765) from server.c -- the configuration the ctest wrapper starts.
+ * (32765) -- the configuration the ctest wrapper starts.
  */
-module chimera_portmap {
+module portmap {
 
     // ------------------------------------------------------------------
     // Domain
@@ -46,7 +47,7 @@ module chimera_portmap {
     /// One row of the portmap service table (struct pmap in RFC 1833).
     type Mapping = { prog: int, vers: int, prot: int, port: int }
 
-    /// rpcbind v3/v4 network identifiers offered by the client.  Chimera
+    /// rpcbind v3/v4 network identifiers offered by the client.  The server
     /// maps "tcp"/"udp" to protocol numbers and treats anything else as
     /// unserved (portmap_netid_to_prot returns 0).
     type Netid =
@@ -67,10 +68,10 @@ module chimera_portmap {
         | MapsR(List[Mapping])
         | AddrR(int)
 
-    /// Chimera's service table, in table order (DUMP returns it verbatim):
+    /// The service table, in table order (DUMP returns it verbatim):
     /// the six static portmap_services entries, then NLM and NSM appended
-    /// at startup (nfs.c calls portmap_set_nlm_port before
-    /// portmap_set_nsm_port).  TCP only -- chimera serves no UDP transports.
+    /// at startup (NLM's port is set before NSM's).  TCP only -- the server
+    /// serves no UDP transports.
     pure val SERVICES: List[Mapping] = List(
         { prog: 100000, vers: 2, prot: 6, port: 111 },
         { prog: 100000, vers: 3, prot: 6, port: 111 },
@@ -235,7 +236,8 @@ module chimera_portmap {
             .then(doGetport(300000, 1, PROT_TCP))
             .expect(lastEvent.reply == PortR(0))
 
-    /// Where chimera deliberately diverges from classic BSD portmap: an
+    /// Where the reference implementation deliberately diverges from classic
+    /// BSD portmap: an
     /// unregistered version of a registered program yields 0, not the
     /// port of a sibling version.
     run noVersionFallbackTest =

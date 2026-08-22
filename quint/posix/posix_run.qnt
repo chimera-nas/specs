@@ -1,6 +1,6 @@
-// SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2026 The Quint Specs Authors
 //
-// SPDX-License-Identifier: LGPL-2.1-only
+// SPDX-License-Identifier: MIT
 
 // Runnable instances of the POSIX model.
 //
@@ -39,7 +39,7 @@ module posixDefault {
     import posixops.* from "./posix_ops"
 }
 
-// The chimera-memfs profile, pinned to the behavior measured by
+// The in-memory-backend profile, pinned to the behavior measured by
 // `posix_replay.py --probe` on 2026-08-10 (see PROFILE there; the probe
 // re-measures and `--check-profile` fails on drift).  Trace generation from
 // this instance produces only profiles the live backend can satisfy, so the
@@ -68,7 +68,7 @@ module posixMemfs {
     import posixops.* from "./posix_ops"
 }
 
-// The chimera-diskfs/cairn profile, pinned to `--probe --backend diskfs`
+// The disk-backend (diskfs/cairn) profile, pinned to `--probe --backend diskfs`
 // and `--backend cairn` measurements on 2026-08-11: both probe identically
 // to memfs except clone_range is unsupported (F_CLONE_RANGE off).  One
 // instance therefore serves trace generation for both backends.
@@ -93,7 +93,7 @@ module posixDisk {
     import posixops.* from "./posix_ops"
 }
 
-// The chimera NFS3-loopback profile (client -> in-process server ->
+// The NFS3-loopback profile (client -> in-process server ->
 // backend), pinned to `--probe --backend nfs3_{memfs,diskfs,cairn}` on
 // 2026-08-12: all three backends probe identically behind the server, so one
 // instance serves the three.  No copy/clone offload (the VFS copy fallback
@@ -120,7 +120,7 @@ module posixNfs3 {
     import posixops.* from "./posix_ops"
 }
 
-// The chimera NFS4-loopback profile, pinned the same day: again identical
+// The NFS4-loopback profile, pinned the same day: again identical
 // across the three backends.  NFS4.2 SEEK backs SEEK_DATA/SEEK_HOLE; atime
 // is not strictly observed.  unlink(dir) now yields EISDIR
 // (P_ERR_UNLINKDIR_ISDIR mandatory, matching nfs3 and the engine backends):

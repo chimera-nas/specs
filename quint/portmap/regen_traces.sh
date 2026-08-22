@@ -1,7 +1,7 @@
 #!/bin/bash
-# SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
+# SPDX-FileCopyrightText: 2026 The Quint Specs Authors
 #
-# SPDX-License-Identifier: Unlicense
+# SPDX-License-Identifier: MIT
 
 # Regenerate the checked-in conformance traces under traces/ from the Quint
 # model.  Run this after changing portmap.qnt (or to widen coverage), then

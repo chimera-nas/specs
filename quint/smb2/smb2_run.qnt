@@ -1,12 +1,13 @@
-// SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2026 The Quint Specs Authors
 //
-// SPDX-License-Identifier: LGPL-2.1-only
+// SPDX-License-Identifier: MIT
 
 // Concrete SMB2 model instances for trace generation, pinned to what
-// chimera + memfs actually does so the generated corpus contains no
+// the reference implementation actually does so the generated corpus
+// contains no
 // not-applicable traces (the tactic that eliminated the NFS capability
 // skips).  `quint run --main=<inst> --step=<flavor> --out-itf` emits ITF
-// traces the C replayer (smb2_mbt_replay.c) drives against the live server.
+// traces the replay harness drives against the server under test.
 //
 // smb2Base pins oplocks and leases OFF: it is the deterministic filesystem
 // core -- the CREATE disposition/type matrix, share arbitration, byte-range

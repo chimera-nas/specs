@@ -1,6 +1,6 @@
-// SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2026 The Quint Specs Authors
 //
-// SPDX-License-Identifier: LGPL-2.1-only
+// SPDX-License-Identifier: MIT
 
 // NFSv4 protocol state model: clients, sessions, owners, stateids, share
 // reservations, byte-range locks, delegations and pNFS layouts.

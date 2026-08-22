@@ -1,20 +1,20 @@
-// SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2026 The Quint Specs Authors
 //
-// SPDX-License-Identifier: LGPL-2.1-only
+// SPDX-License-Identifier: MIT
 
 // Quint model of an NFSv3 server (RFC 1813), used for model-based testing.
 //
 // The model tracks an abstract filesystem and, on every step, records the
 // RPC issued and the reply the server is expected to produce in the state
 // variable `lastOp`.  Traces generated with `quint run --out-itf` are
-// replayed against an in-process chimera server by nfs3_mbt_replay.c,
+// replayed against an in-process NFS3 server by the replay harness,
 // which compares the
 // server's actual replies against `lastOp` step by step.
 //
 // Modeling conventions:
-//  - The model is RFC-first: where chimera's behavior is a deliberate
-//    implementation choice (or a deviation pending triage), the choice is
-//    annotated with a `chimera:` comment citing the source location or the
+//  - The model is RFC-first: where the reference implementation's behavior
+//    is a deliberate implementation choice (or a deviation pending triage),
+//    the choice is annotated with a `ref:` comment citing the
 //    probe that established it.  Deviations from RFC 1813 that are pending
 //    a server-side decision are additionally marked CANDIDATE-FIX; when
 //    the server changes, flip the annotated expectation here and
@@ -77,8 +77,9 @@ module nfs3 {
     // Owner-override (the NFS server's MAY_OWNER_OVERRIDE, RFC 1813 leaves the
     // server free to grant it): when true, a file's owner is granted READ and
     // WRITE regardless of the mode bits -- the Linux/knfsd behavior, and what
-    // chimera's NFS server instructs the VFS to do.  When false, strict POSIX:
-    // the owner is bound by the owner-class bits.  chimera's NFS server grants
+    // the reference implementation's NFS server instructs the VFS to do.  When
+    // false, strict POSIX: the owner is bound by the owner-class bits.  The
+    // reference implementation's NFS server grants
     // owner-override, so the NFS model asserts it on; the strict (false) side
     // is exercised via the POSIX suite's per-backend profile.  Flip here to
     // check strict NFS in isolation.
@@ -200,7 +201,7 @@ module nfs3 {
         { ftype: TReg, mode: m, nlink: 1, data: [], ents: Map(), target: "",
           uid: o.uid, gid: o.gid, xverf: v }
     pure def symlinkNode(tgt: str, o: Cred): Node =
-        // chimera: symlink mode is fixed 0755; the sattr3 mode in the
+        // ref: symlink mode is fixed 0755; the sattr3 mode in the
         // SYMLINK request is not applied (probed 2026-08-08; requested
         // 0777, observed 0755).
         { ftype: TLnk, mode: 493, nlink: 1, data: [], ents: Map(), target: tgt,
@@ -241,7 +242,7 @@ module nfs3 {
                    .flatten()))
 
     action init = all {
-        // chimera: memfs.c:1092 -- a fresh memfs share root is 0777 (511).
+        // ref: a fresh in-memory share root is 0777 (511).
         fs' = Map(ROOT -> emptyDir(511, ROOT_CRED)),
         removed' = Set(),
         nextFid' = 1,
@@ -253,8 +254,9 @@ module nfs3 {
     // ------------------------------------------------------------------
 
     // RFC 1813 3.3.3: LOOKUP on any non-directory handle is NFS3ERR_NOTDIR.
-    // chimera deviates for a symlink handle (returns SERVERFAULT); that is
-    // recorded as deviation `lookup-symlink-serverfault` in the nfs3_mbt_replay.c deviation registry
+    // The reference implementation deviates for a symlink handle (returns
+    // SERVERFAULT); that is
+    // recorded as deviation `lookup-symlink-serverfault` in the replay harness's deviation registry
     // and reconciled by the harness, NOT encoded here.
     action applyLookup(d: Fid, n: Name): bool = all {
         fs' = fs,
@@ -295,11 +297,13 @@ module nfs3 {
     }
 
     // GETATTR through the handle of a fully removed object.  Immediately
-    // after removal chimera returns NFS3ERR_NOENT (probed 2026-08-08), but
-    // this is NOT reliably predictable over a long trace: memfs recycles an
+    // after removal the reference implementation returns NFS3ERR_NOENT
+    // (probed 2026-08-08), but
+    // this is NOT reliably predictable over a long trace: the reference
+    // filesystem recycles an
     // inode's inum+gen once it is freed, so a later CREATE can hand out the
     // very handle a removed object held, and GETATTR then succeeds against
-    // the new object.  Modeling that requires tracking memfs's exact
+    // the new object.  Modeling that requires tracking the exact
     // inum/gen allocation, which the abstract model deliberately avoids.
     // The action and Op variant are retained (the `removed` set still feeds
     // the RENAME/unlink logic) but staleGetattr is excluded from `step`;
@@ -357,7 +361,7 @@ module nfs3 {
 
     // ------------------------------------------------------------------
     // ACCESS (RFC 1813 3.3.4) -- the harness always runs as root/AUTH_SYS.
-    // chimera: root is granted every requested bit, including EXECUTE on a
+    // ref: root is granted every requested bit, including EXECUTE on a
     // file with no execute bits (probed 2026-08-08: mask 0x3f on a 0644
     // file returns 0x3f).  POSIX would withhold EXECUTE unless some x bit
     // is set; RFC 1813 leaves ACCESS semantics to the server, so this is
@@ -402,7 +406,7 @@ module nfs3 {
                 else
                     // UNCHECKED over an existing name succeeds and returns
                     // the existing object *of any type*, attributes
-                    // untouched.  chimera: probed 2026-08-08 -- this holds
+                    // untouched.  ref: probed 2026-08-08 -- this holds
                     // even when the name is a directory or symlink (POSIX
                     // open(O_CREAT) would give EISDIR for a directory).
                     OCreate({ dir: d, name: n, cmode: cm, mode: m, verf: -1,
@@ -432,11 +436,12 @@ module nfs3 {
     }
 
     // EXCLUSIVE create (RFC 1813 3.3.8).  A fresh exclusive create succeeds
-    // and the file materializes with mode 0644 (420, chimera-observed
+    // and the file materializes with mode 0644 (420, empirically observed
     // 2026-08-08; the sattr in an exclusive create is the verifier, not a
     // mode).  RFC 1813: a retry that presents the *same* verifier as the
     // create in progress "should" succeed idempotently and return the same
-    // object; a different verifier gives NFS3ERR_EXIST.  chimera returns
+    // object; a different verifier gives NFS3ERR_EXIST.  The reference
+    // implementation returns
     // EXIST even for the same verifier -- recorded as deviation
     // `exclusive-create-retry-exist` (a status-only divergence: the file
     // exists and is unchanged under either outcome, so model state stays in
@@ -707,9 +712,9 @@ module nfs3 {
     // ------------------------------------------------------------------
     // REMOVE (RFC 1813 3.3.12) -- non-directories only (unlink(2) semantics).
     //
-    // chimera enforces the type: the NFS3 REMOVE proc passes
-    // CHIMERA_VFS_REMOVE_ISNOTDIR to the VFS, so REMOVE of a directory is
-    // NFS3ERR_ISDIR (matching POSIX unlink -> EISDIR), whether the directory
+    // The server enforces the type: REMOVE of a directory is
+    // NFS3ERR_ISDIR (RFC 1813 requires this; matching POSIX unlink -> EISDIR),
+    // whether the directory
     // is empty or not.  A name over a multi-link file just drops that link.
     // ------------------------------------------------------------------
 
@@ -750,9 +755,9 @@ module nfs3 {
     // ------------------------------------------------------------------
     // RMDIR (RFC 1813 3.3.13) -- directories only (rmdir(2) semantics).
     //
-    // chimera enforces the type: the NFS3 RMDIR proc passes
-    // CHIMERA_VFS_REMOVE_ISDIR to the VFS, so RMDIR of a non-directory is
-    // NFS3ERR_NOTDIR.  A non-empty directory is NFS3ERR_NOTEMPTY.  Because
+    // The server enforces the type: RMDIR of a non-directory is
+    // NFS3ERR_NOTDIR (RFC 1813 requires this).  A non-empty directory is
+    // NFS3ERR_NOTEMPTY.  Because
     // the type check is now enforced (no state change on a type mismatch),
     // RMDIR of any name is safe to generate -- server and model agree.
     // ------------------------------------------------------------------
@@ -789,7 +794,8 @@ module nfs3 {
     }
 
     // ------------------------------------------------------------------
-    // RENAME (RFC 1813 3.3.14) -- full POSIX matrix; chimera conforms on
+    // RENAME (RFC 1813 3.3.14) -- full POSIX matrix; the reference
+    // implementation conforms on
     // every probed case (replace, ISDIR/NOTDIR mismatches, NOTEMPTY,
     // subtree cycles -> INVAL, self-rename and hardlink-pair no-ops).
     // ------------------------------------------------------------------
@@ -858,8 +864,8 @@ module nfs3 {
     // ------------------------------------------------------------------
 
     action applyLink(o: Fid, d: Fid, n: Name): bool =
-        // chimera: the directory-target check precedes the name-collision
-        // check (memfs.c:4855 S_ISDIR before :4867 EEXIST), so linking a
+        // ref: the directory-target check precedes the name-collision
+        // check (S_ISDIR before EEXIST), so linking a
         // directory is ISDIR even when the target name is already taken.
         if (fs.get(o).ftype == TDir) all {
             fs' = fs,
@@ -890,15 +896,17 @@ module nfs3 {
     // ------------------------------------------------------------------
     // READDIR / READDIRPLUS (RFC 1813 3.3.16/3.3.17) -- single-shot with a
     // large count; the harness compares the returned entry set against the
-    // model's names plus "." and ".." (chimera emits both, probed
+    // model's names plus "." and ".." (the reference implementation emits
+    // both, probed
     // 2026-08-08), checks per-entry fileids for consistency, and for the
     // PLUS variant learns/verifies per-entry file handles.  Multi-request
     // cookie iteration is phase 3.
     // ------------------------------------------------------------------
 
     // RFC 1813 3.3.16/3.3.17: READDIR/READDIRPLUS on a non-directory is
-    // NFS3ERR_NOTDIR.  chimera deviates for a symlink handle (SERVERFAULT);
-    // recorded as `readdir-symlink-serverfault` in the nfs3_mbt_replay.c deviation registry.
+    // NFS3ERR_NOTDIR.  The reference implementation deviates for a symlink
+    // handle (SERVERFAULT);
+    // recorded as `readdir-symlink-serverfault` in the replay harness's deviation registry.
     action applyReaddir(o: Fid, plus: bool): bool = all {
         fs' = fs,
         removed' = removed,
@@ -920,7 +928,7 @@ module nfs3 {
     // ------------------------------------------------------------------
     // FSSTAT / FSINFO / PATHCONF (RFC 1813 3.3.18/3.3.19/3.3.20) -- the
     // interesting reply fields are constants of the server/backend; the
-    // expected values live in nfs3_mbt_replay.c with citations.  PATHCONF accepts
+    // expected values live in the replay harness with citations.  PATHCONF accepts
     // any live object handle.
     // ------------------------------------------------------------------
 

@@ -1,6 +1,6 @@
-// SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2026 The Quint Specs Authors
 //
-// SPDX-License-Identifier: LGPL-2.1-only
+// SPDX-License-Identifier: MIT
 
 // SMB2/3 stateful generator: config constants, the capability profile
 // chosen at init, generator actions (session/tree bootstrap, the CREATE
@@ -37,7 +37,8 @@ module smb2 {
 
     // Policy: does a conflicting CREATE break a peer's lease at OPEN time
     // (MS-FSA-correct = true), or does an SMB2 lease survive the open and
-    // break only on later I/O / namespace (the chimera Seam-A asymmetry)?
+    // break only on later I/O / namespace (the reference implementation's
+    // Seam-A asymmetry)?
     const P_LEASE_OPEN_BREAK: bool
 
     // ------------------------------------------------------------------
@@ -100,7 +101,7 @@ module smb2 {
             leaseOpenBreak: P_LEASE_OPEN_BREAK
         }
         all {
-            // chimera: memfs share roots are 0777; the root mode is not
+            // ref: in-memory share roots are 0777; the root mode is not
             // asserted by the harness (backend-specific).
             sdb' = stInit(511),
             caps' = c,

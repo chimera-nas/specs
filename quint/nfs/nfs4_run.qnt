@@ -1,6 +1,6 @@
-// SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2026 The Quint Specs Authors
 //
-// SPDX-License-Identifier: LGPL-2.1-only
+// SPDX-License-Identifier: MIT
 
 // Concrete instances of the nfs4 model -- the units `quint run` executes:
 //
@@ -63,7 +63,8 @@ module nfs4V41 {
 
 // ---------------------------------------------------------------------
 // memfs-tuned instances: the profile the CMake ctest suite actually runs
-// against chimera + memfs.  The generic FeatIfAdvertised instances above
+// against the reference implementation's in-memory backend.  The generic
+// FeatIfAdvertised instances above
 // are for a server whose capabilities are unknown a-priori (they skip
 // the non-applicable half of the corpus); against a KNOWN backend that
 // bias only produces spurious skips, so these pin every feature to what
@@ -75,7 +76,8 @@ module nfs4V41 {
 //     model auto-gates these to MINOR >= 2.
 //   - pNFS: memfs is not configured as a pNFS metadata server (the NFS4
 //     layer does not advertise USE_PNFS_MDS), so FeatOff.
-//   - delegations: enabled in the daemon config, but chimera only grants
+//   - delegations: enabled in the daemon config, but the reference
+//     implementation only grants
 //     once a CB_NULL callback-path probe confirms the back channel, which
 //     the current synchronous replay harness does not satisfy -- so no
 //     delegation is ever granted and FeatOff matches reality.  Testing
@@ -163,7 +165,7 @@ module nfs4Memfs40 {
 }
 
 module nfs4PnfsMandatory {
-    // For servers expected to serve pNFS (e.g. a chimera build with the
+    // For servers expected to serve pNFS (e.g. a build with the
     // layout table enabled): not advertising pNFS FAILS the suite.
     import nfs4ops.* from "./nfs4_ops"
     import nfs4(
@@ -180,7 +182,8 @@ module nfs4PnfsMandatory {
 }
 
 module nfs4AllMandatory {
-    // Full-feature conformance profile: everything chimera advertises
+    // Full-feature conformance profile: everything the reference
+    // implementation advertises
     // today is required; any silent regression in advertisement is red.
     import nfs4ops.* from "./nfs4_ops"
     import nfs4(

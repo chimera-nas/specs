@@ -1,6 +1,6 @@
-// SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2026 The Quint Specs Authors
 //
-// SPDX-License-Identifier: LGPL-2.1-only
+// SPDX-License-Identifier: MIT
 
 // SMB2/3 protocol state model: sessions, tree connects, opens (handles),
 // share reservations, the unified oplock/lease caching grant, byte-range

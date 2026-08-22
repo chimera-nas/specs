@@ -1,6 +1,9 @@
 version = 1
 
+# Files that carry no inline SPDX header: the generated portmap ITF traces
+# (JSON, no comment syntax), the pinned quint version marker, and the git
+# ignore list.  Everything else tags its license in-file.
 [[annotations]]
-path = ["quint/portmap/traces/**", ".quint-version"]
-SPDX-FileCopyrightText = "2026 Chimera-NAS Project Contributors"
-SPDX-License-Identifier = "LGPL-2.1-only"
+path = ["quint/portmap/traces/**", ".quint-version", ".gitignore"]
+SPDX-FileCopyrightText = "2026 The Quint Specs Authors"
+SPDX-License-Identifier = "MIT"

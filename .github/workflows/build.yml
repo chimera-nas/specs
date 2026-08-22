@@ -1,5 +1,5 @@
-# SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
-# SPDX-License-Identifier: LGPL-2.1-only
+# SPDX-FileCopyrightText: 2026 The Quint Specs Authors
+# SPDX-License-Identifier: MIT
 name: build-specs
 on:
   push:

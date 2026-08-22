@@ -1,9 +1,9 @@
 #!/bin/bash
-# SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
-# SPDX-License-Identifier: LGPL-2.1-only
+# SPDX-FileCopyrightText: 2026 The Quint Specs Authors
+# SPDX-License-Identifier: MIT
 #
-# Tar the generated trace tree + a manifest into the bundle the chimera build
-# consumes (fetched by the specs submodule's git hash).
+# Tar the generated trace tree + a manifest into the bundle a consuming project
+# fetches by this repo's git hash.
 #
 # Usage: bundle.sh <trace-dir> <out-dir>
 set -euo pipefail

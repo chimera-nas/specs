@@ -1,12 +1,12 @@
-// SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2026 The Quint Specs Authors
 //
-// SPDX-License-Identifier: LGPL-2.1-only
+// SPDX-License-Identifier: MIT
 
 // Stateful POSIX file-API model: universes, trace labels, generator
 // actions and invariants.  One model step is one syscall by one process;
 // the transition label carries the request and the expected result, which
-// is everything the replay harness needs to drive chimera's POSIX client
-// and compare.
+// is everything the replay harness needs to drive the POSIX client under
+// test and compare.
 //
 // Feature/policy gating: each FeatureMode constant below pins one optional
 // feature or server-discretion policy.  init draws the concrete profile

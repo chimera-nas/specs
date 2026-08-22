@@ -1,6 +1,6 @@
-// SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2026 The Quint Specs Authors
 //
-// SPDX-License-Identifier: LGPL-2.1-only
+// SPDX-License-Identifier: MIT
 
 // Generic model of the filesystem underlying an NFSv4 server.
 //
@@ -359,8 +359,8 @@ module nfs4fs {
                         else fsC
                     // 5. RFC 7530 5.8.1.4 / POSIX: a successful rename marks
                     //    the renamed object's status-change time, so its
-                    //    change attribute advances too (chimera/memfs bump
-                    //    the moved inode's ctime -> change).
+                    //    change attribute advances too (the reference
+                    //    implementation bumps the moved inode's ctime -> change).
                     val fsE = fsD.with("inodes", fsD.inodes.setBy(src, x =>
                         x.with("change", fs.chg + 3)))
                     // A same-directory rename touches the one directory

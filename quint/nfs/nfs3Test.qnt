@@ -1,6 +1,6 @@
-// SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2026 The Quint Specs Authors
 //
-// SPDX-License-Identifier: LGPL-2.1-only
+// SPDX-License-Identifier: MIT
 
 // Deterministic self-checks for the NFS3 model, executed with `quint test`.
 // These validate the model's own transition logic without a server, so a
@@ -35,9 +35,10 @@ module nfs3Test {
 
     // RFC 1813 3.3.8: exclusive create is idempotent for the same verifier
     // (retry returns the same object), and NFS3ERR_EXIST for a different
-    // verifier.  chimera returns EXIST even on the same-verifier retry --
+    // verifier.  The reference implementation returns EXIST even on the
+    // same-verifier retry --
     // that divergence is deviation `exclusive-create-retry-exist`, checked
-    // against the live server by the harness; the *model* is RFC-correct.
+    // against the server under test by the harness; the *model* is RFC-correct.
     run exclusiveCreateTest =
         init
             .then(applyCreateExcl(ROOT, "x", 1))
@@ -114,8 +115,8 @@ module nfs3Test {
             .then(applySetattr(1, 493, -1, 0))
             .expect(fs.get(1).mode == 493)
 
-    // REMOVE and RMDIR are both type-checked (chimera enforces the type via
-    // the CHIMERA_VFS_REMOVE_ISNOTDIR / _ISDIR flags): REMOVE of a directory
+    // REMOVE and RMDIR are both type-checked (the server enforces the type,
+    // as RFC 1813 requires): REMOVE of a directory
     // is NFS3ERR_ISDIR, RMDIR of a non-directory is NFS3ERR_NOTDIR, and
     // neither mutates state on a mismatch.
     run removeRmdirTypeCheckTest =
@@ -224,7 +225,7 @@ module nfs3Test {
             .then(applySymlink(ROOT, "s", "a/b/target"))
             .expect(lastOp == OSymlink({ dir: ROOT, name: "s", target: "a/b/target",
                                          status: OK, obj: 1 }))
-            .expect(fs.get(1).mode == 493)   // chimera: mode forced 0755
+            .expect(fs.get(1).mode == 493)   // ref: mode forced 0755
             .then(applyReadlink(1))
             .expect(lastOp == OReadlink({ obj: 1, status: OK, target: "a/b/target" }))
             .then(applySymlink(ROOT, "s", "x"))

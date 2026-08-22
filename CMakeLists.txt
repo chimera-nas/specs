@@ -1,29 +1,29 @@
-# SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
+# SPDX-FileCopyrightText: 2026 The Quint Specs Authors
 #
-# SPDX-License-Identifier: LGPL-2.1-only
+# SPDX-License-Identifier: MIT
 
-# Chimera model-based-test specifications.
+# Model-based-test specifications.
 #
-# This repo owns the Quint models for the chimera MBT suites (posix, nfs3,
-# nfs4, smb2, portmap) and the logic that turns them into a corpus of ITF
-# traces plus the model self-tests and coverage gates.  The C/Python replay
-# harness that drives those traces against chimera lives in the chimera repo,
-# which consumes this repo either as a prebuilt trace bundle (fetched by the
-# submodule's git hash) or -- for spec development -- by building it locally.
+# This repo owns the Quint models for the MBT suites (posix, nfs3, nfs4, smb2,
+# portmap) and the logic that turns them into a corpus of ITF traces plus the
+# model self-tests and coverage gates.  The replay harness that drives those
+# traces against a server under test lives in the consuming project, which
+# embeds this repo either as a prebuilt trace bundle (fetched by the submodule's
+# git hash) or -- for spec development -- by building it locally.
 #
 # Building this project:
 #   * `cmake --build` generates every trace (traces/<suite>/*.itf.json) and
 #     runs the model self-tests as a build-time gate (a self-test failure stops
 #     the corpus at the source).
 #   * `ctest` runs the coverage gates over the generated corpus.
-#   * `bundle.sh` tars traces/ into the artifact the chimera build consumes.
+#   * `bundle.sh` tars traces/ into the artifact the consuming project fetches.
 #
 # Determinism: trace generation is reproducible only against a fixed quint
 # version, recorded in .quint-version.  Both CI and a local build must use it
 # (CI installs it; a developer should `npm i -g @informalsystems/quint@<ver>`).
 
 cmake_minimum_required(VERSION 3.20)
-project(chimera_specs NONE)
+project(specs NONE)
 enable_testing()
 
 find_program(QUINT_BIN quint REQUIRED)
@@ -39,7 +39,7 @@ if(NOT HAVE_QUINT STREQUAL PINNED_QUINT)
         "quint ${HAVE_QUINT} does not match the pinned ${PINNED_QUINT}; "
         "generated traces may not be bit-identical to the published bundle.")
 endif()
-message(STATUS "chimera specs: quint ${HAVE_QUINT} (pinned ${PINNED_QUINT})")
+message(STATUS "specs: quint ${HAVE_QUINT} (pinned ${PINNED_QUINT})")
 
 set(Q ${CMAKE_CURRENT_SOURCE_DIR}/quint)
 set(T ${CMAKE_CURRENT_BINARY_DIR}/traces)

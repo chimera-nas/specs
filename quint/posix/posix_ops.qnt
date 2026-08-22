@@ -1,6 +1,6 @@
-// SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2026 The Quint Specs Authors
 //
-// SPDX-License-Identifier: LGPL-2.1-only
+// SPDX-License-Identifier: MIT
 
 // POSIX.1-2024 syscall semantics: pathname resolution, the file access
 // permission algorithm, and one handler per modeled function mapping
@@ -202,8 +202,9 @@ module posixops {
     // longer than PATH_MAX.  The replay driver materializes them to real
     // over-long strings; keeping them as abstract sentinels lets the
     // generator reach the pjd `<op>/02` (NAME_MAX) and `<op>/03` (PATH_MAX)
-    // scenarios without building a real 4 KiB path.  chimera guards PATH_MAX
-    // in chimera_posix_check_path (before resolution, so it precedes ENOENT/
+    // scenarios without building a real 4 KiB path.  The server guards
+    // PATH_MAX
+    // before resolution (so it precedes ENOENT/
     // ENOTDIR) and NAME_MAX in the VFS layer (when the component is reached,
     // after its parent is validated) -- both surface as ENAMETOOLONG.
     pure val NLONG: Name = "@nlong"
@@ -294,7 +295,7 @@ module posixops {
                      followFinal: bool): RRes = {
         val begin = if (pth.abs) ROOT else start
         if (pathTooLong(pth))
-            // Whole path over PATH_MAX: chimera_posix_check_path rejects it
+            // Whole path over PATH_MAX: the server's path check rejects it
             // up front, before any component is resolved.
             rFail(ENAMETOOLONG)
         else if (pth.comps.length() == 0)
@@ -1550,12 +1551,13 @@ module posixops {
     // fallocate(2)/posix_fallocate(3).  mode 0 reserves [off, off+len) and
     // grows the file to off+len when it is shorter; mode 1 is the
     // FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE pair, which deallocates the
-    // range and leaves the size unchanged.  Chimera validates off/len in the
+    // range and leaves the size unchanged.  The server validates off/len in
+    // the
     // libc-style wrapper BEFORE acquiring the descriptor, so EINVAL (off < 0
     // or len <= 0) precedes EBADF; a descriptor not open for writing is EBADF
     // (fallocate uses EBADF here, not the EINVAL ftruncate returns).  Both
     // modes mark mtime/ctime and neither clears the set-user/group-ID bits
-    // (memfs_allocate bumps times only, never the mode).
+    // (the allocate path bumps times only, never the mode).
     pure def opFallocate(fs: Fs, ps: Pstate, p: Pid, fd: Fd, mode: int,
                          off: int, len: int): Out =
         if (off < 0 or len <= 0) outErr(fs, ps, EINVAL)

@@ -1,21 +1,27 @@
 <!--
-SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
-SPDX-License-Identifier: LGPL-2.1-only
+SPDX-FileCopyrightText: 2026 The Quint Specs Authors
+SPDX-License-Identifier: MIT
 -->
-# chimera specs
+# Quint protocol & filesystem specifications
 
-Quint model-based-test specifications for [chimera](https://github.com/chimera-nas/chimera).
+Spec-first [Quint](https://quint-lang.org) model-based-test specifications for
+common storage protocol and filesystem surfaces, derived from their standards
+documents (RFC 1813, RFC 7530/8881, MS-SMB2/MS-FSA, POSIX). The build turns each
+model into a corpus of ITF traces plus model self-tests and coverage gates; a
+separate replay harness drives those traces against a server under test.
 
-Each suite under `quint/` is a spec-first model of a protocol/filesystem
-surface; the build turns the models into a corpus of ITF traces plus model
-self-tests and coverage gates:
+Each suite under `quint/` is an independent model:
 
-| suite | what it models |
-|-------|----------------|
-| `quint/posix`   | the POSIX filesystem API (memfs/diskfs/cairn + nfs3/nfs4 loopback profiles) |
-| `quint/nfs`     | NFSv3 and NFSv4 (RFC-first) |
-| `quint/smb2`    | SMB2 (shares the nfs4 filesystem substrate) |
-| `quint/portmap` | the RPC portmapper |
+| suite | what it models | source |
+|-------|----------------|--------|
+| `quint/posix`   | the POSIX filesystem API | POSIX.1 / Linux |
+| `quint/nfs`     | NFSv3 and NFSv4 | RFC 1813, RFC 7530/8881 |
+| `quint/smb2`    | SMB2 (shares the nfs4 filesystem substrate) | MS-SMB2, MS-FSA |
+| `quint/portmap` | the RPC portmapper / rpcbind | RFC 1833 |
+
+> These specifications were originally created to facilitate model-based testing
+> of the [Chimera](https://github.com/chimera-nas/chimera) NAS project, but the
+> models encode the standards, not any one implementation, and stand on their own.
 
 ## Building
 
@@ -31,8 +37,9 @@ Trace generation is deterministic only against the quint version in
 
 ## Consumption
 
-The C/Python replay harness lives in the chimera repo. Chimera consumes this
-repo as a submodule at `ext/specs`: when the submodule is clean it fetches the
-prebuilt trace bundle for that commit from `ghcr.io/chimera-nas/specs:<sha>`;
-otherwise (spec development) it builds the corpus locally from these sources.
-CI publishes the `<sha>`-tagged bundle on every push to `main`.
+A consuming project embeds this repo as a submodule and drives the generated
+traces against its server with its own replay harness. When the submodule is
+clean it can fetch the prebuilt trace bundle for that exact commit from
+`ghcr.io/chimera-nas/specs:<sha>` instead of building it; otherwise (spec
+development) it builds the corpus locally from these sources. CI publishes the
+`<sha>`-tagged bundle on every push to `main`.

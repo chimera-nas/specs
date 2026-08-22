@@ -1,6 +1,6 @@
-// SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2026 The Quint Specs Authors
 //
-// SPDX-License-Identifier: LGPL-2.1-only
+// SPDX-License-Identifier: MIT
 
 // NFSv4 COMPOUND evaluator.
 //
@@ -719,8 +719,8 @@ module nfs4ops {
     // ACCESS (RFC 7530 16.1 / RFC 8881 18.1): supported must be a subset
     // of the request; access a subset of supported.  discretion: the
     // harness runs as root over AUTH_SYS, and the model predicts
-    // access == supported == requested (chimera grants root everything;
-    // within RFC discretion, as in the v3 model).
+    // access == supported == requested (the reference implementation grants
+    // root everything; within RFC discretion, as in the v3 model).
     pure def opAccess(a: Acc, mask: int): Acc = {
         val g = fhGate(a)
         if (g != OK) emit(a, SAccess({ st: g, supported: 0, access: 0 }))
@@ -1135,9 +1135,11 @@ module nfs4ops {
             (d.isWrite or access >= 2 or deny % 2 == 1 or truncates)
         })
 
-    // The delegation-grant profile, pinned against chimera by
-    // nfs4_deleg_probe.c (grants are always a server MAY -- RFC 8881
-    // 10.4 -- so the model asserts chimera's observed, deterministic
+    // The delegation-grant profile, pinned against the reference
+    // implementation by empirical probing (grants are always a server MAY --
+    // RFC 8881
+    // 10.4 -- so the model asserts the reference implementation's observed,
+    // deterministic
     // in-process policy):
     //  - grants are active from the client's FIRST open once the
     //    backchannel is up (a 4.1 session created with the backchannel
@@ -1560,7 +1562,8 @@ module nfs4ops {
                     | IoBypass =>
                         // READ-bypass: the server MAY bypass share checks
                         // (RFC 8881 8.2.3).  discretion: modeled as NOT
-                        // bypassing -- chimera's unified VFS share
+                        // bypassing -- the reference implementation's unified
+                        // VFS share
                         // enforcement applies to every accessor, so the
                         // bypass stateid behaves like the anonymous one.
                         if (anyDeny(a.sdb, a.cfh, 1))
@@ -1762,7 +1765,8 @@ module nfs4ops {
     // LOCKU is a lock-owner-sequenced op (RFC 7530 9.1.7): 4.0 requires the
     // request `lseq` to be the lock-owner's last + 1 (a stateid seqid of 0 is
     // the wildcard for the *stateid*, `argSeq`, not for the owner sequence).
-    // The gate precedes the stateid-seqid check (matching chimera's order);
+    // The gate precedes the stateid-seqid check (matching the reference
+    // implementation's order);
     // only a successful unlock advances the owner seqid.
     pure def opLocku(a: Acc, ar: { sid: Sid, argSeq: int, lseq: int,
                                    lo: int, hi: int }): Acc = {

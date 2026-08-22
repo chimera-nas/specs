@@ -1,6 +1,6 @@
-// SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2026 The Quint Specs Authors
 //
-// SPDX-License-Identifier: LGPL-2.1-only
+// SPDX-License-Identifier: MIT
 
 // Quint model of an NFSv4 server (RFC 7530 / RFC 8881 / RFC 7862 /
 // RFC 8276), used for model-based testing -- the NFSv4 sibling of nfs3.qnt.
@@ -108,7 +108,7 @@ module nfs4 {
             closeFreesLocks: P_CLOSE_FREES_LOCKS
         }
         all {
-            // chimera: memfs share roots are 0777; the root mode is not
+            // ref: in-memory share roots are 0777; the root mode is not
             // asserted by the harness (backend-specific).
             fs' = fsInit(511),
             sdb' = sdbInit,
@@ -177,8 +177,8 @@ module nfs4 {
 
     // Files delegated to a client other than `cid`.  Mutating such a file
     // through SETATTR/WRITE/LINK/xattr/sparse ops is EXCLUDED from
-    // generation: chimera recalls but COMPLETES those ops (probed by
-    // nfs4_deleg_probe.c C3/C4), a state-mutating divergence from the
+    // generation: the reference implementation recalls but COMPLETES those
+    // ops (empirically probed), a state-mutating divergence from the
     // RFC's recall-then-DELAY discipline (DEVIATIONS-NFS4.md D4-12), so
     // the model neither predicts nor randomly exercises it.  OPEN and
     // REMOVE/RENAME conflicts follow the DELAY discipline and stay in
@@ -191,11 +191,12 @@ module nfs4 {
 
     // Files delegated to `cid` itself.  A client's own REMOVE/RENAME of
     // a file it holds a delegation on triggers a recall of its OWN
-    // delegation and an unresolvable NFS4ERR_DELAY in chimera (the
+    // delegation and an unresolvable NFS4ERR_DELAY in the reference
+    // implementation (the
     // namespace-op lease-conflict path does not recognize the requester
     // as the holder, unlike the OPEN path -- DEVIATIONS-NFS4.md D4-13),
     // so generation diverts those; the OPEN-path self-exemption is
-    // pinned by nfs4_deleg_probe.c G2.
+    // empirically pinned.
     def delegSelf(f: Ino, cid: ClientId): bool =
         sdb.delegs.keys().exists(s => {
             val d = sdb.delegs.get(s)

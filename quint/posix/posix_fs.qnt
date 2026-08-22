@@ -1,6 +1,6 @@
-// SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2026 The Quint Specs Authors
 //
-// SPDX-License-Identifier: LGPL-2.1-only
+// SPDX-License-Identifier: MIT
 
 // Generic model of the filesystem underlying the POSIX file API.
 //
@@ -15,7 +15,7 @@
 //     POSIX layer resolves them component by component);
 //   - only in nfs4_fs: xattrs, ALLOCATE's allocated-zero block state, the
 //     NFS change attribute, the exclusive-create verifier.
-// Neither module claims to exhaust the real chimera VFS, which is a richer
+// Neither module claims to exhaust the server's real VFS, which is a richer
 // NFS/SMB hybrid (NFSv4 ACLs, share modes, streams); each models exactly
 // what its protocol can observe.
 //

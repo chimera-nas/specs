@@ -1,6 +1,6 @@
-// SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
+// SPDX-FileCopyrightText: 2026 The Quint Specs Authors
 //
-// SPDX-License-Identifier: LGPL-2.1-only
+// SPDX-License-Identifier: MIT
 
 // SMB2/3 command evaluator.
 //
@@ -96,9 +96,10 @@ module smb2ops {
         // discretion: does a conflicting CREATE break a peer's lease at OPEN
         // time (MS-FSA-correct = true), or does an SMB2 RqLs lease survive a
         // conflicting open and break only on the later I/O / namespace op
-        // (the chimera Seam-A asymmetry, vfs_state.c ~L971)?  The pure model
+        // (the reference implementation's Seam-A asymmetry)?  The pure model
         // pins the MS-correct value; the coherency probe (Increment 4)
-        // records chimera's real answer, and a mismatch is a deviation.
+        // records the reference implementation's real answer, and a mismatch
+        // is a deviation.
         leaseOpenBreak: bool
     }
 

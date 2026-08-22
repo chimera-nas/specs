@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: 2026 Chimera-NAS Project Contributors
+# SPDX-FileCopyrightText: 2026 The Quint Specs Authors
 #
-# SPDX-License-Identifier: LGPL-2.1-only
+# SPDX-License-Identifier: MIT
 
 """Model-coverage report over a corpus of generated ITF traces.
 
@@ -14,7 +14,7 @@ needs biasing/more seeds, or the scenario needs a targeted `quint verify`
 witness (see DEVIATIONS.md / the coverage notes).
 
 This reads the same ITF traces the replayer consumes and needs no server -- it
-measures the *model's* generated behavior, independent of chimera.
+measures the *model's* generated behavior, independent of any server.
 
 Usage:
     coverage.py trace1.itf.json trace2.itf.json ...
