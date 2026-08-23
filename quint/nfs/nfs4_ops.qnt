@@ -670,7 +670,27 @@ module nfs4ops {
                             | KDeleg => a.sdb.delegs.get(r.sid).file
                             | KLayout => a.sdb.layouts.get(r.sid).file
                         }
+                        // The client the stateid was issued to.  A stateid
+                        // belongs to the client that created it, so it
+                        // designates no state for anyone else and using it
+                        // from another client is NFS4ERR_BAD_STATEID (RFC
+                        // 8881 15.1.5.2: "a stateid does not properly
+                        // designate any valid state").
+                        //
+                        // Only 4.1+ can detect this: a 4.0 COMPOUND carries
+                        // no client identity of its own, so the stateid is
+                        // the only binding there and there is nothing to
+                        // compare it against.
+                        val ownedBy = match r.kind {
+                            | KOpen => a.sdb.opens.get(r.sid).client
+                            | KLock => a.sdb.locks.get(r.sid).client
+                            | KDeleg => a.sdb.delegs.get(r.sid).client
+                            | KLayout => a.sdb.layouts.get(r.sid).client
+                        }
                         if (fOf != a.cfh) IoError(E_BAD_STATEID)
+                        else if (a.minor >= 1 and a.seqClient != -1 and
+                                 ownedBy != a.seqClient)
+                            IoError(E_BAD_STATEID)
                         else if (r.kind == KOpen and
                                  a.sdb.opens.get(r.sid).needConfirm)
                             IoError(E_BAD_STATEID)
