@@ -198,8 +198,35 @@ endforeach()
 # SMB2  (smb2_run.qnt; depends on the shared nfs4_fs substrate too)
 # ---------------------------------------------------------------------------
 specs_selftest(smb2Test ${Q}/smb2/smb2Test.qnt smb2Test 200 SMB2_DEPS)
-specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Base stepCore 60 6 0x7
-          "smb2Base_stepCore_60_{seq}" SELFTEST_smb2Test SMB2_DEPS)
+# Six registered batches.  Depth is capped per flavor by what replays green
+# against the live server, not by taste: stepCore/stepReq/stepInfo/stepNs
+# sustain 500 steps, stepDir 240, and stepDurable breaks at 180 on the Q-4
+# caching-lifecycle family (see the chimera tree's DEVIATIONS-SMB.md).
+# smb2Replay/stepReplay is deliberately absent -- Q-13 makes affected traces
+# nondeterministic, so registering it would trade trust for coverage.
+specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Base stepCore 500 8 0x7
+          "smb2Base_stepCore_500_0x7_{seq}" SELFTEST_smb2Test SMB2_DEPS)
+specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Base stepReq 500 8 0x11
+          "smb2Base_stepReq_500_0x11_{seq}" SELFTEST_smb2Test SMB2_DEPS)
+specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Base stepDir 240 8 0x5
+          "smb2Base_stepDir_240_0x5_{seq}" SELFTEST_smb2Test SMB2_DEPS)
+specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Base stepInfo 500 8 0x9
+          "smb2Base_stepInfo_500_0x9_{seq}" SELFTEST_smb2Test SMB2_DEPS)
+specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Base stepNs 500 8 0xd
+          "smb2Base_stepNs_500_0xd_{seq}" SELFTEST_smb2Test SMB2_DEPS)
+# smb2Durable/stepDurable is NOT generated, for the same reason
+# smb2Replay/stepReplay is not: it does not replay green in this harness.  A
+# durable handle is PARKED across a transport drop by design, so it outlives
+# the connection -- and the batch replayer tears the share and filesystem down
+# after every trace.  chimera_smb_remove_share() frees the share and destroys
+# its sharemode table with no regard for opens still referencing it, giving a
+# heap-use-after-free in chimera_smb_sharemode_release(); keeping the share
+# instead just moves the problem to rmfs, which then spins on EBUSY until the
+# parked handle's 60 s durable timeout.  The durable MODEL and its
+# ground-truth probe (smb2_durable_probe) both ship and pass; only the
+# generated batch is withheld until the share/handle lifetime is settled.
+# specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Durable stepDurable 160 8 0x41
+#           "smb2Durable_stepDurable_160_0x41_{seq}" SELFTEST_smb2Test SMB2_DEPS)
 
 # ---------------------------------------------------------------------------
 # portmap: traces are committed (regen via quint/portmap/regen_traces.sh);
