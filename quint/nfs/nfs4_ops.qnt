@@ -699,6 +699,15 @@ module nfs4ops {
     // Does any current open of file f deny the given I/O kind (1 = read,
     // 2 = write)?  Anonymous-stateid I/O against a deny mode fails
     // NFS4ERR_LOCKED (RFC 7530 9.1.4.3 / RFC 8881 8.2.3).
+    // A stateid selection that carries no open of its own, and so gets no
+    // share grant with it.
+    pure def namesNoOpen(sel: SidSel): bool =
+        match sel {
+            | SelAnon => true
+            | SelBypass => true
+            | SelRef(_) => false
+        }
+
     pure def anyDeny(sdb: StateDB, f: Ino, kindBit: int): bool =
         sdb.opens.keys().exists(s => {
             val o = sdb.opens.get(s)
@@ -2319,6 +2328,18 @@ module nfs4ops {
                 if (ar.srcOff + cnt > src.sizeBlocks or
                     (ar.cnt == 0 and ar.srcOff > src.sizeBlocks))
                     emit(a, SCopy(nores.with("st", E_INVAL)))
+                // COPY reads the source and writes the destination, so the
+                // share reservations that gate READ and WRITE gate it too
+                // (RFC 8881 9.7).  A stateid that names an open carries its
+                // own grant; an anonymous or READ-bypass one does not, so a
+                // deny held by any owner of any client makes it
+                // NFS4ERR_LOCKED -- otherwise the anonymous stateid would be
+                // a way around the reservation.  Checked after the range so
+                // an out-of-range COPY still reports the argument error.
+                else if (namesNoOpen(ar.srcSel) and anyDeny(a.sdb, a.sfh, 1))
+                    emit(a, SCopy(nores.with("st", E_LOCKED)))
+                else if (namesNoOpen(ar.dstSel) and anyDeny(a.sdb, a.cfh, 2))
+                    emit(a, SCopy(nores.with("st", E_LOCKED)))
                 else {
                     val data = fsReadData(src, ar.srcOff, cnt)
                     val w = range(0, cnt).foldl(a.fs, (acc, i) =>
