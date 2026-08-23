@@ -386,10 +386,24 @@ module nfs3 {
     // ------------------------------------------------------------------
 
     action applyCreate(d: Fid, n: Name, cm: CreateMode, m: int, c: Cred): bool =
-        if (not(hasEnt(d, n)) and not(canModifyDir(fs.get(d), c))) all {
-            // Creating a fresh entry needs write+search on the parent (XBD
-            // 4.6 write, plus search to resolve).  A new file is owned by its
-            // creator's credential.
+        if (not(canSearch(fs.get(d), c))) all {
+            // Resolving the name at all requires search (execute) permission on
+            // the parent directory (POSIX path resolution).  Without it the
+            // server cannot observe whether the name exists, so an entry's
+            // existence or type must not leak -- NFS3ERR_ACCES, taking
+            // precedence over any EXIST/ISDIR outcome.  ref: a server that
+            // resolves the name through the host kernel returns ACCES here; one
+            // that omits the search check on the existing-entry path instead
+            // leaks the type-based reply (a deviation the replay harness may
+            // reconcile).
+            fs' = fs,
+            removed' = removed,
+            nextFid' = nextFid,
+            lastOp' = OCreate({ dir: d, name: n, cmode: cm, mode: m, verf: -1,
+                                status: ERR_ACCES, obj: -1, cred: c }),
+        } else if (not(hasEnt(d, n)) and not(canWrite(fs.get(d), c))) all {
+            // Creating a fresh entry additionally needs write on the parent
+            // (XBD 4.6).  A new file is owned by its creator's credential.
             fs' = fs,
             removed' = removed,
             nextFid' = nextFid,
@@ -400,17 +414,32 @@ module nfs3 {
             removed' = removed,
             nextFid' = nextFid,
             lastOp' =
+                // RFC 1813 3.3.8 create-on-existing, by mode and existing type.
+                // The model is a spec oracle: it encodes the standard, not any
+                // one implementation's behavior.
                 if (cm == Guarded)
+                    // GUARDED: the name exists -> NFS3ERR_EXIST, before any
+                    // per-object access check.
                     OCreate({ dir: d, name: n, cmode: cm, mode: m, verf: -1,
                               status: ERR_EXIST, obj: -1, cred: c })
-                else
-                    // UNCHECKED over an existing name succeeds and returns
-                    // the existing object *of any type*, attributes
-                    // untouched.  ref: probed 2026-08-08 -- this holds
-                    // even when the name is a directory or symlink (POSIX
-                    // open(O_CREAT) would give EISDIR for a directory).
+                else if (fs.get(fs.get(d).ents.get(n)).ftype == TReg)
+                    // UNCHECKED over an existing regular file: succeed and
+                    // return the existing object, attributes untouched (a
+                    // stateless CREATE does not require write on it).
                     OCreate({ dir: d, name: n, cmode: cm, mode: m, verf: -1,
-                              status: OK, obj: fs.get(d).ents.get(n), cred: c }),
+                              status: OK, obj: fs.get(d).ents.get(n), cred: c })
+                else if (fs.get(fs.get(d).ents.get(n)).ftype == TDir)
+                    // UNCHECKED over a directory: a regular-file create cannot
+                    // overwrite a directory -- POSIX open(O_CREAT) gives EISDIR.
+                    OCreate({ dir: d, name: n, cmode: cm, mode: m, verf: -1,
+                              status: ERR_ISDIR, obj: -1, cred: c })
+                else
+                    // UNCHECKED over a symlink/socket/fifo: the name is held by
+                    // a non-regular object and CREATE (which does not follow
+                    // symlinks or unlink) cannot materialize a regular file
+                    // there -> NFS3ERR_EXIST.
+                    OCreate({ dir: d, name: n, cmode: cm, mode: m, verf: -1,
+                              status: ERR_EXIST, obj: -1, cred: c }),
         } else all {
             fs' = fs
                 .put(nextFid, emptyFile(m, c))
