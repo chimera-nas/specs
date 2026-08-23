@@ -41,6 +41,9 @@ module smb2ops {
     pure val ST_PENDING = 0x00000103
     pure val ST_UNSUCCESSFUL = 0xC0000001
     pure val ST_INVALID_PARAMETER = 0xC000000D
+    // A data operation issued against a handle whose stream is a DirectoryStream
+    // (MS-FSA 2.1.5.2 READ / 2.1.5.3 WRITE).
+    pure val ST_INVALID_DEVICE_REQUEST = 0xC0000010
     pure val ST_END_OF_FILE = 0xC0000011
     pure val ST_ACCESS_DENIED = 0xC0000022
     pure val ST_OBJECT_NAME_NOT_FOUND = 0xC0000034
@@ -58,6 +61,18 @@ module smb2ops {
     pure val ST_NOT_A_DIRECTORY = 0xC0000103
     pure val ST_FILE_CLOSED = 0xC0000128
     pure val ST_USER_SESSION_DELETED = 0xC0000203
+    // A CREATE whose DH2Q CreateGuid collides with a durable open this client
+    // already holds (MS-SMB2 3.3.5.9.10).
+    pure val ST_DUPLICATE_OBJECTID = 0xC000022A
+    // MS-SMB2 3.3.5.2.10: the reply to a MUTATING request that arrives with a
+    // superseded ChannelSequence.  The exactly-once guarantee for a mutation is
+    // this refusal and nothing else -- there is no reply cache on that path
+    // (probe R6/4).
+    pure val ST_FILE_NOT_AVAILABLE = 0xC0000467
+    // Oplock/lease acknowledgment rejection arms (MS-SMB2 3.3.5.22.1/.2).
+    pure val ST_INVALID_OPLOCK_PROTOCOL = 0xC00000E3
+    pure val ST_REQUEST_NOT_ACCEPTED = 0xC00000D0
+    pure val ST_INVALID_DEVICE_STATE = 0xC0000184
 
     // CreateAction (MS-SMB2 2.2.14).
     pure val ACT_SUPERSEDED = 0
@@ -93,6 +108,13 @@ module smb2ops {
         dirLeases: bool,
         // durable handles v1/v2 observed grantable.
         durable: bool,
+        // SMB2_SHAREFLAG_FORCE_LEVELII_OPLOCK on the share (MS-SMB2 2.2.10):
+        // every caching grant is capped to a read (LEVEL_II / R) cache, so an
+        // exclusive/batch oplock or a W/H lease is stripped down to R.  This is
+        // a share property, not a negotiated capability, so it is pinned per
+        // instance rather than drawn at init.  (WPTS ShareForceLevel2 is the
+        // single largest oplock family: 112 of its 156 green cases.)
+        forceLevel2: bool,
         // discretion: does a conflicting CREATE break a peer's lease at OPEN
         // time (MS-FSA-correct = true), or does an SMB2 RqLs lease survive a
         // conflicting open and break only on the later I/O / namespace op
@@ -123,13 +145,75 @@ module smb2ops {
     // complement, computed at CREATE time.
     type ShareAccess = { r: bool, w: bool, d: bool }
 
-    // Oplock/lease request in a CREATE.
+    // Oplock/lease request in a CREATE.  An OrLease carries the RqLs context's
+    // version: a v2 context is epoch-versioned (the grant lands at the
+    // requested epoch + 1) and is the only form that can carry a directory
+    // lease; a v1 context is not versioned at all (epoch 0).
     type OplockReq =
         | OrNone
         | OrLevelII
         | OrExclusive
         | OrBatch
-        | OrLease({ key: LeaseKey, r: bool, w: bool, h: bool })
+        | OrLease({ key: LeaseKey, r: bool, w: bool, h: bool,
+                    v2: bool, epoch: int })
+
+    // The lease key a CREATE identifies itself by, or -1 for a legacy oplock /
+    // no oplock.  A holder under the SAME key is the requester's own grant and
+    // is coalesced onto, never broken (smb_proc_create.c break_for_open).
+    pure def reqLeaseKey(o: OplockReq): LeaseKey =
+        match o { | OrLease(x) => x.key | _ => -1 }
+
+    // Does this request ask for a WRITE cache?  MS-FSA routes exactly these
+    // through 2.1.5.18.1 "Algorithm to Request an Exclusive Oplock" (the one
+    // with the sole-Open condition); LEVEL_II and an R / RH lease are SHARED
+    // requests (2.1.5.18.2) and carry no sole-Open condition at all.
+    pure def reqWantsWrite(o: OplockReq): bool =
+        match o {
+            | OrExclusive => true
+            | OrBatch => true
+            | OrLease(x) => x.w
+            | _ => false
+        }
+
+    // Is this an RqLs lease request (as opposed to a legacy oplock)?
+    pure def reqIsLease(o: OplockReq): bool =
+        match o { | OrLease(_) => true | _ => false }
+
+    // The durable-handle context (if any) a CREATE carries (MS-SMB2 2.2.13.2.3
+    // DHnQ, 2.2.13.2.5 DHnC, 2.2.13.2.11 DH2Q, 2.2.13.2.12 DH2C).
+    //
+    //  DurNone         no durable context at all.
+    //  DurQ(x)         a durable REQUEST.  `v2` picks DH2Q (identified by a
+    //                  CreateGuid) over DHnQ (no guid at all).  `persistent`
+    //                  sets SMB2_DHANDLE_FLAG_PERSISTENT, which is only ever
+    //                  honored on a continuously-available share -- no modeled
+    //                  instance has one, so it is carried but never grants.
+    //  DurC(x)         a durable RECONNECT naming a parked handle by the FileId
+    //                  it kept.  `alsoQ` additionally puts the matching REQUEST
+    //                  context on the same CREATE, which is the one place the
+    //                  two versions differ: DH2C + DH2Q is INVALID_PARAMETER,
+    //                  while DHnC + DHnQ is legal and the request is ignored
+    //                  (probe D4e; MS-SMB2 3.3.5.9.7 vs 3.3.5.9.12).
+    //  `withName`      the reconnect names the file instead of sending the
+    //                  usual empty Name -- which a LEASED handle rejects with
+    //                  INVALID_PARAMETER when the name is not its own (D4d).
+    type DurableReq =
+        | DurNone
+        | DurQ({ v2: bool, guid: int, persistent: bool })
+        | DurC({ v2: bool, fid: FileId, guid: int, persistent: bool,
+                 alsoQ: bool, withName: bool })
+
+    pure def durIsReq(d: DurableReq): bool =
+        match d { | DurQ(_) => true | _ => false }
+
+    pure def durIsReconnect(d: DurableReq): bool =
+        match d { | DurC(_) => true | _ => false }
+
+    pure def durReqV2(d: DurableReq): bool =
+        match d { | DurQ(x) => x.v2 | DurC(x) => x.v2 | DurNone => false }
+
+    pure def durReqGuid(d: DurableReq): int =
+        match d { | DurQ(x) => x.guid | DurC(x) => x.guid | DurNone => -1 }
 
     // Which FileId a command targets: the related-compound current fid, or
     // an explicit learned fid.
@@ -142,7 +226,20 @@ module smb2ops {
         | CTreeDisconnect
         | CCreate({ dir: Ino, name: Name, disp: Disposition,
                     access: DesiredAccess, share: ShareAccess,
-                    isDir: bool, delOnClose: bool, oplock: OplockReq })
+                    isDir: bool, delOnClose: bool, oplock: OplockReq,
+                    durable: DurableReq })
+        // The transport dropped (MS-SMB2 3.3.7.1).  Not an SMB2 command -- it
+        // is the connection going away -- but the model needs it as a
+        // transition, and the replayer drives it with an actual
+        // client-initiated disconnect.  It targets the message's session, whose
+        // trees die with it; durable opens PARK and everything else closes.
+        | CDisconnect
+        // A fresh connection + session presenting the SAME ClientGuid as
+        // `prev`, i.e. the reconnect half of a durable handle's lifecycle.  Not
+        // a session BIND (MS-SMB2 3.2.4.1.8 channel binding is out of scope):
+        // a new session, a new session id, the same client identity -- which is
+        // what a leased reclaim's ClientGuid check compares (3.3.5.9.7).
+        | CReconnect({ prev: SessionId })
         | CClose(FidSel)
         | CRead({ fid: FidSel, off: int, len: int })
         | CWrite({ fid: FidSel, off: int, len: int, pat: int })
@@ -153,7 +250,13 @@ module smb2ops {
         | CSetDisposition({ fid: FidSel, del: bool })
         | CSetRename({ fid: FidSel, newdir: Ino, newname: Name })
         | CQueryBasic(FidSel)
-        | CBreakAck(FidSel)
+        // OPLOCK_BREAK / LEASE_BREAK acknowledgment.  `asLease` picks the wire
+        // shape (StructureSize 36 lease ack vs 24 oplock ack -- the server
+        // discriminates on exactly that); `ackLevel` / `ackState` are what the
+        // holder chooses to KEEP, which the server validates against the
+        // retained mask the break asked for.
+        | CBreakAck({ fid: FidSel, asLease: bool, ackLevel: OplockLevel,
+                      ackState: LeaseState })
 
     type AttrSnap = { ftype: Ftype, nlink: int, sizeBlocks: int,
                       change: int, deletePending: bool }
@@ -163,16 +266,28 @@ module smb2ops {
         | RLogoff({ st: int })
         | RTreeConnect({ st: int, tree: TreeId })
         | RTreeDisconnect({ st: int })
+        // `parked` records that the server emitted an async interim
+        // (STATUS_PENDING) before this reply -- i.e. the open was granted but
+        // held until a peer's ack-required break settled.  It is a first-class
+        // wire observable (smb_async_interim.c), not an alternative status: the
+        // CREATE still carries its final status here.
+        // `durable` records that the reply carried a DHnQ / DH2Q response
+        // context, which IS the durable grant signal on the wire: chimera emits
+        // one only when it granted (build_dhnq_response / build_dh2q_response).
+        // A RECONNECT grants nothing new, so it answers false (probe D3).
         | RCreate({ st: int, fid: FileId, act: int, ino: Ino,
-                    caching: Caching, breaks: Set[FileId] })
+                    caching: Caching, breaks: Set[BreakNote], parked: bool,
+                    durable: bool })
+        | RDisconnect({ st: int })
+        | RReconnect({ st: int, sess: SessionId })
         | RClose({ st: int, gone: Ino })
         | RRead({ st: int, count: int, eof: bool, blocks: List[int] })
-        | RWrite({ st: int, count: int, breaks: Set[FileId] })
+        | RWrite({ st: int, count: int, breaks: Set[BreakNote] })
         | RFlush({ st: int })
         | RLock({ st: int })
         | RSetEof({ st: int })
         | RSetDisposition({ st: int })
-        | RSetRename({ st: int, breaks: Set[FileId] })
+        | RSetRename({ st: int, breaks: Set[BreakNote] })
         | RQueryBasic({ st: int, attrs: AttrSnap })
         | RBreakAck({ st: int })
 
@@ -196,7 +311,33 @@ module smb2ops {
     // Access / share helpers
     // ------------------------------------------------------------------
 
-    pure def wantOf(a: DesiredAccess): Access = { r: a.r, w: a.w, d: a.d }
+    // A truncating disposition replaces the file's data, so it invalidates
+    // every cached holder all the way to NONE rather than leaving a read cache.
+    pure def truncating(d: Disposition): bool =
+        d == DispSupersede or d == DispOverwrite or d == DispOverwriteIf
+
+    // The access a CREATE asserts for SHARE ARBITRATION.  A truncating
+    // disposition (SUPERSEDE / OVERWRITE / OVERWRITE_IF) must obtain WRITE at
+    // open time to overwrite the data, even when DesiredAccess never asked for
+    // it -- so it conflicts with a peer that denies write (MS-FSA 2.1.5.1.2
+    // runs the sharing check against the access the open actually needs;
+    // smb_proc_create.c:993-998 "A truncating disposition must obtain write
+    // access at open time to overwrite the data").
+    //
+    // chimera holds that bit only TRANSIENTLY: `held_granted` is snapshotted
+    // before the bit is added and the retained grant is downgraded back to it
+    // once the share lease is inserted, so the HANDLE does not keep write
+    // access.  The model splits the two the same way -- `wantOf` is the
+    // conflict-time access and carries the transient W, while doInsertOpen
+    // below stores x.access unchanged, so a later WRITE through such a handle
+    // is still ACCESS_DENIED when DesiredAccess carried no write bit.
+    //
+    // An attribute-only open is exempt in both: chimera zeroes granted/denied/
+    // held_granted after adding the truncate W when DesiredAccess carries no
+    // share-mode access bit at all, and doCmdCreate's `attrOnly` gate skips the
+    // share check for exactly that case.
+    pure def wantOf(a: DesiredAccess, disp: Disposition): Access =
+        { r: a.r, w: a.w or truncating(disp), d: a.d }
 
     // Denied set = complement of ShareAccess over R/W/D (MS-FSA: a bit not
     // in ShareAccess means concurrent access along that axis is denied).
@@ -220,6 +361,25 @@ module smb2ops {
     // SUPERSEDE is modeled as truncate-or-create keeping the CreateAction
     // FILE_SUPERSEDED (exact delete-recreate identity churn is deferred;
     // the coherency-relevant effect is the zero-length + action code).
+    //
+    // CHECK ORDER (MS-FSA 2.1.5.1.2, "Open of Existing File").  The spec runs,
+    // in this order:
+    //   1. `If CreateDisposition is FILE_CREATE -> STATUS_OBJECT_NAME_COLLISION`
+    //      -- the very first thing the existing-file path does, before the
+    //      target's TYPE is consulted at all;
+    //   2. the type mismatch: in the DirectoryFile branch,
+    //      CreateOptions.FILE_NON_DIRECTORY_FILE -> STATUS_FILE_IS_A_DIRECTORY;
+    //      in the DataFile branch, FILE_DIRECTORY_FILE -> STATUS_NOT_A_DIRECTORY;
+    //   3. only THEN, still inside the DirectoryFile branch, a truncating
+    //      disposition (SUPERSEDE / OVERWRITE / OVERWRITE_IF) on a directory
+    //      -> STATUS_INVALID_PARAMETER (decideByDisp's truncOver/truncSuper).
+    // The model used to run 2 before 1, so a FILE_CREATE over an existing
+    // directory reported FILE_IS_A_DIRECTORY (and a directory FILE_CREATE over
+    // an existing file NOT_A_DIRECTORY) where the spec -- and chimera, which
+    // maps the disposition onto an exclusive VFS create and answers the
+    // backend's EEXIST -- says OBJECT_NAME_COLLISION.  Note 1 is hoisted alone:
+    // running the whole disposition decision first would move 3 ahead of 2 and
+    // answer INVALID_PARAMETER where the spec says FILE_IS_A_DIRECTORY.
     pure def decideCreate(fs: Fs, dir: Ino, name: Name, disp: Disposition,
                           isDir: bool):
             { fs2: Fs, st: int, ino: Ino, act: int } = {
@@ -234,10 +394,17 @@ module smb2ops {
             // or opening an existing object as the wrong type.
             val typeBad =
                 ex and (if (isDir) not(isdir) else isdir)
-            if (ex and typeBad)
+            if (not(ex))
+                decideByDisp(fs, dir, name, disp, isDir, ex, ino, isdir)
+            // step 1: the disposition's existence verdict, ahead of the type.
+            else if (disp == DispCreate)
+                { fs2: fs, st: ST_OBJECT_NAME_COLLISION, ino: -1, act: 0 }
+            // step 2: the type mismatch.
+            else if (typeBad)
                 { fs2: fs, st: if (isDir) ST_NOT_A_DIRECTORY
                                else ST_FILE_IS_A_DIRECTORY,
                   ino: -1, act: 0 }
+            // step 3 lives in decideByDisp (truncate-a-directory).
             else
                 decideByDisp(fs, dir, name, disp, isDir, ex, ino, isdir)
         }
@@ -273,6 +440,9 @@ module smb2ops {
                 if (ex) open
                 else { fs2: fs, st: ST_OBJECT_NAME_NOT_FOUND, ino: -1,
                        act: 0 }
+            // The `ex` arm is adjudicated by decideCreate ahead of the type
+            // check (MS-FSA 2.1.5.1.2 step 1) and so never reaches here; kept
+            // so decideByDisp stays total over the whole matrix.
             | DispCreate =>
                 if (ex) { fs2: fs, st: ST_OBJECT_NAME_COLLISION, ino: -1,
                               act: 0 }
@@ -294,58 +464,176 @@ module smb2ops {
     // Oplock / lease grant policy (discretion, pinned by Caps)
     // ------------------------------------------------------------------
 
-    // Compute the caching grant for a freshly inserted handle `self` on file
-    // f.  Exclusive/batch oplocks need sole access (no other open); a lease
-    // computes RWH from access and coexisting grants (W only when sole);
-    // level II is always grantable.  Gated by caps.oplocks / caps.leases.
+    // A force-level-2 share caps a grant to a read cache: the W and H caching
+    // bits are cleared before arbitration (smb_proc_create.c
+    // `req_smb &= SMB2_LEASE_READ_CACHING`), so a batch oplock lands at
+    // LEVEL_II and an RWH lease at R.  Pinned by probe O10.
+    pure def capForceLevel2(caps: Caps, b: LeaseState): LeaseState =
+        if (caps.forceLevel2) bitsAnd(b, BITS_R) else b
+
+    // An existing grant on f held under lease key `k` (any open), or CNone.
+    //
+    // A member must actually HOLD caching bits.  An RqLs open that was granted
+    // NONE -- leasing not advertised (the bare-RqLs path), or the invalid
+    // W/H-without-R request of MS-SMB2 3.3.5.9.8 -- records a lease key and a
+    // lease-shaped reply but establishes no grant to coalesce onto: chimera
+    // takes no VFS caching grant for it at all (`smb_proc_create.c`, the
+    // `grant == NULL` reporting branch, which reaches
+    // `chimera_vfs_state_put(file_state)` rather than sharing a grant).
+    //
+    // Coalescing onto such an empty record made the model report the FIRST
+    // request's lease version and epoch on a later open under the same key --
+    // so a v1 RqLs joining an earlier v2 bare-RqLs answered v2/epoch 1 where
+    // the wire answers 0, because a v1 response context (MS-SMB2 2.2.13.2.8 /
+    // 2.2.14.2.10) has no Epoch field at all and the reply follows the
+    // REQUEST's version when there is no grant to inherit one from.
+    pure def grantUnderKey(sdb: StateDB, f: Ino, self: FileId,
+                           k: LeaseKey, sess: SessionId): Caching = {
+        val members = opensOfFile(sdb, f).exclude(Set(self)).filter(fid =>
+            leaseKeyOf(sdb.opens.get(fid).caching) == k and
+            not(cachingLevelNone(sdb.opens.get(fid).caching)) and
+            sdb.opens.get(fid).session == sess)
+        if (members.size() == 0) CNone
+        else sdb.opens.get(members.fold(-1, (acc, x) =>
+                 if (acc < 0 or x < acc) x else acc)).caching
+    }
+
+    // Compute the caching grant for a freshly inserted handle `self` on file f.
+    //
+    //  - A second open under an EXISTING lease key COALESCES onto that grant:
+    //    it reports the grant's current state and epoch and never reduces it
+    //    (MS-SMB2 3.3.5.9.8; probe O7).  This is checked first, so a re-open
+    //    asking for less does not downgrade the lease.
+    //  - W/H caching is meaningful only alongside R: a requested lease state
+    //    with W or H but no R is invalid and grants NONE (3.3.5.9.8).
+    //  - A WRITE cache (legacy EXCLUSIVE / BATCH, or a lease carrying W) needs
+    //    sole access: MS-FSA 2.1.5.18.1 ("Algorithm to Request an Exclusive
+    //    Oplock", numbered 2.1.5.17.2 in the revision this suite's older
+    //    citations use) fails the request when "Open.File.OpenList contains
+    //    more than one Open whose Stream is the same as Open.Stream, and
+    //    NO_OPLOCK is present in Open.Stream.Oplock.State".  That clause has NO
+    //    OplockKey and NO client-identity exemption -- the key exemptions in
+    //    2.1.5.18.1 apply only to UPGRADING a stream that already holds an
+    //    R / RH oplock, and a same-lease-key re-open never reaches the FSA
+    //    layer at all (MS-SMB2 3.3.5.9.8 coalesces it -- the `joined` arm
+    //    below).  So the model caps W against EVERY peer open; chimera exempts
+    //    two peer shapes and that is recorded as DEVIATIONS-SMB.md S-3, not
+    //    copied into the model.
+    //  - HANDLE caching on a lease is capped instead against a peer open that
+    //    is not itself lease-backed (probe O12): two RqLs leases coexist at
+    //    R+H, but a plain open owns the handle exclusively.  Granting less than
+    //    was asked for is server discretion (MS-SMB2 3.3.5.9), so this is a
+    //    policy pinned by measurement, not a mandate.
+    //  - A LEGACY oplock request by a client that already holds an H
+    //    (handle-caching) lease on the file is granted NOTHING, at every level
+    //    including LEVEL_II (probe O12[32]/O12[33]): handle caching already
+    //    owns the handle and the oplock must never recall the requester's own
+    //    lease (smb_proc_create.c chimera_vfs_client_holds_handle_lease).
+    //  - A v2 lease is granted at the client's epoch + 1; a v1 lease is not
+    //    versioned and is granted (and broken) at epoch 0 (probe O9).
+    // Gated by caps.oplocks / caps.leases and capped by caps.forceLevel2.
     pure def grantCaching(sdb: StateDB, f: Ino, self: FileId,
-                          oplock: OplockReq, caps: Caps): Caching = {
+                          oplock: OplockReq, caps: Caps,
+                          sess: SessionId): Caching = {
         val others = opensOfFile(sdb, f).exclude(Set(self))
-        val sole = others.size() == 0
+        // Parked handles that SURVIVED this open's purge (doPurgeParked) still
+        // count for the sole-Open condition of MS-FSA 2.1.5.18.1: probe D7d
+        // measured a fully compatible RWH-lease request behind a parked RH
+        // lease being granted RH, i.e. the write cache withheld on account of a
+        // holder that is not even connected.  Found by a generated trace, which
+        // predicted RWH where the wire said RH.
+        val survivors = parkedOnFile(sdb, f)
+        val sole = others.size() == 0 and survivors.size() == 0
+        // A peer open that caps the HANDLE bit of a fresh lease: it must be
+        // visible to the arbitration (not attribute-only) and must not itself
+        // be lease-backed (probe O12[23]-O12[31]).
+        val capsHandle = others.exists(g => {
+            val o = sdb.opens.get(g)
+            openVisibleToGrant(o) and not(isLeaseGrant(o.caching))
+        }) or survivors.exists(k => {
+            // A surviving parked holder is always lease-backed in practice (a
+            // parked OPLOCK holder is a batch oplock, i.e. a write cache, and
+            // is therefore always purged), so this arm is defensive rather than
+            // measured -- kept structurally identical to the live-open test
+            // above so the two cannot drift apart.
+            val o = sdb.parked.get(k).open
+            openVisibleToGrant(o) and not(isLeaseGrant(o.caching))
+        })
+        // Does the REQUESTING client already hold an H lease on this file?
+        //
+        // A PARKED handle of the same client counts, and that is measured, not
+        // assumed: a generated durable trace (smb2Durable/stepDurable 160x8
+        // @0x61, trace 0, smallest failing prefix 96 states) requested a
+        // LEVEL_II oplock on a file whose only holder was this client's own
+        // PARKED R+H lease.  The model granted LEVEL_II; the wire granted
+        // NOTHING -- the same answer G-4 pins for a LIVE H-lease holder
+        // (O12[32], O12[33]), which is coherent with C-28: a surviving parked
+        // holder is still a holder.  DEVIATIONS-SMB.md M-14.
+        //
+        // The parked arm compares CLIENT TAGS, because a parked handle records
+        // its owner as one (there is no session left to compare).  The live arm
+        // deliberately still compares SESSIONS: whether the model's lease-owner
+        // identity should drop the session term is the open question Q-6, and
+        // it is not settled by this trace, so it is not quietly changed here.
+        val myTag = sdb.sessions.get(sess).clientTag
+        val ownHandleLease = others.exists(g => {
+            val o = sdb.opens.get(g)
+            o.session == sess and isLeaseGrant(o.caching) and cachBits(o.caching).h
+        }) or survivors.exists(k => {
+            val p = sdb.parked.get(k)
+            p.owner == myTag and isLeaseGrant(p.open.caching) and
+                cachBits(p.open.caching).h
+        })
         match oplock {
             | OrNone => CNone
             | OrLevelII =>
-                if (caps.oplocks) COplock(OpLevelII) else CNone
+                if (caps.oplocks and not(ownHandleLease))
+                    COplock(oplockOfBits(capForceLevel2(caps, BITS_R)))
+                else CNone
             | OrExclusive =>
-                if (caps.oplocks and sole) COplock(OpExclusive)
-                else if (caps.oplocks) COplock(OpLevelII)
-                else CNone
+                if (not(caps.oplocks) or ownHandleLease) CNone
+                else if (sole) COplock(oplockOfBits(capForceLevel2(caps, BITS_RW)))
+                else COplock(oplockOfBits(capForceLevel2(caps, BITS_R)))
             | OrBatch =>
-                if (caps.oplocks and sole) COplock(OpBatch)
-                else if (caps.oplocks) COplock(OpLevelII)
-                else CNone
-            | OrLease(x) =>
-                if (not(caps.leases)) CNone
-                else CLease({ key: x.key,
-                              st: { r: x.r,
-                                    // discretion: W caching only to a sole
-                                    // opener; H (handle) caching survives
-                                    // coexisting readers.
-                                    w: x.w and sole,
-                                    h: x.h },
-                              epoch: 1 })
-        }
-    }
-
-    // Whether opening file f with desired access `want` must break a peer's
-    // caching grant.  writeOrNs is true when the opener wants write or
-    // delete (forces a full break to NONE); a read-only conflicting open
-    // downgrades exclusive/batch grants.  Leases are broken at OPEN time
-    // only when caps.leaseOpenBreak (the Seam-A policy).
-    pure def openBreakHolders(sdb: StateDB, f: Ino, want: Access,
-                              caps: Caps): Set[FileId] = {
-        val writeOrNs = want.w or want.d
-        opensOfFile(sdb, f).filter(fid => {
-            val o = sdb.opens.get(fid)
-            not(cachingLevelNone(o.caching)) and
-            match o.caching {
-                | COplock(l) =>
-                    writeOrNs or l == OpExclusive or l == OpBatch
-                | CLease(x) =>
-                    caps.leaseOpenBreak and (writeOrNs or x.st.w or x.st.h)
-                | CNone => false
+                if (not(caps.oplocks) or ownHandleLease) CNone
+                else if (sole) COplock(oplockOfBits(capForceLevel2(caps, BITS_RWH)))
+                else COplock(oplockOfBits(capForceLevel2(caps, BITS_R)))
+            | OrLease(x) => {
+                val joined = grantUnderKey(sdb, f, self, x.key, sess)
+                if (not(isLeaseGrant(joined))) {
+                    // Fresh grant.  An RqLs open with leasing disabled still
+                    // reports a lease -- with state NONE (the bare-RqLs path),
+                    // so nothing is cached and no break can ever stall a peer.
+                    val req = if (not(caps.leases) or not(x.r)) BITS_NONE
+                              else capForceLevel2(caps, { r: x.r, w: x.w,
+                                                          h: x.h })
+                    // W caching only to a sole opener (MS-FSA 2.1.5.18.1, the
+                    // mandate above); H caching only when no non-lease peer
+                    // open owns the handle (probe O12, discretion).
+                    val st = { r: req.r, w: req.w and sole,
+                               h: req.h and not(capsHandle) }
+                    CLease({ key: x.key,
+                             st: st,
+                             // A v2 lease is granted at the client's epoch + 1
+                             // -- but ONLY when caching was actually
+                             // established.  A DENIED grant (leasing not
+                             // advertised, or a W/H-without-R request, which is
+                             // invalid and grants NONE per 3.3.5.9.8) sets up no
+                             // caching state, so its epoch does NOT advance: it
+                             // is echoed back unchanged.  MS-SMB2 3.3.5.9.11 --
+                             // the epoch versions the lease STATE, so with no
+                             // state there is nothing to version; chimera says
+                             // the same in the bare-RqLs branch of
+                             // smb_proc_create.c ("No caching state was
+                             // established (granted NONE), so the v2 epoch does
+                             // NOT advance -- it is echoed unchanged").
+                             epoch: if (not(x.v2)) 0
+                                    else if (bitsEmpty(st)) x.epoch
+                                    else x.epoch + 1,
+                             v2: x.v2 })
+                } else joined
             }
-        })
+        }
     }
 
     // ------------------------------------------------------------------
@@ -359,6 +647,14 @@ module smb2ops {
         sess: SessionId,
         tree: TreeId,
         cfid: FileId,        // current related fid (last CREATE), -1 if none
+        // The two SMB2 header fields that carry the exactly-once semantics
+        // (MS-SMB2 2.2.1.2).  `cs` is the request's ChannelSequence -- the
+        // low 16 bits of the field a REPLY calls Status -- and `replay` is
+        // SMB2_FLAGS_REPLAY_OPERATION (0x20000000).  Both belong to the
+        // message rather than the command: the model applies one header to a
+        // whole compound, and the replayer stamps every element of it.
+        cs: int,
+        replay: bool,
         done: bool,
         results: List[Res]
     }
@@ -395,9 +691,40 @@ module smb2ops {
             | RSetRename(x) => x.st
             | RQueryBasic(x) => x.st
             | RBreakAck(x) => x.st
+            | RDisconnect(x) => x.st
+            | RReconnect(x) => x.st
         }
 
-    pure def dispatch(acc: Acc, c: Cmd): Acc =
+    // Which FileId a command RESOLVES, or -1 when it resolves none.
+    //
+    // The set matters for one reason: chimera clears IsReplayEligible inside
+    // chimera_smb_open_file_resolve, so every command listed here closes the
+    // replay window, whatever its own status turns out to be.  Measured, not
+    // inferred: probe R13/1 shows a plain READ closing it and R13/2 shows an
+    // OPLOCK-form break acknowledgment closing it too (it resolves by FileId,
+    // while the LEASE-form ack goes through open_file_resolve_by_lease_key and
+    // does not).  CLOSE is absent because it uses a different resolver -- and
+    // is moot anyway, the handle stops existing.
+    pure def cmdResolvesFid(acc: Acc, c: Cmd): FileId =
+        match c {
+            | CRead(x) => resolveFid(acc, x.fid)
+            | CWrite(x) => resolveFid(acc, x.fid)
+            | CFlush(sel) => resolveFid(acc, sel)
+            | CLock(x) => resolveFid(acc, x.fid)
+            | CSetEof(x) => resolveFid(acc, x.fid)
+            | CSetDisposition(x) => resolveFid(acc, x.fid)
+            | CSetRename(x) => resolveFid(acc, x.fid)
+            | CQueryBasic(sel) => resolveFid(acc, sel)
+            | CBreakAck(x) => if (x.asLease) -1 else resolveFid(acc, x.fid)
+            | _ => -1
+        }
+
+    pure def dispatch(acc0: Acc, c: Cmd): Acc = {
+        val rf = cmdResolvesFid(acc0, c)
+        val acc =
+            if (acc0.replay or rf < 0 or
+                not(acc0.sdb.opens.keys().contains(rf))) acc0
+            else acc0.with("sdb", doClearReplayable(acc0.sdb, rf))
         match c {
             | CSessionSetup(x) => doCmdSessionSetup(acc, x.clientSym)
             | CLogoff => doCmdLogoff(acc)
@@ -413,8 +740,37 @@ module smb2ops {
             | CSetDisposition(x) => doCmdSetDisposition(acc, x)
             | CSetRename(x) => doCmdSetRename(acc, x)
             | CQueryBasic(sel) => doCmdQueryBasic(acc, sel)
-            | CBreakAck(sel) => doCmdBreakAck(acc, sel)
+            | CBreakAck(x) => doCmdBreakAck(acc, x)
+            | CDisconnect => doCmdDisconnect(acc)
+            | CReconnect(x) => doCmdReconnectSession(acc, x.prev)
         }
+    }
+
+    // ------------------------------------------------------------------
+    // The ChannelSequence gate (MS-SMB2 3.3.5.2.10)
+    // ------------------------------------------------------------------
+    //
+    // WHERE this sits is as load-bearing as the rule itself.  Probe R12
+    // measures the order: FILE_CLOSED (no resolved Open) outranks it, and
+    // ACCESS_DENIED outranks it too -- chimera resolves, rejects on access,
+    // and only then consults the sequence.  So every caller below applies the
+    // gate AFTER its own closed/access checks and BEFORE it touches state.
+    //
+    // A MUTATING op from a superseded channel is refused and changes nothing;
+    // an accepted one advances the mark.  A READ is never refused, but a
+    // FORWARD read still advances the mark (probe R7), which is why the
+    // non-mutating form exists at all instead of simply skipping the gate.
+
+    pure def csRefuse(acc: Acc, fid: FileId): bool =
+        csStale(acc.sdb, fid, acc.cs)
+
+    // Accept path: record the new high-water mark.
+    pure def csAccept(acc: Acc, fid: FileId): Acc =
+        acc.with("sdb", doAdvanceCs(acc.sdb, fid, acc.cs))
+
+    // Non-mutating (READ): never refuses; advances only when not stale.
+    pure def csObserve(acc: Acc, fid: FileId): Acc =
+        if (csStale(acc.sdb, fid, acc.cs)) acc else csAccept(acc, fid)
 
     // --- session / tree ----------------------------------------------
 
@@ -424,6 +780,42 @@ module smb2ops {
         // of a related chain.
         emit(acc.with("sdb", r.sdb2).with("sess", r.sess),
              RSessionSetup({ st: ST_SUCCESS, sess: r.sess }), ST_SUCCESS)
+    }
+
+    // The transport drop (MS-SMB2 3.3.7.1).  Durable opens of this session
+    // PARK and everything else closes; the session and its trees die with the
+    // connection.  There is no reply on the wire -- the connection is gone --
+    // so the status here exists only so the transition has a result to record;
+    // the replayer asserts the disconnect was DELIVERED instead.
+    pure def doCmdDisconnect(acc: Acc): Acc =
+        if (not(sessOk(acc)))
+            emit(acc, RDisconnect({ st: ST_USER_SESSION_DELETED }),
+                 ST_USER_SESSION_DELETED)
+        else
+            emit(acc.with("sdb", doDisconnect(acc.sdb, acc.sess)),
+                 RDisconnect({ st: ST_SUCCESS }), ST_SUCCESS)
+
+    // A fresh connection + session presenting `prev`'s ClientGuid.  `prev` need
+    // not still exist -- the usual case is that it does not, because the
+    // disconnect that made the reconnect necessary destroyed it -- so the tag
+    // is taken from the parked handles it left behind when the session itself
+    // is gone.  A reconnect naming a client nothing is known about is still a
+    // perfectly good new session; it simply reclaims nothing.
+    pure def doCmdReconnectSession(acc: Acc, prev: SessionId): Acc = {
+        val sdb = acc.sdb
+        val tag =
+            if (sdb.sessions.keys().contains(prev))
+                sdb.sessions.get(prev).clientTag
+            else {
+                val orphans = sdb.parked.keys().filter(k =>
+                    sdb.parked.get(k).open.session == prev)
+                if (orphans.size() == 0) prev
+                else sdb.parked.get(orphans.fold(-1, (a, x) =>
+                         if (a < 0 or x < a) x else a)).owner
+            }
+        val r = doSessionSetupAs(sdb, prev, tag)
+        emit(acc.with("sdb", r.sdb2).with("sess", r.sess),
+             RReconnect({ st: ST_SUCCESS, sess: r.sess }), ST_SUCCESS)
     }
 
     pure def doCmdLogoff(acc: Acc): Acc =
@@ -454,13 +846,300 @@ module smb2ops {
 
     // --- CREATE -------------------------------------------------------
 
+    // ------------------------------------------------------------------
+    // The CREATE reply cache (MS-SMB2 3.3.5.9.10)
+    // ------------------------------------------------------------------
+    //
+    // The mechanism has NOTHING in common with the ChannelSequence rule above,
+    // and conflating them is the single easiest way to get this wrong.  A
+    // replayed CREATE is *answered from the original open* -- a genuine reply
+    // cache, keyed by the DH2Q CreateGuid -- so its effect is NOT re-applied.
+    // A replayed mutation has no cache at all; it is simply rejected when it
+    // comes from a superseded channel.
+    //
+    // Ground truth: smb2_replay_probe.c R2-R5 and R13.  R3 is the one that
+    // matters most: it asserts the exactly-once property on the EFFECT (the
+    // reply's CreateAction, which a re-applied FILE_CREATE could not produce,
+    // and the open COUNT, proved by handing the file to a share-conflicting
+    // opener after a single close) rather than on the status code, because a
+    // create applied once and one applied twice both report SUCCESS.
+
+    // The handle-type check both replay paths share.  A replay that asks for a
+    // different handle KIND than the open it matched, or for a lease under a
+    // different key, is STATUS_ACCESS_DENIED.
+    //
+    // Note the contrast the model MUST keep: the DH2C reconnect path answers
+    // OBJECT_NAME_NOT_FOUND for the very same mistake (probe R4's note, and
+    // durable probe D4b/D4c).  Two mandates, 3.3.5.9.10 and 3.3.5.9.12, and one
+    // rule for "the reclaim did not match" would be wrong for one of them.
+    pure def replayTypeOk(reqKey: LeaseKey, openIsLease: bool,
+                          openKey: LeaseKey): bool =
+        (reqKey >= 0) == openIsLease and
+        (not(openIsLease) or reqKey == openKey)
+
+    // WHAT a replayed CREATE reports when it asks for something other than
+    // what the open it matched was granted (probe R16, DEVIATIONS-SMB.md M-15).
+    //
+    // Two different rules, and a model with one is wrong for the other:
+    //
+    //  * a LEGACY-oplock handle reports the level the REPLAY REQUESTED, not the
+    //    one the open holds -- chimera's replay reply path "echoes ... (for an
+    //    oplock handle) the requested oplock level" -- and its durable response
+    //    context is emitted only when that requested level is BATCH, i.e. only
+    //    when the request could itself have earned durability
+    //    (build_dh2q_response, citing WPTS replay-dhv2-oplock2, which expects
+    //    durable_open_v2=false for a lesser replay);
+    //  * a LEASE handle reports the grant's CURRENT state instead, because a
+    //    coalesced lease may have been upgraded by a sibling open since this
+    //    handle was granted (chimera re-reads grant->lease.mode.granted), and
+    //    it keeps its durable response.
+    //
+    // Both are about the REPLY only: nothing about the open changes.
+    pure def replayReqLevel(o: OplockReq): OplockLevel =
+        match o {
+            | OrLevelII => OpLevelII
+            | OrExclusive => OpExclusive
+            | OrBatch => OpBatch
+            | _ => OpNone
+        }
+
+    pure def replayReportedCaching(c: Caching, req: OplockReq): Caching =
+        if (isLeaseGrant(c)) c
+        else if (replayReqLevel(req) == OpNone) CNone
+        else COplock(replayReqLevel(req))
+
+    pure def replayReportedDurable(durOn: bool, c: Caching,
+                                   req: OplockReq): bool =
+        durOn and (isLeaseGrant(c) or replayReqLevel(req) == OpBatch)
+
     pure def createErr(acc: Acc, st: int): Acc =
         emit(acc, RCreate({ st: st, fid: -1, act: 0, ino: -1,
-                            caching: CNone, breaks: Set() }), st)
+                            caching: CNone, breaks: Set(),
+                            parked: false, durable: false }), st)
 
+    // An "oplock-transparent" stat open: attribute-only access, no
+    // delete-on-close, non-truncating.  It breaks nobody (MS-FSA;
+    // smb_proc_create.c break_for_open's break_trigger is exactly its inverse).
+    pure def statOpen(x: DesiredAccess, d: Disposition): bool =
+        attrOnly(x) and not(truncating(d))
+
+    // ------------------------------------------------------------------
+    // Durable RECONNECT (MS-SMB2 3.3.5.9.7 / 3.3.5.9.12)
+    //
+    // A CREATE carrying DH2C / DHnC does not resolve a name at all: it names a
+    // handle that outlived its connection, by the persistent id the handle
+    // kept.  chimera dispatches it (chimera_smb_durable_reconnect) BEFORE the
+    // ordinary create path, so none of the disposition / share / caching logic
+    // runs.  The checks below are in chimera_smb_durable_claim's order, and
+    // every arm is measured by probe D4.
+    // ------------------------------------------------------------------
+
+    // The lease key the reconnect presents, or -1 when it carries no RqLs
+    // context at all.
+    pure def reconnectLeaseKey(opl: OplockReq): LeaseKey = reqLeaseKey(opl)
+
+    pure def doCmdReconnect(acc, x, d) = {
+        val sdb = acc.sdb
+        // Malformed context combinations, checked before the registry is even
+        // consulted.  DH2C must stand alone; DHnC may carry a v1 REQUEST
+        // (DHnQ), which is simply ignored (probe D4e vs D5).
+        if (d.alsoQ and d.v2)
+            createErr(acc, ST_INVALID_PARAMETER)
+        else if (not(isParked(sdb, d.fid)))
+            // No parked handle with this id.  This is also where a SECOND
+            // reclaim of an already-reclaimed handle lands: the first reclaim
+            // re-homed it, so it is live, not parked, and a live handle is
+            // never stolen.
+            //
+            // The two ways of not being parked are distinguishable ON THE WIRE,
+            // and the model has to say which: an id that names a LIVE durable
+            // open cannot be told apart, at the moment it is looked up, from
+            // one whose disconnect has not been processed yet, so chimera
+            // announces an async interim and retries on a timer until its
+            // budget lapses (chimera_smb_durable_reconnect_retry_cb); an id
+            // that names nothing at all is refused immediately with no interim.
+            // Both end at OBJECT_NAME_NOT_FOUND.  Found by a generated trace
+            // whose reclaim of a live durable handle drew an interim the model
+            // had not predicted.
+            emit(acc, RCreate({ st: ST_OBJECT_NAME_NOT_FOUND, fid: -1, act: 0,
+                                ino: -1, caching: CNone, breaks: Set(),
+                                parked: liveDurable(sdb, d.fid),
+                                durable: false }),
+                 ST_OBJECT_NAME_NOT_FOUND)
+        else {
+            val p = sdb.parked.get(d.fid)
+            val hasLeaseCtx = reqIsLease(x.oplock)
+            val myTag = sdb.sessions.get(acc.sess).clientTag
+            if (d.v2 and p.guid != d.guid)
+                createErr(acc, ST_OBJECT_NAME_NOT_FOUND)
+            else if (d.v2 and d.persistent and not(p.persistent))
+                // 3.3.5.9.12: the reconnect asked for a persistent handle but
+                // the surviving open is not persistent (probe D4g).  Only DH2C
+                // can ask: DHnC (2.2.13.2.5) has no Flags field at all, so a v1
+                // reconnect can never carry FLAG_PERSISTENT and this arm must
+                // not fire for it -- a MODEL bug found by a generated trace
+                // (model INVALID_PARAMETER, wire OBJECT_NAME_NOT_FOUND).
+                createErr(acc, ST_INVALID_PARAMETER)
+            else if (p.hadLease and p.owner != myTag)
+                // 3.3.5.9.7 binds the ClientGuid check to LEASED opens: a
+                // leased handle is not visible to another client (probe D4i).
+                createErr(acc, ST_OBJECT_NAME_NOT_FOUND)
+            else if (p.hadLease and not(hasLeaseCtx))
+                // 3.3.5.9.7: a leased handle reconnected with no RqLs context
+                // at all.  Kept because the spec and chimera both name it as a
+                // separate check, but note it is SUBSUMED by the lease-key
+                // check below for every input this model can produce: with no
+                // lease context reconnectLeaseKey() is -1, which never matches
+                // a real key, so the next arm answers the same status.
+                // Deleting this branch leaves every self-test passing, and
+                // that was verified rather than assumed -- it is the one
+                // mutation in the durable set the suite does not catch.
+                createErr(acc, ST_OBJECT_NAME_NOT_FOUND)
+            else if (p.hadLease and reconnectLeaseKey(x.oplock) != p.leaseKey)
+                createErr(acc, ST_OBJECT_NAME_NOT_FOUND)
+            else if (p.hadLease and d.withName and x.name != p.name)
+                // A leased reconnect that names a different, non-empty file is
+                // malformed.  An EMPTY name -- the usual reconnect form -- and
+                // a non-leased reconnect both ignore the name entirely.
+                createErr(acc, ST_INVALID_PARAMETER)
+            else {
+                // Warm reclaim: the surviving open is re-homed onto this
+                // session and tree, keeping its FileId, its caching grant at
+                // the same state AND epoch, and its durability -- so a second
+                // drop parks it again (probe D3, D3b).  The reply reports
+                // CreateAction = OPENED and carries NO durable response
+                // context: a reconnect grants nothing new.
+                val sdb2 = doReclaim(sdb, d.fid, acc.sess, acc.tree, acc.cs)
+                emit(acc.with("sdb", sdb2).with("cfid", d.fid),
+                     RCreate({ st: ST_SUCCESS, fid: d.fid, act: ACT_OPENED,
+                               ino: p.open.file, caching: p.open.caching,
+                               breaks: Set(), parked: false,
+                               // A lone reconnect grants nothing new and its
+                               // reply carries no durable context (probe D3).
+                               // A v1 reconnect MAY carry a DHnQ REQUEST
+                               // alongside (3.3.5.9.7), and then the reply does
+                               // carry a DHnQ response context -- measured by
+                               // probe D5c, and found by a generated trace that
+                               // saw the context the model had not predicted.
+                               durable: d.alsoQ }), ST_SUCCESS)
+            }
+        }
+    }
+
+    // The CREATE path, in the order MS-FSA 2.1.5.1 (and chimera's
+    // smb_proc_create.c) runs it:
+    //
+    //   phase 1  break a conflicting HANDLE-caching holder BEFORE the share
+    //            check -- it may close its deferred handle and dissolve the
+    //            conflict, so the break fires even when the open is ultimately
+    //            refused (smb2.oplock.batch5).  RqLs leases are SPARED here (a
+    //            lease keeps H across a compatible open) and dealt with at
+    //            phase 2; retained = R, or nothing for a truncating open.
+    //   share    the share-reservation check.  A refused open STILL recalls
+    //            handle caching (retained R|W) so the holder may relinquish and
+    //            a later retry succeed (smb2.lease.break_twice).
+    //   phase 2  once the open is granted, a conflicting exclusive (W) holder
+    //            breaks down to R|H; a truncating open instead invalidates
+    //            every holder to NONE.
+    //
+    // The share check therefore sits BETWEEN the two break phases rather than
+    // after a single all-or-nothing break, and no result is ST_PENDING: the
+    // reply carries the real status, with `parked` recording whether the server
+    // had to emit an async interim first.
     pure def doCmdCreate(acc, x) =
         if (not(sessOk(acc))) createErr(acc, ST_USER_SESSION_DELETED)
         else if (not(treeOk(acc))) createErr(acc, ST_NETWORK_NAME_DELETED)
+        // A durable RECONNECT bypasses the whole create path (see above).
+        else if (durIsReconnect(x.durable))
+            match x.durable {
+                | DurC(d) => doCmdReconnect(acc, x, d)
+                | _ => createErr(acc, ST_INVALID_PARAMETER)
+            }
+        // --- the reply cache: a REPLAYED create is answered, not executed ---
+        // chimera scans this TREE's live opens first (a still-eligible open
+        // carrying the guid), then the durable registry of this CLIENT (a
+        // parked open).  The two scopes really do differ and the model keeps
+        // them apart (chimera_smb_create_guid_replay ->
+        // chimera_smb_durable_claim_by_guid).
+        else if (acc.replay and durIsReq(x.durable) and durReqV2(x.durable) and
+                 acc.caps.durable and
+                 replayLiveMatch(acc.sdb, acc.tree,
+                                 durReqGuid(x.durable)).size() > 0) {
+            val fid = replayLiveMatch(acc.sdb, acc.tree,
+                                      durReqGuid(x.durable)).fold(-1,
+                          (a, f) => if (a < 0) f else a)
+            val o = acc.sdb.opens.get(fid)
+            if (not(replayTypeOk(reqLeaseKey(x.oplock),
+                                 isLeaseGrant(o.caching),
+                                 leaseKeyOf(o.caching))))
+                createErr(acc, ST_ACCESS_DENIED)
+            else
+                // The ORIGINAL open, verbatim: the same FileId, the CreateAction
+                // the original reported (probe R3c), the caching it holds now,
+                // no breaks (nothing was arbitrated), and the durable grant
+                // re-advertised exactly as the original reported it (probe R2
+                // vs R3c -- present iff the original was granted).
+                emit(acc.with("cfid", fid),
+                     RCreate({ st: ST_SUCCESS, fid: fid, act: o.replayAct,
+                               ino: o.file,
+                               caching: replayReportedCaching(o.caching,
+                                                              x.oplock),
+                               breaks: Set(), parked: false,
+                               durable: replayReportedDurable(o.durable.on,
+                                                              o.caching,
+                                                              x.oplock) }),
+                     ST_SUCCESS)
+        }
+        else if (acc.replay and durIsReq(x.durable) and durReqV2(x.durable) and
+                 acc.caps.durable and
+                 replayParkedMatch(acc.sdb,
+                     acc.sdb.sessions.get(acc.sess).clientTag,
+                     durReqGuid(x.durable)).size() > 0) {
+            val pk = replayParkedMatch(acc.sdb,
+                         acc.sdb.sessions.get(acc.sess).clientTag,
+                         durReqGuid(x.durable)).fold(-1,
+                         (a, f) => if (a < 0) f else a)
+            val p = acc.sdb.parked.get(pk)
+            if (not(replayTypeOk(reqLeaseKey(x.oplock), p.hadLease,
+                                 p.leaseKey)))
+                createErr(acc, ST_ACCESS_DENIED)
+            else {
+                // RECLAIM: re-home the parked handle onto this session/tree,
+                // exactly as a DH2C reconnect would -- but the REPLY differs.
+                // A DH2C reclaim carries no DH2Q response context; a
+                // replay-driven reclaim does, because the replayed request IS a
+                // DH2Q create and chimera's emitters key on the request's
+                // context mask (probe R4 against durable probe D3).
+                val sdb1 = doReclaim(acc.sdb, pk, acc.sess, acc.tree, acc.cs)
+                emit(acc.with("sdb", sdb1).with("cfid", pk),
+                     RCreate({ st: ST_SUCCESS, fid: pk,
+                               act: p.open.replayAct, ino: p.open.file,
+                               caching: replayReportedCaching(p.open.caching,
+                                                              x.oplock),
+                               breaks: Set(), parked: false,
+                               durable: replayReportedDurable(true,
+                                                              p.open.caching,
+                                                              x.oplock) }),
+                     ST_SUCCESS)
+            }
+        }
+        // MS-SMB2 3.3.5.9.10: a CreateGuid identifies ONE durable open per
+        // client.  A non-replay CREATE carrying a DH2Q whose CreateGuid already
+        // names a durable open of this ClientGuid -- live on any connection, or
+        // parked -- collides with it and is refused STATUS_DUPLICATE_OBJECTID.
+        // chimera checks this before it resolves the name, so it outranks every
+        // disposition and share outcome (chimera_smb_create_guid_replay ->
+        // chimera_smb_durable_claim_by_guid).
+        //
+        // Found by the FIRST generated durable trace, which drew two creates
+        // with one CreateGuid symbol: the model said SUCCESS, the wire said
+        // DUPLICATE_OBJECTID, and the wire was right.
+        else if (durIsReq(x.durable) and durReqV2(x.durable) and
+                 acc.caps.durable and
+                 durGuidCollisionEx(acc.sdb, durReqGuid(x.durable),
+                                    acc.sdb.sessions.get(acc.sess).clientTag,
+                                    acc.sess, acc.replay))
+            createErr(acc, ST_DUPLICATE_OBJECTID)
         // FILE_DELETE_ON_CLOSE requires DELETE access in DesiredAccess
         // (MS-FSA 2.1.5.1: an open that sets delete-on-close without DELETE
         // access is failed with STATUS_ACCESS_DENIED, checked before name
@@ -476,50 +1155,165 @@ module smb2ops {
                      dec.act == ACT_OPENED)
                 createErr(acc, ST_DELETE_PENDING)
             else {
-                val want = wantOf(x.access)
-                val deny = denyOf(x.share)
-                val sdb1 = acc.sdb.with("fs", dec.fs2)
-                // 1. oplock/lease break: a conflicting open recalls peer
-                //    caching grants; the open stalls (PENDING) until drain.
-                val holders =
-                    if (attrOnly(x.access)) Set()
-                    else openBreakHolders(sdb1, dec.ino, want, acc.caps)
-                if (holders.size() > 0) {
-                    val sdb2 = doBreakAll(sdb1, dec.ino, -1, want.w or want.d)
-                    emit(acc.with("sdb", sdb2),
-                         RCreate({ st: ST_PENDING, fid: -1, act: 0,
-                                   ino: dec.ino, caching: CNone,
-                                   breaks: holders }), ST_PENDING)
-                }
-                else if (not(attrOnly(x.access)) and
-                         breakInProgress(sdb1, dec.ino, -1))
-                    // a peer break is still draining -> keep stalling.
+                val want = wantOf(x.access, x.disp)
+                // An attribute-only open (no R/W/D in DesiredAccess) neither
+                // takes part in share arbitration nor IMPOSES a deny on later
+                // openers: chimera registers it as an inert (granted=0,
+                // denied=0) SHARE entry -- "Attribute-only opens hold no
+                // share-mode rights and impose no deny", smb_proc_create.c:1002
+                // -1010, which zeroes granted/denied/held_granted whenever
+                // DesiredAccess carries no SMB2_SHAREMODE_ACCESS_MASK bit.  The
+                // entry still exists so the layer can answer "is there another
+                // opener?", which is why it is inserted rather than skipped.
+                // Storing denyOf(share) here instead would let a stat-open with
+                // ShareAccess=NONE lock every later opener out.
+                val deny = if (attrOnly(x.access)) ACC_NONE
+                           else denyOf(x.share)
+                val trunc = truncating(x.disp)
+                val stat = statOpen(x.access, x.disp) and not(x.delOnClose)
+                val selfKey = reqLeaseKey(x.oplock)
+                // A PARKED durable holder of this file is purged by any open
+                // that would have had to break it -- which is every open except
+                // an attribute-only, non-truncating one, because the parked
+                // holder is by construction a BATCH / HANDLE-caching holder and
+                // has nobody left to acknowledge the break (MS-SMB2 3.3.4.6).
+                // Both halves are measured: probe D7 (a conflicting open takes
+                // the file and the reclaim then fails) and probe D7b (an
+                // attribute-only open leaves the parked handle reclaimable).
+                // Purged BEFORE the share check, as chimera does -- the parked
+                // handle must not contribute a sharing violation it is about to
+                // stop existing for.
+                val sdb0 = if (stat) acc.sdb
+                           else doPurgeParked(acc.sdb, dec.ino, want, deny)
+                val sdb1 = sdb0.with("fs", dec.fs2)
+                // A lease key binds to exactly ONE file per client
+                // (MS-SMB2 3.3.5.9.8): reusing it on a different file is
+                // STATUS_INVALID_PARAMETER, not a second grant.  Checked after
+                // the open (so the disposition's create/truncate has already
+                // landed) and before any arbitration -- exactly where
+                // chimera_smb_session_lease_key_conflict sits.
+                if (selfKey >= 0 and
+                    sdb1.opens.keys().exists(g => {
+                        val o = sdb1.opens.get(g)
+                        o.session == acc.sess and
+                        leaseKeyOf(o.caching) == selfKey and
+                        o.file != dec.ino
+                    }))
                     emit(acc.with("sdb", sdb1),
-                         RCreate({ st: ST_PENDING, fid: -1, act: 0,
-                                   ino: dec.ino, caching: CNone,
-                                   breaks: Set() }), ST_PENDING)
-                // 2. share reservation check (MS-FSA SharingViolation).
-                else if (not(attrOnly(x.access)) and
-                         shareConflict(sdb1, dec.ino, want, deny))
-                    createErr(acc.with("sdb", sdb1), ST_SHARING_VIOLATION)
+                         RCreate({ st: ST_INVALID_PARAMETER, fid: -1, act: 0,
+                                   ino: -1, caching: CNone, breaks: Set(),
+                                   parked: false, durable: false }),
+                         ST_INVALID_PARAMETER)
                 else {
-                    // 3. insert the open and grant caching.
-                    val ins = doInsertOpen(sdb1, acc.sess, acc.tree, dec.ino,
+                // --- phase 1: handle-caching holders, leases spared --------
+                // Phase 1 recalls only HANDLE caching and always SPARES RqLs
+                // leases (a lease keeps H across a compatible open and is dealt
+                // with at phase 2); a truncating open retains nothing, so a
+                // batch oplock goes straight to NONE here.
+                val r1 = if (trunc) BITS_NONE else BITS_R
+                val h1 = if (stat) Set()
+                         else breakHolders(sdb1, dec.ino, -1, BITS_H, r1, true,
+                                           selfKey, acc.sess)
+                // A truncating open then ALSO runs break_on_write, so a legacy
+                // oplock broken here is broken a second time -- and settles
+                // without an ack (see breakNotesEx).
+                val n1 = breakNotesEx(sdb1, dec.ino, h1, r1, trunc)
+                val sdb2a = h1.fold(sdb1, (a, fid) => doBreakOne(a, fid, r1))
+                val sdb2 = if (not(trunc)) sdb2a
+                           else h1.fold(sdb2a, (a, fid) =>
+                               if (isLeaseGrant(a.opens.get(fid).caching)) a
+                               else doAckBreak(a, fid, BITS_NONE))
+                // --- share reservation check (MS-FSA SharingViolation) -----
+                if (not(attrOnly(x.access)) and
+                    shareConflict(sdb2, dec.ino, want, deny)) {
+                    val h2 = breakHolders(sdb2, dec.ino, -1, BITS_H, BITS_RW,
+                                          false, selfKey, acc.sess)
+                    val n2 = breakNotes(sdb2, dec.ino, h2, BITS_RW)
+                    val sdb3 = h2.fold(sdb2, (a, fid) =>
+                                   doBreakOne(a, fid, BITS_RW))
+                    emit(acc.with("sdb", sdb3),
+                         RCreate({ st: ST_SHARING_VIOLATION, fid: -1, act: 0,
+                                   ino: -1, caching: CNone,
+                                   breaks: n1.union(n2), parked: false,
+                                   durable: false }),
+                         ST_SHARING_VIOLATION)
+                } else {
+                    // --- insert the open ------------------------------------
+                    val ins = doInsertOpen(sdb2, acc.sess, acc.tree, dec.ino,
                         x.dir, x.name,
                         { r: x.access.r, w: x.access.w, h: x.access.h,
                           d: x.access.d },
-                        deny, x.delOnClose)
-                    val gr = grantCaching(ins.sdb2, dec.ino, ins.fid,
-                                          x.oplock, acc.caps)
-                    val sdb3 = doSetCaching(ins.sdb2, ins.fid, gr)
-                    val sdb4 = if (x.delOnClose)
-                                   sdb3.with("deletePending",
-                                             sdb3.deletePending.union(Set(dec.ino)))
-                               else sdb3
-                    emit(acc.with("sdb", sdb4).with("cfid", ins.fid),
+                        // The CREATE's own ChannelSequence seeds the handle's
+                        // high-water mark (probe R11): an Open does NOT start
+                        // at zero.
+                        deny, x.delOnClose, acc.cs)
+                    // --- phase 2: exclusive (W) holders ---------------------
+                    val r2 = if (trunc) BITS_NONE else BITS_RH
+                    // A truncating open replaces the data, so it invalidates
+                    // every cached holder (break_on_write); a plain
+                    // conflicting open only recalls the exclusive WRITE cache.
+                    val t2 = if (trunc) BITS_RWH else BITS_W
+                    val h2 = if (stat or not(acc.caps.leaseOpenBreak)) Set()
+                             else breakHolders(ins.sdb2, dec.ino, ins.fid, t2,
+                                               r2, false, selfKey, acc.sess)
+                    val n2 = breakNotes(ins.sdb2, dec.ino, h2, r2)
+                    val sdb3 = h2.fold(ins.sdb2, (a, fid) =>
+                                   doBreakOne(a, fid, r2))
+                    // --- grant this open's own caching ----------------------
+                    val gr = grantCaching(sdb3, dec.ino, ins.fid, x.oplock,
+                                          acc.caps, acc.sess)
+                    val sdb4 = doSetCaching(sdb3, ins.fid, gr)
+                    val sdb4b = if (x.delOnClose)
+                                   sdb4.with("deletePending",
+                                             sdb4.deletePending.union(Set(dec.ino)))
+                               else sdb4
+                    // --- grant this open's DURABILITY -----------------------
+                    // MS-SMB2 3.3.5.9.6 / 3.3.5.9.10, measured by probe D1:
+                    // the durable request is honored only when the caching
+                    // grant that was actually made is a BATCH oplock or a
+                    // HANDLE-caching lease -- and only when the server
+                    // advertises durable handles at all (caps.durable, i.e.
+                    // config persistent_handles; chimera returns immediately
+                    // from chimera_smb_create_grant_durable otherwise).
+                    val durOk = acc.caps.durable and durIsReq(x.durable) and
+                                durableEligible(gr)
+                    val durSt: DurState =
+                        if (not(durOk)) DUR_NONE
+                        else { on: true, v2: durReqV2(x.durable),
+                               guid: if (durReqV2(x.durable))
+                                         durReqGuid(x.durable) else -1,
+                               // Persistence needs a continuously-available
+                               // share, which no modeled instance has (probe
+                               // D11 covers it deterministically instead).
+                               persistent: false }
+                    val sdb5 = doSetDurable(sdb4b, ins.fid, durSt)
+                    // --- replay ELIGIBILITY ---------------------------------
+                    // Set by the DH2Q CONTEXT, not by the durable GRANT: probe
+                    // R2 replays a create that was refused durability for want
+                    // of a caching oplock and still gets the original handle
+                    // back.  Still gated on caps.durable, because
+                    // chimera_smb_create_grant_durable -- which is where the
+                    // create_guid is recorded at all -- returns immediately
+                    // when persistent_handles is off.
+                    val sdb6 = if (acc.caps.durable and durIsReq(x.durable) and
+                                   durReqV2(x.durable))
+                                   doSetReplayable(sdb5, ins.fid,
+                                                   durReqGuid(x.durable),
+                                                   dec.act)
+                               else sdb5
+                    emit(acc.with("sdb", sdb6).with("cfid", ins.fid),
                          RCreate({ st: ST_SUCCESS, fid: ins.fid,
                                    act: dec.act, ino: dec.ino,
-                                   caching: gr, breaks: Set() }), ST_SUCCESS)
+                                   caching: gr, breaks: n1.union(n2),
+                                   // the open was granted but is held until a
+                                   // peer's ack-required break settles: the
+                                   // server emits an async interim first
+                                   // (chimera_vfs_state_caching_breaking).
+                                   parked: breakInProgress(sdb6, dec.ino,
+                                                           ins.fid),
+                                   durable: durOk }),
+                         ST_SUCCESS)
+                }
                 }
             }
         }
@@ -528,6 +1322,15 @@ module smb2ops {
 
     pure def fidBad(acc: Acc): bool =
         not(sessOk(acc)) or not(treeOk(acc))
+
+    // Does this handle name a DIRECTORY?  A READ or a WRITE issued through a
+    // directory handle is STATUS_INVALID_DEVICE_REQUEST (MS-FSA 2.1.5.2 /
+    // 2.1.5.3: "If Open.Stream.StreamType is DirectoryStream, the operation
+    // MUST be failed with STATUS_INVALID_DEVICE_REQUEST") -- adjudicated on the
+    // stream type BEFORE the access mask, the offset and any lock, so it never
+    // degenerates into END_OF_FILE or ACCESS_DENIED.
+    pure def isDirOpen(acc: Acc, fid: FileId): bool =
+        fsGet(acc.sdb.fs, acc.sdb.opens.get(fid).file).ftype == FDir
 
     pure def doCmdClose(acc: Acc, sel: FidSel): Acc = {
         val fid = resolveFid(acc, sel)
@@ -545,42 +1348,87 @@ module smb2ops {
         if (not(acc.sdb.opens.keys().contains(fid)))
             emit(acc, RRead({ st: ST_FILE_CLOSED, count: -1, eof: false,
                               blocks: [] }), ST_FILE_CLOSED)
+        else if (isDirOpen(acc, fid))
+            // MS-FSA 2.1.5.2: a READ on a DirectoryStream handle is refused on
+            // the stream type, ahead of the access/offset checks -- so it is
+            // never END_OF_FILE, which is what a directory's zero data length
+            // would otherwise produce.
+            emit(acc, RRead({ st: ST_INVALID_DEVICE_REQUEST, count: -1,
+                              eof: false, blocks: [] }),
+                 ST_INVALID_DEVICE_REQUEST)
         else {
             val o = acc.sdb.opens.get(fid)
             if (not(o.granted.r))
                 emit(acc, RRead({ st: ST_ACCESS_DENIED, count: -1,
                                   eof: false, blocks: [] }), ST_ACCESS_DENIED)
-            // mandatory byte-range lock enforcement (MS-FSA 2.1.4.2).
-            else if (rangeIoConflict(acc.sdb, o.file, fid, x.off, x.len, false))
-                emit(acc, RRead({ st: ST_FILE_LOCK_CONFLICT, count: -1,
-                                  eof: false, blocks: [] }),
-                     ST_FILE_LOCK_CONFLICT)
             else {
-                val nd = acc.sdb.fs.inodes.get(o.file)
-                val rd = fsReadData(nd, x.off, x.len)
-                // a read wholly at/after EOF returns STATUS_END_OF_FILE.
-                if (x.off >= nd.sizeBlocks and x.len > 0)
-                    emit(acc, RRead({ st: ST_END_OF_FILE, count: 0,
-                                      eof: true, blocks: [] }), ST_END_OF_FILE)
-                else
-                    emit(acc, RRead({ st: ST_SUCCESS, count: rd.count,
-                                      eof: rd.eof, blocks: rd.syms }),
-                         ST_SUCCESS)
+                // MS-SMB2 3.3.5.2.10: a READ is never REFUSED for a stale
+                // ChannelSequence, but a FORWARD one still ADVANCES the Open's
+                // high-water mark (probe R7) -- which is why this is a distinct
+                // operation rather than "skip the gate".  It sits after the
+                // access check and before the lock check, exactly where
+                // smb_proc_read.c:271 sits (probe R12 pins that ACCESS_DENIED
+                // outranks the sequence on the I/O path).
+                val a1 = csObserve(acc, fid)
+                // mandatory byte-range lock enforcement (MS-FSA 2.1.4.2).
+                if (rangeIoConflict(a1.sdb, o.file, fid, x.off, x.len, false))
+                    emit(a1, RRead({ st: ST_FILE_LOCK_CONFLICT, count: -1,
+                                     eof: false, blocks: [] }),
+                         ST_FILE_LOCK_CONFLICT)
+                else {
+                    val nd = a1.sdb.fs.inodes.get(o.file)
+                    val rd = fsReadData(nd, x.off, x.len)
+                    // a read wholly at/after EOF returns STATUS_END_OF_FILE.
+                    if (x.off >= nd.sizeBlocks and x.len > 0)
+                        emit(a1, RRead({ st: ST_END_OF_FILE, count: 0,
+                                         eof: true, blocks: [] }),
+                             ST_END_OF_FILE)
+                    else
+                        emit(a1, RRead({ st: ST_SUCCESS, count: rd.count,
+                                         eof: rd.eof, blocks: rd.syms }),
+                             ST_SUCCESS)
+                }
             }
         }
     }
 
-    pure def doCmdWrite(acc, x) = {
-        val fid = resolveFid(acc, x.fid)
-        if (not(acc.sdb.opens.keys().contains(fid)))
-            emit(acc, RWrite({ st: ST_FILE_CLOSED, count: -1, breaks: Set() }),
+    pure def doCmdWrite(acc0, x) = {
+        val fid = resolveFid(acc0, x.fid)
+        if (not(acc0.sdb.opens.keys().contains(fid)))
+            emit(acc0, RWrite({ st: ST_FILE_CLOSED, count: -1, breaks: Set() }),
                  ST_FILE_CLOSED)
+        else if (isDirOpen(acc0, fid))
+            // MS-FSA 2.1.5.3, the WRITE twin of the READ guard above.  Without
+            // it the model let a directory handle accumulate data blocks, which
+            // then made a later directory READ report SUCCESS.
+            emit(acc0, RWrite({ st: ST_INVALID_DEVICE_REQUEST, count: -1,
+                               breaks: Set() }), ST_INVALID_DEVICE_REQUEST)
         else {
-            val o = acc.sdb.opens.get(fid)
+            val o = acc0.sdb.opens.get(fid)
             if (not(o.granted.w))
-                emit(acc, RWrite({ st: ST_ACCESS_DENIED, count: -1,
+                emit(acc0, RWrite({ st: ST_ACCESS_DENIED, count: -1,
                                    breaks: Set() }), ST_ACCESS_DENIED)
-            else if (rangeIoConflict(acc.sdb, o.file, fid, x.off, x.len, true))
+            // MS-SMB2 3.3.5.2.10: a WRITE from a SUPERSEDED channel is refused
+            // so a delayed retry cannot clobber newer data -- and it must
+            // change NOTHING, which is the property probe R6/2 asserts on the
+            // file's content rather than on this status.  The gate sits AFTER
+            // the access check (probe R12: a write that is both unauthorized
+            // and stale answers ACCESS_DENIED) and before the lock check,
+            // matching smb_proc_write.c:294.
+            else if (csRefuse(acc0, fid))
+                emit(acc0, RWrite({ st: ST_FILE_NOT_AVAILABLE, count: -1,
+                                   breaks: Set() }), ST_FILE_NOT_AVAILABLE)
+            else {
+            // The mark advances the MOMENT the gate is passed, not when the
+            // write finally lands: chimera advances inside
+            // chimera_smb_channel_sequence_stale (smb_proc_write.c:294), which
+            // runs BEFORE the byte-range-lock check (:356).  So a write that
+            // clears the gate and is then refused for a lock conflict has
+            // still moved the mark, and a following request at the earlier
+            // sequence is stale.  Modeling the advance on the success path
+            // only would have been wrong for exactly that interleaving.
+            val acc = csAccept(acc0, fid)
+            if (rangeIoConflict(acc.sdb, o.file, fid, x.off, x.len, true))
                 emit(acc, RWrite({ st: ST_FILE_LOCK_CONFLICT, count: -1,
                                    breaks: Set() }), ST_FILE_LOCK_CONFLICT)
             else {
@@ -588,12 +1436,35 @@ module smb2ops {
                 // handle's read cache to NONE (protocol-agnostic, Seam 4a).
                 // The write itself completes -- the D4-12 ordering hazard
                 // (write lands before the recall drains) applies here too.
-                val holders = breakHolders(acc.sdb, o.file, fid, true)
-                val sdb1 = doBreakAll(acc.sdb, o.file, fid, true)
-                val wr = fsWrite(sdb1.fs, o.file, x.off, x.len, x.pat)
-                emit(acc.with("sdb", sdb1.with("fs", wr.fs2)),
-                     RWrite({ st: ST_SUCCESS, count: x.len, breaks: holders }),
+                // A holder under the writer's OWN lease key is exempt
+                // (chimera_vfs_lease_smb2_same_key).
+                val selfKey = leaseKeyOf(o.caching)
+                val holders = breakHolders(acc.sdb, o.file, fid, BITS_RWH,
+                                           BITS_NONE, false, selfKey,
+                                           o.session)
+                val notes = breakNotes(acc.sdb, o.file, holders, BITS_NONE)
+                val sdb1 = holders.fold(acc.sdb, (a, h) =>
+                               doBreakOne(a, h, BITS_NONE))
+                // A LEVEL_II oplock confers no write coherence, so a write
+                // through the very handle that holds one must break the
+                // writer's OWN read cache to NONE (vfs_state.c: "a write by
+                // one LEVEL_II holder breaks BOTH LEVEL_II oplocks").  A
+                // grant carrying W (exclusive/batch, or a W lease) is the
+                // writer's own coherent cache and survives.
+                val selfII = match o.caching {
+                    | COplock(l) => l == OpLevelII
+                    | _ => false
+                }
+                val selfNotes = if (selfII)
+                                    breakNotes(sdb1, o.file, Set(fid), BITS_NONE)
+                                else Set()
+                val sdb2 = if (selfII) doBreakOne(sdb1, fid, BITS_NONE) else sdb1
+                val wr = fsWrite(sdb2.fs, o.file, x.off, x.len, x.pat)
+                emit(acc.with("sdb", sdb2.with("fs", wr.fs2)),
+                     RWrite({ st: ST_SUCCESS, count: x.len,
+                              breaks: notes.union(selfNotes) }),
                      ST_SUCCESS)
+            }
             }
         }
     }
@@ -635,28 +1506,55 @@ module smb2ops {
         }
     }
 
+    // SET_INFO's ChannelSequence gate sits in the OPPOSITE place to WRITE's,
+    // and the asymmetry is measured, not assumed: chimera consults the sequence
+    // in chimera_smb_set_info immediately after resolving the handle and BEFORE
+    // the per-info-class switch (smb_proc_set_info.c:509), so on SET_INFO a
+    // stale sequence outranks the very ACCESS_DENIED that outranks it on WRITE.
+    // Probe R12 drives exactly that pair: the same read-only handle, the same
+    // stale sequence, ACCESS_DENIED from WRITE and FILE_NOT_AVAILABLE from
+    // SET_INFO.
     pure def doCmdSetEof(acc, x) = {
         val fid = resolveFid(acc, x.fid)
         if (not(acc.sdb.opens.keys().contains(fid)))
             emit(acc, RSetEof({ st: ST_FILE_CLOSED }), ST_FILE_CLOSED)
+        else if (csRefuse(acc, fid))
+            emit(acc, RSetEof({ st: ST_FILE_NOT_AVAILABLE }),
+                 ST_FILE_NOT_AVAILABLE)
         else {
-            val o = acc.sdb.opens.get(fid)
+            val a1 = csAccept(acc, fid)
+            val o = a1.sdb.opens.get(fid)
             if (not(o.granted.w))
-                emit(acc, RSetEof({ st: ST_ACCESS_DENIED }), ST_ACCESS_DENIED)
+                emit(a1, RSetEof({ st: ST_ACCESS_DENIED }), ST_ACCESS_DENIED)
             else
-                emit(acc.with("sdb",
-                         acc.sdb.with("fs", fsResize(acc.sdb.fs, o.file,
-                                                     x.sizeBlocks))),
+                emit(a1.with("sdb",
+                         a1.sdb.with("fs", fsResize(a1.sdb.fs, o.file,
+                                                    x.sizeBlocks))),
                      RSetEof({ st: ST_SUCCESS }), ST_SUCCESS)
         }
     }
 
-    pure def doCmdSetDisposition(acc, x) = {
-        val fid = resolveFid(acc, x.fid)
-        if (not(acc.sdb.opens.keys().contains(fid)))
-            emit(acc, RSetDisposition({ st: ST_FILE_CLOSED }), ST_FILE_CLOSED)
+    pure def doCmdSetDisposition(acc0, x) = {
+        val fid = resolveFid(acc0, x.fid)
+        if (not(acc0.sdb.opens.keys().contains(fid)))
+            emit(acc0, RSetDisposition({ st: ST_FILE_CLOSED }), ST_FILE_CLOSED)
+        else if (csRefuse(acc0, fid))
+            emit(acc0, RSetDisposition({ st: ST_FILE_NOT_AVAILABLE }),
+                 ST_FILE_NOT_AVAILABLE)
         else {
+            val acc = csAccept(acc0, fid)
             val o = acc.sdb.opens.get(fid)
+            // MS-FSA 2.1.5.14.3 (FileDispositionInformation): the set
+            // requires DELETE access on the handle -- marking or UNmarking a
+            // file for deletion is a delete-authorization decision -- and
+            // without it the operation MUST fail ACCESS_DENIED.  chimera does
+            // not check (smb_proc_set_info.c has no access check of any kind,
+            // DEVIATIONS-SMB.md S-4), so the model stays spec-first here and
+            // the generator draws only DELETE-capable handles.
+            if (not(o.granted.d))
+                emit(acc, RSetDisposition({ st: ST_ACCESS_DENIED }),
+                     ST_ACCESS_DENIED)
+            else
             // a directory must be empty to set delete-on-close.
             if (x.del and fsGet(acc.sdb.fs, o.file).ftype == FDir and
                 fsGet(acc.sdb.fs, o.file).ents.keys().size() > 0)
@@ -668,13 +1566,33 @@ module smb2ops {
         }
     }
 
-    pure def doCmdSetRename(acc, x) = {
-        val fid = resolveFid(acc, x.fid)
-        if (not(acc.sdb.opens.keys().contains(fid)))
-            emit(acc, RSetRename({ st: ST_FILE_CLOSED, breaks: Set() }),
+    pure def doCmdSetRename(acc0, x) = {
+        val fid = resolveFid(acc0, x.fid)
+        if (not(acc0.sdb.opens.keys().contains(fid)))
+            emit(acc0, RSetRename({ st: ST_FILE_CLOSED, breaks: Set() }),
                  ST_FILE_CLOSED)
+        else if (csRefuse(acc0, fid))
+            // A RENAME is the sharpest case for the exactly-once rule: it is
+            // the one mutating op that genuinely cannot be applied twice.  A
+            // stale one must leave the namespace exactly as it was.
+            emit(acc0, RSetRename({ st: ST_FILE_NOT_AVAILABLE, breaks: Set() }),
+                 ST_FILE_NOT_AVAILABLE)
         else {
+            val acc = csAccept(acc0, fid)
             val o = acc.sdb.opens.get(fid)
+            // MS-FSA 2.1.5.14.11.1: a rename removes the old name from its
+            // parent and adds a new one, so the SOURCE handle must hold
+            // DELETE; without it the operation MUST fail ACCESS_DENIED.  The
+            // gate runs BEFORE the destination-existence probe, so a target
+            // collision on an unauthorized handle still reports the
+            // authorization error rather than masking it (chimera gates in the
+            // same place and cites the same clause; DEVIATIONS-SMB.md M-20 --
+            // the model used to have no access check here at all and answered
+            // SUCCESS for every read-only handle).
+            if (not(o.granted.d))
+                emit(acc, RSetRename({ st: ST_ACCESS_DENIED, breaks: Set() }),
+                     ST_ACCESS_DENIED)
+            else
             // SetFileRenameInformation with ReplaceIfExists = false
             // (MS-FSA 2.1.5.14.11): a rename onto an existing different name
             // fails with OBJECT_NAME_COLLISION.  Modeling the no-replace case
@@ -688,8 +1606,12 @@ module smb2ops {
                      ST_OBJECT_NAME_COLLISION)
             else {
             // namespace mutation recalls every caching holder (Seam 4b).
-            val holders = breakHolders(acc.sdb, o.file, fid, true)
-            val sdb1 = doBreakAll(acc.sdb, o.file, fid, true)
+            val selfKey = leaseKeyOf(o.caching)
+            val holders = breakHolders(acc.sdb, o.file, fid, BITS_RWH,
+                                       BITS_NONE, false, selfKey, o.session)
+            val notes = breakNotes(acc.sdb, o.file, holders, BITS_NONE)
+            val sdb1 = holders.fold(acc.sdb, (a, h) =>
+                           doBreakOne(a, h, BITS_NONE))
             // target is absent or the same file, so fsRename never replaces.
             val rn = fsRename(sdb1.fs, o.dir, o.name, x.newdir, x.newname,
                               pinnedFiles(sdb1))
@@ -711,7 +1633,7 @@ module smb2ops {
                         else oo
                     }))
                 emit(acc.with("sdb", sdb2),
-                     RSetRename({ st: ST_SUCCESS, breaks: holders }),
+                     RSetRename({ st: ST_SUCCESS, breaks: notes }),
                      ST_SUCCESS)
             }
             }
@@ -742,25 +1664,72 @@ module smb2ops {
 
     // --- oplock / lease break ack ------------------------------------
 
-    pure def doCmdBreakAck(acc: Acc, sel: FidSel): Acc = {
-        val fid = resolveFid(acc, sel)
+    // The status an OPLOCK_BREAK ack (StructureSize 24) gets when the open is
+    // NOT in the Breaking state (MS-SMB2 3.3.5.22.1): the exact code depends on
+    // the level held and the level acknowledged.  chimera used to collapse all
+    // of these to INVALID_OPLOCK_PROTOCOL; the WPTS
+    // OplockOnShareWithForceLevel2 not-Breaking acks distinguish them.
+    pure def oplockAckNotBreaking(cur: OplockLevel, ack: OplockLevel): int =
+        if ((cur == OpExclusive or cur == OpBatch) and
+            ack != OpLevelII and ack != OpNone)
+            ST_INVALID_OPLOCK_PROTOCOL
+        else if (cur == OpLevelII and ack != OpNone)
+            ST_INVALID_OPLOCK_PROTOCOL
+        else if (ack == OpLevelII or ack == OpNone)
+            ST_INVALID_DEVICE_STATE
+        else ST_INVALID_OPLOCK_PROTOCOL
+
+    // OPLOCK_BREAK / LEASE_BREAK acknowledgment (MS-SMB2 3.3.5.22.1/.2).
+    //
+    // Four distinct rejection arms, all reachable:
+    //   * an ack whose FileId names no open -> FILE_CLOSED (oplock ack only; a
+    //     lease ack whose key resolves to nothing is benign SUCCESS, because
+    //     another handle may still carry the lease);
+    //   * an ack while no break is outstanding -> UNSUCCESSFUL for a lease,
+    //     and the INVALID_DEVICE_STATE / INVALID_OPLOCK_PROTOCOL matrix above
+    //     for a legacy oplock;
+    //   * an ack that tries to KEEP a caching bit the break asked the holder to
+    //     give up -> REQUEST_NOT_ACCEPTED, with the grant left BREAKING;
+    //   * otherwise the grant settles at exactly what the holder kept -- which
+    //     may be LESS than it was allowed to keep.
+    pure def doCmdBreakAck(acc, x) = {
+        val fid = resolveFid(acc, x.fid)
         if (not(acc.sdb.opens.keys().contains(fid)))
-            emit(acc, RBreakAck({ st: ST_FILE_CLOSED }), ST_FILE_CLOSED)
-        // idempotency: an ack on a grant that is not mid-break is an error
-        // (MS-SMB2 3.3.5.22.1: the 3 xfail "ack on already-settled break"
-        // rows -> STATUS_UNSUCCESSFUL).
-        else if (not(acc.sdb.opens.get(fid).breaking))
-            emit(acc, RBreakAck({ st: ST_UNSUCCESSFUL }), ST_UNSUCCESSFUL)
-        else
-            emit(acc.with("sdb", doAckBreak(acc.sdb, fid)),
-                 RBreakAck({ st: ST_SUCCESS }), ST_SUCCESS)
+            if (x.asLease)
+                emit(acc, RBreakAck({ st: ST_SUCCESS }), ST_SUCCESS)
+            else
+                emit(acc, RBreakAck({ st: ST_FILE_CLOSED }), ST_FILE_CLOSED)
+        else {
+            val o = acc.sdb.opens.get(fid)
+            // What the holder chooses to keep: a lease ack names the state
+            // directly, a legacy ack keeps a read cache only at LEVEL_II.
+            val kept = if (x.asLease) x.ackState
+                       else if (x.ackLevel == OpLevelII) BITS_R
+                       else BITS_NONE
+            if (not(o.breaking))
+                if (x.asLease)
+                    emit(acc, RBreakAck({ st: ST_UNSUCCESSFUL }),
+                         ST_UNSUCCESSFUL)
+                else {
+                    val st = oplockAckNotBreaking(oplockOfBits(cachBits(o.caching)),
+                                                  x.ackLevel)
+                    emit(acc, RBreakAck({ st: st }), st)
+                }
+            else if (not(bitsSubset(kept, cachBits(o.breakTo))))
+                emit(acc, RBreakAck({ st: ST_REQUEST_NOT_ACCEPTED }),
+                     ST_REQUEST_NOT_ACCEPTED)
+            else
+                emit(acc.with("sdb", doAckBreak(acc.sdb, fid, kept)),
+                     RBreakAck({ st: ST_SUCCESS }), ST_SUCCESS)
+        }
     }
 
     // ------------------------------------------------------------------
     // Message (compound) evaluator
     // ------------------------------------------------------------------
 
-    type Msg = { sess: SessionId, tree: TreeId, related: bool, cmds: List[Cmd] }
+    type Msg = { sess: SessionId, tree: TreeId, related: bool,
+                 cs: int, replay: bool, cmds: List[Cmd] }
 
     type MsgOutcome = { sdb2: StateDB, results: List[Res] }
 
@@ -768,6 +1737,7 @@ module smb2ops {
         val a0: Acc = {
             sdb: sdb, caps: caps, related: msg.related,
             sess: msg.sess, tree: msg.tree, cfid: -1,
+            cs: msg.cs, replay: msg.replay,
             done: false, results: []
         }
         val aN = msg.cmds.foldl(a0, (acc, c) =>
