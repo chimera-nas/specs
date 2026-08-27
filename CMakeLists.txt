@@ -143,6 +143,15 @@ set(POSIX_BATCHES
   "posixDisk|disk_|stepDirs|128|3|0x1"    "posixDisk|disk_|stepData|128|4|0x1"
   "posixDisk|disk_|stepLocks|128|2|0x1"   "posixDisk|disk_|stepPerms|128|5|0x1"
   "posixDisk|disk_|stepLinks|128|5|0x1"   "posixDisk|disk_|stepFds|128|5|0x1"
+  "posixFuse|fuse_|step|128|10|0x1"       "posixFuse|fuse_|step|128|6|0x2"
+  "posixFuse|fuse_|step|256|3|0x100"      "posixFuse|fuse_|step|512|2|0x5"
+  "posixFuse|fuse_|stepNamespace|128|4|0x1" "posixFuse|fuse_|stepNamespace|256|2|0x9"
+  "posixFuse|fuse_|stepDescriptors|128|4|0x1" "posixFuse|fuse_|stepMetadata|128|4|0x1"
+  "posixFuse|fuse_|stepDirs|128|3|0x1"    "posixFuse|fuse_|stepData|128|4|0x1"
+  "posixFuse|fuse_|stepLocks|128|2|0x1"   "posixFuse|fuse_|stepPerms|128|5|0x1"
+  "posixFuse|fuse_|stepLinks|128|5|0x1"   "posixFuse|fuse_|stepFds|128|5|0x1"
+  "posixFuse|fuse_|stepTooLong|128|4|0x1" "posixFuse|fuse_|stepPrefix|128|5|0x1"
+  "posixFuse|fuse_|stepFallocate|128|4|0x1"
 )
 foreach(b ${POSIX_BATCHES})
     string(REPLACE "|" ";" parts "${b}")

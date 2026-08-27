@@ -28,6 +28,7 @@ module posixTestStd {
         P_RENAME_CTIME = FeatOff,
         P_STRICT_ATIME = FeatMandatory,
         P_STICKY_WRITE_ARM = FeatOff,
+        P_CHOWN_SUPP_GROUP = FeatMandatory,
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatOff,
@@ -766,6 +767,14 @@ module posixTestStd {
         .then(runOp(0, RCopyRange({ fdIn: 0, offIn: 0, fdOut: 1, offOut: 0,
                                     len: BS })))
         .expect(lastE == EBADF)
+        // ...and clone rejects it the same way, ahead of any range check:
+        // do_clone_file_range() runs generic_file_rw_checks() before it
+        // consults ->remap_file_range, so an append-mode destination is EBADF
+        // even on a filesystem that cannot reflink and even for a range that
+        // would otherwise be EINVAL.
+        .then(runOp(0, RCloneRange({ fdDst: 1, offDst: 0, fdSrc: 0,
+                                     offSrc: 4 * BS, len: 4 * BS })))
+        .expect(lastE == EBADF)
 
     // ---------------- timestamp ordering ----------------
 
@@ -906,6 +915,7 @@ module posixTestRoot {
         P_RENAME_CTIME = FeatOff,
         P_STRICT_ATIME = FeatMandatory,
         P_STICKY_WRITE_ARM = FeatOff,
+        P_CHOWN_SUPP_GROUP = FeatMandatory,
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatOff,
