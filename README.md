@@ -6,7 +6,8 @@ SPDX-License-Identifier: MIT
 
 Spec-first [Quint](https://quint-lang.org) model-based-test specifications for
 common storage protocol and filesystem surfaces, derived from their standards
-documents (RFC 1833, RFC 1813, RFC 7530/8881, MS-SMB2/MS-FSA, POSIX). The build turns each
+documents (RFC 1833, RFC 1813, RFC 7530/8881, MS-SMB2/MS-FSA, POSIX, the AWS
+S3 API Reference). The build turns each
 model into a corpus of ITF traces plus model self-tests and coverage gates; a
 separate replay harness drives those traces against a server under test.
 
@@ -18,6 +19,7 @@ Each suite under `quint/` is an independent model:
 | `quint/nfs`     | NFSv3 and NFSv4 | RFC 1813, RFC 7530/8881 |
 | `quint/smb2`    | SMB2 (shares the nfs4 filesystem substrate) | MS-SMB2, MS-FSA |
 | `quint/nfsaux`  | the four protocols around NFSv3: portmap/rpcbind, MOUNT, NLM, NSM | RFC 1833, RFC 1813 App. I+II |
+| `quint/s3`      | the Amazon S3 REST API, scoped to a filesystem-backed gateway | AWS S3 API Reference (2006-03-01) |
 
 > These specifications were originally created to facilitate model-based testing
 > of the [Chimera](https://github.com/chimera-nas/chimera) NAS project, but the

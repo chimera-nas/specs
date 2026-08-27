@@ -5,7 +5,7 @@
 # Model-based-test specifications.
 #
 # This repo owns the Quint models for the MBT suites (posix, nfs3, nfs4, smb2,
-# nfsaux) and the logic that turns them into a corpus of ITF traces plus the
+# nfsaux, s3) and the logic that turns them into a corpus of ITF traces plus the
 # model self-tests and coverage gates.  The replay harness that drives those
 # traces against a server under test lives in the consuming project, which
 # embeds this repo either as a prebuilt trace bundle (fetched by the submodule's
@@ -49,6 +49,7 @@ file(GLOB NFS_QNT   ${Q}/nfs/*.qnt)
 file(GLOB SMB2_QNT  ${Q}/smb2/*.qnt)
 file(GLOB NFSAUX_QNT ${Q}/nfsaux/*.qnt)
 set(SMB2_DEPS ${SMB2_QNT} ${Q}/nfs/nfs4_fs.qnt)   # smb2 shares the nfs4 fs
+file(GLOB S3_QNT    ${Q}/s3/*.qnt)
 
 set(ALL_TRACES)          # every generated trace, for the top-level target
 set(SELFTEST_STAMPS)     # every self-test stamp, gating generation
@@ -277,6 +278,23 @@ foreach(b ${NFSAUX_BATCHES})
     specs_gen(nfsaux ${Q}/nfsaux/nfsaux_run.qnt nfsauxRef ${flavor} ${steps}
               ${nt} ${seed} "${flavor}_${steps}_${seed}_{seq}"
               NFSAUX_GATE NFSAUX_QNT)
+endforeach()
+
+# ---------------------------------------------------------------------------
+# S3  (s3.qnt is the run model directly; no --main)
+# ---------------------------------------------------------------------------
+specs_selftest(s3Test ${Q}/s3/s3Test.qnt s3Test 200 S3_QNT)
+set(S3_BATCHES
+  "step|128|8|0x1"  "step|256|3|0x100"  "stepData|128|5|0x1"
+  "stepList|128|5|0x1"  "stepBucket|64|4|0x1")
+foreach(b ${S3_BATCHES})
+    string(REPLACE "|" ";" parts "${b}")
+    list(GET parts 0 flavor)
+    list(GET parts 1 steps)
+    list(GET parts 2 nt)
+    list(GET parts 3 seed)
+    specs_gen(s3 ${Q}/s3/s3.qnt - ${flavor} ${steps} ${nt} ${seed}
+              "${flavor}_${steps}_${seed}_{seq}" SELFTEST_s3Test S3_QNT)
 endforeach()
 
 # ---------------------------------------------------------------------------
