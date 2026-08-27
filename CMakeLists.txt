@@ -220,6 +220,17 @@ foreach(inst nfs4Memfs42Deleg nfs4Memfs41Deleg)
               "${inst}_stepDeleg_80_{seq}" NFS4_GATE NFS_QNT)
 endforeach()
 
+# pNFS traces are their own suite rather than more nfs4/ traces: a pNFS
+# profile only replays against a server configured as a metadata server, and
+# the plain nfs4 profiles only replay against one that is not, so a single
+# directory would make each batch skip most of what it read.
+foreach(inst nfs4Pnfs42 nfs4Pnfs41)
+    foreach(fs stepPnfs stepData)
+        specs_gen(nfs4pnfs ${Q}/nfs/nfs4_run.qnt ${inst} ${fs} 80 6 0x7
+                  "${inst}_${fs}_80_{seq}" NFS4_GATE NFS_QNT)
+    endforeach()
+endforeach()
+
 # ---------------------------------------------------------------------------
 # SMB2  (smb2_run.qnt; depends on the shared nfs4_fs substrate too)
 # ---------------------------------------------------------------------------
