@@ -31,6 +31,7 @@ module posixDefault {
         P_RENAME_CTIME = FeatIfAdvertised,
         P_STRICT_ATIME = FeatIfAdvertised,
         P_STICKY_WRITE_ARM = FeatIfAdvertised,
+        P_CHOWN_SUPP_GROUP = FeatIfAdvertised,
         P_ERR_NOTEMPTY = FeatIfAdvertised,
         P_ERR_STICKY_ACCES = FeatIfAdvertised,
         P_ERR_UNLINKDIR_ISDIR = FeatIfAdvertised,
@@ -60,6 +61,7 @@ module posixMemfs {
         P_RENAME_CTIME = FeatMandatory,
         P_STRICT_ATIME = FeatOff,
         P_STICKY_WRITE_ARM = FeatOff,
+        P_CHOWN_SUPP_GROUP = FeatMandatory,
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
@@ -85,6 +87,7 @@ module posixDisk {
         P_RENAME_CTIME = FeatMandatory,
         P_STRICT_ATIME = FeatOff,
         P_STICKY_WRITE_ARM = FeatOff,
+        P_CHOWN_SUPP_GROUP = FeatMandatory,
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
@@ -112,6 +115,7 @@ module posixNfs3 {
         P_RENAME_CTIME = FeatMandatory,
         P_STRICT_ATIME = FeatMandatory,
         P_STICKY_WRITE_ARM = FeatOff,
+        P_CHOWN_SUPP_GROUP = FeatMandatory,
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
@@ -140,6 +144,44 @@ module posixNfs4 {
         P_RENAME_CTIME = FeatMandatory,
         P_STRICT_ATIME = FeatOff,
         P_STICKY_WRITE_ARM = FeatOff,
+        P_CHOWN_SUPP_GROUP = FeatMandatory,
+        P_ERR_NOTEMPTY = FeatMandatory,
+        P_ERR_STICKY_ACCES = FeatMandatory,
+        P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
+        P_ERR_LOCK_AGAIN = FeatMandatory
+    ).* from "./posix"
+    import posixops.* from "./posix_ops"
+}
+
+// The chimera FUSE profile, pinned to `posix_replay.py --probe` against
+// fuse_quint_driver (the in-process FUSE harness) on 2026-08-26.  It differs
+// from the memfs profile it is served by in three ways, all of them properties
+// of the FUSE transport rather than of the backend:
+//
+//   * no reflink.  FICLONERANGE is an ioctl; there is no FUSE request for it
+//     and fuse_file_operations has no ->remap_file_range, so the kernel answers
+//     EOPNOTSUPP without the server ever seeing the call.
+//   * strict atime.  Every read reaches the server (no page cache to satisfy
+//     it), so memfs's relatime update is observed rather than hidden behind a
+//     stale cached attribute the way the direct POSIX client hides it.
+//   * no chgrp to a supplementary group.  fuse_in_header carries a single gid,
+//     so the server cannot tell that the caller belongs to the target group and
+//     refuses with EPERM.  Measured on a live mount: as uid 200 gid 20 with
+//     groups 20,30, `chgrp 30` fails EPERM where `chgrp 20` succeeds.
+module posixFuse {
+    import posix(
+        F_COPY_RANGE = FeatMandatory,
+        F_CLONE_RANGE = FeatOff,
+        F_SEEK_HOLE = FeatMandatory,
+        F_ROOT = FeatIfAdvertised,
+        P_GID_FROM_PARENT = FeatOff,
+        P_SGID_INHERIT = FeatOff,
+        P_WRITE_CLEARS_SETIDS = FeatMandatory,
+        P_PWRITE_APPENDS = FeatOff,
+        P_RENAME_CTIME = FeatMandatory,
+        P_STRICT_ATIME = FeatMandatory,
+        P_STICKY_WRITE_ARM = FeatOff,
+        P_CHOWN_SUPP_GROUP = FeatOff,
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
@@ -161,6 +203,7 @@ module posixStrict {
         P_RENAME_CTIME = FeatOff,
         P_STRICT_ATIME = FeatMandatory,
         P_STICKY_WRITE_ARM = FeatOff,
+        P_CHOWN_SUPP_GROUP = FeatMandatory,
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatOff,
@@ -182,6 +225,7 @@ module posixLinuxish {
         P_RENAME_CTIME = FeatMandatory,
         P_STRICT_ATIME = FeatOff,
         P_STICKY_WRITE_ARM = FeatOff,
+        P_CHOWN_SUPP_GROUP = FeatMandatory,
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatOff,
         P_ERR_UNLINKDIR_ISDIR = FeatMandatory,

@@ -92,6 +92,9 @@ module posixops {
         renameCtime: bool,      // rename marks the moved object's ctime
         strictAtime: bool,      // harness enforces atime marking exactly
         stickyWriteArm: bool,   // sticky check exempts write-permitted callers
+        chownSuppGroup: bool,   // chgrp to a *supplementary* group is accepted
+                                // (false: only the caller's egid is, because
+                                // the transport carries no group list)
         // Errno choices POSIX leaves open (true = first-named value):
         errNotempty: bool,      // ENOTEMPTY (else EEXIST) for non-empty dirs
         errStickyAcces: bool,   // EACCES (else EPERM) for sticky violations
@@ -908,8 +911,13 @@ module posixops {
     // clear on regular files carrying an execute bit (Issue 8 makes the
     // no-execute case and the privileged case implementation-defined; the
     // model clears exactly when an execute bit is present).
-    pure def chownCommon(fs: Fs, ps: Pstate, p: Pid, i: Ino, u: int,
-                         g: int): Out = {
+    // `caps.chownSuppGroup` false narrows the "member of the target group"
+    // arm to the caller's egid alone.  POSIX permits chgrp to any group the
+    // caller belongs to, but a server reached over a transport that carries
+    // no supplementary group list (FUSE: fuse_in_header has a single gid)
+    // cannot see the rest of the list and refuses them with EPERM.
+    pure def chownCommon(fs: Fs, ps: Pstate, caps: Caps, p: Pid, i: Ino,
+                         u: int, g: int): Out = {
         val cr = psCred(ps, p)
         val nd = fs.inodes.get(i)
         // chown(-1, -1) names neither id: it changes nothing and so needs no
@@ -925,7 +933,9 @@ module posixops {
                 isPriv(cr) or
                 (cr.euid == nd.uid and
                  (u == -1 or u == nd.uid) and
-                 (g == -1 or inGroup(cr, g)))
+                 (g == -1 or
+                  (if (caps.chownSuppGroup) inGroup(cr, g)
+                   else cr.egid == g)))
             if (not(allowed)) outErr(fs, ps, EPERM)
             else out(fsChown(fs, i, u, g, nd.ftype == FReg and anyExec(nd.mode)),
                      ps, SOk({ e: OK }))
@@ -939,14 +949,14 @@ module posixops {
         else {
             val r = resolveEx(fs, caps, psCred(ps, p), at.start, pth, follow)
             if (r.err != OK) outErr(fs, ps, r.err)
-            else chownCommon(fs, ps, p, r.ino, u, g)
+            else chownCommon(fs, ps, caps, p, r.ino, u, g)
         }
     }
 
-    pure def opFchown(fs: Fs, ps: Pstate, p: Pid, fd: Fd, u: int,
-                      g: int): Out =
+    pure def opFchown(fs: Fs, ps: Pstate, caps: Caps, p: Pid, fd: Fd,
+                      u: int, g: int): Out =
         if (not(fdLive(ps, p, fd))) outErr(fs, ps, EBADF)
-        else chownCommon(fs, ps, p, fdOfd(ps, p, fd).ino, u, g)
+        else chownCommon(fs, ps, caps, p, fdOfd(ps, p, fd).ino, u, g)
 
     pure def tsVal(t: TimeSpec): int =
         match t {
@@ -1515,14 +1525,20 @@ module posixops {
                           fdDst: Fd, offDst: int, fdSrc: Fd, offSrc: int,
                           len: int): Out =
         // Linux orders the descriptor checks before the filesystem-support
-        // check: FICLONERANGE's EBADF (bad fd / wrong access mode) wins over
-        // EOPNOTSUPP from a backend without reflink support.
+        // check: FICLONERANGE's EBADF (bad fd / wrong access mode / append-mode
+        // destination) wins over EOPNOTSUPP from a backend without reflink
+        // support.  do_clone_file_range() runs generic_file_rw_checks(), which
+        // rejects an O_APPEND destination exactly as copy_file_range does,
+        // before it consults ->remap_file_range.  Measured on Linux 6.x over a
+        // non-reflink filesystem: both fds sane gives EOPNOTSUPP, an O_APPEND
+        // destination gives EBADF.
         if (not(fdLive(ps, p, fdDst)) or not(fdLive(ps, p, fdSrc)))
             outErr(fs, ps, EBADF)
         else {
             val od = fdOfd(ps, p, fdDst)
             val os = fdOfd(ps, p, fdSrc)
-            if (not(accWrites(od.acc)) or not(accReads(os.acc)))
+            if (not(accWrites(od.acc)) or not(accReads(os.acc)) or
+                    od.appendF)
                 outErr(fs, ps, EBADF)
             else if (not(caps.cloneRange)) outErr(fs, ps, EOPNOTSUPP)
             else if (fs.inodes.get(od.ino).ftype != FReg or
@@ -1604,7 +1620,7 @@ module posixops {
             | RFchmod(a) => opFchmod(fs, ps, p, a.fd, a.mode)
             | RChown(a) => opChown(fs, ps, caps, p, a.dfd, a.pth, a.u, a.g,
                                    a.follow)
-            | RFchown(a) => opFchown(fs, ps, p, a.fd, a.u, a.g)
+            | RFchown(a) => opFchown(fs, ps, caps, p, a.fd, a.u, a.g)
             | RUtimens(a) => opUtimens(fs, ps, caps, p, a.dfd, a.pth, a.ta,
                                        a.tm)
             | RFutimens(a) => opFutimens(fs, ps, p, a.fd, a.ta, a.tm)
