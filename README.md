@@ -6,7 +6,7 @@ SPDX-License-Identifier: MIT
 
 Spec-first [Quint](https://quint-lang.org) model-based-test specifications for
 common storage protocol and filesystem surfaces, derived from their standards
-documents (RFC 1813, RFC 7530/8881, MS-SMB2/MS-FSA, POSIX). The build turns each
+documents (RFC 1833, RFC 1813, RFC 7530/8881, MS-SMB2/MS-FSA, POSIX). The build turns each
 model into a corpus of ITF traces plus model self-tests and coverage gates; a
 separate replay harness drives those traces against a server under test.
 
@@ -17,7 +17,7 @@ Each suite under `quint/` is an independent model:
 | `quint/posix`   | the POSIX filesystem API | POSIX.1 / Linux |
 | `quint/nfs`     | NFSv3 and NFSv4 | RFC 1813, RFC 7530/8881 |
 | `quint/smb2`    | SMB2 (shares the nfs4 filesystem substrate) | MS-SMB2, MS-FSA |
-| `quint/portmap` | the RPC portmapper / rpcbind | RFC 1833 |
+| `quint/nfsaux`  | the four protocols around NFSv3: portmap/rpcbind, MOUNT, NLM, NSM | RFC 1833, RFC 1813 App. I+II |
 
 > These specifications were originally created to facilitate model-based testing
 > of the [Chimera](https://github.com/chimera-nas/chimera) NAS project, but the

@@ -5,7 +5,7 @@
 # Model-based-test specifications.
 #
 # This repo owns the Quint models for the MBT suites (posix, nfs3, nfs4, smb2,
-# portmap) and the logic that turns them into a corpus of ITF traces plus the
+# nfsaux) and the logic that turns them into a corpus of ITF traces plus the
 # model self-tests and coverage gates.  The replay harness that drives those
 # traces against a server under test lives in the consuming project, which
 # embeds this repo either as a prebuilt trace bundle (fetched by the submodule's
@@ -47,6 +47,7 @@ set(T ${CMAKE_CURRENT_BINARY_DIR}/traces)
 file(GLOB POSIX_QNT ${Q}/posix/*.qnt)
 file(GLOB NFS_QNT   ${Q}/nfs/*.qnt)
 file(GLOB SMB2_QNT  ${Q}/smb2/*.qnt)
+file(GLOB NFSAUX_QNT ${Q}/nfsaux/*.qnt)
 set(SMB2_DEPS ${SMB2_QNT} ${Q}/nfs/nfs4_fs.qnt)   # smb2 shares the nfs4 fs
 
 set(ALL_TRACES)          # every generated trace, for the top-level target
@@ -244,25 +245,44 @@ specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Base stepNs 500 8 0xd
 #           "smb2Durable_stepDurable_160_0x41_{seq}" SELFTEST_smb2Test SMB2_DEPS)
 
 # ---------------------------------------------------------------------------
-# portmap: traces are committed (regen via quint/portmap/regen_traces.sh);
-# stage them into the bundle tree so the bundle is self-contained.
+# NFSAUX -- the four protocols that surround NFSv3: portmap/rpcbind, MOUNT,
+# NLM and NSM (nfsaux_run.qnt; nfsauxRef is the profile a real server matches).
+#
+# Three self-tests, not one: the reference profile, the everything-implemented
+# profile that keeps the RFC semantics of the procedures a minimal server
+# refuses under test, and the grace-window profile.  Only the reference
+# profile generates traces -- it is the only one a server matches.
 # ---------------------------------------------------------------------------
-file(GLOB PORTMAP_TRACES ${Q}/portmap/traces/*.itf.json)
-set(PORTMAP_STAGED)
-foreach(src ${PORTMAP_TRACES})
-    get_filename_component(nm ${src} NAME)
-    add_custom_command(OUTPUT ${T}/portmap/${nm}
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${T}/portmap
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${src} ${T}/portmap/${nm}
-        DEPENDS ${src}
-        VERBATIM)
-    list(APPEND PORTMAP_STAGED ${T}/portmap/${nm})
+specs_selftest(nfsauxTestRef   ${Q}/nfsaux/nfsauxTest.qnt nfsauxTestRef   200 NFSAUX_QNT)
+specs_selftest(nfsauxTestFull  ${Q}/nfsaux/nfsauxTest.qnt nfsauxTestFull  200 NFSAUX_QNT)
+specs_selftest(nfsauxTestGrace ${Q}/nfsaux/nfsauxTest.qnt nfsauxTestGrace 200 NFSAUX_QNT)
+set(NFSAUX_GATE ${SELFTEST_nfsauxTestRef} ${SELFTEST_nfsauxTestFull}
+                ${SELFTEST_nfsauxTestGrace})
+
+# flavor | steps | ntraces | seed.  The per-protocol flavors keep a divergence
+# legible (a portmap trace fails on portmap); the mixed `step` flavor is what
+# reaches the seams between them.
+set(NFSAUX_BATCHES
+  "stepPortmap|200|4|0x1"  "stepMount|200|4|0x2"
+  "stepLocks|200|6|0x3"    "stepAsync|150|4|0x4"
+  "stepRecovery|200|6|0x5" "stepShare|150|3|0x6"
+  "stepBlocking|200|6|0x9"
+  "step|200|6|0x7"         "step|300|3|0x8")
+foreach(b ${NFSAUX_BATCHES})
+    string(REPLACE "|" ";" parts "${b}")
+    list(GET parts 0 flavor)
+    list(GET parts 1 steps)
+    list(GET parts 2 nt)
+    list(GET parts 3 seed)
+    specs_gen(nfsaux ${Q}/nfsaux/nfsaux_run.qnt nfsauxRef ${flavor} ${steps}
+              ${nt} ${seed} "${flavor}_${steps}_${seed}_{seq}"
+              NFSAUX_GATE NFSAUX_QNT)
 endforeach()
 
 # ---------------------------------------------------------------------------
 # Aggregate + bundle
 # ---------------------------------------------------------------------------
-add_custom_target(specs_traces ALL DEPENDS ${ALL_TRACES} ${PORTMAP_STAGED})
+add_custom_target(specs_traces ALL DEPENDS ${ALL_TRACES})
 
 add_custom_target(bundle
     COMMAND ${CMAKE_COMMAND} -E env QUINT_VERSION=${PINNED_QUINT}
@@ -278,3 +298,5 @@ add_test(NAME coverage/nfs3
             --fail-on-starved --glob "${T}/nfs3/*.itf.json")
 add_test(NAME coverage/smb2
     COMMAND ${Python3_EXECUTABLE} ${Q}/smb2/coverage.py ${T}/smb2)
+add_test(NAME coverage/nfsaux
+    COMMAND ${Python3_EXECUTABLE} ${Q}/nfsaux/coverage.py ${T}/nfsaux)
