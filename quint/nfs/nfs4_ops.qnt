@@ -191,6 +191,16 @@ module nfs4ops {
         sparse: bool,
         // RFC 7862 intra-server synchronous COPY supported.
         copy: bool,
+        // RFC 7862 15.10 READ_PLUS (sparse-aware READ) supported.
+        readPlus: bool,
+        // RFC 7862 15.5 IO_ADVISE supported.  Advisory: a server that
+        // supports the operation may still honor no hints at all.
+        ioAdvise: bool,
+        // RFC 7862 15.13 WRITE_SAME (Application Data Block expansion)
+        // supported.
+        writeSame: bool,
+        // RFC 7862 15.4 CLONE (reflink a byte range) supported.
+        clone: bool,
         // discretion: a conflicting op during delegation recall returns
         // NFS4ERR_DELAY (true) or blocks until the recall completes
         // (false).  Both are conformant (RFC 8881 10.4.4); only the DELAY
@@ -283,6 +293,12 @@ module nfs4ops {
         | RSeek({ sel: SidSel, off: int, whatData: bool })
         | RCopy({ srcSel: SidSel, dstSel: SidSel,
                   srcOff: int, dstOff: int, cnt: int })
+        | RReadPlus({ sel: SidSel, off: int, len: int })
+        | RIoAdvise({ sel: SidSel, off: int, len: int, hint: int })
+        | RWriteSame({ sel: SidSel, off: int, blocks: int, pat: int,
+                       blocknum: bool })
+        | RClone({ srcSel: SidSel, dstSel: SidSel,
+                   srcOff: int, dstOff: int, cnt: int })
         | RGetxattr(Name)
         | RSetxattr({ name: Name, sym: int, how: XattrSetHow })
         | RListxattrs
@@ -357,6 +373,13 @@ module nfs4ops {
         | SDeallocate({ st: int })
         | SSeek({ st: int, eof: bool, offset: int })
         | SCopy({ st: int, copied: int })
+        // blocks/isData describe the requested range block by block; a
+        // server may legally return a shorter prefix (see opReadPlus).
+        | SReadPlus({ st: int, eof: bool, count: int,
+                      blocks: List[int], isData: List[bool] })
+        | SIoAdvise({ st: int })
+        | SWriteSame({ st: int, count: int })
+        | SClone({ st: int })
         | SGetxattr({ st: int, sym: int })
         | SSetxattr({ st: int })
         | SListxattrs({ st: int, names: Set[Name] })
@@ -433,6 +456,10 @@ module nfs4ops {
             | SDeallocate(x) => x.st
             | SSeek(x) => x.st
             | SCopy(x) => x.st
+            | SReadPlus(x) => x.st
+            | SIoAdvise(x) => x.st
+            | SWriteSame(x) => x.st
+            | SClone(x) => x.st
             | SGetxattr(x) => x.st
             | SSetxattr(x) => x.st
             | SListxattrs(x) => x.st
@@ -1960,6 +1987,36 @@ module nfs4ops {
         }
     }
 
+    // CLONE resolves both stateids through the state table, which does not
+    // accept the special stateids (they name no concrete state).  Unlike the
+    // single-filehandle I/O ops, the two stateids are validated against
+    // DIFFERENT filehandles -- the source against the saved FH and the
+    // destination against the current one -- so this cannot reuse resolveSel,
+    // which always checks against the current FH.
+    pure def cloneSidGate(a: Acc, sel: SidSel, fh: Ino): int =
+        match sel {
+            | SelAnon => E_BAD_STATEID
+            | SelBypass => E_BAD_STATEID
+            | SelRef(r) =>
+                match checkSid(a.sdb, r.sid, r.kind, r.argSeq) {
+                    | SidBad => E_BAD_STATEID
+                    | SidOld => E_OLD_STATEID
+                    | SidOk => {
+                        val fOf = match r.kind {
+                            | KOpen => a.sdb.opens.get(r.sid).file
+                            | KLock => a.sdb.locks.get(r.sid).file
+                            | KDeleg => a.sdb.delegs.get(r.sid).file
+                            | KLayout => a.sdb.layouts.get(r.sid).file
+                        }
+                        if (fOf != fh) E_BAD_STATEID
+                        else if (r.kind == KOpen and
+                                 a.sdb.opens.get(r.sid).needConfirm)
+                            E_BAD_STATEID
+                        else OK
+                    }
+                }
+        }
+
     pure def opAllocate(a: Acc, ar: { sel: SidSel, off: int, len: int }): Acc =
         if (a.minor < 2) emit(a, SAllocate({ st: E_OP_ILLEGAL }))
         else if (not(a.caps.sparse)) emit(a, SAllocate({ st: E_NOTSUPP }))
@@ -2014,7 +2071,12 @@ module nfs4ops {
     // Intra-server synchronous COPY (RFC 7862 15.2): sfh = source, cfh =
     // destination; same file -> NFS4ERR_INVAL (any ranges); source range
     // beyond the source size -> NFS4ERR_INVAL; cnt = 0 copies through the
-    // source EOF.
+    // source EOF.  The special stateids are accepted (copyTest pins this):
+    // nothing in RFC 7862 15.2 excludes them, and the server derives its
+    // access check from the filehandles.  NOTE: the reference implementation
+    // resolves both stateids through the state table and so answers
+    // NFS4ERR_BAD_STATEID for an anonymous COPY -- an open divergence, which
+    // is why copyRange generates concrete open stateids only.
     pure def opCopy(a: Acc, ar: { srcSel: SidSel, dstSel: SidSel,
                                   srcOff: int, dstOff: int, cnt: int }): Acc = {
         val nores = { st: OK, copied: 0 }
@@ -2045,6 +2107,141 @@ module nfs4ops {
                         fsWrite(acc, a.cfh, ar.dstOff + i, 1,
                                 data.syms[i]).fs2)
                     emit(a.with("fs", w), SCopy({ st: OK, copied: cnt }))
+                }
+            }
+        }
+    }
+
+    // IO_ADVISE validates only the filehandle and the stateid.  The
+    // operation is advisory, so no file-type and no open-mode check applies
+    // (RFC 7862 15.5 requires neither).
+    pure def ioAdviseGate(a: Acc, sel: SidSel): int = {
+        val g = fhGate(a)
+        if (g != OK) g
+        else match resolveSel(a, sel) {
+            | IoError(e) => e
+            | IoAnon => OK
+            | IoBypass => OK
+            | IoState(s) => OK
+        }
+    }
+
+    // READ_PLUS (RFC 7862 15.10): a sparse-aware READ that reports the range
+    // as DATA and HOLE segments.  Allocated-but-unwritten blocks classify as
+    // DATA, the same rule SEEK uses.  The model predicts the classification
+    // and contents of the WHOLE requested range; a server may legally return
+    // a shorter prefix of it (rpr_contents is an array and the client
+    // re-issues from the last byte returned), so the harness matches the
+    // returned segments against this as a prefix rather than for equality.
+    pure def opReadPlus(a: Acc, ar: { sel: SidSel, off: int, len: int }): Acc = {
+        val nores = { st: OK, eof: false, count: 0, blocks: [], isData: [] }
+        if (a.minor < 2) emit(a, SReadPlus(nores.with("st", E_OP_ILLEGAL)))
+        else if (not(a.caps.readPlus))
+            emit(a, SReadPlus(nores.with("st", E_NOTSUPP)))
+        else {
+            val g = io42Gate(a, ar.sel, false)
+            if (g != OK) emit(a, SReadPlus(nores.with("st", g)))
+            else {
+                val nd = cfhNode(a)
+                val r = fsReadData(nd, ar.off, ar.len)
+                emit(a, SReadPlus({
+                    st: OK, eof: r.eof, count: r.count, blocks: r.syms,
+                    isData: range(ar.off, ar.off + r.count).foldl([],
+                        (acc, i) => acc.append(match blockAt(nd, i) {
+                            | BHole => false
+                            | BZero => true
+                            | BData(s) => true
+                        })) }))
+            }
+        }
+    }
+
+    // IO_ADVISE (RFC 7862 15.5): purely advisory I/O hints.  A server is
+    // permitted to honor none of them, so the model predicts the status only
+    // and the harness checks the honored set is a subset of the requested
+    // hints (the one constraint the RFC does impose).
+    pure def opIoAdvise(a: Acc, ar: { sel: SidSel, off: int, len: int,
+                                      hint: int }): Acc =
+        if (a.minor < 2) emit(a, SIoAdvise({ st: E_OP_ILLEGAL }))
+        else if (not(a.caps.ioAdvise)) emit(a, SIoAdvise({ st: E_NOTSUPP }))
+        else emit(a, SIoAdvise({ st: ioAdviseGate(a, ar.sel) }))
+
+    // WRITE_SAME (RFC 7862 15.13) expands an Application Data Block -- a
+    // pattern replicated across a run of fixed-size blocks -- so the pattern
+    // crosses the wire once.  Per-block-number stamping (adb_reloff_blocknum
+    // != NFS4_UINT64_MAX) is the unsupported arm of the union and is rejected
+    // by argument validation, ahead of every filehandle, stateid and
+    // capability check.  The model pins one ADB block to one model block, so
+    // `blocks` is adb_block_count and the byte count follows from it.
+    pure def opWriteSame(a: Acc, ar: { sel: SidSel, off: int, blocks: int,
+                                       pat: int, blocknum: bool }): Acc = {
+        val nores = { st: OK, count: 0 }
+        if (a.minor < 2) emit(a, SWriteSame(nores.with("st", E_OP_ILLEGAL)))
+        else if (ar.blocknum)
+            emit(a, SWriteSame(nores.with("st", E_UNION_NOTSUPP)))
+        else if (not(a.caps.writeSame))
+            emit(a, SWriteSame(nores.with("st", E_NOTSUPP)))
+        else {
+            val g = io42Gate(a, ar.sel, true)
+            if (g != OK) emit(a, SWriteSame(nores.with("st", g)))
+            else if (ar.blocks <= 0) emit(a, SWriteSame({ st: OK, count: 0 }))
+            else emit(a.with("fs", fsWrite(a.fs, a.cfh, ar.off, ar.blocks,
+                                           ar.pat).fs2),
+                      SWriteSame({ st: OK, count: ar.blocks }))
+        }
+    }
+
+    // CLONE (RFC 7862 15.4) reflinks a source range (sfh) into the
+    // destination (cfh); the ranges then share storage copy-on-write, which
+    // is invisible at the protocol level -- the observable effect is a COPY.
+    // cl_count == 0 clones through the source EOF, and a source offset at or
+    // past EOF is a no-op success.  Unlike COPY, CLONE resolves both stateids
+    // as concrete open/lock state: it takes no special-stateid shortcut, so
+    // an anonymous or read-bypass selector is NFS4ERR_BAD_STATEID.  Cloning
+    // overlapping ranges of one file is NFS4ERR_INVAL.
+    pure def opClone(a: Acc, ar: { srcSel: SidSel, dstSel: SidSel,
+                                   srcOff: int, dstOff: int, cnt: int }): Acc = {
+        if (a.minor < 2) emit(a, SClone({ st: E_OP_ILLEGAL }))
+        else if (a.sfh == -1 or a.cfh == -1)
+            emit(a, SClone({ st: E_NOFILEHANDLE }))
+        else if (not(fsLive(a.fs, a.sfh)) or not(fsLive(a.fs, a.cfh)))
+            emit(a, SClone({ st: E_STALE }))
+        else {
+            // Both stateids are resolved before the operation is judged
+            // unsupported, so a bad stateid outranks NFS4ERR_NOTSUPP.
+            val sg = cloneSidGate(a, ar.srcSel, a.sfh)
+            val dg = cloneSidGate(a, ar.dstSel, a.cfh)
+            if (sg != OK) emit(a, SClone({ st: sg }))
+            else if (dg != OK) emit(a, SClone({ st: dg }))
+            else if (not(a.caps.clone)) emit(a, SClone({ st: E_NOTSUPP }))
+            else {
+                val src = fsGet(a.fs, a.sfh)
+                val dst = fsGet(a.fs, a.cfh)
+                if (src.ftype != FReg or dst.ftype != FReg)
+                    emit(a, SClone({ st:
+                        if (src.ftype == FDir or dst.ftype == FDir) E_ISDIR
+                        else E_WRONG_TYPE }))
+                else {
+                    val cnt = if (ar.cnt == 0)
+                                  imax(0, src.sizeBlocks - ar.srcOff)
+                              else ar.cnt
+                    if (a.sfh == a.cfh and
+                        ar.srcOff < ar.dstOff + cnt and
+                        ar.dstOff < ar.srcOff + cnt)
+                        emit(a, SClone({ st: E_INVAL }))
+                    else if (cnt == 0)
+                        // Nothing to clone (count 0 with the source offset at
+                        // or past EOF): success, no state change.
+                        emit(a, SClone({ st: OK }))
+                    else if (ar.srcOff + cnt > src.sizeBlocks)
+                        emit(a, SClone({ st: E_INVAL }))
+                    else
+                        // Reflink: the destination takes the source's block
+                        // CONTENT, so a hole in the source stays a hole.
+                        emit(a.with("fs",
+                                    fsCopyBlocks(a.fs, a.sfh, ar.srcOff,
+                                                 a.cfh, ar.dstOff, cnt)),
+                             SClone({ st: OK }))
                 }
             }
         }
@@ -2176,6 +2373,10 @@ module nfs4ops {
             | RDeallocate(ar) => opDeallocate(a, ar)
             | RSeek(ar) => opSeek(a, ar)
             | RCopy(ar) => opCopy(a, ar)
+            | RReadPlus(ar) => opReadPlus(a, ar)
+            | RIoAdvise(ar) => opIoAdvise(a, ar)
+            | RWriteSame(ar) => opWriteSame(a, ar)
+            | RClone(ar) => opClone(a, ar)
             | RGetxattr(n) => opGetxattr(a, n)
             | RSetxattr(ar) => opSetxattr(a, ar)
             | RListxattrs => opListxattrs(a)
@@ -2193,6 +2394,8 @@ module nfs4ops {
                     xattr: bool, sparse: bool, copyOk: bool): Caps =
         { pnfs: pnfs, readDeleg: readDeleg, writeDeleg: writeDeleg,
           xattr: xattr, sparse: sparse, copy: copyOk,
+          readPlus: copyOk, ioAdvise: copyOk, writeSame: copyOk,
+          clone: copyOk,
           conflictDelays: true, closeFreesLocks: true }
 
     // Evaluate a whole COMPOUND.  reqTag identifies the request for the

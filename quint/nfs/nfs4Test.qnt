@@ -23,6 +23,10 @@ module nfs4Test42 {
         F_XATTR = FeatMandatory,
         F_SPARSE = FeatMandatory,
         F_COPY = FeatMandatory,
+        F_READ_PLUS = FeatMandatory,
+        F_IO_ADVISE = FeatMandatory,
+        F_WRITE_SAME = FeatMandatory,
+        F_CLONE = FeatMandatory,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true
     ).* from "./nfs4"
@@ -629,6 +633,64 @@ module nfs4Test42 {
                                  srcOff: 5, dstOff: 0, cnt: 1 }) ]))
             .expect(lastStatus == E_INVAL)
 
+    // --- RFC 7862 data operations ---------------------------------------
+
+    run dataOps42Test =
+        openCreateRun
+            // f (ino 1): block 0 written, block 1 left a hole, block 2 written.
+            .then(runC([ seq0(2), RPutfh(1),
+                         RWrite({ sel: SelAnon, off: 0, len: 1, pat: 2,
+                                  stable: 0 }) ]))
+            .then(runC([ seq0(3), RPutfh(1),
+                         RWrite({ sel: SelAnon, off: 2, len: 1, pat: 3,
+                                  stable: 0 }) ]))
+            .expect(lastStatus == OK and fsGet(fs, 1).sizeBlocks == 3)
+            // READ_PLUS classifies the range block by block: DATA, HOLE, DATA.
+            .then(runC([ seq0(4), RPutfh(1),
+                         RReadPlus({ sel: SelAnon, off: 0, len: 3 }) ]))
+            .expect(match resAt(2) {
+                | SReadPlus(x) => x.st == OK and x.count == 3 and
+                                  x.isData == [ true, false, true ] and
+                                  x.blocks == [ 2, 0, 3 ] and x.eof
+                | _ => false })
+            // At EOF: no segment, eof set.
+            .then(runC([ seq0(5), RPutfh(1),
+                         RReadPlus({ sel: SelAnon, off: 3, len: 2 }) ]))
+            .expect(match resAt(2) {
+                | SReadPlus(x) => x.st == OK and x.count == 0 and x.eof
+                | _ => false })
+            // IO_ADVISE is a validating no-op.
+            .then(runC([ seq0(6), RPutfh(1),
+                         RIoAdvise({ sel: SelAnon, off: 0, len: 1,
+                                     hint: 2 }) ]))
+            .expect(lastStatus == OK)
+            // WRITE_SAME fills the hole and extends the file.
+            .then(runC([ seq0(7), RPutfh(1),
+                         RWriteSame({ sel: SelAnon, off: 1, blocks: 3,
+                                      pat: 1, blocknum: false }) ]))
+            .expect(lastStatus == OK and fsGet(fs, 1).sizeBlocks == 4 and
+                    match resAt(2) {
+                        | SWriteSame(x) => x.count == 3
+                        | _ => false })
+            // Per-block-number stamping is the unsupported arm of the union,
+            // rejected ahead of every other check.
+            .then(runC([ seq0(8), RPutfh(1),
+                         RWriteSame({ sel: SelAnon, off: 0, blocks: 1,
+                                      pat: 1, blocknum: true }) ]))
+            .expect(lastStatus == E_UNION_NOTSUPP)
+            // CLONE needs concrete open state: the anonymous stateid names
+            // none, so it is NFS4ERR_BAD_STATEID.
+            .then(runC([ seq0(9), RPutrootfh,
+                         ROpen({ client: 0, owner: 2, oseq: 0,
+                                 claim: OCNull("g"),
+                                 how: HGuarded({ mode: 420 }),
+                                 access: 3, deny: 0 }), RGetfh ]))
+            .expect(lastStatus == OK)
+            .then(runC([ seq0(10), RPutfh(1), RSavefh, RPutfh(2),
+                         RClone({ srcSel: SelAnon, dstSel: SelAnon,
+                                  srcOff: 0, dstOff: 0, cnt: 1 }) ]))
+            .expect(lastStatus == E_BAD_STATEID)
+
     // --- xattrs -------------------------------------------------------
 
     run xattrTest =
@@ -731,6 +793,10 @@ module nfs4Test40 {
         F_XATTR = FeatOff,
         F_SPARSE = FeatOff,
         F_COPY = FeatOff,
+        F_READ_PLUS = FeatOff,
+        F_IO_ADVISE = FeatOff,
+        F_WRITE_SAME = FeatOff,
+        F_CLONE = FeatOff,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true
     ).* from "./nfs4"

@@ -459,6 +459,25 @@ module nfs4fs {
     // change attribute moves only on an actual change; memfs matches this,
     // e.g. an O_TRUNC-style OPEN of an already-empty file).  A real size
     // change advances change and clears the verifier.
+    // Transfer whole blocks from one file to another preserving each block's
+    // CONTENT -- hole, allocated-but-unwritten, or data.  Reflinking (CLONE)
+    // shares the source's extents, so a hole in the source stays a hole in
+    // the destination; fsReadData cannot express that, because it flattens
+    // BHole and BZero to the same symbol 0.
+    pure def fsCopyBlocks(fs: Fs, src: Ino, srcOff: int,
+                          dst: Ino, dstOff: int, cnt: int): Fs = {
+        val sn = fs.inodes.get(src)
+        val dn = fs.inodes.get(dst)
+        val nblocks = range(0, cnt).foldl(dn.blocks, (acc, i) =>
+            acc.put(dstOff + i, blockAt(sn, srcOff + i)))
+        fs.with("inodes", fs.inodes.setBy(dst, x => x
+              .with("blocks", nblocks)
+              .with("sizeBlocks", imax(dn.sizeBlocks, dstOff + cnt))
+              .with("change", fs.chg)
+              .with("xverf", 0)))
+          .with("chg", fs.chg + 1)
+    }
+
     pure def fsResize(fs: Fs, f: Ino, n: int): Fs = {
         val nd = fs.inodes.get(f)
         if (nd.sizeBlocks == n) fs

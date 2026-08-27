@@ -24,6 +24,10 @@ module nfs4Default {
         F_XATTR = FeatIfAdvertised,
         F_SPARSE = FeatIfAdvertised,
         F_COPY = FeatIfAdvertised,
+        F_READ_PLUS = FeatIfAdvertised,
+        F_IO_ADVISE = FeatIfAdvertised,
+        F_WRITE_SAME = FeatIfAdvertised,
+        F_CLONE = FeatIfAdvertised,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true
     ).* from "./nfs4"
@@ -40,6 +44,10 @@ module nfs4V40 {
         F_XATTR = FeatOff,
         F_SPARSE = FeatOff,
         F_COPY = FeatOff,
+        F_READ_PLUS = FeatOff,
+        F_IO_ADVISE = FeatOff,
+        F_WRITE_SAME = FeatOff,
+        F_CLONE = FeatOff,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true
     ).* from "./nfs4"
@@ -56,6 +64,10 @@ module nfs4V41 {
         F_XATTR = FeatOff,
         F_SPARSE = FeatOff,
         F_COPY = FeatOff,
+        F_READ_PLUS = FeatOff,
+        F_IO_ADVISE = FeatOff,
+        F_WRITE_SAME = FeatOff,
+        F_CLONE = FeatOff,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true
     ).* from "./nfs4"
@@ -94,6 +106,10 @@ module nfs4Memfs42 {
         F_XATTR = FeatMandatory,
         F_SPARSE = FeatMandatory,
         F_COPY = FeatMandatory,
+        F_READ_PLUS = FeatMandatory,
+        F_IO_ADVISE = FeatMandatory,
+        F_WRITE_SAME = FeatMandatory,
+        F_CLONE = FeatMandatory,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true
     ).* from "./nfs4"
@@ -114,6 +130,10 @@ module nfs4Memfs42Deleg {
         F_XATTR = FeatMandatory,
         F_SPARSE = FeatMandatory,
         F_COPY = FeatMandatory,
+        F_READ_PLUS = FeatMandatory,
+        F_IO_ADVISE = FeatMandatory,
+        F_WRITE_SAME = FeatMandatory,
+        F_CLONE = FeatMandatory,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true
     ).* from "./nfs4"
@@ -129,6 +149,10 @@ module nfs4Memfs41Deleg {
         F_XATTR = FeatOff,
         F_SPARSE = FeatOff,
         F_COPY = FeatOff,
+        F_READ_PLUS = FeatOff,
+        F_IO_ADVISE = FeatOff,
+        F_WRITE_SAME = FeatOff,
+        F_CLONE = FeatOff,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true
     ).* from "./nfs4"
@@ -144,6 +168,10 @@ module nfs4Memfs41 {
         F_XATTR = FeatOff,
         F_SPARSE = FeatOff,
         F_COPY = FeatOff,
+        F_READ_PLUS = FeatOff,
+        F_IO_ADVISE = FeatOff,
+        F_WRITE_SAME = FeatOff,
+        F_CLONE = FeatOff,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true
     ).* from "./nfs4"
@@ -159,6 +187,10 @@ module nfs4Memfs40 {
         F_XATTR = FeatOff,
         F_SPARSE = FeatOff,
         F_COPY = FeatOff,
+        F_READ_PLUS = FeatOff,
+        F_IO_ADVISE = FeatOff,
+        F_WRITE_SAME = FeatOff,
+        F_CLONE = FeatOff,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true
     ).* from "./nfs4"
@@ -176,6 +208,10 @@ module nfs4PnfsMandatory {
         F_XATTR = FeatIfAdvertised,
         F_SPARSE = FeatIfAdvertised,
         F_COPY = FeatIfAdvertised,
+        F_READ_PLUS = FeatIfAdvertised,
+        F_IO_ADVISE = FeatIfAdvertised,
+        F_WRITE_SAME = FeatIfAdvertised,
+        F_CLONE = FeatIfAdvertised,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true
     ).* from "./nfs4"
@@ -194,6 +230,10 @@ module nfs4AllMandatory {
         F_XATTR = FeatMandatory,
         F_SPARSE = FeatMandatory,
         F_COPY = FeatMandatory,
+        F_READ_PLUS = FeatMandatory,
+        F_IO_ADVISE = FeatMandatory,
+        F_WRITE_SAME = FeatMandatory,
+        F_CLONE = FeatMandatory,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true
     ).* from "./nfs4"
