@@ -40,6 +40,10 @@ module nfs4 {
     const F_XATTR: FeatureMode
     const F_SPARSE: FeatureMode
     const F_COPY: FeatureMode
+    const F_READ_PLUS: FeatureMode
+    const F_IO_ADVISE: FeatureMode
+    const F_WRITE_SAME: FeatureMode
+    const F_CLONE: FeatureMode
 
     // Server-policy profile knobs (both choices are RFC-conformant; the
     // trace pins the assumption and the harness verifies it holds):
@@ -60,6 +64,11 @@ module nfs4 {
     pure val MAX_BLOCKS = 6
     // Symbol 0 is reserved for holes/zeroes; see nfs4_fs.qnt.
     pure val BLOCK_SYMS = 1.to(3)
+
+    // io_advise_type4 bit numbers (RFC 7862 15.5): NORMAL, SEQUENTIAL,
+    // RANDOM, WILLNEED, DONTNEED.  Advisory, so the value only has to be a
+    // legal hint -- the server may honor none of them.
+    pure val IO_ADVISE_HINTS = Set(1, 2, 3, 4, 5)
     pure val STABLE_LEVELS = Set(0, 1, 2)   // UNSTABLE4/DATA_SYNC4/FILE_SYNC4
     pure val ACCESS_MASKS = Set(1, 32, 63)
     // Byte-range lock space [0, LOCK_BYTES); a lock reaching LOCK_BYTES is
@@ -97,6 +106,18 @@ module nfs4 {
         nondet cXa = oneOf(capChoices(F_XATTR))
         nondet cSp = oneOf(capChoices(F_SPARSE))
         nondet cCp = oneOf(capChoices(F_COPY))
+        // Resolved deterministically rather than drawn.  A nondet draw here
+        // would consume from the same random stream the step actions use, so
+        // adding one regenerates EVERY existing trace in the corpus for every
+        // instance and flavor -- a corpus-wide churn that buries whatever the
+        // new operations actually change.  The instances that feed the ctest
+        // corpus pin these FeatMandatory or FeatOff, so there is no profile
+        // to explore; FeatIfAdvertised resolves to "unsupported", which the
+        // harness reconciles against the live advertisement as usual.
+        val cRp = F_READ_PLUS == FeatMandatory
+        val cIa = F_IO_ADVISE == FeatMandatory
+        val cWs = F_WRITE_SAME == FeatMandatory
+        val cCl = F_CLONE == FeatMandatory
         val c: Caps = {
             pnfs: cPnfs and MINOR >= 1,
             readDeleg: cRd,
@@ -104,6 +125,10 @@ module nfs4 {
             xattr: cXa and MINOR >= 2,
             sparse: cSp and MINOR >= 2,
             copy: cCp and MINOR >= 2,
+            readPlus: cRp and MINOR >= 2,
+            ioAdvise: cIa and MINOR >= 2,
+            writeSame: cWs and MINOR >= 2,
+            clone: cCl and MINOR >= 2,
             conflictDelays: P_CONFLICT_DELAYS,
             closeFreesLocks: P_CLOSE_FREES_LOCKS
         }
@@ -223,6 +248,25 @@ module nfs4 {
     // legal server state, but such state can't be exercised meanwhile).
     def clientUsable(c: ClientId): bool =
         MINOR == 0 or sessOf(c) != -1
+
+    // CLONE pairs: a source open and a destination open held by ONE client
+    // on DISTINCT files, the source readable and the destination writable.
+    // CLONE resolves both stateids as concrete open state, so having such a
+    // pair is a precondition of generating the operation at all -- drawing
+    // two opens at random almost never satisfies it.
+    def clonePairs: Set[{ src: Sid, dst: Sid }] =
+        usableOpens.fold(Set(), (acc, sp) => {
+            val so = sdb.opens.get(sp)
+            if (not(bitsOverlap(so.access, 1))) acc
+            else acc.union(usableOpens.fold(Set(), (a2, dp) => {
+                val dofs = sdb.opens.get(dp)
+                if (bitsOverlap(dofs.access, 2) and
+                    dofs.client == so.client and
+                    dofs.file != so.file)
+                    a2.union(Set({ src: sp, dst: dp }))
+                else a2
+            }))
+        })
 
     // Opens usable for I/O: 4.0 unconfirmed opens and stranded-client
     // opens are excluded from generation.
@@ -1023,23 +1067,191 @@ module nfs4 {
         },
     }
 
+    // COPY draws from the same pair set as CLONE so it runs against real
+    // files with real open state.  It deliberately does NOT generate the
+    // anonymous stateid: the model accepts it there but the reference server
+    // rejects it (see opCopy), and that divergence is not this corpus's to
+    // assert.
     action copyRange = all {
         MINOR >= 2,
-        files.size() > 1,
+        genReady,
+        clonePairs.size() > 0,
+        {
+            nondet p = oneOf(clonePairs)
+            val so = sdb.opens.get(p.src)
+            val dofs = sdb.opens.get(p.dst)
+            nondet srcOff = oneOf(0.to(MAX_BLOCKS - 1))
+            nondet dstOff = oneOf(0.to(MAX_BLOCKS - 1))
+            nondet cnt = oneOf(1.to(2))
+            // Keep the source range inside the source file.  The out-of-range
+            // shapes are a second open divergence: RFC 7862 15.2.3 makes a
+            // source offset past the source size NFS4ERR_INVAL, and the
+            // reference server answers NFS4_OK.  Asserting that is not this
+            // corpus's job.
+            if (delegOther(dofs.file, dofs.client) or
+                delegOtherWrite(so.file, so.client) or
+                srcOff + cnt > fsGet(fs, so.file).sizeBlocks)
+                runC(withSess(dofs.client, [ RPutfh(dofs.file), RGetattr ]))
+            else
+                runC(withSess(dofs.client,
+                    [ RPutfh(so.file), RSavefh, RPutfh(dofs.file),
+                      RCopy({ srcSel: openSel(p.src), dstSel: openSel(p.dst),
+                              srcOff: srcOff, dstOff: dstOff,
+                              cnt: cnt }) ]))
+        },
+    }
+
+    // READ_PLUS over a range that straddles written blocks, holes and EOF:
+    // the interesting classifications all live near a sparse file's edges.
+    action sparseReadPlus = all {
+        MINOR >= 2,
+        files.size() > 0,
         genReady,
         {
-            nondet src = oneOf(files)
-            nondet dst = oneOf(files)
-            nondet so = oneOf(0.to(MAX_BLOCKS - 1))
-            nondet dofs = oneOf(0.to(MAX_BLOCKS - 1))
-            nondet cnt = oneOf(0.to(2))
-            if (delegOther(dst, anyReady) or delegOtherWrite(src, anyReady))
-                runC(withSess(anyReady, [ RPutfh(dst), RGetattr ]))
+            nondet f = oneOf(files)
+            nondet off = oneOf(0.to(MAX_BLOCKS))
+            nondet len = oneOf(1.to(3))
+            // Only opens carrying the read bit: READ (and so READ_PLUS)
+            // through a write-only open is a MAY the model resolves as
+            // NFS4ERR_OPENMODE, and the generator avoids that discretion
+            // rather than assert either answer (see opRead).
+            val opensOfF = usableOpens.filter(s =>
+                sdb.opens.get(s).file == f and
+                bitsOverlap(sdb.opens.get(s).access, 1))
+            nondet useOpen = oneOf(Set(false, true))
+            val sid = opensOfF.fold(-1, (a2, s) => imax(a2, s))
+            val sel = if (useOpen and sid != -1) openSel(sid) else SelAnon
+            val cid = if (useOpen and sid != -1) sdb.opens.get(sid).client
+                      else anyReady
+            val rcid = if (MINOR == 0) -1 else
+                       (if (cid == -1) anyReady else cid)
+            if (delegOtherWrite(f, if (rcid == -1) anyReady else rcid))
+                runC(withSess(rcid, [ RPutfh(f), RGetattr ]))
             else
-                runC(withSess(anyReady,
-                    [ RPutfh(src), RSavefh, RPutfh(dst),
-                      RCopy({ srcSel: SelAnon, dstSel: SelAnon,
-                              srcOff: so, dstOff: dofs, cnt: cnt }) ]))
+                runC(withSess(rcid,
+                    [ RPutfh(f),
+                      RReadPlus({ sel: sel, off: off, len: len }) ]))
+        },
+    }
+
+    // IO_ADVISE is advisory and never mutates state, so it is generated
+    // freely: it validates only a filehandle and a stateid.
+    action ioAdvise = all {
+        MINOR >= 2,
+        files.size() > 0,
+        genReady,
+        {
+            nondet f = oneOf(files)
+            nondet off = oneOf(0.to(MAX_BLOCKS))
+            nondet len = oneOf(1.to(2))
+            nondet hint = oneOf(IO_ADVISE_HINTS)
+            val opensOfF = usableOpens.filter(s => sdb.opens.get(s).file == f)
+            nondet useOpen = oneOf(Set(false, true))
+            val sid = opensOfF.fold(-1, (a2, s) => imax(a2, s))
+            val sel = if (useOpen and sid != -1) openSel(sid) else SelAnon
+            val cid = if (useOpen and sid != -1) sdb.opens.get(sid).client
+                      else anyReady
+            val acid = if (MINOR == 0) -1 else
+                       (if (cid == -1) anyReady else cid)
+            runC(withSess(acid,
+                [ RPutfh(f),
+                  RIoAdvise({ sel: sel, off: off, len: len, hint: hint }) ]))
+        },
+    }
+
+    // WRITE_SAME, including the per-block-number arm the server rejects with
+    // NFS4ERR_UNION_NOTSUPP before it looks at anything else.
+    action writeSame = all {
+        MINOR >= 2,
+        files.size() > 0,
+        genReady,
+        {
+            nondet f = oneOf(files)
+            nondet off = oneOf(0.to(MAX_BLOCKS - 1))
+            nondet blocks = oneOf(1.to(2))
+            nondet pat = oneOf(BLOCK_SYMS)
+            // Set literals deduplicate, so weight with an int draw: one in
+            // four WRITE_SAMEs takes the per-block-number arm.
+            nondet bnDraw = oneOf(0.to(3))
+            val blocknum = (bnDraw == 0)
+            val opensOfF = usableOpens.filter(s =>
+                sdb.opens.get(s).file == f and
+                bitsOverlap(sdb.opens.get(s).access, 2))
+            nondet useOpen = oneOf(Set(false, true))
+            val sid = opensOfF.fold(-1, (a2, s) => imax(a2, s))
+            val sel = if (useOpen and sid != -1) openSel(sid) else SelAnon
+            val cid = if (useOpen and sid != -1) sdb.opens.get(sid).client
+                      else anyReady
+            val wcid = if (MINOR == 0) -1 else
+                       (if (cid == -1) anyReady else cid)
+            if (delegOther(f, if (wcid == -1) anyReady else wcid))
+                runC(withSess(wcid, [ RPutfh(f), RGetattr ]))
+            else
+                runC(withSess(wcid,
+                    [ RPutfh(f),
+                      RWriteSame({ sel: sel, off: off,
+                                   blocks: imin(blocks, MAX_BLOCKS - off),
+                                   pat: pat, blocknum: blocknum }) ]))
+        },
+    }
+
+    // CLONE needs ONE client holding opens on TWO different files.  openNew
+    // draws its client uniformly from readyClients, so two concurrent opens
+    // almost never share a client and the pair never forms by chance.  This
+    // action grows an existing client's open set instead, opening for BOTH
+    // read and write so the new open can serve as either clone end.
+    action cloneOpenPair = all {
+        MINOR >= 2,
+        usableOpens.size() > 0,
+        liveInos.size() < MAX_OBJECTS,
+        {
+            nondet sp = oneOf(usableOpens)
+            val o = sdb.opens.get(sp)
+            nondet ow = oneOf(OPEN_OWNERS)
+            nondet d = oneOf(dirs)
+            nondet n = oneOf(NAMES)
+            nondet m = oneOf(MODES)
+            runC(withSess(o.client,
+                [ RPutfh(d),
+                  ROpen({ client: o.client, owner: ow,
+                          oseq: oseqFor(o.client, ow),
+                          claim: OCNull(n),
+                          how: HUnchecked({ mode: m, truncate: false }),
+                          access: 3, deny: 0 }),
+                  RGetfh ]))
+        },
+    }
+
+    // CLONE reflinks a source range into another file.  A minority of draws
+    // use the anonymous stateid, which CLONE must reject with
+    // NFS4ERR_BAD_STATEID -- it resolves both stateids as concrete state and
+    // takes no special-stateid shortcut.
+    action cloneRange = all {
+        MINOR >= 2,
+        genReady,
+        clonePairs.size() > 0,
+        {
+            nondet p = oneOf(clonePairs)
+            val so = sdb.opens.get(p.src)
+            val dofs = sdb.opens.get(p.dst)
+            nondet srcOff = oneOf(0.to(MAX_BLOCKS - 1))
+            nondet dstOff = oneOf(0.to(MAX_BLOCKS - 1))
+            nondet cnt = oneOf(0.to(2))
+            // As above: one clone in four uses the anonymous stateid so the
+            // BAD_STATEID rejection is covered without starving the success
+            // path.
+            nondet anonDraw = oneOf(0.to(3))
+            val anon = (anonDraw == 0)
+            val srcSel = if (anon) SelAnon else openSel(p.src)
+            if (delegOther(dofs.file, dofs.client) or
+                delegOtherWrite(so.file, so.client))
+                runC(withSess(dofs.client, [ RPutfh(dofs.file), RGetattr ]))
+            else
+                runC(withSess(dofs.client,
+                    [ RPutfh(so.file), RSavefh, RPutfh(dofs.file),
+                      RClone({ srcSel: srcSel, dstSel: openSel(p.dst),
+                               srcOff: srcOff, dstOff: dstOff,
+                               cnt: cnt }) ]))
         },
     }
 
@@ -1198,6 +1410,59 @@ module nfs4 {
     }
 
     // Data-path heavy: I/O, sparse ops, copies, layouts.
+    // Deny-free OPEN for the RFC 7862 data flavor.  Share-conflict semantics
+    // are stepState's subject; here a deny-mode open only drives the server
+    // into a persistent NFS4ERR_DELAY on a later OPEN -- which reproduces
+    // with none of the 7862 operations present, so it is pre-existing and not
+    // this flavor's to chase.
+    action openNoDeny = all {
+        readyClients.size() > 0,
+        liveInos.size() < MAX_OBJECTS,
+        {
+            nondet c = oneOf(readyClients)
+            nondet ow = oneOf(OPEN_OWNERS)
+            nondet d = oneOf(dirs)
+            nondet n = oneOf(NAMES)
+            nondet acc = oneOf(Set(1, 2, 3))
+            nondet m = oneOf(MODES)
+            runC(withSess(c,
+                [ RPutfh(d),
+                  ROpen({ client: c, owner: ow, oseq: oseqFor(c, ow),
+                          claim: OCNull(n),
+                          how: HUnchecked({ mode: m, truncate: false }),
+                          access: acc, deny: 0 }),
+                  RGetfh ]))
+        },
+    }
+
+    // RFC 7862 data operations (READ_PLUS, IO_ADVISE, WRITE_SAME, CLONE).
+    //
+    // A dedicated flavor rather than an addition to stepData, for two
+    // reasons.  First, stepData carries neither reclaimComplete nor nsCreate,
+    // so every OPEN in it returns NFS4ERR_GRACE and `files` stays empty --
+    // every data action's guard fails and the flavor generates nothing but
+    // setup churn.  Second, once those are supplied the walk reaches
+    // pre-existing model/server divergences in SETATTR-size and COPY that are
+    // unrelated to these operations; keeping this flavor separate exercises
+    // the 7862 ops without asserting on them.
+    //
+    // The mix deliberately builds the state these ops need: files (nsCreate),
+    // opens on two files for one client (cloneOpenPair), written blocks
+    // (ioWrite) and holes/unwritten extents (sparseAllocate, sparseDeallocate)
+    // so READ_PLUS has both DATA and HOLE runs to classify.
+    action stepData42 = any {
+        setupExchangeId, setupCreateSession,
+        reclaimComplete, reclaimComplete,
+        nsCreate, nsCreate,
+        openNoDeny, openNoDeny, cloneOpenPair, cloneOpenPair, closeOpen,
+        ioWrite, ioWrite, ioRead,
+        sparseReadPlus, sparseReadPlus, sparseReadPlus,
+        ioAdvise, ioAdvise,
+        writeSame, writeSame, writeSame,
+        cloneRange, cloneRange, cloneRange,
+        nsGetattr,
+    }
+
     action stepData = any {
         setupSetclientid, setupSetclientidConfirm,
         setupExchangeId, setupCreateSession,

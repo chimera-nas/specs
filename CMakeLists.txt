@@ -198,6 +198,12 @@ foreach(inst nfs4Memfs42 nfs4Memfs41 nfs4Memfs40)
                   "${inst}_${fs}_80_{seq}" NFS4_GATE NFS_QNT)
     endforeach()
 endforeach()
+# RFC 7862 data operations (READ_PLUS, IO_ADVISE, WRITE_SAME, CLONE).  4.2
+# only: every action in the flavor guards on MINOR >= 2, so the 4.0/4.1
+# instances would generate setup churn and nothing else.
+specs_gen(nfs4 ${Q}/nfs/nfs4_run.qnt nfs4Memfs42 stepData42 80 8 0x7
+          "nfs4Memfs42_stepData42_80_{seq}" NFS4_GATE NFS_QNT)
+
 foreach(inst nfs4Memfs42Deleg nfs4Memfs41Deleg)
     specs_gen(nfs4 ${Q}/nfs/nfs4_run.qnt ${inst} stepDeleg 80 10 0x7
               "${inst}_stepDeleg_80_{seq}" NFS4_GATE NFS_QNT)
