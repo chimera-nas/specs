@@ -407,16 +407,12 @@ module nfsdrc {
      */
     action stepV3Only(c: int, x: int, u: int, m: str): bool = all {
         dir.keys().size() > 0,
+        nondet h = liveFhs(dir).oneOf()
         any {
-            all { linkableFhs(dir).size() > 0,
-                  nondet h = linkableFhs(dir).oneOf()
-                      call(false, c, x, u, ALink({ src: h, to: m })) },
-            nondet h = liveFhs(dir).oneOf()
-                any {
-                    nondet z = Set(0, 4096).oneOf()
-                        call(false, c, x, u, ASetsize({ fh: h, size: z })),
-                    call(false, c, x, u, AGetattr({ fh: h })),
-                },
+            call(false, c, x, u, ALink({ src: h, to: m })),
+            nondet z = Set(0, 4096).oneOf()
+                call(false, c, x, u, ASetsize({ fh: h, size: z })),
+            call(false, c, x, u, AGetattr({ fh: h })),
         },
     }
 

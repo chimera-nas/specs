@@ -102,19 +102,6 @@ module drcOps {
     pure def liveFhs(d: Dir): Set[Fh] =
         d.keys().map(n => d.get(n).id)
 
-    /**
-     * Every object a hard link may be made to.
-     *
-     * Directories are excluded, and not because linking one is legal.  It is
-     * refused everywhere -- but by different errors: RFC 1813 Section 3.3.15
-     * lists neither NFS3ERR_ISDIR (which chimera answers) nor NFS3ERR_PERM
-     * (which Linux answers) among LINK's errors, and offers NFS3ERR_INVAL and
-     * NFS3ERR_NOTSUPP without saying which applies.  A trace that asked would
-     * be a test of that disagreement rather than of a reply cache.
-     */
-    pure def linkableFhs(d: Dir): Set[Fh] =
-        d.keys().filter(n => d.get(n).ftype != T_DIR).map(n => d.get(n).id)
-
     // ==================================================================
     // The operations
     // ==================================================================
@@ -219,16 +206,25 @@ module drcOps {
                     { d: dirDrop(d, r.from).put(r.to, d.get(r.from)),
                       nextId: nextId, st: NFS3_OK }
 
-            // A second name for the same object, sharing its handle.
+            /*
+             * A second name for the same object, sharing its handle.
+             *
+             * A directory cannot have one.  NFS3ERR_ISDIR is not in LINK's
+             * error list in RFC 1813 Section 3.3.15, but that list is not
+             * exhaustive -- the only thing the RFC closes is the nfsstat3 enum
+             * itself ("nfsstat3 now defines the full set of errors that can be
+             * returned by a server.  No other values are allowed", Section 1.2)
+             * -- and NFS3ERR_ISDIR's own definition is exactly this case: "the
+             * caller specified a directory in a non-directory operation"
+             * (Section 2.6).  Linux answers the same, from an explicit check in
+             * nfsd_link rather than as a side effect of a type test.
+             */
             | ALink(l) =>
                 if (not(fhLive(d, l.src)))
                     { d: d, nextId: nextId, st: NFS3ERR_STALE }
                 else if (namesOf(d, l.src).exists(n =>
                                                   d.get(n).ftype == T_DIR))
-                    // Not generated: see linkableFhs for why a directory is
-                    // left out.  NFS3ERR_INVAL is the answer RFC 1813
-                    // Section 3.3.15 does list for a link it will not make.
-                    { d: d, nextId: nextId, st: NFS3ERR_INVAL }
+                    { d: d, nextId: nextId, st: NFS3ERR_ISDIR }
                 else if (d.keys().contains(l.to))
                     { d: d, nextId: nextId, st: NFS3ERR_EXIST }
                 else {
