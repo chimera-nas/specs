@@ -84,7 +84,8 @@ module posixTestStd {
         | LInit(x) => NO_TARGET
     }
 
-    val noGetlk = { e: -999, conflict: false, cpid: -1, cw: false }
+    val noGetlk = { e: -999, conflict: false, cpid: -1, cw: false,
+                    cowners: Set(), cwowners: Set(), crowners: Set() }
 
     def lastGetlk = match lastOp {
         | LCall(c) => match c.res { | SGetlkR(x) => x | _ => noGetlk }

@@ -947,9 +947,22 @@ module posix {
         genStatEntry, genStatfs, genFstatfs
     }
 
-    action stepLocks = any {
+    // The lock mix as the broad `step` flavor has always drawn it.  Kept
+    // separate from stepLocks below so that flavor can add an action without
+    // changing `step`'s action set -- which would reshuffle every draw in
+    // the whole pre-existing corpus.
+    action stepLockOps = any {
         genLockSet, genLockWait, genLockGet, genLockf, genOpenFile,
         genClose
+    }
+
+    // The dedicated flavor has to CREATE the files it locks.  The initial
+    // filesystem holds only the root directory, so with no creating action
+    // genOpenFile never has a file to open, every lock action's guard fails
+    // for want of an open descriptor, and the walk stalls immediately: every
+    // trace this flavor generated was a single state long.
+    action stepLocks = any {
+        stepLockOps, genOpenCreat
     }
 
     action stepDirs = any {
@@ -1037,7 +1050,7 @@ module posix {
     }
 
     action step = any {
-        stepNamespace, stepDescriptors, stepMetadata, stepLocks,
+        stepNamespace, stepDescriptors, stepMetadata, stepLockOps,
         stepDirs, stepData
     }
 
