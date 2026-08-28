@@ -24,6 +24,8 @@ Usage:
 import argparse
 import glob as globmod
 import json
+import os
+import re
 import sys
 
 
@@ -361,6 +363,151 @@ def analyze(trace_files):
     return total, unknown, steps
 
 
+# --------------------------------------------------------------------------
+# NFSv4 (--proto 4)
+#
+# The v3 classifier reads `lastOp` as a single-op union.  The v4 label is one
+# whole COMPOUND, so it gets its own loader, its own bucket vocabulary, and --
+# unlike v3 -- a *dynamic* bucket set: buckets are whatever the corpus
+# produces, and the contract lives in a checked-in baseline (--expect).
+#
+# That inversion is deliberate.  The v4 corpus is a random walk over a
+# generator that keeps growing, so every time a step flavor gains a branch the
+# draw sequence shifts and individual behaviours can silently stop being
+# produced.  A hand-maintained ALL_BUCKETS list cannot notice that; a baseline
+# recorded from a known-good corpus can.  The baseline is a ratchet: anything
+# it lists must still be produced, and anything new is reported so the
+# baseline can be raised on purpose rather than by accident.
+# --------------------------------------------------------------------------
+
+def load_status_names(model_dir):
+    """code -> NFS4ERR name, parsed from the model itself.
+
+    Deliberately not a hand-written table: the model is the authority for
+    these values, and a stale copy here would mislabel exactly the codes a
+    coverage regression is about.
+    """
+    names = {0: "OK"}
+    path = os.path.join(model_dir, "nfs4_ops.qnt")
+    with open(path) as f:
+        for ln in f:
+            m = re.match(r"\s*pure val E_([A-Z_0-9]+)\s*=\s*(\d+)", ln)
+            if m:
+                names.setdefault(int(m.group(2)), m.group(1))
+    return names
+
+
+def load_trace4(path):
+    """ITF states with the `<instance>::nfs4::` variable prefix stripped."""
+    with open(path) as f:
+        raw = json.load(f)
+    if "states" not in raw:
+        raise TraceFormatError(f"{path}: not an ITF trace")
+    states = []
+    for st in raw["states"]:
+        out = {}
+        for k, v in st.items():
+            if k == "#meta":
+                continue
+            out[k.split("::")[-1]] = itf_decode(v)
+        states.append(out)
+    if not states or "lastOp" not in states[-1]:
+        raise TraceFormatError(f"{path}: no lastOp in v4 trace")
+    return states
+
+
+def classify_compound4(lab, names, buckets):
+    """One COMPOUND -> buckets: compound status, and per-op result status."""
+    def nm(code):
+        return names.get(code, f"code{code}")
+
+    buckets.add(f"v4:compound:{nm(lab['status'])}")
+    buckets.add(f"v4:compound:nops:{min(len(lab['ops']), 6)}")
+    if not lab["results"]:
+        # A compound rejected before any operation ran (malformed tag).
+        buckets.add("v4:compound:no-results")
+    if lab.get("tagName"):
+        buckets.add("v4:compound:tagged")
+    for r in lab["results"]:
+        st = r["value"].get("st", 0) if isinstance(r["value"], dict) else 0
+        buckets.add(f"v4:{r['tag']}:{nm(st)}")
+
+
+def analyze4(trace_files, model_dir):
+    names = load_status_names(model_dir)
+    total = {}
+    steps = 0
+    for path in trace_files:
+        for st in load_trace4(path):
+            lab = st["lastOp"]
+            if lab.get("tag") != "LCompound":
+                continue
+            steps += 1
+            here = set()
+            classify_compound4(lab["value"], names, here)
+            for b in here:
+                total[b] = total.get(b, 0) + 1
+    return total, steps
+
+
+def main_v4(args, files):
+    model_dir = os.path.dirname(os.path.abspath(__file__))
+    total, steps = analyze4(files, model_dir)
+
+    print(f"corpus: {len(files)} traces, {steps} compounds\n")
+    width = max((len(b) for b in total), default=10)
+    for b in sorted(total):
+        c = total[b]
+        flag = "  low" if c < args.low else ""
+        print(f"  {b:<{width}}  {c:6d}{flag}")
+    print(f"\nsummary: {len(total)} buckets produced")
+
+    if args.write_expect:
+        with open(args.write_expect, "w") as f:
+            # The baseline is a source file like any other and reuse-lint
+            # checks it, so re-emit the licence header the rewrite would
+            # otherwise drop.  The tags below are data, not this file's own
+            # licence: REUSE would otherwise read them off the string
+            # literals and report an unparseable expression.
+            # REUSE-IgnoreStart
+            f.write("# SPDX-FileCopyrightText: 2026 The Quint Specs Authors\n"
+                    "#\n"
+                    "# SPDX-License-Identifier: MIT\n"
+                    "#\n")
+            # REUSE-IgnoreEnd
+            f.write("# NFSv4 coverage baseline -- every bucket here must keep\n"
+                    "# being produced by the generated corpus.  Raise it with\n"
+                    "# --write-expect once new behaviour is deliberate.\n")
+            for b in sorted(total):
+                f.write(b + "\n")
+        print(f"wrote baseline: {args.write_expect} ({len(total)} buckets)")
+
+    rc = 0
+    if args.expect:
+        want = set()
+        with open(args.expect) as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln and not ln.startswith("#"):
+                    want.add(ln)
+        missing = sorted(want - set(total))
+        added = sorted(set(total) - want)
+        if added:
+            print(f"\nNEW buckets ({len(added)}) -- raise the baseline if "
+                  f"these are intended:")
+            for b in added:
+                print(f"  + {b}")
+        if missing:
+            print(f"\nREGRESSION: {len(missing)} baseline buckets are no "
+                  f"longer produced:")
+            for b in missing:
+                print(f"  - {b}")
+            rc = 1
+        else:
+            print(f"\nbaseline: all {len(want)} buckets still produced")
+    return rc
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("traces", nargs="*")
@@ -369,6 +516,17 @@ def main():
                     help="threshold below which a bucket is flagged LOW")
     ap.add_argument("--fail-on-starved", action="store_true",
                     help="exit non-zero if any behavior bucket has zero hits")
+    ap.add_argument("--proto", type=int, choices=(3, 4), default=3,
+                    help="which model's traces these are (v4 uses a dynamic "
+                         "bucket set plus a --expect baseline)")
+    ap.add_argument("--expect", metavar="FILE",
+                    help="v4 baseline: every bucket listed must still be "
+                         "produced.  Missing ones are a regression and exit "
+                         "non-zero; new ones are reported so the baseline can "
+                         "be raised deliberately.")
+    ap.add_argument("--write-expect", metavar="FILE",
+                    help="write the observed bucket list to FILE (used to "
+                         "create or raise the baseline)")
     args = ap.parse_args()
 
     files = list(args.traces)
@@ -376,6 +534,9 @@ def main():
         files += sorted(globmod.glob(args.glob))
     if not files:
         ap.error("no trace files given")
+
+    if args.proto == 4:
+        return main_v4(args, files)
 
     total, unknown, steps = analyze(files)
 
@@ -412,4 +573,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

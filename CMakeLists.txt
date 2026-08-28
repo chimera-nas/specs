@@ -193,11 +193,20 @@ endforeach()
 specs_selftest(nfs4Test42 ${Q}/nfs/nfs4Test.qnt nfs4Test42 200 NFS_QNT)
 specs_selftest(nfs4Test40 ${Q}/nfs/nfs4Test.qnt nfs4Test40 200 NFS_QNT)
 set(NFS4_GATE ${SELFTEST_nfs4Test42} ${SELFTEST_nfs4Test40})
+# 8 traces per flavor rather than 6: the rare error branches the model now
+# reaches (BADNAME/BADCHAR/NAMETOOLONG, the compound-tag rejections, the
+# session-position rules) land only a handful of times per corpus, and a
+# behaviour sampled 2-3 times is one generator tweak away from vanishing.
+# stepTypes is the object-type matrix -- every type-gated op driven against
+# directories, symlinks, FIFOs, sockets and device nodes as well as the type
+# it expects.
 foreach(inst nfs4Memfs42 nfs4Memfs41 nfs4Memfs40)
     foreach(fs step stepState stepNamespace stepData)
-        specs_gen(nfs4 ${Q}/nfs/nfs4_run.qnt ${inst} ${fs} 80 6 0x7
+        specs_gen(nfs4 ${Q}/nfs/nfs4_run.qnt ${inst} ${fs} 80 8 0x7
                   "${inst}_${fs}_80_{seq}" NFS4_GATE NFS_QNT)
     endforeach()
+    specs_gen(nfs4 ${Q}/nfs/nfs4_run.qnt ${inst} stepTypes 80 6 0x7
+              "${inst}_stepTypes_80_{seq}" NFS4_GATE NFS_QNT)
 endforeach()
 # RFC 7862 data operations (READ_PLUS, IO_ADVISE, WRITE_SAME, CLONE).  4.2
 # only: every action in the flavor guards on MINOR >= 2, so the 4.0/4.1
@@ -300,3 +309,15 @@ add_test(NAME coverage/smb2
     COMMAND ${Python3_EXECUTABLE} ${Q}/smb2/coverage.py ${T}/smb2)
 add_test(NAME coverage/nfsaux
     COMMAND ${Python3_EXECUTABLE} ${Q}/nfsaux/coverage.py ${T}/nfsaux)
+
+# The NFSv4 gate is a *ratchet* rather than a fixed bucket list.  The v4
+# generator keeps growing, and every branch added to a step flavor shifts the
+# random walk's draw sequence, so a behaviour that used to be produced can
+# quietly stop being produced.  The baseline records what a known-good corpus
+# generates: anything in it that disappears fails, and anything new is
+# reported so the baseline is raised deliberately (coverage.py --write-expect)
+# rather than by drift.
+add_test(NAME coverage/nfs4
+    COMMAND ${Python3_EXECUTABLE} ${Q}/nfs/coverage.py --proto 4
+            --expect ${Q}/nfs/nfs4_coverage_baseline.txt
+            --glob "${T}/nfs4/*.itf.json")

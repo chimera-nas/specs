@@ -248,6 +248,12 @@ module nfs4ops {
         | RLookup(Name)
         | RLookupp
         | RGetattr
+        | RGetattrWide
+        | RSecinfo(Name)
+        | RSetattrWide(int)
+        | RVerifyWide
+        | RNverifyWide
+        | RBindConnToSession({ sess: SessId, dir: int })
         | RReadlink
         | RAccess(int)
         | RReaddir
@@ -320,6 +326,9 @@ module nfs4ops {
         | SPutfh({ st: int })
         | SGetfh({ st: int, ino: Ino })
         | SSavefh({ st: int })
+        | SGetattrWide({ st: int })
+        | SSecinfo({ st: int })
+        | SBindConnToSession({ st: int })
         | SRestorefh({ st: int })
         | SLookup({ st: int, child: Ino })
         | SLookupp({ st: int, parent: Ino })
@@ -412,6 +421,9 @@ module nfs4ops {
             | SPutfh(x) => x.st
             | SGetfh(x) => x.st
             | SSavefh(x) => x.st
+            | SGetattrWide(x) => x.st
+            | SSecinfo(x) => x.st
+            | SBindConnToSession(x) => x.st
             | SRestorefh(x) => x.st
             | SLookup(x) => x.st
             | SLookupp(x) => x.st
@@ -478,6 +490,45 @@ module nfs4ops {
 
     pure def cfhLive(a: Acc): bool = a.cfh != -1 and fsLive(a.fs, a.cfh)
     pure def cfhNode(a: Acc): Inode = fsGet(a.fs, a.cfh)
+
+    // Component-name validation, mirroring chimera_nfs4_validate_name()
+    // (nfs4_procs.h) exactly, including its order: empty before too-long
+    // before dot/dotdot before path-separator/NUL before malformed UTF-8.
+    // The hostile names are abstract sentinels the harness materializes into
+    // real bytes (v4_expand_name in nfs4_mbt_replay.c) -- a JSON trace cannot
+    // carry an embedded NUL or a lone 0x80.  Every op that names a component
+    // runs this immediately after its filehandle gate, which is where chimera
+    // runs it too.
+    pure def nameStatus(n: Name): int =
+        if (n == "NEMPTY") E_INVAL
+        else if (n == "NLONG") E_NAMETOOLONG
+        else if (n == "NDOT" or n == "NDOTDOT") E_BADNAME
+        else if (n == "NSLASH" or n == "NNUL") E_BADCHAR
+        // Malformed UTF-8, one sentinel per reject branch of
+        // chimera_nfs4_utf8_valid: stray continuation, overlong 2/3/4-byte,
+        // surrogate, non-character, above U+10FFFF, c > 0xF4, truncated
+        // sequence, bad continuation byte.
+        else if (n == "NUTF8" or n == "NUTF8B" or n == "NUTF8C" or
+                 n == "NUSUR" or n == "NUNCH" or n == "NU4OV" or
+                 n == "NU4HI" or n == "NUF5" or n == "NUTRUNC" or
+                 n == "NUBADC" or
+                 // valid prefix, malformed tail: these reach the loop's
+                 // second and later iterations, which a single-character
+                 // sentinel cannot
+                 n == "NUMIXB" or n == "NUMIXT" or n == "NUMIXS") E_INVAL
+        // Everything else -- including the valid multi-byte names NU2/NU3/
+        // NU4/NU3E/NU3S/NU4M -- is a legal component and travels as an
+        // ordinary name.  Those exist to drive the validator's ACCEPT paths
+        // for 2-, 3- and 4-byte sequences, which pure-ASCII names skip.
+        else OK
+
+    // The name a claim carries, if any.  CLAIM_FH names no component, so it
+    // has nothing to validate.
+    pure def claimNameStatus(c: OpenClaim): int =
+        match c {
+            | OCNull(n) => nameStatus(n)
+            | OCFh => OK
+        }
 
     // Shared filehandle gate: NOFILEHANDLE when unset (RFC 7530 13.1.2.5),
     // STALE when the object has been removed (RFC 7530 13.1.2.7; checked
@@ -619,7 +670,27 @@ module nfs4ops {
                             | KDeleg => a.sdb.delegs.get(r.sid).file
                             | KLayout => a.sdb.layouts.get(r.sid).file
                         }
+                        // The client the stateid was issued to.  A stateid
+                        // belongs to the client that created it, so it
+                        // designates no state for anyone else and using it
+                        // from another client is NFS4ERR_BAD_STATEID (RFC
+                        // 8881 15.1.5.2: "a stateid does not properly
+                        // designate any valid state").
+                        //
+                        // Only 4.1+ can detect this: a 4.0 COMPOUND carries
+                        // no client identity of its own, so the stateid is
+                        // the only binding there and there is nothing to
+                        // compare it against.
+                        val ownedBy = match r.kind {
+                            | KOpen => a.sdb.opens.get(r.sid).client
+                            | KLock => a.sdb.locks.get(r.sid).client
+                            | KDeleg => a.sdb.delegs.get(r.sid).client
+                            | KLayout => a.sdb.layouts.get(r.sid).client
+                        }
                         if (fOf != a.cfh) IoError(E_BAD_STATEID)
+                        else if (a.minor >= 1 and a.seqClient != -1 and
+                                 ownedBy != a.seqClient)
+                            IoError(E_BAD_STATEID)
                         else if (r.kind == KOpen and
                                  a.sdb.opens.get(r.sid).needConfirm)
                             IoError(E_BAD_STATEID)
@@ -648,6 +719,15 @@ module nfs4ops {
     // Does any current open of file f deny the given I/O kind (1 = read,
     // 2 = write)?  Anonymous-stateid I/O against a deny mode fails
     // NFS4ERR_LOCKED (RFC 7530 9.1.4.3 / RFC 8881 8.2.3).
+    // A stateid selection that carries no open of its own, and so gets no
+    // share grant with it.
+    pure def namesNoOpen(sel: SidSel): bool =
+        match sel {
+            | SelAnon => true
+            | SelBypass => true
+            | SelRef(_) => false
+        }
+
     pure def anyDeny(sdb: StateDB, f: Ino, kindBit: int): bool =
         sdb.opens.keys().exists(s => {
             val o = sdb.opens.get(s)
@@ -687,7 +767,9 @@ module nfs4ops {
     // symlink -> NFS4ERR_SYMLINK, other non-directory -> NFS4ERR_NOTDIR.
     pure def opLookup(a: Acc, n: Name): Acc = {
         val g = fhGate(a)
+        val ns = nameStatus(n)
         if (g != OK) emit(a, SLookup({ st: g, child: -1 }))
+        else if (ns != OK) emit(a, SLookup({ st: ns, child: -1 }))
         else {
             val nd = cfhNode(a)
             if (nd.ftype == FLnk)
@@ -727,6 +809,71 @@ module nfs4ops {
             emit(a, SGetattr({ st: g, attrs: { ftype: FReg, mode: 0, nlink: 0,
                                                sizeBlocks: 0, change: 0 } }))
         else emit(a, SGetattr({ st: OK, attrs: snapOf(cfhNode(a)) }))
+    }
+
+    // GETATTR over the server's whole supported-attribute set.  The model
+    // predicts only that the call succeeds, not the values: the point is to
+    // drive chimera's attribute marshaller, which encodes ~50 attributes of
+    // which the five the model tracks are a small corner.  Deliberately a
+    // separate op rather than a wider mask on RGetattr -- the harness decodes
+    // the attribute blob positionally in FATTR4 bit order and knows only
+    // those five, so widening the existing request would shift every offset
+    // and compare garbage.  There is no SGetattrWide comparator arm, so only
+    // the status is checked.
+    pure def opGetattrWide(a: Acc): Acc = {
+        val g = fhGate(a)
+        if (g != OK) emit(a, SGetattrWide({ st: g }))
+        else emit(a, SGetattrWide({ st: OK }))
+    }
+
+    // BIND_CONN_TO_SESSION (RFC 8881 18.34): associates the connection the
+    // request arrived on with an existing session; 4.1+ only.
+    //
+    // The NOT_ONLY_OP rule is the subtle one and the reason this op is worth
+    // modeling carefully: it applies only when the compound carries NO
+    // SEQUENCE (chimera gates on `!req->seen_sequence && num_argarray != 1`),
+    // not unconditionally on nOps > 1.  Getting that backwards is exactly the
+    // mispredict the pynfs audit found sitting in opExchangeId /
+    // opCreateSession / opDestroyClientid.
+    //
+    // Valid directions are the four channel_dir_from_client4 values (FORE=1,
+    // BACK=2, FORE_OR_BOTH=3, BACK_OR_BOTH=7 -- note 4 is NOT one of them);
+    // anything else is NFS4ERR_INVAL, after the session lookup.  The model
+    // predicts the status only: the reply's direction and rdma flag are a
+    // deterministic function of the argument, and comparing them needs a
+    // comparator arm this cluster leaves to a follow-on.
+    pure def opBindConnToSession(a: Acc, ar: { sess: SessId, dir: int }): Acc =
+        if (a.minor == 0) emit(a, SBindConnToSession({ st: E_OP_ILLEGAL }))
+        else if (not(a.seqDone) and a.nOps > 1)
+            emit(a, SBindConnToSession({ st: E_NOT_ONLY_OP }))
+        else if (not(a.sdb.sessions.keys().contains(ar.sess)))
+            emit(a, SBindConnToSession({ st: E_BADSESSION }))
+        else if (not(Set(1, 2, 3, 7).contains(ar.dir)))
+            emit(a, SBindConnToSession({ st: E_INVAL }))
+        else emit(a, SBindConnToSession({ st: OK }))
+
+    // SECINFO (RFC 7530 16.31 / RFC 8881 18.29): reports which security
+    // flavors may be used for `name` in the current directory.  The model
+    // predicts the status only -- the flavor list is export policy, not
+    // filesystem state, so there is no SSecinfo comparator arm.
+    //
+    // The interesting part is the side effect: SECINFO **consumes the current
+    // filehandle** (RFC 7530 16.31.3 / RFC 8881 18.29.3 -- chimera zeroes
+    // req->fhlen in secinfo_complete), so a following op that needs a cfh
+    // must answer NFS4ERR_NOFILEHANDLE.  That is the model's only generator
+    // of a cfh-less op today.
+    pure def opSecinfo(a: Acc, n: Name): Acc = {
+        val g = fhGate(a)
+        val ns = nameStatus(n)
+        if (g != OK) emit(a, SSecinfo({ st: g }))
+        else if (ns != OK) emit(a, SSecinfo({ st: ns }))
+        else {
+            val nd = cfhNode(a)
+            if (nd.ftype != FDir) emit(a, SSecinfo({ st: E_NOTDIR }))
+            else if (not(fsHasEnt(a.fs, a.cfh, n)))
+                emit(a, SSecinfo({ st: E_NOENT }))
+            else emit(a.with("cfh", -1), SSecinfo({ st: OK }))
+        }
     }
 
     // READLINK (RFC 7530 16.25 / RFC 8881 18.24): directory -> ISDIR,
@@ -774,6 +921,8 @@ module nfs4ops {
         val g = fhGate(a)
         val bad = { st: g, ino: -1, cinfo: { before: 0, after: 0 } }
         if (g != OK) emit(a, SCreate(bad))
+        else if (nameStatus(ar.name) != OK)
+            emit(a, SCreate(bad.with("st", nameStatus(ar.name))))
         else if (ar.ctype == FReg)
             emit(a, SCreate(bad.with("st", E_BADTYPE)))
         else {
@@ -797,7 +946,10 @@ module nfs4ops {
     // reaped at the last CLOSE.
     pure def opRemove(a: Acc, n: Name): Acc = {
         val g = fhGate(a)
+        val ns = nameStatus(n)
         if (g != OK) emit(a, SRemove({ st: g, cinfo: { before: 0, after: 0 } }))
+        else if (ns != OK)
+            emit(a, SRemove({ st: ns, cinfo: { before: 0, after: 0 } }))
         else {
             // Delegations held by other clients on the victim force a
             // recall; REMOVE observes NFS4ERR_DELAY until they return
@@ -829,6 +981,12 @@ module nfs4ops {
             emit(a, SRename({ st: E_NOFILEHANDLE, cinfoS: zero, cinfoT: zero }))
         else if (not(fsLive(a.fs, a.sfh)) or not(fsLive(a.fs, a.cfh)))
             emit(a, SRename({ st: E_STALE, cinfoS: zero, cinfoT: zero }))
+        else if (nameStatus(ar.oldname) != OK)
+            emit(a, SRename({ st: nameStatus(ar.oldname),
+                              cinfoS: zero, cinfoT: zero }))
+        else if (nameStatus(ar.newname) != OK)
+            emit(a, SRename({ st: nameStatus(ar.newname),
+                              cinfoS: zero, cinfoT: zero }))
         else {
             // Rename-over unlinks the target: other-client delegations on
             // it force a recall + NFS4ERR_DELAY, mirroring REMOVE.  (The
@@ -861,6 +1019,8 @@ module nfs4ops {
             emit(a, SLink({ st: E_NOFILEHANDLE, cinfo: zero }))
         else if (not(fsLive(a.fs, a.sfh)) or not(fsLive(a.fs, a.cfh)))
             emit(a, SLink({ st: E_STALE, cinfo: zero }))
+        else if (nameStatus(n) != OK)
+            emit(a, SLink({ st: nameStatus(n), cinfo: zero }))
         else {
             val o = fsLink(a.fs, a.sfh, a.cfh, n)
             emit(a.with("fs", o.fs2), SLink({ st: fsStatus(o.st), cinfo: o.cinfo }))
@@ -935,6 +1095,29 @@ module nfs4ops {
         else emit(a, SVerify({ st: E_NOT_SAME }))
     }
 
+    // VERIFY / NVERIFY over the server's whole supported-attribute set.
+    //
+    // chimera marshals every requested attribute and only then compares --
+    // one memcmp over the finished buffer, guarded by a length check
+    // (nfs4_proc_verify.c) -- so a wide mask drives its private copy of
+    // chimera_nfs4_marshall_attrs no matter what the comparison decides.
+    // The decision is still deterministic without the model predicting a
+    // single attribute value: the harness sends the wide mask with an EMPTY
+    // value blob, so `out_len == args->attr_vals.len` is false and the
+    // attributes always compare as different.  VERIFY therefore answers
+    // NFS4ERR_NOT_SAME and NVERIFY answers NFS4_OK.
+    pure def opVerifyWide(a: Acc): Acc = {
+        val g = fhGate(a)
+        if (g != OK) emit(a, SVerify({ st: g }))
+        else emit(a, SVerify({ st: E_NOT_SAME }))
+    }
+
+    pure def opNverifyWide(a: Acc): Acc = {
+        val g = fhGate(a)
+        if (g != OK) emit(a, SNverify({ st: g }))
+        else emit(a, SNverify({ st: OK }))
+    }
+
     pure def opNverifySize(a: Acc, sz: int): Acc = {
         val g = fhGate(a)
         if (g != OK) emit(a, SNverify({ st: g }))
@@ -977,8 +1160,14 @@ module nfs4ops {
             }
         }
 
+    // RENEW is 4.0-only: RFC 8881 removed it (4.1+ renews the lease
+    // implicitly through SEQUENCE), so a 4.1+ server treats op 30 as unknown
+    // and answers OP_ILLEGAL -- not NOTSUPP, which is the answer for a
+    // *recognized* but unsupported op.  Matches opReclaimComplete's use of
+    // E_OP_ILLEGAL for the mirror-image case.  Not generated under 4.1+ (see
+    // nsRenew), because the wire form is a resop the harness cannot decode.
     pure def opRenew(a: Acc, cid: ClientId): Acc =
-        if (a.minor != 0) emit(a, SRenew({ st: E_NOTSUPP }))
+        if (a.minor != 0) emit(a, SRenew({ st: E_OP_ILLEGAL }))
         else if (not(a.sdb.clients.keys().contains(cid)) or
                  not(a.sdb.clients.get(cid).confirmed))
             emit(a, SRenew({ st: E_STALE_CLIENTID }))
@@ -1013,10 +1202,13 @@ module nfs4ops {
         if (a.minor == 0)
             emit(a, SExchangeId({ st: E_OP_ILLEGAL, client: -1, csSeq: 0,
                                   confirmedR: false, pnfsMds: false }))
-        else if (a.nOps > 1)
-            // Outside a session EXCHANGE_ID must be the only op
-            // (RFC 8881 18.35.3); compounds mixing it with SEQUENCE are
-            // not generated.
+        else if (not(a.seqDone) and a.nOps > 1)
+            // *Outside a session* EXCHANGE_ID must be the only op
+            // (RFC 8881 18.35.3).  Inside one -- i.e. when the compound
+            // carries a SEQUENCE -- it may appear as an ordinary operation
+            // anywhere, which is exactly what chimera implements
+            // (`!req->seen_sequence && num_argarray != 1`).  Gating on
+            // nOps > 1 alone was an over-approximation.
             emit(a, SExchangeId({ st: E_NOT_ONLY_OP, client: -1, csSeq: 0,
                                   confirmedR: false, pnfsMds: false }))
         else {
@@ -1033,7 +1225,9 @@ module nfs4ops {
                                            backChan: bool }): Acc =
         if (a.minor == 0)
             emit(a, SCreateSession({ st: E_OP_ILLEGAL, sess: -1 }))
-        else if (a.nOps > 1)
+        else if (not(a.seqDone) and a.nOps > 1)
+            // Same rule as EXCHANGE_ID above (RFC 8881 18.36.3): sole op
+            // only when the compound carries no SEQUENCE.
             emit(a, SCreateSession({ st: E_NOT_ONLY_OP, sess: -1 }))
         else {
             val r = applyCreateSession(a.sdb, ar.client, ar.csaSeq,
@@ -1097,6 +1291,11 @@ module nfs4ops {
 
     pure def opDestroySession(a: Acc, sess: SessId): Acc =
         if (a.minor == 0) emit(a, SDestroySession({ st: E_OP_ILLEGAL }))
+        else if (if (a.seqDone) a.idx != a.nOps - 1 else a.nOps > 1)
+            // RFC 8881 18.37.3, the same shape as DESTROY_CLIENTID: last op
+            // when a SEQUENCE precedes it, sole op when none does.  The model
+            // had no position guard at all here.
+            emit(a, SDestroySession({ st: E_NOT_ONLY_OP }))
         else {
         val r = applyDestroySession(a.sdb, sess)
         if (r.ok) emit(a.with("sdb", r.sdb2), SDestroySession({ st: OK }))
@@ -1105,7 +1304,11 @@ module nfs4ops {
 
     pure def opDestroyClientid(a: Acc, cid: ClientId): Acc =
         if (a.minor == 0) emit(a, SDestroyClientid({ st: E_OP_ILLEGAL }))
-        else if (a.nOps > 1)
+        else if (if (a.seqDone) a.idx != a.nOps - 1 else a.nOps > 1)
+            // RFC 8881 18.50.3: preceded by a SEQUENCE, DESTROY_CLIENTID
+            // must be the *final* operation of the compound; with no
+            // SEQUENCE it must be the only one.  chimera implements both
+            // arms (nfs4_proc_destroy_clientid.c).
             emit(a, SDestroyClientid({ st: E_NOT_ONLY_OP }))
         else if (not(a.sdb.clients.keys().contains(cid)))
             emit(a, SDestroyClientid({ st: E_STALE_CLIENTID }))
@@ -1136,6 +1339,17 @@ module nfs4ops {
     // of the deferred restart scenarios.)
     pure def opFreeStateid(a: Acc, r: SidRef): Acc =
         if (a.minor == 0) emit(a, SFreeStateid({ st: E_OP_ILLEGAL }))
+        // A *live* open or delegation stateid is not a bad stateid -- it names
+        // state that FREE_STATEID is simply not the way to release (CLOSE and
+        // DELEGRETURN are).  RFC 8881 18.38.3 defines the op as freeing a
+        // stateid with no associated locks, "including opens, byte-range
+        // locks, delegations and layouts", so a live one is NFS4ERR_LOCKS_HELD
+        // -- which is what chimera answers (nfs4_proc_free_stateid.c handles
+        // NFS4_SLOT_TYPE_OPEN and NFS4_SLOT_TYPE_DELEG that way).
+        else if (r.kind == KOpen and sidLive(a.sdb, r.sid, KOpen))
+            emit(a, SFreeStateid({ st: E_LOCKS_HELD }))
+        else if (r.kind == KDeleg and sidLive(a.sdb, r.sid, KDeleg))
+            emit(a, SFreeStateid({ st: E_LOCKS_HELD }))
         else if (r.kind != KLock or not(sidLive(a.sdb, r.sid, KLock)))
             emit(a, SFreeStateid({ st: E_BAD_STATEID }))
         else if (a.sdb.locks.get(r.sid).bytes.keys().size() > 0)
@@ -1345,6 +1559,27 @@ module nfs4ops {
             // twin gate: lock state requires an open stateid, which this
             // gate already forces behind RECLAIM_COMPLETE.
             emit(a, SOpen(nores.with("st", E_GRACE)))
+        // CLAIM_NULL names a component, so it runs the same validator every
+        // other name-taking op does.  It sits *after* the grace gate on
+        // purpose: chimera checks grace in chimera_nfs4_open() (the entry
+        // point) and validates the name later, in
+        // chimera_nfs4_open_parent_complete() -- so inside the grace window
+        // the answer is GRACE even for a malformed name.
+        //
+        // The status consumes the 4.0 open-owner seqid: NFS4ERR_INVAL,
+        // BADNAME, BADCHAR and NAMETOOLONG are none of them in RFC 7530
+        // §9.1.7's no-consume list (see consumesSeqid), and chimera reaches
+        // this through chimera_nfs4_open_complete(), which advances the
+        // owner seqid via nfs4_seqid_should_advance().  So settle the owner
+        // exactly as the other consuming error arms above do.
+        else if (claimNameStatus(ar.claim) != OK) {
+            val st = claimNameStatus(ar.claim)
+            val a1 = emit(a, SOpen(nores.with("st", st)))
+            if (a.minor == 0)
+                a1.with("sdb", ooSettle(a1.sdb, ar.client, ar.owner, ar.oseq,
+                                        st, false))
+            else a1
+        }
         else {
             val res = openResolve(a, ar.claim, ar.how)
             if (res.st != OK) {
@@ -1776,13 +2011,25 @@ module nfs4ops {
         if (g != OK) emit(a, SLockt({ st: g, deniedOwner: -1 }))
         else if (ar.lo >= ar.hi)
             emit(a, SLockt({ st: E_INVAL, deniedOwner: -1 }))
-        else if (lockConflict(a.sdb, ar.client, ar.lockOwner, a.cfh,
-                              ar.lo, ar.hi, ar.wr)) {
-            val who = lockConflictOwner(a.sdb, ar.client, ar.lockOwner,
-                                        a.cfh, ar.lo, ar.hi, ar.wr)
-            emit(a, SLockt({ st: E_DENIED, deniedOwner: who }))
+        else {
+            // Byte-range locking is defined for regular files only, so the
+            // same type gate READ/WRITE/COMMIT use applies (RFC 7530 16.11 /
+            // RFC 8881 18.11).  The zero-length check precedes it, matching
+            // chimera (nfs4_proc_lockt.c puts the length check in the open
+            // callback and the type check in the getattr probe); the RFCs do
+            // not order the two.  opLock needs no twin gate: its target is
+            // reached only through an open stateid, and openResolve admits
+            // regular files only.
+            val tg = dataTypeGate(a)
+            if (tg != OK) emit(a, SLockt({ st: tg, deniedOwner: -1 }))
+            else if (lockConflict(a.sdb, ar.client, ar.lockOwner, a.cfh,
+                                  ar.lo, ar.hi, ar.wr)) {
+                val who = lockConflictOwner(a.sdb, ar.client, ar.lockOwner,
+                                            a.cfh, ar.lo, ar.hi, ar.wr)
+                emit(a, SLockt({ st: E_DENIED, deniedOwner: who }))
+            }
+            else emit(a, SLockt({ st: OK, deniedOwner: -1 }))
         }
-        else emit(a, SLockt({ st: OK, deniedOwner: -1 }))
     }
 
     // LOCKU (RFC 7530 16.12 / RFC 8881 18.12): unlocking a never-locked
@@ -2101,6 +2348,18 @@ module nfs4ops {
                 if (ar.srcOff + cnt > src.sizeBlocks or
                     (ar.cnt == 0 and ar.srcOff > src.sizeBlocks))
                     emit(a, SCopy(nores.with("st", E_INVAL)))
+                // COPY reads the source and writes the destination, so the
+                // share reservations that gate READ and WRITE gate it too
+                // (RFC 8881 9.7).  A stateid that names an open carries its
+                // own grant; an anonymous or READ-bypass one does not, so a
+                // deny held by any owner of any client makes it
+                // NFS4ERR_LOCKED -- otherwise the anonymous stateid would be
+                // a way around the reservation.  Checked after the range so
+                // an out-of-range COPY still reports the argument error.
+                else if (namesNoOpen(ar.srcSel) and anyDeny(a.sdb, a.sfh, 1))
+                    emit(a, SCopy(nores.with("st", E_LOCKED)))
+                else if (namesNoOpen(ar.dstSel) and anyDeny(a.sdb, a.cfh, 2))
+                    emit(a, SCopy(nores.with("st", E_LOCKED)))
                 else {
                     val data = fsReadData(src, ar.srcOff, cnt)
                     val w = range(0, cnt).foldl(a.fs, (acc, i) =>
@@ -2320,6 +2579,12 @@ module nfs4ops {
             | RDestroySession(x) => true
             | RDestroyClientid(x) => true
             | RSequence(x) => true
+            // BIND_CONN_TO_SESSION is exempt by construction: its whole job is
+            // to associate a connection with a session, which a client must be
+            // able to do before it can issue SEQUENCE over that connection
+            // (RFC 8881 18.34.3, and 18.46.3's list).  chimera agrees -- it
+            // has an explicit `!req->seen_sequence` path.
+            | RBindConnToSession(x) => true
             | _ => false
         }
 
@@ -2333,6 +2598,18 @@ module nfs4ops {
             | RLookup(n) => opLookup(a, n)
             | RLookupp => opLookupp(a)
             | RGetattr => opGetattr(a)
+            | RGetattrWide => opGetattrWide(a)
+            | RSecinfo(n) => opSecinfo(a, n)
+            // Same oracle as a mode-only SETATTR on purpose: the extra
+            // attributes the harness sends (owner, owner_group, both settable
+            // times) are ones the model does not track, so the observable
+            // outcome -- status, mode, and the change-attribute bump -- is
+            // identical.  Only chimera's attribute parser sees the difference.
+            | RSetattrWide(m) =>
+                opSetattr(a, { mode: m, sizeBlocks: -1, sel: SelAnon })
+            | RVerifyWide => opVerifyWide(a)
+            | RNverifyWide => opNverifyWide(a)
+            | RBindConnToSession(r) => opBindConnToSession(a, r)
             | RReadlink => opReadlink(a)
             | RAccess(m) => opAccess(a, m)
             | RReaddir => opReaddir(a)

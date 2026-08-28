@@ -496,6 +496,12 @@ module nfs4state {
             if (existing != -1) {
                 // Upgrade: union into the one stateid, seqid bumped even
                 // when the union is unchanged (RFC 8881 9.9).
+                //
+                // needConfirm still reports the *owner's* confirmation
+                // state, not this OPEN's novelty: RFC 7530 16.18.5 keys
+                // OPEN4_RESULT_CONFIRM off the open-owner, so an upgrade
+                // for an owner that has never been confirmed asks for
+                // confirmation just as the first OPEN did.
                 val o = sdb.opens.get(existing)
                 { sdb2: sdb.with("opens", sdb.opens.setBy(existing, x => x
                       .with("access", orBits(x.access, access))
@@ -504,7 +510,7 @@ module nfs4state {
                                                           deny: deny })))
                       .with("seq", x.seq + 1))),
                   denied: false, sid: existing, seq: o.seq + 1,
-                  needConfirm: false }
+                  needConfirm: needConfirm40 }
             } else {
                 val s = sdb.nextSid
                 { sdb2: sdb

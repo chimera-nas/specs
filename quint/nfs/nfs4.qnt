@@ -59,7 +59,40 @@ module nfs4 {
     // ------------------------------------------------------------------
 
     pure val NAMES = Set("a", "b", "c", "d")
-    pure val MODES = Set(420, 493)          // 0644, 0755
+    // Hostile component names: abstract sentinels the harness materializes
+    // into bytes a JSON trace cannot carry (embedded NUL, invalid UTF-8, 256
+    // chars) -- see v4_expand_name in nfs4_mbt_replay.c and nameStatus in
+    // nfs4_ops.qnt.  Every op that names a component runs chimera's
+    // validator, and the corpus had never driven it off its success path.
+    pure val BAD_NAMES = Set("NEMPTY", "NLONG", "NDOT", "NDOTDOT",
+                             "NSLASH", "NNUL",
+                             // one per reject branch of the UTF-8 validator
+                             "NUTF8", "NUTF8B", "NUTF8C", "NUSUR", "NUNCH",
+                             "NU4OV", "NU4HI", "NUF5", "NUTRUNC", "NUBADC",
+                             // multi-character: valid prefix, malformed tail
+                             "NUMIXB", "NUMIXT", "NUMIXS")
+    // Valid multi-byte UTF-8 component names.  These are legal and behave
+    // like any other name -- the point is the validator's ACCEPT paths for
+    // 2-, 3- and 4-byte sequences (and the U+0800 / U+D7FF / U+10FFFF
+    // boundaries), which every name the model generated before this was pure
+    // ASCII and therefore skipped.  Kept out of NAMES so the ordinary
+    // namespace stays small and collisions stay frequent; they enter the
+    // namespace only through nsUtf8Name.
+    pure val UTF8_NAMES = Set("NU2", "NU3", "NU4", "NU3E", "NU3S", "NU4M",
+                              // multi-character: mixed widths in one name,
+                              // and a repeated 2-byte character, so the
+                              // validator's loop actually iterates
+                              "NUMIX", "NUREP")
+    // 0644, 0755, 0600, 0700, 0777.  Plain permission bits only: the
+    // set-user-ID / set-group-ID / sticky bits are deliberately excluded
+    // because the model does not pin whether a backend preserves them, and a
+    // mismatch there would be a backend question rather than a protocol one.
+    pure val MODES = Set(420, 493, 384, 448, 511)
+    // Every NFSv4 object type the model can name.  CREATE draws from this set
+    // directly: NF4REG is not creatable through CREATE and must draw
+    // NFS4ERR_BADTYPE (RFC 7530 16.4.4), which is a modeled answer, not a
+    // malformed request.
+    pure val FTYPES = Set(FReg, FDir, FLnk, FFifo, FSock, FBlk, FChr)
     pure val MAX_OBJECTS = 12
     pure val MAX_BLOCKS = 6
     // Symbol 0 is reserved for holes/zeroes; see nfs4_fs.qnt.
@@ -90,7 +123,10 @@ module nfs4 {
 
     type Label =
         | LInit({ minor: int, caps: Caps })
-        | LCompound({ tag: int, ops: List[OpReq], status: int,
+        // `tag` is the compound's identity (an int the harness formats as
+        // "t<N>").  `tagName` overrides the wire tag with a sentinel the
+        // harness materializes -- "" means use the default.
+        | LCompound({ tag: int, tagName: str, ops: List[OpReq], status: int,
                       results: List[OpRes] })
 
     var fs: Fs
@@ -159,10 +195,55 @@ module nfs4 {
             sdb' = out.sdb2,
             caps' = caps,
             tag' = tag + 1,
-            lastOp' = LCompound({ tag: tag, ops: ops, status: out.status,
+            lastOp' = LCompound({ tag: tag, tagName: "", ops: ops,
+                                  status: out.status,
                                   results: out.results }),
         }
     }
+
+
+    // The COMPOUND tag (RFC 7530 16.2.3 / RFC 8881 16.2.3) is a utf8str_cs
+    // that chimera validates *before any operation runs*: a malformed tag is
+    // NFS4ERR_INVAL with an EMPTY result array (nfs4_proc_compound.c), a
+    // compound shape the model had no way to express.  Nothing executes, so
+    // no filesystem or state changes -- and, importantly, no SEQUENCE slot
+    // advances, which is why these compounds carry no SEQUENCE at all.
+    //
+    // The tag is checked against the UTF-8 rules only, not the component-name
+    // rules: "." or a 256-byte tag is a perfectly legal tag, and a zero-length
+    // tag skips validation entirely (chimera guards on `args->tag.len &&`).
+    // A well-formed tag -- including multi-byte -- is accepted and the
+    // compound runs normally, which is what reaches the validator's accept
+    // paths.
+    pure def tagStatus(t: str): int =
+        if (t == "NUTF8" or t == "NUTF8B" or t == "NUTF8C" or t == "NUSUR" or
+            t == "NUNCH" or t == "NU4OV" or t == "NU4HI" or t == "NUF5" or
+            t == "NUTRUNC" or t == "NUBADC" or t == "NUMIXB" or
+            t == "NUMIXT" or t == "NUMIXS") E_INVAL
+        else OK
+
+    action runTagged(t: str, ops: List[OpReq]): bool =
+        if (tagStatus(t) != OK)
+            all {
+                fs' = fs,
+                sdb' = sdb,
+                caps' = caps,
+                tag' = tag + 1,
+                lastOp' = LCompound({ tag: tag, tagName: t, ops: ops,
+                                      status: E_INVAL, results: [] }),
+            }
+        else {
+            val out = evalCompound(fs, sdb, MINOR, caps, tag, ops)
+            all {
+                fs' = out.fs2,
+                sdb' = out.sdb2,
+                caps' = caps,
+                tag' = tag + 1,
+                lastOp' = LCompound({ tag: tag, tagName: t, ops: ops,
+                                      status: out.status,
+                                      results: out.results }),
+            }
+        }
 
     // Newest session of a client; -1 if none.
     def sessOf(c: ClientId): SessId =
@@ -199,6 +280,27 @@ module nfs4 {
     def files = fsFiles(fs)
     def symlinks = fsSymlinks(fs)
     def liveInos = fs.inodes.keys()
+
+    // Live objects of type `t`, or the whole namespace when the type is
+    // currently unrepresented (so a draw is never made from an empty set).
+    def ofTypeOr(t: Ftype): Set[Ino] = {
+        val s = liveInos.filter(i => fs.inodes.get(i).ftype == t)
+        if (s.size() > 0) s else liveInos
+    }
+
+    // Target draw for a type-gated op.  Three draws in four hand the op the
+    // object type it likes, so the deep behavior behind the gate -- block
+    // maps, share state, lock ranges, cinfo -- is not starved; the fourth
+    // hands it an object of the separately drawn TYPE, so the evaluator's
+    // type gates (dataTypeGate, opSetattr's non-regular size gate,
+    // opReadlink's non-symlink arms, the parent-must-be-a-directory gates in
+    // fsRemove/fsRename/fsLink/openResolve) are reached by the walk instead
+    // of being unreachable code.  Drawing the TYPE first and the object
+    // second is deliberate: a uniform draw over liveInos would hit the
+    // specials only at population frequency (one block device among eight
+    // regular files), which is exactly the starvation this closes.
+    def wide(typed: Set[Ino], m: int, t: Ftype): Set[Ino] =
+        if (m == 0 or typed.size() == 0) ofTypeOr(t) else typed
 
     // Files delegated to a client other than `cid`.  Mutating such a file
     // through SETATTR/WRITE/LINK/xattr/sparse ops is EXCLUDED from
@@ -363,6 +465,63 @@ module nfs4 {
         },
     }
 
+    // 4.1+: until a client sends its global RECLAIM_COMPLETE, every
+    // lock-obtaining op is NFS4ERR_GRACE (RFC 8881 18.51.3 -- the gate at
+    // the top of opOpen).  A flavor that never generates one therefore
+    // emits a trace of nothing but GRACE, and every OPEN/LOCK/CLOSE and
+    // stateid-I/O behavior it was written to cover is vacuous.  So the
+    // flavors are reclaim-first: while a ready client still owes its
+    // reclaim, that is nearly the only thing generated.  MINOR == 0 has no
+    // grace window, so this is false there and the wrapper is inert.
+    def reclaimPending: bool =
+        MINOR >= 1 and
+        readyClients.exists(c => not(sdb.clients.get(c).reclaimDone))
+
+    // Negative (4.1+): a non-reclaim OPEN before the client's global
+    // RECLAIM_COMPLETE -> NFS4ERR_GRACE, no state touched (RFC 8881
+    // 18.51.3).  Reachable only from inside the reclaim window, which the
+    // reclaim-first wrapper otherwise closes immediately.
+    action openBeforeReclaim = all {
+        MINOR >= 1,
+        readyClients.exists(c => not(sdb.clients.get(c).reclaimDone)),
+        {
+            nondet c = oneOf(readyClients.filter(c =>
+                not(sdb.clients.get(c).reclaimDone)))
+            nondet ow = oneOf(OPEN_OWNERS)
+            nondet d = oneOf(dirs)
+            nondet n = oneOf(NAMES)
+            runC(withSess(c,
+                [ RPutfh(d),
+                  ROpen({ client: c, owner: ow, oseq: oseqFor(c, ow),
+                          claim: OCNull(n), how: HNoCreate,
+                          access: 1, deny: 0 }) ]))
+        },
+    }
+
+    // Negative (4.1+): a second RECLAIM_COMPLETE from a client that has
+    // already reclaimed -> NFS4ERR_COMPLETE_ALREADY (RFC 8881 18.51.3).
+    // reclaimComplete filters those clients out, so opReclaimComplete's
+    // COMPLETE_ALREADY arm is unreachable in generation without this.
+    action reclaimAgain = all {
+        MINOR >= 1,
+        readyClients.exists(c => sdb.clients.get(c).reclaimDone),
+        {
+            nondet c = oneOf(readyClients.filter(c =>
+                sdb.clients.get(c).reclaimDone))
+            runC(withSess(c, [ RReclaimComplete ]))
+        },
+    }
+
+    // Inside the grace window the generator sends the RECLAIM_COMPLETE,
+    // but takes the chance to probe the gate itself first: an OPEN inside
+    // the window MUST be NFS4ERR_GRACE.  The 3:1 weighting keeps the
+    // window ~1.3 extra steps wide per client rather than the ~27 steps a
+    // flat draw over the whole flavor would cost.
+    action reclaimFirst = any {
+        reclaimComplete, reclaimComplete, reclaimComplete,
+        openBeforeReclaim,
+    }
+
     // Negative: SEQUENCE with a skipped slot seqid -> NFS4ERR_SEQ_MISORDERED
     // (state must be untouched, RFC 8881 2.10.6.1).
     action seqMisordered = all {
@@ -451,12 +610,258 @@ module nfs4 {
         },
     }
 
+    // READLINK against any object type: symlink -> OK, directory -> ISDIR,
+    // any other type -> INVAL (RFC 7530 16.25.4/.5, R-CORE-86).  The
+    // symlinks-must-exist guard is gone: the non-symlink arms are the point.
     action nsReadlink = all {
         genReady,
-        symlinks.size() > 0,
         {
-            nondet l = oneOf(symlinks)
+            nondet m = oneOf(0.to(3))
+            nondet wt = oneOf(FTYPES)
+            nondet l = oneOf(wide(symlinks, m, wt))
             runC(withSess(anyReady, [ RPutfh(l), RReadlink ]))
+        },
+    }
+
+    // RENEW (RFC 7530 16.30): explicit 4.0 lease renewal; 4.1+ renews
+    // implicitly through SEQUENCE, so the op answers NFS4ERR_NOTSUPP there.
+    // Both arms were modeled and neither was ever generated, which is why
+    // chimera's whole renew path sat unexercised.  Drawing the *argument*
+    // clientid from every record (not just the confirmed ones) also reaches
+    // the NFS4ERR_STALE_CLIENTID arm, while the SEQUENCE prefix -- when there
+    // is one -- rides on a ready client as usual.
+    // 4.0 only: RENEW (op 30) was *removed* in NFSv4.1, so a 4.1+ server
+    // answers with a resop of OP_ILLEGAL rather than a RENEW result -- a wire
+    // shape the harness has no decoder for.  Generating it there aborts the
+    // replay instead of testing anything, so the minor gate lives here; the
+    // evaluator's own minor arm stays as the specification of the answer.
+    // Drives chimera's full attribute marshaller (see opGetattrWide): the
+    // harness asks for every attribute the server advertises as supported,
+    // and the oracle checks only the status.  Aimed at every object type,
+    // since several attributes (RAWDEV, SPACE_*, TIME_*) are type-dependent.
+    // SECINFO, plus the NFS4ERR_NOFILEHANDLE it strands behind it.  Half the
+    // draws trail a GETFH: SECINFO consumes the current filehandle, so that
+    // GETFH must fail NOFILEHANDLE -- currently the model's only route to
+    // chimera's cfh-less path, and one of the error codes the corpus never
+    // produced.  The parent is a `wide` draw so the NOTDIR arm is reached too.
+    // BIND_CONN_TO_SESSION.  Two shapes: as the lone op in a compound (the
+    // normal form, which reaches the bind path and the INVAL direction arm),
+    // and paired with a second op and no SEQUENCE, which must answer
+    // NFS4ERR_NOT_ONLY_OP.  Direction 5 is not a channel_dir_from_client4
+    // value (the valid ones are 1/2/3/7), so it drives the INVAL arm.
+    // Compound-position rules for the session-management ops (RFC 8881
+    // 18.35.3 / 18.36.3 / 18.37.3 / 18.50.3).  EXCHANGE_ID and CREATE_SESSION
+    // become ordinary operations once a SEQUENCE is present; DESTROY_SESSION
+    // and DESTROY_CLIENTID must additionally be the *last* op.  None of these
+    // shapes was ever generated, which is why the model could carry the wrong
+    // gate on all four ops without a single trace noticing.
+    //
+    // The two destroy ops are generated only in the *illegal* position: they
+    // answer NFS4ERR_NOT_ONLY_OP and so tear nothing down, which keeps this
+    // action free of side effects on the rest of the walk.
+    action nsSessionPosition = all {
+        MINOR >= 1,
+        readyClients.size() > 0,
+        {
+            nondet c = oneOf(readyClients)
+            nondet ow = oneOf(CLIENT_OWNERS)
+            nondet vf = oneOf(VERFS)
+            nondet which = oneOf(0.to(3))
+            if (which == 0)
+                runC(withSess(c, [ RExchangeId({ ownerSym: ow, verfSym: vf }),
+                                   RPutrootfh ]))
+            else if (which == 1)
+                runC(withSess(c, [ RCreateSession({ client: c,
+                                                    csaSeq: sdb.clients.get(c).csSeq,
+                                                    backChan: true }),
+                                   RPutrootfh ]))
+            else if (which == 2)
+                runC(withSess(c, [ RDestroySession(sessOf(c)), RPutrootfh ]))
+            else
+                runC(withSess(c, [ RDestroyClientid(c), RPutrootfh ]))
+        },
+    }
+
+    action nsBindConnToSession = all {
+        MINOR >= 1,
+        sdb.sessions.keys().size() > 0,
+        {
+            nondet s = oneOf(sdb.sessions.keys())
+            nondet d = oneOf(Set(1, 2, 3, 7, 5))
+            nondet lone = oneOf(Set(false, false, true))
+            if (lone)
+                runC([ RBindConnToSession({ sess: s, dir: d }), RPutrootfh ])
+            else
+                runC([ RBindConnToSession({ sess: s, dir: d }) ])
+        },
+    }
+
+    // Wide VERIFY/NVERIFY -- see opVerifyWide.  Aimed at every object type,
+    // since a good part of the attribute marshaller is type-dependent
+    // (RAWDEV for device nodes, the SPACE_* and TIME_* families).
+    // Aim a hostile name at each op that names a component.  This is the only
+    // generator of NFS4ERR_BADNAME, NFS4ERR_BADCHAR and NFS4ERR_NAMETOOLONG,
+    // all three of which had zero occurrences across the whole corpus, and it
+    // drives chimera_nfs4_validate_name / chimera_nfs4_utf8_valid off the
+    // success path they had always taken.
+    // Compound tags: malformed ones (rejected whole, zero results) and valid
+    // multi-byte ones (accepted, compound runs).  Deliberately SEQUENCE-free:
+    // a rejected compound advances no slot, and keeping the session out of it
+    // means the two cases differ only in the tag.
+    action nsCompoundTag = all {
+        MINOR == 0 or readyClients.size() > 0,
+        {
+            nondet t = oneOf(BAD_NAMES.union(UTF8_NAMES))
+            runTagged(t, [ RPutrootfh ])
+        },
+    }
+
+    action nsBadName = all {
+        genReady,
+        {
+            nondet bn = oneOf(BAD_NAMES)
+            nondet gn = oneOf(NAMES)
+            nondet d = oneOf(dirs)
+            nondet o = oneOf(liveInos)
+            nondet which = oneOf(0.to(6))
+            if (which == 0)
+                runC(withSess(anyReady, [ RPutfh(d), RLookup(bn) ]))
+            else if (which == 1)
+                runC(withSess(anyReady, [ RPutfh(d), RRemove(bn) ]))
+            else if (which == 2)
+                runC(withSess(anyReady,
+                    [ RPutfh(d), RCreate({ ctype: FDir, name: bn,
+                                           mode: 493, target: "t" }) ]))
+            else if (which == 3)
+                runC(withSess(anyReady,
+                    [ RPutfh(o), RSavefh, RPutfh(d), RLink(bn) ]))
+            else if (which == 4)
+                // hostile source name
+                runC(withSess(anyReady,
+                    [ RPutfh(d), RSavefh, RPutfh(d),
+                      RRename({ oldname: bn, newname: gn }) ]))
+            else if (which == 5)
+                // hostile target name -- reached only after the source name
+                // validates, so it pins the two-step order chimera uses
+                runC(withSess(anyReady,
+                    [ RPutfh(d), RSavefh, RPutfh(d),
+                      RRename({ oldname: gn, newname: bn }) ]))
+            else
+                runC(withSess(anyReady, [ RPutfh(d), RSecinfo(bn) ]))
+        },
+    }
+
+    // Legal multi-byte names through the full namespace lifecycle: created,
+    // looked up, linked, renamed and enumerated.  This is what drives
+    // chimera_nfs4_utf8_valid's accept paths, and it also pushes multi-byte
+    // bytes through READDIR's per-entry name encoding.
+    action nsUtf8Name = all {
+        genReady,
+        liveInos.size() < MAX_OBJECTS,
+        {
+            nondet un = oneOf(UTF8_NAMES)
+            nondet gn = oneOf(NAMES)
+            nondet d = oneOf(dirs)
+            nondet which = oneOf(0.to(4))
+            if (which == 0)
+                // RGetfh matters: without it the harness never learns the new
+                // object's filehandle and a later PUTFH on it cannot be sent.
+                runC(withSess(anyReady,
+                    [ RPutfh(d), RCreate({ ctype: FDir, name: un,
+                                           mode: 493, target: "t" }),
+                      RGetfh, RGetattr ]))
+            else if (which == 1)
+                runC(withSess(anyReady, [ RPutfh(d), RLookup(un), RGetfh ]))
+            else if (which == 2)
+                runC(withSess(anyReady, [ RPutfh(d), RRemove(un) ]))
+            else if (which == 3)
+                runC(withSess(anyReady,
+                    [ RPutfh(d), RSavefh, RPutfh(d),
+                      RRename({ oldname: gn, newname: un }) ]))
+            else
+                runC(withSess(anyReady, [ RPutfh(d), RReaddir ]))
+        },
+    }
+
+    // SETATTR carrying every writable attribute chimera accepts except SIZE
+    // and ACL.  The model treats it as exactly a mode-only SETATTR (identical
+    // oracle, so the change attribute bumps the same way); the extra
+    // attributes exist to drive SETATTR's own copy of
+    // chimera_nfs4_unmarshall_attrs, which a mode/size-only model leaves at a
+    // fraction of its regions.  The delegation guard mirrors nsSetattrMode:
+    // mutating another client's delegated file is excluded from generation
+    // (D4-12).
+    action nsSetattrWide = all {
+        genReady,
+        {
+            nondet o = oneOf(liveInos)
+            nondet m = oneOf(MODES)
+            if (delegOther(o, anyReady))
+                runC(withSess(anyReady, [ RPutfh(o), RGetattr ]))
+            else
+                runC(withSess(anyReady, [ RPutfh(o), RSetattrWide(m), RGetattr ]))
+        },
+    }
+
+    action nsVerifyWide = all {
+        genReady,
+        {
+            nondet o = oneOf(liveInos)
+            nondet neg = oneOf(Set(false, true))
+            runC(withSess(anyReady,
+                [ RPutfh(o), if (neg) RNverifyWide else RVerifyWide ]))
+        },
+    }
+
+    action nsSecinfo = all {
+        genReady,
+        {
+            nondet wm = oneOf(0.to(3))
+            nondet wt = oneOf(FTYPES)
+            nondet d = oneOf(wide(dirs, wm, wt))
+            nondet n = oneOf(NAMES)
+            nondet trail = oneOf(Set(false, true))
+            if (trail)
+                runC(withSess(anyReady, [ RPutfh(d), RSecinfo(n), RGetfh ]))
+            else
+                runC(withSess(anyReady, [ RPutfh(d), RSecinfo(n) ]))
+        },
+    }
+
+    action nsGetattrWide = all {
+        genReady,
+        {
+            nondet o = oneOf(liveInos)
+            runC(withSess(anyReady, [ RPutfh(o), RGetattrWide ]))
+        },
+    }
+
+    action nsRenew = all {
+        MINOR == 0,
+        genReady,
+        sdb.clients.keys().size() > 0,
+        {
+            nondet c = oneOf(sdb.clients.keys())
+            runC([ RRenew(c) ])
+        },
+    }
+
+    // RESTOREFH (RFC 7530 16.31 / RFC 8881 18.30): with a SAVEFH earlier in
+    // the compound the saved handle comes back and GETFH observes it; with no
+    // saved handle the op must answer NFS4ERR_RESTOREFH.  SAVEFH was already
+    // generated (inside RENAME and LINK) but RESTOREFH never was, so neither
+    // arm -- nor the compound-scoped save register itself -- was under test.
+    action nsRestorefh = all {
+        genReady,
+        {
+            nondet o1 = oneOf(liveInos)
+            nondet o2 = oneOf(liveInos)
+            nondet saved = oneOf(Set(false, true))
+            if (saved)
+                runC(withSess(anyReady,
+                    [ RPutfh(o1), RSavefh, RPutfh(o2), RRestorefh, RGetfh ]))
+            else
+                runC(withSess(anyReady, [ RPutfh(o1), RRestorefh ]))
         },
     }
 
@@ -464,10 +869,15 @@ module nfs4 {
         genReady,
         liveInos.size() < MAX_OBJECTS,
         {
-            nondet d = oneOf(dirs)
+            nondet wm = oneOf(0.to(3))
+            nondet wt = oneOf(FTYPES)
+            nondet d = oneOf(wide(dirs, wm, wt))
             nondet n = oneOf(NAMES)
             nondet m = oneOf(MODES)
-            nondet ct = oneOf(Set(FDir, FLnk, FFifo, FSock))
+            // FReg draws NFS4ERR_BADTYPE (CREATE cannot make regular files,
+            // RFC 7530 16.4.4); FBlk/FChr are device nodes the harness and
+            // chimera already encode.
+            nondet ct = oneOf(FTYPES)
             runC(withSess(anyReady,
                 [ RPutfh(d),
                   RCreate({ ctype: ct, name: n, mode: m, target: "t" }),
@@ -478,7 +888,9 @@ module nfs4 {
     action nsRemove = all {
         genReady,
         {
-            nondet d = oneOf(dirs)
+            nondet wm = oneOf(0.to(3))
+            nondet wt = oneOf(FTYPES)
+            nondet d = oneOf(wide(dirs, wm, wt))
             nondet n = oneOf(NAMES)
             val victim = if (fsHasEnt(fs, d, n)) fsChild(fs, d, n) else -1
             if (victim != -1 and delegSelf(victim, anyReady))
@@ -491,9 +903,15 @@ module nfs4 {
     action nsRename = all {
         genReady,
         {
-            nondet sd = oneOf(dirs)
+            // Two independent (mode, type) pairs, so a mistyped *source*
+            // parent and a mistyped *target* parent both arise.
+            nondet wm = oneOf(0.to(3))
+            nondet wt = oneOf(FTYPES)
+            nondet wm2 = oneOf(0.to(3))
+            nondet wt2 = oneOf(FTYPES)
+            nondet sd = oneOf(wide(dirs, wm, wt))
             nondet sn = oneOf(NAMES)
-            nondet td = oneOf(dirs)
+            nondet td = oneOf(wide(dirs, wm2, wt2))
             nondet tn = oneOf(NAMES)
             val srcObj = if (fsHasEnt(fs, sd, sn)) fsChild(fs, sd, sn) else -1
             val tgtObj = if (fsHasEnt(fs, td, tn)) fsChild(fs, td, tn) else -1
@@ -510,8 +928,10 @@ module nfs4 {
     action nsLink = all {
         genReady,
         {
+            nondet wm = oneOf(0.to(3))
+            nondet wt = oneOf(FTYPES)
             nondet o = oneOf(liveInos)
-            nondet d = oneOf(dirs)
+            nondet d = oneOf(wide(dirs, wm, wt))
             nondet n = oneOf(NAMES)
             if (delegOther(o, anyReady))
                 runC(withSess(anyReady, [ RPutfh(o), RGetattr ]))
@@ -524,9 +944,9 @@ module nfs4 {
     action nsSetattrMode = all {
         genReady,
         {
-            nondet o = oneOf(liveInos.filter(i =>
-                fs.inodes.get(i).ftype == FReg or
-                fs.inodes.get(i).ftype == FDir))
+            // A mode set is valid on every object type, so no `wide` draw is
+            // needed here -- the whole namespace is already the right domain.
+            nondet o = oneOf(liveInos)
             nondet m = oneOf(MODES)
             if (delegOther(o, anyReady))
                 runC(withSess(anyReady, [ RPutfh(o), RGetattr ]))
@@ -563,7 +983,9 @@ module nfs4 {
         {
             nondet c = oneOf(readyClients)
             nondet ow = oneOf(OPEN_OWNERS)
-            nondet d = oneOf(dirs)
+            nondet wm = oneOf(0.to(3))
+            nondet wt = oneOf(FTYPES)
+            nondet d = oneOf(wide(dirs, wm, wt))
             nondet n = oneOf(NAMES)
             nondet acc = oneOf(Set(1, 2, 3))
             nondet dny = oneOf(Set(0, 1, 2, 3))
@@ -669,13 +1091,37 @@ module nfs4 {
 
     // Negative (4.0): OPEN with a skipped owner seqid -> NFS4ERR_BAD_SEQID,
     // no seqid consumed.
+    // OPEN whose CLAIM_NULL name is malformed, or a valid multi-byte name.
+    // OPEN was the one name-taking op the hostile-name work skipped, because
+    // its error path also has to settle the 4.0 open-owner seqid: INVAL,
+    // BADNAME, BADCHAR and NAMETOOLONG all consume it (RFC 7530 9.1.7), so
+    // this exercises the name validator and that settling path together.
+    // Drawing valid multi-byte names too covers the accept side, where the
+    // OPEN then proceeds to an ordinary NOENT.
+    action openOddName = all {
+        readyClients.size() > 0,
+        {
+            nondet c = oneOf(readyClients)
+            nondet ow = oneOf(OPEN_OWNERS)
+            nondet d = oneOf(dirs)
+            nondet n = oneOf(BAD_NAMES.union(UTF8_NAMES))
+            runC(withSess(c,
+                [ RPutfh(d),
+                  ROpen({ client: c, owner: ow, oseq: oseqFor(c, ow),
+                          claim: OCNull(n), how: HNoCreate,
+                          access: 1, deny: 0 }) ]))
+        },
+    }
+
     action openBadSeqid = all {
         MINOR == 0,
         readyClients.size() > 0,
         sdb.oo40.keys().size() > 0,
         {
             nondet k = oneOf(sdb.oo40.keys())
-            nondet d = oneOf(dirs)
+            nondet wm = oneOf(0.to(3))
+            nondet wt = oneOf(FTYPES)
+            nondet d = oneOf(wide(dirs, wm, wt))
             nondet n = oneOf(NAMES)
             runC([ RPutfh(d),
                    ROpen({ client: k._1, owner: k._2,
@@ -693,7 +1139,9 @@ module nfs4 {
         genReady,
         files.size() > 0,
         {
-            nondet f = oneOf(files)
+            nondet wm = oneOf(0.to(3))
+            nondet wt = oneOf(FTYPES)
+            nondet f = oneOf(wide(files, wm, wt))
             nondet off = oneOf(0.to(MAX_BLOCKS))
             nondet len = oneOf(1.to(2))
             val opensOfF = usableOpens.filter(s => sdb.opens.get(s).file == f)
@@ -719,7 +1167,9 @@ module nfs4 {
         genReady,
         files.size() > 0,
         {
-            nondet f = oneOf(files)
+            nondet wm = oneOf(0.to(3))
+            nondet wt = oneOf(FTYPES)
+            nondet f = oneOf(wide(files, wm, wt))
             nondet off = oneOf(0.to(MAX_BLOCKS - 1))
             nondet len = oneOf(1.to(2))
             nondet pat = oneOf(BLOCK_SYMS)
@@ -747,7 +1197,9 @@ module nfs4 {
         genReady,
         files.size() > 0,
         {
-            nondet f = oneOf(files)
+            nondet wm = oneOf(0.to(3))
+            nondet wt = oneOf(FTYPES)
+            nondet f = oneOf(wide(files, wm, wt))
             runC(withSess(anyReady, [ RPutfh(f), RCommit ]))
         },
     }
@@ -756,7 +1208,9 @@ module nfs4 {
         genReady,
         files.size() > 0,
         {
-            nondet f = oneOf(files)
+            nondet wm = oneOf(0.to(3))
+            nondet wt = oneOf(FTYPES)
+            nondet f = oneOf(wide(files, wm, wt))
             nondet sz = oneOf(0.to(MAX_BLOCKS))
             val opensOfF = usableOpens.filter(s => sdb.opens.get(s).file == f)
             nondet useOpen = oneOf(Set(false, true))
@@ -828,7 +1282,9 @@ module nfs4 {
         {
             nondet c = oneOf(readyClients)
             nondet lown = oneOf(LOCK_OWNERS)
-            nondet f = oneOf(files)
+            nondet wm = oneOf(0.to(3))
+            nondet wt = oneOf(FTYPES)
+            nondet f = oneOf(wide(files, wm, wt))
             nondet lo = oneOf(0.to(LOCK_BYTES - 2))
             nondet len = oneOf(1.to(3))
             nondet wr = oneOf(Set(false, true))
@@ -862,6 +1318,21 @@ module nfs4 {
             val l = sdb.locks.get(s)
             runC(withSess(l.client,
                 [ RFreeStateid({ sid: s, kind: KLock, argSeq: 0 }) ]))
+        },
+    }
+
+    // FREE_STATEID against an *open* stateid.  Only lock stateids were ever
+    // fed to the op, so the model's open/delegation arms -- and chimera's
+    // NFS4_SLOT_TYPE_OPEN branch -- were both unreachable.  A live open still
+    // has state, so the answer is NFS4ERR_LOCKS_HELD, not BAD_STATEID.
+    action freeStateidOpen = all {
+        MINOR >= 1,
+        usableOpens.size() > 0,
+        {
+            nondet s = oneOf(usableOpens)
+            val o = sdb.opens.get(s)
+            runC(withSess(o.client,
+                [ RFreeStateid({ sid: s, kind: KOpen, argSeq: 0 }) ]))
         },
     }
 
@@ -1020,7 +1491,9 @@ module nfs4 {
         files.size() > 0,
         genReady,
         {
-            nondet f = oneOf(files)
+            nondet wm = oneOf(0.to(3))
+            nondet wt = oneOf(FTYPES)
+            nondet f = oneOf(wide(files, wm, wt))
             nondet off = oneOf(0.to(MAX_BLOCKS - 1))
             nondet len = oneOf(1.to(2))
             if (delegOther(f, anyReady))
@@ -1038,7 +1511,9 @@ module nfs4 {
         files.size() > 0,
         genReady,
         {
-            nondet f = oneOf(files)
+            nondet wm = oneOf(0.to(3))
+            nondet wt = oneOf(FTYPES)
+            nondet f = oneOf(wide(files, wm, wt))
             nondet off = oneOf(0.to(MAX_BLOCKS - 1))
             nondet len = oneOf(1.to(2))
             if (delegOther(f, anyReady))
@@ -1055,7 +1530,9 @@ module nfs4 {
         files.size() > 0,
         genReady,
         {
-            nondet f = oneOf(files)
+            nondet wm = oneOf(0.to(3))
+            nondet wt = oneOf(FTYPES)
+            nondet f = oneOf(wide(files, wm, wt))
             nondet off = oneOf(0.to(MAX_BLOCKS))
             nondet whatData = oneOf(Set(false, true))
             if (delegOtherWrite(f, anyReady))
@@ -1083,14 +1560,14 @@ module nfs4 {
             nondet srcOff = oneOf(0.to(MAX_BLOCKS - 1))
             nondet dstOff = oneOf(0.to(MAX_BLOCKS - 1))
             nondet cnt = oneOf(1.to(2))
-            // Keep the source range inside the source file.  The out-of-range
-            // shapes are a second open divergence: RFC 7862 15.2.3 makes a
-            // source offset past the source size NFS4ERR_INVAL, and the
-            // reference server answers NFS4_OK.  Asserting that is not this
-            // corpus's job.
+            // The source range is deliberately allowed to run past the end of
+            // the source file: RFC 7862 15.2.3 makes a source offset past the
+            // source size NFS4ERR_INVAL, and opCopy predicts it.  The server
+            // used to answer NFS4_OK, which is why this shape was suppressed
+            // here; it validates the range now, so the corpus asserts it and
+            // the v4:SCopy:INVAL bucket stays covered.
             if (delegOther(dofs.file, dofs.client) or
-                delegOtherWrite(so.file, so.client) or
-                srcOff + cnt > fsGet(fs, so.file).sizeBlocks)
+                delegOtherWrite(so.file, so.client))
                 runC(withSess(dofs.client, [ RPutfh(dofs.file), RGetattr ]))
             else
                 runC(withSess(dofs.client,
@@ -1311,12 +1788,12 @@ module nfs4 {
     // Step distributions
     // ------------------------------------------------------------------
 
-    action step = any {
+    action stepBody = any {
         setupSetclientid,
         setupSetclientidConfirm,
         setupExchangeId,
         setupCreateSession,
-        reclaimComplete,
+        reclaimAgain,
         seqMisordered,
         destroySession,
         destroyClientid,
@@ -1332,12 +1809,24 @@ module nfs4 {
         nsLink,
         nsSetattrMode,
         nsVerify,
+        nsRenew,
+        nsRestorefh,
+        nsGetattrWide,
+        nsSecinfo,
+        nsVerifyWide,
+        nsSetattrWide,
+        nsBadName, nsBadName,
+        nsCompoundTag, nsCompoundTag,
+        nsUtf8Name, nsUtf8Name,
+        nsBindConnToSession,
+        nsSessionPosition,
         openNew,
         openFh,
         openConfirm,
         openDowngrade,
         closeOpen,
         openBadSeqid,
+        openOddName,
         ioRead,
         ioWrite,
         ioCommit,
@@ -1347,6 +1836,7 @@ module nfs4 {
         lockCheck,
         lockUnlock,
         lockFree,
+        freeStateidOpen,
         lockReleaseOwner,
         delegReturn,
         pnfsLayoutget,
@@ -1366,24 +1856,30 @@ module nfs4 {
 
     // Open/close/lock-heavy: exercises share matrices, upgrades,
     // downgades, seqid discipline and lock splitting.
-    action stepState = any {
+    action stepStateBody = any {
         setupSetclientid, setupSetclientidConfirm,
         setupExchangeId, setupCreateSession,
+        reclaimAgain,
         openNew, openNew, openNew, openFh, openConfirm, openConfirm,
         openDowngrade, openDowngrade, closeOpen, closeOpen, openBadSeqid,
+        openOddName, openOddName,
         lockNew, lockNew, lockExist, lockCheck, lockUnlock, lockUnlock,
-        lockFree, lockReleaseOwner, delegReturn,
+        lockFree, freeStateidOpen, lockReleaseOwner, delegReturn,
         ioRead, ioWrite,
         nsGetattr,
     }
 
     // Namespace churn (the v3-style workload plus OPEN-created files).
-    action stepNamespace = any {
+    action stepNamespaceBody = any {
         setupSetclientid, setupSetclientidConfirm,
         setupExchangeId, setupCreateSession,
         nsCreate, nsCreate, nsRemove, nsRemove, nsRename, nsRename,
         nsLink, nsLink, openNew, closeOpen,
         nsLookup, nsLookupp, nsGetattr, nsReaddir,
+        nsRestorefh, nsRenew, nsGetattrWide, nsSecinfo, nsVerifyWide,
+        nsBadName, nsBadName,
+        nsUtf8Name, nsUtf8Name,
+        nsBindConnToSession,
     }
 
     // Delegation lifecycle: grants, cross-client conflicts (recall +
@@ -1397,10 +1893,9 @@ module nfs4 {
     // reconcile with the model's block map) is a deeper coherency layer
     // left to a follow-on; nsGetattr is the one read here, and it only
     // observes the change attribute the lifecycle already tracks.
-    action stepDeleg = any {
+    action stepDelegBody = any {
         setupSetclientid, setupSetclientidConfirm,
         setupExchangeId, setupCreateSession,
-        reclaimComplete, reclaimComplete,
         delegOpenNew, delegOpenNew, delegOpenNew,
         delegBreakOpen, delegBreakOpen, delegBreakOpen,
         delegBreakRemove, delegBreakRemove,
@@ -1463,7 +1958,7 @@ module nfs4 {
         nsGetattr,
     }
 
-    action stepData = any {
+    action stepDataBody = any {
         setupSetclientid, setupSetclientidConfirm,
         setupExchangeId, setupCreateSession,
         openNew, closeOpen,
@@ -1474,6 +1969,41 @@ module nfs4 {
         xattrSet, xattrGet, xattrList, xattrRemove,
         nsGetattr,
     }
+
+    // Object-type matrix.  Every other flavor reaches a mistyped target only
+    // at the wide() rate; here that is the whole point, so each type-gated op
+    // is weighted up and the create mix (which is what makes all seven types
+    // exist at once) is weighted highest.  nsRemove stays at weight 1:
+    // MAX_OBJECTS is 12 and the matrix needs the types alive together.
+    action stepTypesBody = any {
+        setupSetclientid, setupSetclientidConfirm,
+        setupExchangeId, setupCreateSession,
+        nsCreate, nsCreate, nsCreate, nsCreate, nsCreate,
+        nsReadlink, nsReadlink, nsReadlink,
+        nsVerifyWide, nsVerifyWide,
+        nsBadName,
+        ioRead, ioRead, ioWrite, ioWrite, ioCommit, ioCommit,
+        ioSetattrSize, ioSetattrSize, nsSetattrMode,
+        lockCheck, lockCheck, lockCheck,
+        nsRemove, nsRename, nsLink, openNew, closeOpen,
+        nsGetattr, nsGetattrWide, nsGetattrWide,
+        nsAccess, nsReaddir, nsLookup, nsLookupp,
+    }
+
+    // The public flavor names -- CMake passes these to `--step=`, so they
+    // must not change.  Each is its body behind the reclaim-first wrapper:
+    // under 4.1+ a ready client that still owes its RECLAIM_COMPLETE sends
+    // it (or probes the grace gate with an OPEN that must fail GRACE)
+    // before the flavor's real workload starts, so that workload runs
+    // against a server that has left grace.  Under 4.0 there is no grace
+    // window, reclaimPending is always false, and each of these is exactly
+    // its body.
+    action step          = if (reclaimPending) reclaimFirst else stepBody
+    action stepState     = if (reclaimPending) reclaimFirst else stepStateBody
+    action stepNamespace = if (reclaimPending) reclaimFirst else stepNamespaceBody
+    action stepDeleg     = if (reclaimPending) reclaimFirst else stepDelegBody
+    action stepData      = if (reclaimPending) reclaimFirst else stepDataBody
+    action stepTypes     = if (reclaimPending) reclaimFirst else stepTypesBody
 
     // ------------------------------------------------------------------
     // Invariants

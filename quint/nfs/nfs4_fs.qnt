@@ -452,13 +452,6 @@ module nfs4fs {
           eof: off + ret >= nd.sizeBlocks }
     }
 
-    // SETATTR size: truncate (drop blocks at/after n) or extend (the new
-    // tail is a hole).  A resize to the *current* size changes no data or
-    // metadata, so it is a no-op: the change attribute does not advance and
-    // the exclusive-create verifier is not cleared (RFC 7530 5.8.1.4 -- the
-    // change attribute moves only on an actual change; memfs matches this,
-    // e.g. an O_TRUNC-style OPEN of an already-empty file).  A real size
-    // change advances change and clears the verifier.
     // Transfer whole blocks from one file to another preserving each block's
     // CONTENT -- hole, allocated-but-unwritten, or data.  Reflinking (CLONE)
     // shares the source's extents, so a hole in the source stays a hole in
@@ -478,10 +471,19 @@ module nfs4fs {
           .with("chg", fs.chg + 1)
     }
 
+    // SETATTR size: truncate (drop blocks at/after n) or extend (the new
+    // tail is a hole).  A real size change advances change and clears the
+    // exclusive-create verifier.
+    // A successful resize stamps the file even when the size it asks for is
+    // the size the file already has: POSIX marks the last data modification
+    // and last file status change timestamps for update on any successful
+    // truncate/ftruncate, without conditioning that on the length changing
+    // (Linux's do_truncate sets ATTR_CTIME unconditionally for the same
+    // reason).  ctime moving is a metadata change, so RFC 7530 5.4 requires
+    // the change attribute to move with it.
     pure def fsResize(fs: Fs, f: Ino, n: int): Fs = {
         val nd = fs.inodes.get(f)
-        if (nd.sizeBlocks == n) fs
-        else {
+        {
             val nblocks = nd.blocks.keys().filter(i => i < n).mapBy(i => nd.blocks.get(i))
             fs.with("inodes", fs.inodes.setBy(f, x => x
                   .with("blocks", nblocks)
