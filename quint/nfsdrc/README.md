@@ -112,10 +112,6 @@ different requests the same one.
   flaky for a reason unrelated to a cache. The property that matters, that a
   *retransmit* carrying such a handle replays rather than re-resolving, is
   asserted in the harness's ground-truth probe where it is deterministic.
-* **Hard-linking a directory.** Refused everywhere, but by different errors:
-  RFC 1813 Section 3.3.15 lists neither NFS3ERR_ISDIR (chimera) nor
-  NFS3ERR_PERM (Linux) among LINK's errors. A trace that asked would be testing
-  that disagreement.
 * **The NFSv4.1 session reply cache.** A different mechanism — a slot table
   with sequence numbers rather than a key over transport identity — and it
   belongs with the sessions, in the nfs4 model.

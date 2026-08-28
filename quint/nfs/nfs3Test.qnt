@@ -137,11 +137,11 @@ module nfs3Test {
             .then(applyRmdir(ROOT, "d"))
             .expect(lastOp == ORmdir({ dir: ROOT, name: "d", status: OK }))
             .expect(fs.keys() == Set(ROOT) and removed == Set(1, 2))
-            // Immediately after a real removal, GETATTR on the dead handle
-            // returns NOENT (the reliable case; see the staleGetattr note in
-            // nfs3.qnt for why longer traces cannot assert this).
+            // After a real removal, GETATTR on the dead handle is STALE (see
+            // the staleGetattr note in nfs3.qnt for why longer traces cannot
+            // assert this).
             .then(applyStaleGetattr(1))
-            .expect(lastOp == OStaleGetattr({ obj: 1, status: ERR_NOENT }))
+            .expect(lastOp == OStaleGetattr({ obj: 1, status: ERR_STALE }))
 
     run mkdirRmdirTest =
         init
