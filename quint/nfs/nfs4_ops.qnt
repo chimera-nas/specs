@@ -2286,9 +2286,21 @@ module nfs4ops {
                       SDeallocate({ st: OK }))
         }
 
-    // SEEK (RFC 7862 15.11): offset at/after EOF -> NFS4ERR_NXIO; a data
-    // search in a trailing hole returns eof=true at the size (the virtual
-    // hole/EOF rule); allocated-but-unwritten blocks count as data.
+    // SEEK (RFC 7862 15.11): offset at/after EOF -> NFS4ERR_NXIO, and so is a
+    // data search that finds no data before EOF.
+    //
+    // 15.11.3 reads as though the second case were NFS4_OK with sr_eof set
+    // ("if the server cannot find a corresponding sa_what, then the status
+    // will still be NFS4_OK, but sr_eof would be TRUE"), and the model used to
+    // say that.  Every deployed implementation disagrees: Linux's nfsd maps
+    // the vfs_llseek ENXIO straight to NFS4ERR_NXIO, and nfstest_sparse
+    // asserts it outright -- "SEEK should fail with NFS4ERR_NXIO using
+    // SEEK_DATA when offset is in the middle of last hole".  A model that
+    // contradicts the suite the servers are tested against is the wrong
+    // oracle, so follow the ecosystem.
+    //
+    // SEEK_HOLE is unaffected: every file has a virtual hole at EOF, so a hole
+    // search always finds one.  Allocated-but-unwritten blocks count as data.
     pure def opSeek(a: Acc, ar: { sel: SidSel, off: int, whatData: bool }): Acc = {
         val nores = { st: OK, eof: false, offset: 0 }
         if (a.minor < 2) emit(a, SSeek(nores.with("st", E_OP_ILLEGAL)))
@@ -2303,9 +2315,8 @@ module nfs4ops {
                 else {
                     val r = fsSeek(nd, ar.off, ar.whatData)
                     if (ar.whatData and not(r.found))
-                        // No data before EOF: sr_eof = true at the size.
-                        emit(a, SSeek({ st: OK, eof: true,
-                                        offset: nd.sizeBlocks }))
+                        // No data between the offset and EOF.
+                        emit(a, SSeek(nores.with("st", E_NXIO)))
                     else
                         emit(a, SSeek({ st: OK,
                                         eof: r.offset >= nd.sizeBlocks,
