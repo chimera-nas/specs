@@ -383,15 +383,42 @@ module nfs4state {
     type SeqOutcome =
         | SeqNew
         | SeqReplay
+        | SeqUncachedRetry
         | SeqFalseRetry
         | SeqMisordered
         | SeqBadSession
         | SeqBadSlot
 
-    // SEQUENCE (RFC 8881 18.46.3, 2.10.6.1).  reqTag identifies the whole
-    // compound so a same-seq retry can be classified as replay (same tag)
-    // or false retry (different tag).  On SeqNew the slot advances and
-    // records the tag; on errors and replays the table is unchanged.
+    /// SEQUENCE (RFC 8881 18.46.3, 2.10.6.1).  reqTag identifies the whole
+    /// compound, so a same-seq retry is a replay when the tag matches and a
+    /// false retry when it does not.  On SeqNew the slot advances and records
+    /// the tag and whether the reply was cached; on errors and replays the
+    /// table is unchanged (Section 2.10.6.1.2: "Any time SEQUENCE or
+    /// CB_SEQUENCE returns an error, the sequence ID of the slot MUST NOT
+    /// change").
+    ///
+    /// Three things a retry can be, and the distinction between the first two
+    /// is what `cached` is for:
+    ///
+    ///   SeqReplay         the original's reply was cached, and is re-sent.
+    ///   SeqUncachedRetry  it was not (sa_cachethis was FALSE), so there is
+    ///                     nothing to re-send.  The SEQUENCE reply itself is
+    ///                     always cached (Section 2.10.6.1.1) and is answered
+    ///                     NFS4_OK; the operation AFTER it carries
+    ///                     NFS4ERR_RETRY_UNCACHED_REP, and Section 2.10.6.1.3
+    ///                     says the replier "MUST NOT return
+    ///                     NFS4ERR_RETRY_UNCACHED_REP in reply to a Sequence
+    ///                     operation if the Sequence operation is the first
+    ///                     operation", which it always is.
+    ///   SeqFalseRetry     the retry is not the original request.  The RFC
+    ///                     permits four answers here (Section 2.10.6.1.3) --
+    ///                     the cached reply, SEQ_FALSE_RETRY, or either
+    ///                     request's second operation with
+    ///                     RETRY_UNCACHED_REP -- and MANDATES SEQ_FALSE_RETRY
+    ///                     only when the two requests were made by different
+    ///                     users (Section 2.10.6.1.3.1).  The traces do not
+    ///                     generate one: they retransmit verbatim, which is
+    ///                     the only thing a conforming client does.
     pure def applySequence(sdb: StateDB, sess: SessId, slotId: int, seq: int,
                            reqTag: int, cacheThis: bool):
             { sdb2: StateDB, st: SeqOutcome } =
@@ -410,8 +437,9 @@ module nfs4state {
                       st: SeqNew }
                 else if (seq == slot.seq and slot.seq > 0)
                     { sdb2: sdb,
-                      st: if (slot.reqTag == reqTag) SeqReplay
-                          else SeqFalseRetry }
+                      st: if (slot.reqTag != reqTag) SeqFalseRetry
+                          else if (slot.cached) SeqReplay
+                          else SeqUncachedRetry }
                 else
                     { sdb2: sdb, st: SeqMisordered }
             }
