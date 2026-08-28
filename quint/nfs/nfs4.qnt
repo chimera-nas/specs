@@ -1560,14 +1560,14 @@ module nfs4 {
             nondet srcOff = oneOf(0.to(MAX_BLOCKS - 1))
             nondet dstOff = oneOf(0.to(MAX_BLOCKS - 1))
             nondet cnt = oneOf(1.to(2))
-            // Keep the source range inside the source file.  The out-of-range
-            // shapes are a second open divergence: RFC 7862 15.2.3 makes a
-            // source offset past the source size NFS4ERR_INVAL, and the
-            // reference server answers NFS4_OK.  Asserting that is not this
-            // corpus's job.
+            // The source range is deliberately allowed to run past the end of
+            // the source file: RFC 7862 15.2.3 makes a source offset past the
+            // source size NFS4ERR_INVAL, and opCopy predicts it.  The server
+            // used to answer NFS4_OK, which is why this shape was suppressed
+            // here; it validates the range now, so the corpus asserts it and
+            // the v4:SCopy:INVAL bucket stays covered.
             if (delegOther(dofs.file, dofs.client) or
-                delegOtherWrite(so.file, so.client) or
-                srcOff + cnt > fsGet(fs, so.file).sizeBlocks)
+                delegOtherWrite(so.file, so.client))
                 runC(withSess(dofs.client, [ RPutfh(dofs.file), RGetattr ]))
             else
                 runC(withSess(dofs.client,

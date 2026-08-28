@@ -464,6 +464,17 @@ def main_v4(args, files):
 
     if args.write_expect:
         with open(args.write_expect, "w") as f:
+            # The baseline is a source file like any other and reuse-lint
+            # checks it, so re-emit the licence header the rewrite would
+            # otherwise drop.  The tags below are data, not this file's own
+            # licence: REUSE would otherwise read them off the string
+            # literals and report an unparseable expression.
+            # REUSE-IgnoreStart
+            f.write("# SPDX-FileCopyrightText: 2026 The Quint Specs Authors\n"
+                    "#\n"
+                    "# SPDX-License-Identifier: MIT\n"
+                    "#\n")
+            # REUSE-IgnoreEnd
             f.write("# NFSv4 coverage baseline -- every bucket here must keep\n"
                     "# being produced by the generated corpus.  Raise it with\n"
                     "# --write-expect once new behaviour is deliberate.\n")

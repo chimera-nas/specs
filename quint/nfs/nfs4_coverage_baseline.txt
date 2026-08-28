@@ -6,11 +6,15 @@
 # being produced by the generated corpus.  Raise it with
 # --write-expect once new behaviour is deliberate.
 v4:SAccess:OK
+v4:SAllocate:ISDIR
 v4:SAllocate:LOCKED
 v4:SAllocate:OK
 v4:SBindConnToSession:INVAL
 v4:SBindConnToSession:NOT_ONLY_OP
 v4:SBindConnToSession:OK
+v4:SClone:BAD_STATEID
+v4:SClone:INVAL
+v4:SClone:OK
 v4:SClose:OK
 v4:SCommit:ISDIR
 v4:SCommit:OK
@@ -43,6 +47,7 @@ v4:SGetfh:NOFILEHANDLE
 v4:SGetfh:OK
 v4:SGetxattr:NOXATTR
 v4:SGetxattr:OK
+v4:SIoAdvise:OK
 v4:SLayoutget:NOTSUPP
 v4:SLink:BADCHAR
 v4:SLink:BADNAME
@@ -100,6 +105,7 @@ v4:SRead:LOCKED
 v4:SRead:OK
 v4:SRead:OPENMODE
 v4:SRead:WRONG_TYPE
+v4:SReadPlus:OK
 v4:SReaddir:NOTDIR
 v4:SReaddir:OK
 v4:SReadlink:INVAL
@@ -145,6 +151,7 @@ v4:SSeek:OK
 v4:SSequence:OK
 v4:SSequence:OP_NOT_IN_SESSION
 v4:SSequence:SEQ_MISORDERED
+v4:SSetattr:BAD_STATEID
 v4:SSetattr:INVAL
 v4:SSetattr:ISDIR
 v4:SSetattr:LOCKED
@@ -162,10 +169,14 @@ v4:SWrite:ISDIR
 v4:SWrite:LOCKED
 v4:SWrite:OK
 v4:SWrite:OPENMODE
+v4:SWrite:WRONG_TYPE
+v4:SWriteSame:OK
+v4:SWriteSame:UNION_NOTSUPP
 v4:compound:BADCHAR
 v4:compound:BADNAME
 v4:compound:BADTYPE
 v4:compound:BAD_SEQID
+v4:compound:BAD_STATEID
 v4:compound:CLIENTID_BUSY
 v4:compound:COMPLETE_ALREADY
 v4:compound:DELAY
@@ -195,6 +206,7 @@ v4:compound:SEQ_MISORDERED
 v4:compound:SHARE_DENIED
 v4:compound:STALE_CLIENTID
 v4:compound:SYMLINK
+v4:compound:UNION_NOTSUPP
 v4:compound:WRONG_TYPE
 v4:compound:no-results
 v4:compound:nops:1
