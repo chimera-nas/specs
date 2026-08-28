@@ -343,12 +343,21 @@ module nfsdrc {
      */
     action stepShared(v4Proto: bool, c: int, x: int, u: int, n: str,
                       m: str): bool = any {
+        // One branch per object type rather than a type chosen inside one
+        // create branch: nesting the choice makes each individual type a third
+        // as likely as any other operation, and a corpus then has to be three
+        // times as long before a replay lands on, say, a MKDIR.  Creates are
+        // also the operations whose replay is most visible, so weighting them
+        // up is the right way round.
+        //
         // NFSv4 CREATE makes non-regular objects only -- a regular file is
-        // OPEN's job (RFC 7530 Section 16.4) -- so the NFSv4 traces choose from
-        // the two types their CREATE can actually ask for.
-        nondet t = (if (v4Proto) Set(T_DIR, T_LNK)
-                    else Set(T_REG, T_DIR, T_LNK)).oneOf()
-            call(v4Proto, c, x, u, ACreate({ name: n, ftype: t })),
+        // OPEN's job (RFC 7530 Section 16.4) -- so the regular-file branch is
+        // NFSv3's alone.
+        call(v4Proto, c, x, u, ACreate({ name: n, ftype: T_DIR })),
+        call(v4Proto, c, x, u, ACreate({ name: n, ftype: T_LNK })),
+        all { not(v4Proto),
+              call(false, c, x, u, ACreate({ name: n, ftype: T_REG })) },
+
         // RMDIR and REMOVE both, for NFSv3: identical arguments, different
         // procedure numbers, and only the key's procedure field between them.
         // A COMPOUND has one REMOVE for both, so asDir is immaterial there and
@@ -356,6 +365,7 @@ module nfsdrc {
         call(v4Proto, c, x, u, ARemove({ name: n, asDir: false })),
         all { not(v4Proto), call(false, c, x, u,
                                  ARemove({ name: n, asDir: true })) },
+
         call(v4Proto, c, x, u, ARename({ from: n, to: m })),
         call(v4Proto, c, x, u, ALookup({ name: n })),
     }
