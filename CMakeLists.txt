@@ -224,35 +224,54 @@ endforeach()
 # SMB2  (smb2_run.qnt; depends on the shared nfs4_fs substrate too)
 # ---------------------------------------------------------------------------
 specs_selftest(smb2Test ${Q}/smb2/smb2Test.qnt smb2Test 200 SMB2_DEPS)
-# Six registered batches.  Depth is capped per flavor by what replays green
-# against the live server, not by taste: stepCore/stepReq/stepInfo/stepNs
-# sustain 500 steps, stepDir 240, and stepDurable breaks at 180 on the Q-4
-# caching-lifecycle family (see the chimera tree's DEVIATIONS-SMB.md).
-# smb2Replay/stepReplay is deliberately absent -- Q-13 makes affected traces
-# nondeterministic, so registering it would trade trust for coverage.
+# Two capability-off instances of the same model.  They are what make
+# `caps.durable` and `caps.leases` provably load-bearing: smb2Test pins both
+# FeatMandatory, so a model that stopped reading either would behave
+# identically there and only fail here.  (smb2TestNoDurable already said in
+# its header that CMake ran it; it did not, so nothing was gating it.)
+specs_selftest(smb2TestNoDurable ${Q}/smb2/smb2Test.qnt smb2TestNoDurable 200
+               SMB2_DEPS)
+specs_selftest(smb2TestNoLease ${Q}/smb2/smb2Test.qnt smb2TestNoLease 200
+               SMB2_DEPS)
+set(SMB2_GATE ${SELFTEST_smb2Test} ${SELFTEST_smb2TestNoDurable}
+              ${SELFTEST_smb2TestNoLease})
+# Every instance the model defines, with the flavors that instance exists to
+# exercise.  Generation is UNCONDITIONAL: no batch is withheld, and no depth is
+# clipped, on account of what some particular server does with it.  A corpus
+# that quietly omits the cases an implementation fails is a corpus that cannot
+# report them, and the omission then has to be remembered rather than measured.
+# Where a server diverges, its own replay harness records the divergence
+# against a registry that harness owns -- harness/samba/samba_deviations.py for
+# Samba here, and the consuming project's own registry for its own server.
+#
+# Depth is per flavor and reflects how much state each one needs to reach its
+# interesting behavior, nothing else.
 specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Base stepCore 500 8 0x7
-          "smb2Base_stepCore_500_0x7_{seq}" SELFTEST_smb2Test SMB2_DEPS)
+          "smb2Base_stepCore_500_0x7_{seq}" SMB2_GATE SMB2_DEPS)
 specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Base stepReq 500 8 0x11
-          "smb2Base_stepReq_500_0x11_{seq}" SELFTEST_smb2Test SMB2_DEPS)
-specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Base stepDir 240 8 0x5
-          "smb2Base_stepDir_240_0x5_{seq}" SELFTEST_smb2Test SMB2_DEPS)
+          "smb2Base_stepReq_500_0x11_{seq}" SMB2_GATE SMB2_DEPS)
+specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Base stepDir 500 8 0x5
+          "smb2Base_stepDir_500_0x5_{seq}" SMB2_GATE SMB2_DEPS)
 specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Base stepInfo 500 8 0x9
-          "smb2Base_stepInfo_500_0x9_{seq}" SELFTEST_smb2Test SMB2_DEPS)
+          "smb2Base_stepInfo_500_0x9_{seq}" SMB2_GATE SMB2_DEPS)
 specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Base stepNs 500 8 0xd
-          "smb2Base_stepNs_500_0xd_{seq}" SELFTEST_smb2Test SMB2_DEPS)
-# smb2Durable/stepDurable is NOT generated, for the same reason
-# smb2Replay/stepReplay is not: it does not replay green in this harness.  A
-# durable handle is PARKED across a transport drop by design, so it outlives
-# the connection -- and the batch replayer tears the share and filesystem down
-# after every trace.  chimera_smb_remove_share() frees the share and destroys
-# its sharemode table with no regard for opens still referencing it, giving a
-# heap-use-after-free in chimera_smb_sharemode_release(); keeping the share
-# instead just moves the problem to rmfs, which then spins on EBUSY until the
-# parked handle's 60 s durable timeout.  The durable MODEL and its
-# ground-truth probe (smb2_durable_probe) both ship and pass; only the
-# generated batch is withheld until the share/handle lifetime is settled.
-# specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Durable stepDurable 160 8 0x41
-#           "smb2Durable_stepDurable_160_0x41_{seq}" SELFTEST_smb2Test SMB2_DEPS)
+          "smb2Base_stepNs_500_0xd_{seq}" SMB2_GATE SMB2_DEPS)
+# The caching instances: oplocks and leases mandatory, so the grant / break /
+# acknowledge lifecycle is exercised rather than skipped.  smb2ForceL2 is the
+# same model on a share carrying SMB2_SHAREFLAG_FORCE_LEVELII_OPLOCK, where
+# every caching grant caps to a read cache.
+specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Leases stepLease 300 8 0x21
+          "smb2Leases_stepLease_300_0x21_{seq}" SMB2_GATE SMB2_DEPS)
+specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2ForceL2 stepLease 300 8 0x31
+          "smb2ForceL2_stepLease_300_0x31_{seq}" SMB2_GATE SMB2_DEPS)
+# The durable-handle lifecycle: request, grant, park across a transport drop,
+# reconnect, reclaim, and the reclaim denial matrix.
+specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Durable stepDurable 300 8 0x41
+          "smb2Durable_stepDurable_300_0x41_{seq}" SMB2_GATE SMB2_DEPS)
+# The exactly-once layer: ChannelSequence and SMB2_FLAGS_REPLAY_OPERATION
+# stamped on ordinary requests.
+specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Replay stepReplay 300 8 0x51
+          "smb2Replay_stepReplay_300_0x51_{seq}" SMB2_GATE SMB2_DEPS)
 
 # ---------------------------------------------------------------------------
 # NFSAUX -- the four protocols that surround NFSv3: portmap/rpcbind, MOUNT,
@@ -344,3 +363,141 @@ add_test(NAME coverage/nfs4
     COMMAND ${Python3_EXECUTABLE} ${Q}/nfs/coverage.py --proto 4
             --expect ${Q}/nfs/nfs4_coverage_baseline.txt
             --glob "${T}/nfs4/*.itf.json")
+
+# ---------------------------------------------------------------------------
+# Samba conformance (harness/samba)
+#
+# The corpus above is generated from models that encode MS-SMB2 / MS-FSA, not
+# any one server.  These tests are what makes that claim falsifiable: they
+# replay the generated SMB2 traces against a real Samba smbd and compare every
+# reply to the result the model baked into the trace.  Where the two disagree,
+# one of them is wrong -- and harness/samba/samba_deviations.py records which,
+# with a citation, so a known divergence stays enumerable and a NEW one turns
+# the suite red.
+#
+# One ctest per generated batch, so a divergence names the flavor that found
+# it and the batches run concurrently.  Each test stands up its own smbd inside
+# a private network namespace, which is what lets them: every instance binds
+# 127.0.0.1:445 in its own namespace, so there is no port to broker.  Without
+# CAP_NET_ADMIN there is no isolation, so the tests fall back to the shared
+# host network serialized under one RESOURCE_LOCK -- the same graceful
+# degradation chimera and libevpl use for their netns tests.
+# ---------------------------------------------------------------------------
+
+# Only when specs is the project being built, not when it is a subdirectory of
+# a consumer.  A consuming project embeds this repo to get the CORPUS; its test
+# suite is about ITS server, and silently adding nine Samba tests to it would
+# make a Samba divergence fail someone else's build -- with a test they did not
+# write, against a server they are not shipping.  (Chimera's devcontainer
+# carries samba for smbtorture, so this is not hypothetical: without the guard
+# its `ctest` picks these up the moment it builds specs from source instead of
+# fetching the bundle.)  SPECS_SAMBA_TESTS forces the question either way.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    set(_samba_default ON)
+else()
+    set(_samba_default OFF)
+endif()
+option(SPECS_SAMBA_TESTS
+       "Register the Samba conformance suite (default: on only when specs is \
+the top-level project)" ${_samba_default})
+
+set(SAMBA_HARNESS ${CMAKE_CURRENT_SOURCE_DIR}/harness/samba)
+
+# The probes below only run when the suite is wanted: they are not free (one
+# creates and deletes a real network namespace), and a consumer that is never
+# going to register these tests should not pay for them -- nor have its
+# configure step create namespaces as a side effect.
+if(SPECS_SAMBA_TESTS)
+    find_program(SMBD_BIN NAMES smbd
+                 PATHS /usr/sbin /usr/local/sbin
+                 DOC "Samba smbd, the server under test for the samba MBT suite")
+
+    # The replay client is pure Python but needs `smbprotocol` (used at its raw
+    # layer).  Probed rather than assumed: without it every samba test would
+    # fail identically at import time, which reads as a broken suite rather
+    # than a missing dependency.
+    execute_process(COMMAND ${Python3_EXECUTABLE} -c "import smbprotocol"
+                    RESULT_VARIABLE HAVE_SMBPROTOCOL
+                    OUTPUT_QUIET ERROR_QUIET)
+
+    # Can we create a network namespace?  If not the tests still run,
+    # serialized on the host network.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        execute_process(
+            COMMAND bash -c "set -e; n=specs_netns_probe_$$; ip netns add \"$n\"; ip netns delete \"$n\""
+            RESULT_VARIABLE NETNS_PROBE OUTPUT_QUIET ERROR_QUIET)
+    else()
+        set(NETNS_PROBE 1)
+    endif()
+endif()
+
+if(NOT SPECS_SAMBA_TESTS)
+    message(STATUS
+        "samba MBT tests: not registered (specs is a subdirectory of "
+        "${CMAKE_PROJECT_NAME}; -DSPECS_SAMBA_TESTS=ON to register them)")
+elseif(NOT SMBD_BIN)
+    message(STATUS "samba MBT tests: disabled (smbd not found)")
+elseif(NOT HAVE_SMBPROTOCOL EQUAL 0)
+    message(STATUS "samba MBT tests: disabled "
+            "(python module 'smbprotocol' not installed)")
+else()
+    if(NETNS_PROBE EQUAL 0)
+        set(SAMBA_NETNS TRUE)
+        message(STATUS "samba MBT tests: enabled (${SMBD_BIN}, netns isolated)")
+    else()
+        set(SAMBA_NETNS FALSE)
+        message(STATUS "samba MBT tests: enabled (${SMBD_BIN}, no netns -- "
+                "serialized on the host network)")
+        if(REQUIRE_NETNS_TESTS)
+            message(FATAL_ERROR
+                "REQUIRE_NETNS_TESTS=ON but `ip netns add` failed (need "
+                "CAP_NET_ADMIN / root).  Run privileged, or drop the flag.")
+        endif()
+    endif()
+
+    # batch name | trace glob.  One per specs_gen batch above -- ALL of them,
+    # including the ones this harness cannot drive.  Those report a ctest SKIP
+    # (the replayer exits 77 when every trace in a batch needs a capability it
+    # does not implement), which keeps the gap visible and attributable to the
+    # harness instead of hiding it by not generating the traces.
+    set(SAMBA_BATCHES
+        "stepCore|smb2Base_stepCore_500_0x7_*.itf.json"
+        "stepReq|smb2Base_stepReq_500_0x11_*.itf.json"
+        "stepDir|smb2Base_stepDir_500_0x5_*.itf.json"
+        "stepInfo|smb2Base_stepInfo_500_0x9_*.itf.json"
+        "stepNs|smb2Base_stepNs_500_0xd_*.itf.json"
+        "leases|smb2Leases_stepLease_300_0x21_*.itf.json"
+        "forceL2|smb2ForceL2_stepLease_300_0x31_*.itf.json"
+        "durable|smb2Durable_stepDurable_300_0x41_*.itf.json"
+        "replay|smb2Replay_stepReplay_300_0x51_*.itf.json")
+
+    foreach(b ${SAMBA_BATCHES})
+        string(REPLACE "|" ";" parts "${b}")
+        list(GET parts 0 bname)
+        list(GET parts 1 bglob)
+        set(tname samba/smb2/${bname})
+        add_test(NAME ${tname}
+                 COMMAND ${SAMBA_HARNESS}/run_samba_mbt.sh ${T}/smb2 ${bglob})
+        # TIMEOUT: 8 traces at depth 240-500 against a real server, each
+        # resetting the share and reconnecting per session -- minutes, not
+        # seconds.  ENVIRONMENT hands the wrapper the smbd CMake resolved, so
+        # the test does not depend on /usr/sbin being on the invoking shell's
+        # PATH.  SKIP_RETURN_CODE lets the wrapper report "no samba here" as a
+        # ctest SKIP rather than a failure.
+        set_tests_properties(${tname} PROPERTIES
+            LABELS "samba;smb2;mbt"
+            TIMEOUT 1800
+            SKIP_RETURN_CODE 77
+            ENVIRONMENT "SMBD=${SMBD_BIN}")
+        if(NOT SAMBA_NETNS)
+            # No namespace to keep the instances apart, so only one smbd may
+            # own :445 at a time.
+            # ENVIRONMENT is a list property and setting it again would
+            # REPLACE the SMBD entry above, so append instead.
+            set_tests_properties(${tname} PROPERTIES
+                RESOURCE_LOCK samba_smb_port)
+            set_property(TEST ${tname} APPEND PROPERTY
+                ENVIRONMENT "SPECS_SAMBA_NO_NETNS=1")
+        endif()
+    endforeach()
+endif()

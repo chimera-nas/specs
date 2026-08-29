@@ -7,33 +7,78 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Pull through the internal mirrors, as chimera's workflows do.  Not a
+# connectivity requirement -- the ARC runners reach the public registries
+# fine -- but this image installs a Ubuntu base plus samba, node and a
+# toolchain on every run, and there is no reason to fetch all of that from the
+# internet each time.  The Dockerfile already takes both as ARGs and rewrites
+# its apt sources / base image from them; these are what feed it.  npm is not
+# mirrored (chimera has no npm proxy either), so quint still comes from the
+# public registry.
+env:
+  APT_MIRROR: http://repository.mdh.quantum.com/repository/pkgs/ubuntu
+  DOCKER_MIRROR: repository.mdh.quantum.com/
+
 jobs:
+  # Heavy: simulates every model to generate the corpus, then runs the coverage
+  # gates over it -- so it gets a full-size ARC runner.
+  #
+  # Everything runs INSIDE the devcontainer image rather than on the runner.
+  # The ARC runners are minimal hosts: they carry git and the runner itself and
+  # not much else -- no cmake, no node -- where the GitHub-hosted images this
+  # job used to run on came with a whole SDK preinstalled.  Rather than
+  # reassembling that toolchain on the host one setup-action at a time, use the
+  # image that already defines it: .devcontainer is exactly "the dependency set
+  # of cmake -B build && cmake --build build && ctest", pinned quint included.
+  # That also makes CI and a developer's container the same environment, so a
+  # green run here means the same thing locally.
   build:
-    runs-on: ubuntu-latest
+    runs-on: arc-amd64
     permissions:
       contents: read
       packages: write        # publish the trace bundle to GHCR
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install pinned quint
-        run: |
-          npm i -g "@informalsystems/quint@$(cat .quint-version)"
-          quint --version
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver: docker-container
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["repository.mdh.quantum.com:5001"]
 
+      - name: Build the devcontainer image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: .devcontainer/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: specs-dev:${{ github.sha }}
+          cache-from: type=registry,ref=repository.mdh.quantum.com:5004/cache/specs-dev:amd64
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=registry,ref=repository.mdh.quantum.com:5004/cache/specs-dev:amd64,mode=max' || '' }}
+          build-args: |
+            APT_MIRROR=${{ env.APT_MIRROR }}
+            DOCKER_MIRROR=${{ env.DOCKER_MIRROR }}
+
+      # On the host, not in the image: it is only needed to push the finished
+      # bundle, which the bind mount below leaves in the workspace.
       - name: Install oras
         uses: oras-project/setup-oras@v1
 
-      - name: Configure + build (generate traces; self-tests gate the build)
+      # -LE samba: the Samba conformance suite is the `samba` job's business and
+      # needs a live smbd; this job gates the corpus itself.
+      - name: Generate the corpus, gate it, and bundle it
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(nproc)"
-
-      - name: Coverage gates
-        run: ctest --test-dir build --output-on-failure
-
-      - name: Bundle
-        run: cmake --build build --target bundle
+          docker run --rm -v "$PWD:/specs" -w /specs specs-dev:${{ github.sha }} \
+            bash -c '
+              set -e
+              cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+              cmake --build build -j"$(nproc)"
+              ctest --test-dir build --output-on-failure -LE samba
+              cmake --build build --target bundle
+            '
 
       - name: Publish bundle to GHCR (main only, keyed by commit SHA)
         if: github.ref == 'refs/heads/main'
@@ -44,3 +89,71 @@ jobs:
           oras push "ghcr.io/chimera-nas/specs:${{ github.sha }}" \
               --annotation "org.opencontainers.image.source=https://github.com/chimera-nas/specs" \
               specs-traces.tar.gz:application/gzip
+
+  # Replay the generated SMB2 corpus against a real Samba server.  This is what
+  # keeps the models honest: a model developed alongside one implementation
+  # drifts toward it, and an unrelated server is the cheapest way to notice.
+  # Runs in its own job, in the devcontainer image (which carries Samba and the
+  # replay client), privileged because each test isolates its smbd in a network
+  # namespace so the batches can run concurrently on :445.
+  samba:
+    runs-on: arc-amd64
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver: docker-container
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["repository.mdh.quantum.com:5001"]
+
+      # Layers are cached in the internal registry, next to chimera's, rather
+      # than in GitHub's artifact/actions cache: the cache then lives beside the
+      # runners that use it instead of crossing the internet twice per run.
+      # cache-to only on main -- as chimera does -- so a PR can read the shared
+      # cache but never write to it.  load: true because the image is used by
+      # `docker run` in the steps below rather than pushed anywhere.
+      - name: Build the devcontainer image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: .devcontainer/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: specs-dev:${{ github.sha }}
+          cache-from: type=registry,ref=repository.mdh.quantum.com:5004/cache/specs-dev:amd64
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=registry,ref=repository.mdh.quantum.com:5004/cache/specs-dev:amd64,mode=max' || '' }}
+          build-args: |
+            APT_MIRROR=${{ env.APT_MIRROR }}
+            DOCKER_MIRROR=${{ env.DOCKER_MIRROR }}
+
+      - name: Generate the corpus
+        run: |
+          docker run --rm --privileged -v "$PWD:/specs" -w /specs specs-dev:${{ github.sha }} \
+            bash -c '
+              set -e
+              cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+              cmake --build build -j"$(nproc)"
+            '
+
+      # Split from generation so a replay failure is not buried under twenty
+      # minutes of trace generation, and run VERBOSE: each batch stands up its
+      # own smbd, and when something goes wrong at the process level the useful
+      # evidence is how far each script got, which --output-on-failure cannot
+      # show for a test that never completed.
+      - name: Replay the corpus against samba
+        run: |
+          docker run --rm --privileged -v "$PWD:/specs" -w /specs specs-dev:${{ github.sha }} \
+            bash -c '
+              ctest --test-dir build -L samba -V --no-tests=error -j 2
+              rc=$?
+              if [ "$rc" != 0 ]; then
+                echo "=== ctest exited $rc; LastTest.log ==="
+                tail -400 build/Testing/Temporary/LastTest.log 2>/dev/null || true
+              fi
+              exit $rc
+            '

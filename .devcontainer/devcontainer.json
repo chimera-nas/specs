@@ -1,0 +1,35 @@
+{
+        "name": "specs",
+        "build": {
+                "dockerfile": "Dockerfile",
+                "context": "..",
+                "args": {
+                        "DOCKER_MIRROR": "${localEnv:DOCKER_MIRROR}",
+                        "APT_MIRROR": "${localEnv:APT_MIRROR}"
+                }
+        },
+        "initializeCommand": "mkdir -p \"${localEnv:HOME}${localEnv:USERPROFILE}/.claude\"",
+        "containerEnv": {
+                "SPECS_BUILD_DIR": "/build"
+        },
+        "customizations": {
+                "vscode": {
+                        "settings": {},
+                        "extensions": [
+                                "ms-vscode.cmake-tools",
+                                "fredericbonnet.cmake-test-adapter",
+                                "ms-python.python",
+                                "anthropic.claude-code"
+                        ]
+                }
+        },
+        "mounts": [
+                "source=specs-build,target=/build,type=volume",
+                "source=${localEnv:HOME}${localEnv:USERPROFILE}/.claude,target=/root/.claude,type=bind,consistency=cached"
+        ],
+        "appPort": [],
+        "forwardPorts": [],
+        "privileged": true,
+        "workspaceMount": "source=${localWorkspaceFolder},target=/specs,type=bind",
+        "workspaceFolder": "/specs"
+}

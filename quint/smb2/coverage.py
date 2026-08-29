@@ -74,6 +74,10 @@ SHARE_PROFILES = ["-", "d", "r", "rd", "rw", "rwd", "w"]
 # the filesystem-core buckets it shares with `stepCore`.
 CACHING_FLAVORS = ("stepLease",)
 
+# Flavors that never build a compound message, so the compound buckets do not
+# apply to them.
+NON_COMPOUND_FLAVORS = ("stepReplay",)
+
 # Flavors whose whole point is the file/directory TYPE matrix and the
 # directory-handle I/O guard.  Without extra buckets a `stepDir` corpus that
 # stopped producing directories at all would still satisfy every generic
@@ -159,6 +163,15 @@ def scan(path, buckets):
         doc = json.load(f)
     states = doc["states"]
     key = last_op_key(states[0])
+    # The capability profile the corpus was generated under.  Some rules are
+    # conditional on a capability actually being advertised, and a bucket that
+    # can only be reached under a capability the instance turned off is not a
+    # coverage hole -- it is a requirement that does not apply.
+    init = states[0].get(key)
+    if init and init.get("tag") == "LInit":
+        for cap, on in init["value"]["caps"].items():
+            if on:
+                buckets["caps:" + cap] = True
     for st in states[1:]:
         lo = st.get(key)
         if not lo or lo.get("tag") != "LMsg":
@@ -305,7 +318,13 @@ def scan(path, buckets):
                     buckets["break:epoch_bump"] = True
 
 
-def required_buckets(flavor):
+def required_buckets(flavor, observed=None):
+    """Buckets this (instance, flavor) group must exercise.
+
+    `observed` is the group's own bucket set, used only for requirements that
+    are conditional on the capability profile the corpus was generated under.
+    """
+    observed = observed or {}
     req = []
     req += ["disp:" + d for d in DISPOSITIONS]
     req += ["acc:" + a for a in ACCESS_PROFILES]
@@ -318,7 +337,12 @@ def required_buckets(flavor):
     req += ["write:0x%08x" % ST_SUCCESS]
     req += ["close:0x%08x" % ST_SUCCESS]
     req += ["session:0x%08x" % ST_SUCCESS, "tree:0x%08x" % ST_SUCCESS]
-    req += ["compound:full", "compound:abort"]
+    # Compounds, but only for the flavors that build them.  stepReplay's whole
+    # purpose is stamping ChannelSequence and the REPLAY flag on ORDINARY
+    # singleton requests, so it draws no compound at all -- demanding one there
+    # would be demanding the flavor stop being itself.
+    if flavor not in NON_COMPOUND_FLAVORS:
+        req += ["compound:full", "compound:abort"]
     # Both arms of the truncating-open share check, and the attribute-only
     # bypass.  See the scan() comment: these are shapes, not statuses, and
     # they are what the M-1 / M-5 model defects got wrong.
@@ -331,8 +355,16 @@ def required_buckets(flavor):
         # 3.3.5.9.8 (STATUS_INVALID_PARAMETER, C-10).
         req += ["oplreq:" + o for o in ("OrNone", "OrLevelII", "OrExclusive",
                                         "OrBatch", "OrLease")]
-        req += ["lease:v1", "lease:v2", "grant:lease:-",
-                "cr_status:0x%08x" % ST_INVALID_PARAMETER]
+        req += ["lease:v1", "lease:v2", "grant:lease:-"]
+        # The lease-key-per-file binding (MS-SMB2 3.3.5.9.8) answers
+        # STATUS_INVALID_PARAMETER -- but only on a server that ADVERTISES
+        # leasing.  With leasing off the RqLs context is not processed at all,
+        # so the rule never fires and demanding the status here would require
+        # the model to invent it (which it used to, and which Samba caught as
+        # SD-6).  On a leases-off instance the rule is pinned by the
+        # smb2TestNoLease self-test instead, where it belongs.
+        if observed.get("caps:leases"):
+            req += ["cr_status:0x%08x" % ST_INVALID_PARAMETER]
     if flavor in DUR_FLAVORS:
         # The durable REQUEST, both versions, and both verdicts (granted /
         # refused -- probe D1's matrix boils down to that pair).
@@ -411,18 +443,32 @@ def required_buckets(flavor):
                                     "OrBatch", "OrLease")]
     req += ["lease:v1", "lease:v2"]
     # Grant shapes: the legacy levels and the lease states that matter.
-    req += ["grant:none", "grant:oplock:OpLevelII", "grant:oplock:OpExclusive",
-            "grant:oplock:OpBatch", "grant:lease:rwh", "grant:lease:rh"]
-    # A CREATE that had to park behind an ack-required break, and one that did
-    # not: without both, the async-interim path is untested in one direction.
-    req += ["park:0", "park:1"]
-    # Break notifications: both wire shapes, both acknowledgment requirements,
-    # and the cascade rungs RH (0x03), R (0x01) and NONE (0x00).
-    req += ["break:oplock", "break:lease", "break:ack:0", "break:ack:1",
-            "break:new:0x00", "break:new:0x01", "break:new:0x03"]
+    req += ["grant:none", "grant:oplock:OpLevelII"]
+    # A share carrying SMB2_SHAREFLAG_FORCE_LEVELII_OPLOCK caps every grant to
+    # a READ cache (MS-SMB2 2.2.10), so on such an instance an exclusive or
+    # batch oplock, a W- or H-carrying lease, and everything that follows from
+    # one -- an ack-required break, the parked open waiting behind it, the
+    # acknowledgment matrix -- are unreachable BY CONSTRUCTION, not starved.
+    # Requiring them there would demand the share flag stop working.  The
+    # capped instance is still gated on the read-cache lifecycle below.
+    if not observed.get("caps:forceLevel2"):
+        req += ["grant:oplock:OpExclusive", "grant:oplock:OpBatch",
+                "grant:lease:rwh", "grant:lease:rh"]
+        # A CREATE that had to park behind an ack-required break, and one that
+        # did not: without both, the async-interim path is untested in one
+        # direction.
+        req += ["park:0", "park:1"]
+        req += ["break:ack:1", "break:new:0x01", "break:new:0x03"]
+        # Acknowledgment outcomes, including the three rejections.  A break
+        # that needs no ack is never acknowledged, so with caching capped there
+        # is nothing here to exercise.
+        req += ["ack:0x%08x" % s for s in ACK_STATUSES]
+    else:
+        req += ["park:0"]
+    # Break notifications: both wire shapes, the no-ack requirement, and the
+    # NONE rung -- all reachable however the grant is capped.
+    req += ["break:oplock", "break:lease", "break:ack:0", "break:new:0x00"]
     req += ["break:epoch_bump"]
-    # Acknowledgment outcomes, including the three rejections.
-    req += ["ack:0x%08x" % s for s in ACK_STATUSES]
     return req
 
 
@@ -455,10 +501,10 @@ def main():
 
     rc = 0
     for gname, gtraces in groups.items():
-        required = required_buckets(gname.split("/", 1)[1])
         buckets = {}
         for t in gtraces:
             scan(t, buckets)
+        required = required_buckets(gname.split("/", 1)[1], buckets)
         missing = [b for b in required if b not in buckets]
         print("SMB2 MBT coverage for %s over %d trace(s):"
               % (gname, len(gtraces)))
