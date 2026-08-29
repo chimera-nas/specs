@@ -282,16 +282,28 @@ module smb2Test {
     // (MS-FSA 2.1.5.1.2; smb_proc_create.c's held_granted snapshot).
     run truncatingTakesWriteTest =
         boot2Run
-            // Client 1 holds "a" read-only and shares READ only, so it denies
-            // WRITE and DELETE to everyone else.
-            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_R,
-                                        SHARE_R, false, OrNone))))
+            // Seed "a" with one block, so a truncate is OBSERVABLE.  Without
+            // data every truncate is a no-op and the SD-7 assertion below --
+            // that a REFUSED truncating open did not truncate -- would hold
+            // vacuously.
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
             .expect(stAt(0) == ST_SUCCESS and asCreate(resAt(0)).fid == 0)
+            .then(runM(one(0, 0, CWrite({ fid: FidRef(0), off: 0, len: 1,
+                                          pat: 1 }))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .then(runM(one(0, 0, CClose(FidRef(0)))))
+            .expect(stAt(0) == ST_SUCCESS)
+            // Client 0 now holds "a" read-only and shares READ only, so it
+            // denies WRITE and DELETE to everyone else.
+            .then(runM(one(0, 0, create(ROOT, "a", DispOpen, ACCESS_R,
+                                        SHARE_R, false, OrNone))))
+            .expect(stAt(0) == ST_SUCCESS and asCreate(resAt(0)).fid == 1)
             // A read-only OPEN asserts no write, so it coexists.
             .then(runM(one(1, 1, create(ROOT, "a", DispOpen, ACCESS_R,
                                         SHARE_R, false, OrNone))))
-            .expect(stAt(0) == ST_SUCCESS and asCreate(resAt(0)).fid == 1)
-            .then(runM(one(1, 1, CClose(FidRef(1)))))
+            .expect(stAt(0) == ST_SUCCESS and asCreate(resAt(0)).fid == 2)
+            .then(runM(one(1, 1, CClose(FidRef(2)))))
             .expect(stAt(0) == ST_SUCCESS)
             // The SAME DesiredAccess with a truncating disposition asserts
             // WRITE and therefore collides with client 1's deny-W.  All three
@@ -305,29 +317,114 @@ module smb2Test {
             .then(runM(one(1, 1, create(ROOT, "a", DispSupersede, ACCESS_R,
                                         SHARE_R, false, OrNone))))
             .expect(stAt(0) == ST_SHARING_VIOLATION)
-            // An ATTRIBUTE-ONLY truncating open asserts nothing and imposes
-            // nothing: chimera zeroes granted/denied after adding the transient
-            // write bit when DesiredAccess carries no share-mode access at all.
+            // An ATTRIBUTE-ONLY open with a TRUNCATING disposition is NOT a
+            // stat open: the truncate is the only thing asserting write, and
+            // it asserts it just as much as an explicit FILE_WRITE_DATA would.
+            // So it collides with the deny-W peer exactly like the arms above.
+            // (This used to expect SUCCESS -- the share check was skipped for
+            // any attribute-only open, which discarded the very write bit
+            // wantOf() had just added.  Samba refuses it; SD-3.)
             .then(runM(one(1, 1, create(ROOT, "a", DispOverwriteIf,
                                         { r: false, w: false, h: true,
                                           d: false }, SHARE_NONE, false,
                                         OrNone))))
-            .expect(stAt(0) == ST_SUCCESS and asCreate(resAt(0)).fid == 2)
-            .then(runM(one(1, 1, CClose(FidRef(2)))))
+            .expect(stAt(0) == ST_SHARING_VIOLATION)
+            // ...and a REFUSED truncating open must not have truncated:
+            // "a" still holds the block client 0 wrote.  A failed open has no
+            // side effects (MS-FSA 2.1.5.1.2 arbitrates before it modifies).
+            // The model used to commit the disposition before the share check,
+            // so the refusal above silently emptied the file (SD-7).
+            .expect(sdb.fs.inodes.get(1).sizeBlocks == 1)
             // With the write-denying peer gone the truncating open succeeds --
             // and the write access it took for the CONFLICT CHECK is not
             // RETAINED: the handle still carries no write, so a WRITE through
             // it is ACCESS_DENIED.
-            .then(runM(one(0, 0, CClose(FidRef(0)))))
+            .then(runM(one(0, 0, CClose(FidRef(1)))))
             .expect(stAt(0) == ST_SUCCESS)
             .then(runM(one(1, 1, create(ROOT, "a", DispOverwriteIf, ACCESS_R,
                                         SHARE_R, false, OrNone))))
             .expect(stAt(0) == ST_SUCCESS and asCreate(resAt(0)).fid == 3)
             .expect(sdb.opens.get(3).granted.r and
                     not(sdb.opens.get(3).granted.w))
+            // NOW it truncated -- the open succeeded, so the disposition landed.
+            .expect(sdb.fs.inodes.get(1).sizeBlocks == 0)
             .then(runM(one(1, 1, CWrite({ fid: FidRef(3), off: 0, len: 1,
                                           pat: 1 }))))
             .expect(stAt(0) == ST_ACCESS_DENIED)
+
+    // The other half of a truncating open's participation: it asserts its
+    // ShareAccess against existing holders at OPEN time, but leaves no deny
+    // behind afterwards.  The two are genuinely different values -- the write
+    // it takes is transient, so once the handle exists it is an ordinary
+    // attribute-only handle and denies nobody.
+    run truncatingDenyIsOpenTimeOnlyTest =
+        boot2Run
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(stAt(0) == ST_SUCCESS and asCreate(resAt(0)).fid == 0)
+            // A peer holding READ and sharing everything.
+            .then(runM(one(0, 0, create(ROOT, "a", DispOpen, ACCESS_R,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(stAt(0) == ST_SUCCESS and asCreate(resAt(0)).fid == 1)
+            // An attribute-only TRUNCATING open that shares nothing collides
+            // with that peer's READ -- its ShareAccess is arbitrated.
+            .then(runM(one(1, 1, create(ROOT, "a", DispOverwriteIf, ACCESS_H,
+                                        SHARE_NONE, false, OrNone))))
+            .expect(stAt(0) == ST_SHARING_VIOLATION)
+            // The same open is fine while nothing else holds the file...
+            .then(runM(one(0, 0, CClose(FidRef(1)))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .then(runM(one(0, 0, CClose(FidRef(0)))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .then(runM(one(1, 1, create(ROOT, "a", DispOverwriteIf, ACCESS_H,
+                                        SHARE_NONE, false, OrNone))))
+            .expect(stAt(0) == ST_SUCCESS and asCreate(resAt(0)).fid == 2)
+            // ...and having taken it, it denies NOTHING: a reader gets in even
+            // though the truncating handle shared nothing.
+            .expect(sdb.opens.get(2).denied == { r: false, w: false, d: false })
+            .then(runM(one(0, 0, create(ROOT, "a", DispOpen, ACCESS_R,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(stAt(0) == ST_SUCCESS)
+
+    // A byte-range lock is a data operation and needs data access on the
+    // handle: neither a DELETE-only nor an attribute-only handle may take one
+    // (MS-SMB2 3.3.5.14).  The model used to perform no access check at all
+    // and granted both (samba conformance suite, SD-2).
+    run lockNeedsDataAccessTest =
+        bootRun
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .then(runM(one(0, 0, CLock({ fid: FidRef(0), lo: 0, hi: 2,
+                                         wr: true, unlock: false,
+                                         failImmediately: true }))))
+            .expect(stAt(0) == ST_SUCCESS)
+            // read-only is enough
+            .then(runM(one(0, 0, create(ROOT, "a", DispOpen, ACCESS_R,
+                                        SHARE_RWD, false, OrNone))))
+            .then(runM(one(0, 0, CLock({ fid: FidRef(1), lo: 4, hi: 5,
+                                         wr: false, unlock: false,
+                                         failImmediately: true }))))
+            .expect(stAt(0) == ST_SUCCESS)
+            // DELETE-only is not
+            .then(runM(one(0, 0, create(ROOT, "a", DispOpen, ACCESS_D,
+                                        SHARE_RWD, false, OrNone))))
+            .then(runM(one(0, 0, CLock({ fid: FidRef(2), lo: 5, hi: 6,
+                                         wr: true, unlock: false,
+                                         failImmediately: true }))))
+            .expect(stAt(0) == ST_ACCESS_DENIED)
+            // nor is attribute-only
+            .then(runM(one(0, 0, create(ROOT, "a", DispOpen, ACCESS_H,
+                                        SHARE_RWD, false, OrNone))))
+            .then(runM(one(0, 0, CLock({ fid: FidRef(3), lo: 5, hi: 6,
+                                         wr: true, unlock: false,
+                                         failImmediately: true }))))
+            .expect(stAt(0) == ST_ACCESS_DENIED)
+            // and the refusals took no lock: the range is still free
+            .then(runM(one(0, 0, CLock({ fid: FidRef(0), lo: 5, hi: 6,
+                                         wr: true, unlock: false,
+                                         failImmediately: true }))))
+            .expect(stAt(0) == ST_SUCCESS)
 
     // ------------------------------------------------------------------
     // Oplock/lease break lifecycle
@@ -816,7 +913,11 @@ module smb2Test {
 
     // FLUSH (MS-SMB2 3.3.5.13) has no observable effect in this model beyond
     // its status, which is exactly why the status must be pinned: a live
-    // handle succeeds, a FileId that names no open is STATUS_FILE_CLOSED.
+    // WRITABLE handle succeeds, a FileId that names no open is
+    // STATUS_FILE_CLOSED, and a handle without write access is
+    // STATUS_ACCESS_DENIED -- FLUSH is a write-side operation and needs the
+    // access to match, exactly as SET_INFO/EndOfFile does above.  The model
+    // used to answer SUCCESS on any live handle whatever its access (SD-1).
     run flushTest =
         bootRun
             .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RW,
@@ -824,6 +925,18 @@ module smb2Test {
             .expect(stAt(0) == ST_SUCCESS)
             .then(runM(one(0, 0, CFlush(FidRef(0)))))
             .expect(stAt(0) == ST_SUCCESS)
+            // a read-only handle on the same file may not flush it
+            .then(runM(one(0, 0, create(ROOT, "a", DispOpen, ACCESS_R,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .then(runM(one(0, 0, CFlush(FidRef(1)))))
+            .expect(stAt(0) == ST_ACCESS_DENIED)
+            // nor may an attribute-only one
+            .then(runM(one(0, 0, create(ROOT, "a", DispOpen, ACCESS_H,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .then(runM(one(0, 0, CFlush(FidRef(2)))))
+            .expect(stAt(0) == ST_ACCESS_DENIED)
             .then(runM(one(0, 0, CClose(FidRef(0)))))
             .expect(stAt(0) == ST_SUCCESS)
             .then(runM(one(0, 0, CFlush(FidRef(0)))))
@@ -2278,4 +2391,87 @@ module smb2TestNoDurable {
     // may appear anywhere along the walk.
     run noDurableWalkTest =
         init.then(60.reps(_ => all { inv, durableRespected, stepDurable }))
+}
+
+// A THIRD instance, with LEASES not advertised.
+//
+// It exists for the same reason smb2TestNoDurable does: `caps.leases` cannot
+// be shown to be load-bearing from inside smb2Test, which pins
+// F_LEASES = FeatMandatory.  The rule under test is the lease-key-to-file
+// binding (MS-SMB2 3.3.5.9.8).  The model used to enforce it whenever a
+// request merely CARRIED an RqLs context, which made a server that does no
+// leasing at all answer STATUS_INVALID_PARAMETER for a rebound key -- while a
+// real one (Samba with `leases = no`) ignores the context outright, as the
+// spec allows.  Deleting `acc.caps.leases` from that condition leaves every
+// smb2Test check passing and fails only here (samba conformance suite, SD-6).
+//
+// Run as its own `quint test --main=smb2TestNoLease` (see CMakeLists.txt).
+module smb2TestNoLease {
+    import nfs4fs.* from "../nfs/nfs4_fs"
+    import smb2state.* from "./smb2_state"
+    import smb2ops.* from "./smb2_ops"
+    import smb2(
+        DIALECT = 0x0311,
+        F_OPLOCKS = FeatOff,
+        F_LEASES = FeatOff,
+        F_DIRLEASE = FeatOff,
+        F_DURABLE = FeatOff,
+        P_LEASE_OPEN_BREAK = true,
+        P_FORCE_LEVEL2 = false
+    ).* from "./smb2"
+
+    def lastResults: List[Res] =
+        match lastOp {
+            | LMsg(l) => l.results
+            | LInit(_) => []
+        }
+
+    def resAt(i: int): Res = lastResults[i]
+    def stAt(i: int): int = stOf(resAt(i))
+
+    val noCreate: { st: int, fid: FileId, act: int, ino: Ino,
+                    caching: Caching, breaks: Set[BreakNote],
+                    parked: bool, durable: bool } =
+        { st: -1, fid: -1, act: -1, ino: -1, caching: CNone,
+          breaks: Set(), parked: false, durable: false }
+    def asCreate(r) =
+        match r { | RCreate(x) => x | _ => noCreate }
+
+    def leaseReq(k: int): OplockReq =
+        OrLease({ key: k, r: true, w: false, h: true, v2: false, epoch: 0 })
+
+    def createL(n: Name, d: Disposition, o: OplockReq): Cmd =
+        CCreate({ dir: ROOT, name: n, disp: d, access: ACCESS_RW,
+                  share: SHARE_RWD, isDir: false, delOnClose: false,
+                  oplock: o, durable: DurNone })
+
+    // The bare-RqLs reply: leasing is off, so the request is answered with a
+    // lease that caches NOTHING rather than with a grant.
+    def bareRqLs(c: Caching, k: int): bool =
+        match c {
+            | CLease(l) => l.key == k and l.st == BITS_NONE
+            | _ => false
+        }
+
+    // One lease key, two different files, one session.  With leasing
+    // advertised this is STATUS_INVALID_PARAMETER (MS-SMB2 3.3.5.9.8); with
+    // leasing off the binding rule does not apply at all, so both opens
+    // succeed and each is answered with the bare, cacheless RqLs reply.
+    run noLeaseKeyBindingTest =
+        init
+            .then(runM({ sess: -1, tree: -1, related: false, cs: 0,
+                         replay: false,
+                         cmds: [ CSessionSetup({ clientSym: 1 }) ] }))
+            .then(runM(one(0, -1, CTreeConnect({ share: 1 }))))
+            .then(runM(one(0, 0, createL("a", DispCreate, leaseReq(1)))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .expect(bareRqLs(asCreate(resAt(0)).caching, 1))
+            // the SAME key on a DIFFERENT file
+            .then(runM(one(0, 0, createL("b", DispCreate, leaseReq(1)))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .expect(bareRqLs(asCreate(resAt(0)).caching, 1))
+
+    // The whole request-matrix walk with caching off: no grant may appear.
+    run noLeaseWalkTest =
+        init.then(60.reps(_ => all { inv, stepReq }))
 }

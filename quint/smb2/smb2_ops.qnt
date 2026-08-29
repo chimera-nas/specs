@@ -1167,10 +1167,27 @@ module smb2ops {
                 // opener?", which is why it is inserted rather than skipped.
                 // Storing denyOf(share) here instead would let a stat-open with
                 // ShareAccess=NONE lock every later opener out.
-                val deny = if (attrOnly(x.access)) ACC_NONE
-                           else denyOf(x.share)
                 val trunc = truncating(x.disp)
                 val stat = statOpen(x.access, x.disp) and not(x.delOnClose)
+                // TWO deny values, because the open asserts one thing while it
+                // is being arbitrated and retains another once it is open.
+                //
+                // denyCheck is what this open asserts AGAINST existing holders.
+                // A truncating open is a full participant in both directions --
+                // it asserts WRITE (see wantOf) and it asserts its ShareAccess
+                // -- because it is going to modify the file.  Only a true STAT
+                // open (attribute-only AND non-truncating) is exempt.
+                //
+                // deny is what the open LEAVES BEHIND on the share entry, and
+                // there the attribute-only bypass is unconditional: the write
+                // was transient, so an attribute-only handle denies nothing to
+                // later openers however it was created.  Measured against
+                // Samba, which refuses a peer's read at open time and then
+                // admits the identical open once the truncating handle is
+                // established (samba conformance suite, SD-3).
+                val denyCheck = if (stat) ACC_NONE else denyOf(x.share)
+                val deny = if (attrOnly(x.access)) ACC_NONE
+                           else denyOf(x.share)
                 val selfKey = reqLeaseKey(x.oplock)
                 // A PARKED durable holder of this file is purged by any open
                 // that would have had to break it -- which is every open except
@@ -1183,16 +1200,34 @@ module smb2ops {
                 // Purged BEFORE the share check, as chimera does -- the parked
                 // handle must not contribute a sharing violation it is about to
                 // stop existing for.
-                val sdb0 = if (stat) acc.sdb
-                           else doPurgeParked(acc.sdb, dec.ino, want, deny)
-                val sdb1 = sdb0.with("fs", dec.fs2)
+                val sdb1 = if (stat) acc.sdb
+                           else doPurgeParked(acc.sdb, dec.ino, want, denyCheck)
+                // NOTE the filesystem effect of the disposition (dec.fs2) is
+                // deliberately NOT committed here.  A CREATE that goes on to
+                // be REFUSED must leave the file exactly as it found it, and a
+                // truncating disposition committed at this point survived into
+                // the failure arms below -- so a refused OVERWRITE still
+                // emptied the file (MS-FSA 2.1.5.1.2 runs the sharing check
+                // before it modifies anything).  Both sides answered
+                // STATUS_SHARING_VIOLATION, so nothing caught it until the
+                // reads that came after did.  dec.fs2 is now applied on the
+                // success path only, where the open is actually inserted.
+                // Found by the samba conformance suite as SD-7.
+                //
+                // Nothing between here and there needs the new filesystem:
+                // the purge, the break phases and the share check all read
+                // `opens` and `parked`, never `fs`.
+                //
                 // A lease key binds to exactly ONE file per client
                 // (MS-SMB2 3.3.5.9.8): reusing it on a different file is
-                // STATUS_INVALID_PARAMETER, not a second grant.  Checked after
-                // the open (so the disposition's create/truncate has already
-                // landed) and before any arbitration -- exactly where
-                // chimera_smb_session_lease_key_conflict sits.
-                if (selfKey >= 0 and
+                // STATUS_INVALID_PARAMETER, not a second grant.  Gated on the
+                // server actually ADVERTISING leases: the spec conditions RqLs
+                // processing on lease support, so a server with leasing off
+                // ignores the context outright and with it this rule -- which
+                // is what Samba does with `leases = no`, and what the model
+                // used to get wrong by keying off the mere presence of the
+                // context (samba conformance suite, SD-6).
+                if (acc.caps.leases and selfKey >= 0 and
                     sdb1.opens.keys().exists(g => {
                         val o = sdb1.opens.get(g)
                         o.session == acc.sess and
@@ -1224,8 +1259,17 @@ module smb2ops {
                                if (isLeaseGrant(a.opens.get(fid).caching)) a
                                else doAckBreak(a, fid, BITS_NONE))
                 // --- share reservation check (MS-FSA SharingViolation) -----
-                if (not(attrOnly(x.access)) and
-                    shareConflict(sdb2, dec.ino, want, deny)) {
+                // Skipped only for a true STAT open -- attribute-only AND
+                // non-truncating.  It used to be skipped for any
+                // attribute-only open, which threw away the whole point of
+                // `want`: wantOf() adds WRITE for a truncating disposition
+                // precisely so it can conflict with a peer that denies write,
+                // and the one case where the truncate is the ONLY source of
+                // that write was exactly the case that never arbitrated.  The
+                // model's own statOpen() already draws the line in the right
+                // place (samba conformance suite, SD-3).
+                if (not(stat) and
+                    shareConflict(sdb2, dec.ino, want, denyCheck)) {
                     val h2 = breakHolders(sdb2, dec.ino, -1, BITS_H, BITS_RW,
                                           false, selfKey, acc.sess)
                     val n2 = breakNotes(sdb2, dec.ino, h2, BITS_RW)
@@ -1239,7 +1283,10 @@ module smb2ops {
                          ST_SHARING_VIOLATION)
                 } else {
                     // --- insert the open ------------------------------------
-                    val ins = doInsertOpen(sdb2, acc.sess, acc.tree, dec.ino,
+                    // The disposition's create/truncate lands HERE, on the
+                    // success path, and nowhere else (see SD-7 above).
+                    val ins = doInsertOpen(sdb2.with("fs", dec.fs2),
+                        acc.sess, acc.tree, dec.ino,
                         x.dir, x.name,
                         { r: x.access.r, w: x.access.w, h: x.access.h,
                           d: x.access.d },
@@ -1473,6 +1520,14 @@ module smb2ops {
         val fid = resolveFid(acc, sel)
         if (not(acc.sdb.opens.keys().contains(fid)))
             emit(acc, RFlush({ st: ST_FILE_CLOSED }), ST_FILE_CLOSED)
+        // MS-SMB2 3.3.5.13: FLUSH is a WRITE-side operation and the handle
+        // must carry write access for it.  The model used to answer SUCCESS on
+        // any open handle, which made a flush through a read-only or
+        // attribute-only handle succeed; Samba refuses it, and so does Windows
+        // (FlushFileBuffers on a read-only handle fails ERROR_ACCESS_DENIED).
+        // Found by the samba conformance suite as SD-1.
+        else if (not(acc.sdb.opens.get(fid).granted.w))
+            emit(acc, RFlush({ st: ST_ACCESS_DENIED }), ST_ACCESS_DENIED)
         else
             emit(acc, RFlush({ st: ST_SUCCESS }), ST_SUCCESS)
     }
@@ -1481,6 +1536,15 @@ module smb2ops {
         val fid = resolveFid(acc, x.fid)
         if (not(acc.sdb.opens.keys().contains(fid)))
             emit(acc, RLock({ st: ST_FILE_CLOSED }), ST_FILE_CLOSED)
+        // MS-SMB2 3.3.5.14: a byte-range lock needs FILE_READ_DATA or
+        // FILE_WRITE_DATA on the handle.  The model used to perform no access
+        // check at all, so it granted locks on DELETE-only and attribute-only
+        // handles.  Samba refuses those -- though it answers
+        // STATUS_INVALID_HANDLE where the spec calls for STATUS_ACCESS_DENIED,
+        // which remains a recorded Samba deviation (SD-2).
+        else if (not(acc.sdb.opens.get(fid).granted.r) and
+                 not(acc.sdb.opens.get(fid).granted.w))
+            emit(acc, RLock({ st: ST_ACCESS_DENIED }), ST_ACCESS_DENIED)
         else {
             val o = acc.sdb.opens.get(fid)
             if (x.unlock)
