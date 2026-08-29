@@ -8,13 +8,23 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Heavy: installs quint and simulates every model to generate the corpus,
+  # then runs the coverage gates over it -- so it gets a full-size ARC runner.
   build:
-    runs-on: ubuntu-latest
+    runs-on: arc-amd64
     permissions:
       contents: read
       packages: write        # publish the trace bundle to GHCR
     steps:
       - uses: actions/checkout@v4
+
+      # Pin node rather than depending on whatever the runner image ships.  The
+      # GitHub-hosted images this job used to run on carry node preinstalled;
+      # the ARC images are not built to that same contract, and quint is an npm
+      # package, so a missing npm would fail this job at its first step.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
 
       - name: Install pinned quint
         run: |

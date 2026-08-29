@@ -9,8 +9,9 @@ on:
   pull_request:
 
 jobs:
+  # Light: a lint pass over the tree, no build -- a small ARC runner is plenty.
   reuse-lint:
-    runs-on: ubuntu-latest
+    runs-on: arc-small
 
     steps:
     - name: Checkout repository
@@ -23,10 +24,13 @@ jobs:
       with:
         python-version: '3.x'
 
+    # Through the internal PyPI proxy, as chimera's identical job does.  The
+    # public index is reachable from ARC; this is only so the same wheels are
+    # not refetched from the internet on every run.
     - name: Install reuse tool
       run: |
-        pip install --upgrade pip
-        pip install 'reuse[charset-normalizer]'
+        pip install --upgrade pip -i http://repository.mdh.quantum.com/repository/pypi-proxy/simple/ --trusted-host repository.mdh.quantum.com
+        pip install 'reuse[charset-normalizer]' -i http://repository.mdh.quantum.com/repository/pypi-proxy/simple/ --trusted-host repository.mdh.quantum.com
 
     - name: Run REUSE lint
       run: |
