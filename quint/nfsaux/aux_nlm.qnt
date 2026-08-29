@@ -138,14 +138,14 @@ module nlmProto {
         conflictsWith(held, probe).length() > 0
 
     /**
-     * The exact lock a request names, in the sense UNLOCK uses (RFC 1813
-     * A.6.4): owner + file + exact offset and length.  A client holding two
-     * non-overlapping ranges on one file with one owner needs the range to
-     * pick the right one.
+     * The exact lock a request names: owner + file + exact offset and
+     * length.  A repeat LOCK uses this to recognize an idempotent retry: a
+     * client holding two non-overlapping ranges on one file with one owner
+     * needs the range to pick the right one.
      *
-     * The mode is NOT part of the match -- neither UNLOCK nor a repeat LOCK
-     * carries a meaningful one for this purpose -- which has a consequence
-     * worth naming: a LOCK that names a range this owner already holds is
+     * The mode is NOT part of the match -- a repeat LOCK carries no
+     * meaningful one for this purpose -- which has a consequence worth
+     * naming: a LOCK that names a range this owner already holds is
      * answered GRANTED as an idempotent retry even when it asks for a
      * DIFFERENT mode, so an upgrade from shared to exclusive is a silent
      * no-op rather than a conflict test.  `upgradeIsNoop` says whether the
@@ -162,12 +162,29 @@ module nlmProto {
     pure def holdsExact(held: List[Lock], probe: Lock): bool =
         findExact(held, probe).length() > 0
 
-    pure def dropExact(held: List[Lock], probe: Lock): List[Lock] =
+    /// Containment, with 0 meaning to-EOF on either side: is
+    /// [aOff, aOff+aLen) inside [bOff, bOff+bLen)?
+    pure def rangeWithin(aOff: int, aLen: int, bOff: int,
+                         bLen: int): bool =
+        aOff >= bOff and
+        (bLen == 0 or (aLen != 0 and aOff + aLen <= bOff + bLen))
+
+    /**
+     * UNLOCK's reach: the owner's locks on the file that lie WITHIN the
+     * named range are released, not only an exactly-equal one -- every real
+     * client unlocks [0, to-EOF) at close(2) to drop whatever it still
+     * holds on the file, and an exact-match unlock would leave those locks
+     * (and the open handles pinning their files) held forever.
+     * Containment only: a lock straddling the range boundary would need a
+     * split, which the server under test does not implement and no known
+     * client emits.
+     */
+    pure def dropWithin(held: List[Lock], probe: Lock): List[Lock] =
         held.select(l => not(
             l.file == probe.file and
             sameOwner(l.owner, probe.owner) and
-            l.offset == probe.offset and
-            posixLen(l.wireLen) == posixLen(probe.wireLen)))
+            rangeWithin(l.offset, posixLen(l.wireLen),
+                        probe.offset, posixLen(probe.wireLen))))
 
     // ------------------------------------------------------------------
     // LOCK

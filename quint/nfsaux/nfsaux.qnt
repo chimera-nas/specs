@@ -592,7 +592,7 @@ module nfsaux {
     action nlmUnlock(msg: bool, l: Lock): bool = {
         val name = if (msg) "NLMPROC4_UNLOCK_MSG" else "NLMPROC4_UNLOCK"
         val runs = isRun(name)
-        val after = if (runs) dropExact(held, l) else held
+        val after = if (runs) dropWithin(held, l) else held
         val pumped = promoteBlocked(after, queue)
         all {
             services' = services,
