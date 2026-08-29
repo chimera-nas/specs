@@ -201,6 +201,15 @@ module nfs4ops {
         writeSame: bool,
         // RFC 7862 15.4 CLONE (reflink a byte range) supported.
         clone: bool,
+        // discretion: the granularity a server keeps layouts at.  true: one
+        // whole-file layout per (client, file) -- LAYOUTGET always grants
+        // [0, EOF) whatever range was asked for, and a LAYOUTRETURN4_FILE of
+        // any sub-range retires the whole thing (nothing is left to hold a
+        // stateid for, so lrs_present is false).  false: the server accounts
+        // for the returned range and keeps the remainder.  Both satisfy
+        // RFC 8881 12.5.3 / 18.44.3; whole-file is the simpler contract and
+        // the one a server that never stripes has any reason to implement.
+        layoutWholeFile: bool,
         // discretion: a conflicting op during delegation recall returns
         // NFS4ERR_DELAY (true) or blocks until the recall completes
         // (false).  Both are conformant (RFC 8881 10.4.4); only the DELAY
@@ -556,16 +565,24 @@ module nfs4ops {
         { ftype: nd.ftype, mode: nd.mode, nlink: nd.nlink,
           sizeBlocks: nd.sizeBlocks, change: nd.change }
 
-    // Inodes that must survive losing their last name: files with opens,
-    // delegations or layouts stay reachable through their filehandle until
-    // the state goes away (RFC 7530 16.26.5 / RFC 8881 18.25.4).
+    // Inodes that must survive losing their last name: a file with opens or
+    // delegations stays reachable through its filehandle until that state
+    // goes away (RFC 7530 16.26.5 / RFC 8881 18.25.4).
+    //
+    // A LAYOUT is deliberately NOT a pin.  It grants a client direct access to
+    // where the data lives, not a reference to the file: RFC 8881 has no rule
+    // keeping a removed file alive for one, and a client holding a layout must
+    // also hold an open to have obtained it.  A server that reaped the file at
+    // its last open would then answer PUTFH on the layout's filehandle with
+    // NFS4ERR_STALE, which is exactly what the layout stateid becoming stale
+    // means.  (Pinning here instead was a model-only assumption; it made the
+    // model expect a file to outlive its last open whenever a layout survived.)
     pure def pinnedInos(sdb: StateDB): Set[Ino] =
         sdb.opens.keys().map(s => sdb.opens.get(s).file)
             .union(sdb.delegs.keys().map(s => sdb.delegs.get(s).file))
-            .union(sdb.layouts.keys().map(s => sdb.layouts.get(s).file))
 
     // Reap an orphan once its last pin is gone (called after CLOSE /
-    // DELEGRETURN / final LAYOUTRETURN).
+    // DELEGRETURN).
     pure def maybeReap(fs: Fs, sdb: StateDB, f: Ino): Fs =
         if (fsLive(fs, f) and fsGet(fs, f).nlink == 0 and
             not(pinnedInos(sdb).contains(f)))
@@ -1055,7 +1072,14 @@ module nfs4ops {
                             val fs1 = fsResize(a.fs, a.cfh, ar.sizeBlocks)
                             val fs2 = if (ar.mode >= 0) fsChmod(fs1, a.cfh, ar.mode)
                                       else fs1
-                            emit(a.with("fs", fs2), SSetattr({ st: OK }))
+                            // A size change recalls every layout on the file
+                            // (see revokeLayoutsOn).  A layout is a pin, so
+                            // losing the last one can be what finally reaps an
+                            // unlinked-but-pinned file.
+                            val sdbR = revokeLayoutsOn(a.sdb, a.cfh)
+                            emit(a.with("fs", maybeReap(fs2, sdbR, a.cfh))
+                                  .with("sdb", sdbR),
+                                 SSetattr({ st: OK }))
                         }
                     | IoBypass =>
                         // READ-bypass acts as anonymous outside READ
@@ -1066,7 +1090,14 @@ module nfs4ops {
                             val fs1 = fsResize(a.fs, a.cfh, ar.sizeBlocks)
                             val fs2 = if (ar.mode >= 0) fsChmod(fs1, a.cfh, ar.mode)
                                       else fs1
-                            emit(a.with("fs", fs2), SSetattr({ st: OK }))
+                            // A size change recalls every layout on the file
+                            // (see revokeLayoutsOn).  A layout is a pin, so
+                            // losing the last one can be what finally reaps an
+                            // unlinked-but-pinned file.
+                            val sdbR = revokeLayoutsOn(a.sdb, a.cfh)
+                            emit(a.with("fs", maybeReap(fs2, sdbR, a.cfh))
+                                  .with("sdb", sdbR),
+                                 SSetattr({ st: OK }))
                         }
                     | IoState(s) =>
                         if (not(bitsOverlap(ioMode(a, io), 2)))
@@ -1075,7 +1106,14 @@ module nfs4ops {
                             val fs1 = fsResize(a.fs, a.cfh, ar.sizeBlocks)
                             val fs2 = if (ar.mode >= 0) fsChmod(fs1, a.cfh, ar.mode)
                                       else fs1
-                            emit(a.with("fs", fs2), SSetattr({ st: OK }))
+                            // A size change recalls every layout on the file
+                            // (see revokeLayoutsOn).  A layout is a pin, so
+                            // losing the last one can be what finally reaps an
+                            // unlinked-but-pinned file.
+                            val sdbR = revokeLayoutsOn(a.sdb, a.cfh)
+                            emit(a.with("fs", maybeReap(fs2, sdbR, a.cfh))
+                                  .with("sdb", sdbR),
+                                 SSetattr({ st: OK }))
                         }
                 }
             } else if (ar.mode >= 0)
@@ -2146,6 +2184,12 @@ module nfs4ops {
         else {
             val g = fhGate(a)
             if (g != OK) emit(a, SLayoutreturn(nores.with("st", g)))
+            else if (ar.argSeq == 0)
+                // RFC 8881 18.44.3: a LAYOUTRETURN4_FILE stateid's seqid
+                // MUST NOT be zero.  This is the one place a zero seqid is
+                // NOT the "current stateid" wildcard checkSid otherwise
+                // models, so the check has to come before it.
+                emit(a, SLayoutreturn(nores.with("st", E_BAD_STATEID)))
             else if (not(sidLive(a.sdb, ar.sid, KLayout)))
                 emit(a, SLayoutreturn(nores.with("st", E_BAD_STATEID)))
             else {
@@ -2157,7 +2201,8 @@ module nfs4ops {
                         // Returning an unheld range is success, not an
                         // error (RFC 8881 18.44.3).
                         val f = a.sdb.layouts.get(ar.sid).file
-                        val r = doLayoutReturn(a.sdb, ar.sid, ar.lo, ar.hi)
+                        val r = doLayoutReturn(a.sdb, ar.sid, ar.lo, ar.hi,
+                                               a.caps.layoutWholeFile)
                         emit(a.with("sdb", r.sdb2)
                               .with("fs", maybeReap(a.fs, r.sdb2, f)),
                              SLayoutreturn({ st: OK, present: r.remains,
@@ -2184,15 +2229,27 @@ module nfs4ops {
                 emit(a, SLayoutcommit(nores.with("st", E_BAD_STATEID)))
             else {
                 val l = a.sdb.layouts.get(ar.sid)
-                val overlapRw = range(ar.lo, ar.hi).foldl(false, (acc, b) =>
-                    acc or (l.blocks.keys().contains(b) and l.blocks.get(b)))
+                // A server holding one whole-file layout has no per-range
+                // accounting to consult (caps.layoutWholeFile): the layout
+                // either covers writes or it does not, and lo/hi say nothing.
+                val overlapRw = if (a.caps.layoutWholeFile)
+                                    l.blocks.keys().exists(b => l.blocks.get(b))
+                                else
+                                    range(ar.lo, ar.hi).foldl(false, (acc, b) =>
+                                        acc or (l.blocks.keys().contains(b)
+                                                and l.blocks.get(b)))
+                // loca_last_write_offset is how far the client wrote through
+                // the layout, not a truncate: it extends the file and never
+                // shrinks it (RFC 8881 18.42.3).  The harness reports the last
+                // byte of [lo, hi), so the commit's high-water mark is hi.
+                val newSize = imax(fsGet(a.fs, l.file).sizeBlocks, ar.hi)
                 if (l.file != a.cfh)
                     emit(a, SLayoutcommit(nores.with("st", E_BAD_STATEID)))
                 else if (not(overlapRw))
                     emit(a, SLayoutcommit(nores.with("st", E_BADLAYOUT)))
                 else
-                    emit(a, SLayoutcommit({ st: OK,
-                        newSizeBlocks: fsGet(a.fs, l.file).sizeBlocks }))
+                    emit(a.with("fs", fsResize(a.fs, l.file, newSize)),
+                         SLayoutcommit({ st: OK, newSizeBlocks: newSize }))
             }
         }
     }
@@ -2684,7 +2741,8 @@ module nfs4ops {
           xattr: xattr, sparse: sparse, copy: copyOk,
           readPlus: copyOk, ioAdvise: copyOk, writeSame: copyOk,
           clone: copyOk,
-          conflictDelays: true, closeFreesLocks: true }
+          conflictDelays: true, closeFreesLocks: true,
+          layoutWholeFile: true }
 
     // Evaluate a whole COMPOUND.  reqTag identifies the request for the
     // 4.1 SEQUENCE replay/false-retry classification.

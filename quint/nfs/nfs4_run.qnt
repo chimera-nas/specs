@@ -29,7 +29,8 @@ module nfs4Default {
         F_WRITE_SAME = FeatIfAdvertised,
         F_CLONE = FeatIfAdvertised,
         P_CONFLICT_DELAYS = true,
-        P_CLOSE_FREES_LOCKS = true
+        P_CLOSE_FREES_LOCKS = true,
+        P_LAYOUT_WHOLE_FILE = true
     ).* from "./nfs4"
 }
 
@@ -49,7 +50,8 @@ module nfs4V40 {
         F_WRITE_SAME = FeatOff,
         F_CLONE = FeatOff,
         P_CONFLICT_DELAYS = true,
-        P_CLOSE_FREES_LOCKS = true
+        P_CLOSE_FREES_LOCKS = true,
+        P_LAYOUT_WHOLE_FILE = true
     ).* from "./nfs4"
 }
 
@@ -69,7 +71,8 @@ module nfs4V41 {
         F_WRITE_SAME = FeatOff,
         F_CLONE = FeatOff,
         P_CONFLICT_DELAYS = true,
-        P_CLOSE_FREES_LOCKS = true
+        P_CLOSE_FREES_LOCKS = true,
+        P_LAYOUT_WHOLE_FILE = true
     ).* from "./nfs4"
 }
 
@@ -111,7 +114,8 @@ module nfs4Memfs42 {
         F_WRITE_SAME = FeatMandatory,
         F_CLONE = FeatMandatory,
         P_CONFLICT_DELAYS = true,
-        P_CLOSE_FREES_LOCKS = true
+        P_CLOSE_FREES_LOCKS = true,
+        P_LAYOUT_WHOLE_FILE = true
     ).* from "./nfs4"
 }
 
@@ -135,7 +139,8 @@ module nfs4Memfs42Deleg {
         F_WRITE_SAME = FeatMandatory,
         F_CLONE = FeatMandatory,
         P_CONFLICT_DELAYS = true,
-        P_CLOSE_FREES_LOCKS = true
+        P_CLOSE_FREES_LOCKS = true,
+        P_LAYOUT_WHOLE_FILE = true
     ).* from "./nfs4"
 }
 
@@ -154,7 +159,8 @@ module nfs4Memfs41Deleg {
         F_WRITE_SAME = FeatOff,
         F_CLONE = FeatOff,
         P_CONFLICT_DELAYS = true,
-        P_CLOSE_FREES_LOCKS = true
+        P_CLOSE_FREES_LOCKS = true,
+        P_LAYOUT_WHOLE_FILE = true
     ).* from "./nfs4"
 }
 
@@ -173,7 +179,8 @@ module nfs4Memfs41 {
         F_WRITE_SAME = FeatOff,
         F_CLONE = FeatOff,
         P_CONFLICT_DELAYS = true,
-        P_CLOSE_FREES_LOCKS = true
+        P_CLOSE_FREES_LOCKS = true,
+        P_LAYOUT_WHOLE_FILE = true
     ).* from "./nfs4"
 }
 
@@ -192,7 +199,53 @@ module nfs4Memfs40 {
         F_WRITE_SAME = FeatOff,
         F_CLONE = FeatOff,
         P_CONFLICT_DELAYS = true,
-        P_CLOSE_FREES_LOCKS = true
+        P_CLOSE_FREES_LOCKS = true,
+        P_LAYOUT_WHOLE_FILE = true
+    ).* from "./nfs4"
+}
+
+// pNFS profiles.  These are the memfs instances with F_PNFS turned on:
+// the server under test is a metadata server, so failing to advertise pNFS
+// (EXCHGID4_FLAG_USE_PNFS_MDS) is a failure rather than a skip.  Delegations
+// stay off for the same reason they are off in the plain instances -- the
+// replay harness has no callback servicer that satisfies the grant probe.
+module nfs4Pnfs42 {
+    import nfs4ops.* from "./nfs4_ops"
+    import nfs4(
+        MINOR = 2,
+        F_PNFS = FeatMandatory,
+        F_READ_DELEG = FeatOff,
+        F_WRITE_DELEG = FeatOff,
+        F_XATTR = FeatMandatory,
+        F_SPARSE = FeatMandatory,
+        F_COPY = FeatMandatory,
+        F_READ_PLUS = FeatMandatory,
+        F_IO_ADVISE = FeatMandatory,
+        F_WRITE_SAME = FeatMandatory,
+        F_CLONE = FeatMandatory,
+        P_CONFLICT_DELAYS = true,
+        P_CLOSE_FREES_LOCKS = true,
+        P_LAYOUT_WHOLE_FILE = true
+    ).* from "./nfs4"
+}
+
+module nfs4Pnfs41 {
+    import nfs4ops.* from "./nfs4_ops"
+    import nfs4(
+        MINOR = 1,
+        F_PNFS = FeatMandatory,
+        F_READ_DELEG = FeatOff,
+        F_WRITE_DELEG = FeatOff,
+        F_XATTR = FeatOff,
+        F_SPARSE = FeatOff,
+        F_COPY = FeatOff,
+        F_READ_PLUS = FeatOff,
+        F_IO_ADVISE = FeatOff,
+        F_WRITE_SAME = FeatOff,
+        F_CLONE = FeatOff,
+        P_CONFLICT_DELAYS = true,
+        P_CLOSE_FREES_LOCKS = true,
+        P_LAYOUT_WHOLE_FILE = true
     ).* from "./nfs4"
 }
 
@@ -213,7 +266,8 @@ module nfs4PnfsMandatory {
         F_WRITE_SAME = FeatIfAdvertised,
         F_CLONE = FeatIfAdvertised,
         P_CONFLICT_DELAYS = true,
-        P_CLOSE_FREES_LOCKS = true
+        P_CLOSE_FREES_LOCKS = true,
+        P_LAYOUT_WHOLE_FILE = true
     ).* from "./nfs4"
 }
 
@@ -235,6 +289,7 @@ module nfs4AllMandatory {
         F_WRITE_SAME = FeatMandatory,
         F_CLONE = FeatMandatory,
         P_CONFLICT_DELAYS = true,
-        P_CLOSE_FREES_LOCKS = true
+        P_CLOSE_FREES_LOCKS = true,
+        P_LAYOUT_WHOLE_FILE = true
     ).* from "./nfs4"
 }

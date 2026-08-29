@@ -28,7 +28,8 @@ module nfs4Test42 {
         F_WRITE_SAME = FeatMandatory,
         F_CLONE = FeatMandatory,
         P_CONFLICT_DELAYS = true,
-        P_CLOSE_FREES_LOCKS = true
+        P_CLOSE_FREES_LOCKS = true,
+        P_LAYOUT_WHOLE_FILE = true
     ).* from "./nfs4"
 
     def lastStatus: int =
@@ -82,6 +83,12 @@ module nfs4Test42 {
         match r {
             | SLayoutreturn(x) => x
             | _ => { st: -999, present: false, seq: 0 }
+        }
+
+    def asLayoutcommit(r) =
+        match r {
+            | SLayoutcommit(x) => x
+            | _ => { st: -999, newSizeBlocks: -1 }
         }
 
     // The session bootstrap used by every 4.1/4.2 test: EXCHANGE_ID
@@ -552,20 +559,72 @@ module nfs4Test42 {
                                       sel: SelRef({ sid: 2, kind: KLayout,
                                                     argSeq: 0 }) }) ]))
             .expect(lastStatus == OK and asLayoutget(resAt(2)).seq == 2)
-            // LAYOUTCOMMIT over a held RW range.
+            // LAYOUTCOMMIT over a held RW range: it publishes the client's
+            // high-water mark, so the file grows to it.
             .then(runC([ seq0(5), RPutfh(1),
                          RLayoutcommit({ sid: 2, lo: 0, hi: 2 }) ]))
             .expect(lastStatus == OK)
-            // Partial return keeps the stateid (lrs_present).
+            .expect(asLayoutcommit(resAt(2)).newSizeBlocks == 2)
+            .expect(fsGet(fs, 1).sizeBlocks == 2)
+            // ... and never shrinks it: a commit below the current size
+            // reports the size unchanged.
             .then(runC([ seq0(6), RPutfh(1),
-                         RLayoutreturn({ sid: 2, argSeq: 0, lo: 0, hi: 3 }) ]))
-            .expect(lastStatus == OK and asLayoutreturn(resAt(2)).present)
-            // Returning the rest retires it.
+                         RLayoutcommit({ sid: 2, lo: 0, hi: 1 }) ]))
+            .expect(lastStatus == OK)
+            .expect(asLayoutcommit(resAt(2)).newSizeBlocks == 2)
+            .expect(fsGet(fs, 1).sizeBlocks == 2)
+            // A zero seqid is the "current stateid" wildcard everywhere
+            // else, but NOT on LAYOUTRETURN4_FILE (RFC 8881 18.44.3).
             .then(runC([ seq0(7), RPutfh(1),
-                         RLayoutreturn({ sid: 2, argSeq: 0, lo: 3, hi: 6 }) ]))
+                         RLayoutreturn({ sid: 2, argSeq: 0, lo: 0, hi: 3 }) ]))
+            .expect(lastStatus == E_BAD_STATEID)
+            .expect(sdb.layouts.keys().size() == 1)
+            // A stale seqid is OLD_STATEID.
+            .then(runC([ seq0(8), RPutfh(1),
+                         RLayoutreturn({ sid: 2, argSeq: 1, lo: 0, hi: 3 }) ]))
+            .expect(lastStatus == E_OLD_STATEID)
+            // This profile is layoutWholeFile: there is one whole-file
+            // layout, so returning any sub-range of it retires all of it.
+            .then(runC([ seq0(9), RPutfh(1),
+                         RLayoutreturn({ sid: 2, argSeq: 2, lo: 0, hi: 3 }) ]))
             .expect(lastStatus == OK and not(asLayoutreturn(resAt(2)).present))
             .expect(sdb.layouts.keys().size() == 0)
             // LAYOUTCOMMIT with no layout -> BAD_STATEID (freed sid).
+            .then(runC([ seq0(10), RPutfh(1),
+                         RLayoutcommit({ sid: 2, lo: 0, hi: 1 }) ]))
+            .expect(lastStatus == E_BAD_STATEID)
+
+    // A read-only layout carries no writes to publish, so LAYOUTCOMMIT
+    // against one is NFS4ERR_BADLAYOUT (RFC 8881 18.42.3) -- and a SETATTR
+    // that changes size revokes every layout on the file (12.5.5).
+    run layoutReadOnlyCommitTest =
+        openCreateRun
+            .then(runC([ seq0(2), RPutfh(1),
+                         RDelegreturn({ sid: 1, kind: KDeleg, argSeq: 0 }) ]))
+            .then(runC([ seq0(3), RPutfh(1),
+                         RLayoutget({ rw: false, lo: 0, hi: 4,
+                                      sel: SelRef({ sid: 0, kind: KOpen,
+                                                    argSeq: 0 }) }) ]))
+            .expect(lastStatus == OK)
+            .then(runC([ seq0(4), RPutfh(1),
+                         RLayoutcommit({ sid: 2, lo: 0, hi: 2 }) ]))
+            .expect(lastStatus == E_BADLAYOUT)
+            // Widening the same layout to RW makes the commit legal.
+            .then(runC([ seq0(5), RPutfh(1),
+                         RLayoutget({ rw: true, lo: 0, hi: 4,
+                                      sel: SelRef({ sid: 2, kind: KLayout,
+                                                    argSeq: 0 }) }) ]))
+            .expect(lastStatus == OK)
+            .then(runC([ seq0(6), RPutfh(1),
+                         RLayoutcommit({ sid: 2, lo: 0, hi: 2 }) ]))
+            .expect(lastStatus == OK)
+            // A size change recalls and revokes it.
+            .then(runC([ seq0(7), RPutfh(1),
+                         RSetattr({ mode: -1, sizeBlocks: 1,
+                                    sel: SelRef({ sid: 0, kind: KOpen,
+                                                  argSeq: 0 }) }) ]))
+            .expect(lastStatus == OK)
+            .expect(sdb.layouts.keys().size() == 0)
             .then(runC([ seq0(8), RPutfh(1),
                          RLayoutcommit({ sid: 2, lo: 0, hi: 1 }) ]))
             .expect(lastStatus == E_BAD_STATEID)
@@ -798,7 +857,8 @@ module nfs4Test40 {
         F_WRITE_SAME = FeatOff,
         F_CLONE = FeatOff,
         P_CONFLICT_DELAYS = true,
-        P_CLOSE_FREES_LOCKS = true
+        P_CLOSE_FREES_LOCKS = true,
+        P_LAYOUT_WHOLE_FILE = true
     ).* from "./nfs4"
 
     def lastStatus: int =

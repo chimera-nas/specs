@@ -780,11 +780,16 @@ module nfs4state {
     // away; if nothing remains the layout stateid is retired and the next
     // LAYOUTGET starts over, otherwise the seqid advances and the stateid
     // stays valid.
-    pure def doLayoutReturn(sdb: StateDB, sid: Sid, lo: int, hi: int):
+    // whole == the server's layoutWholeFile policy (see Caps): it holds one
+    // whole-file layout, so a LAYOUTRETURN4_FILE of any sub-range leaves it
+    // nothing to keep and the layout is retired outright.
+    pure def doLayoutReturn(sdb: StateDB, sid: Sid, lo: int, hi: int,
+                            whole: bool):
             { sdb2: StateDB, remains: bool, seq: int } = {
         val l = sdb.layouts.get(sid)
-        val kept = l.blocks.keys().filter(b => b < lo or b >= hi)
-            .mapBy(b => l.blocks.get(b))
+        val kept = if (whole) Map()
+                   else l.blocks.keys().filter(b => b < lo or b >= hi)
+                         .mapBy(b => l.blocks.get(b))
         if (kept.keys().size() == 0)
             { sdb2: sdb.with("layouts", smapDrop(sdb.layouts, sid))
                        .with("freedSids", sdb.freedSids.union(Set(sid))),
@@ -794,6 +799,19 @@ module nfs4state {
                   .with("blocks", kept)
                   .with("seq", x.seq + 1))),
               remains: true, seq: l.seq + 1 }
+    }
+
+    // A size change conflicts with every outstanding layout for the file, so
+    // the server recalls them from all holders before applying it (RFC 8881
+    // 12.5.5).  A client that declines the recall -- it holds nothing it needs
+    // to flush, or cannot answer out of band -- leaves the server no choice but
+    // to revoke, which is what this models: after a SETATTR that sets size,
+    // no layout on that file survives, and every one of their stateids is
+    // freed (so a later use is BAD_STATEID, not a silent success).
+    pure def revokeLayoutsOn(sdb: StateDB, f: Ino): StateDB = {
+        val doomed = sdb.layouts.keys().filter(s => sdb.layouts.get(s).file == f)
+        sdb.with("layouts", doomed.fold(sdb.layouts, (m, s) => smapDrop(m, s)))
+           .with("freedSids", sdb.freedSids.union(doomed))
     }
 
     // ------------------------------------------------------------------

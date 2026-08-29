@@ -51,8 +51,13 @@ module nfs4 {
     //    NFS4ERR_DELAY while the recall is outstanding (vs blocking).
     //  - P_CLOSE_FREES_LOCKS: CLOSE with live byte-range locks frees them
     //    (vs NFS4ERR_LOCKS_HELD).
+    //  - P_LAYOUT_WHOLE_FILE: the server keeps one whole-file layout per
+    //    (client, file), so a LAYOUTRETURN of a sub-range retires all of it
+    //    and LAYOUTCOMMIT ignores the committed range (vs per-range
+    //    accounting).
     const P_CONFLICT_DELAYS: bool
     const P_CLOSE_FREES_LOCKS: bool
+    const P_LAYOUT_WHOLE_FILE: bool
 
     // ------------------------------------------------------------------
     // Bounded universes
@@ -166,7 +171,8 @@ module nfs4 {
             writeSame: cWs and MINOR >= 2,
             clone: cCl and MINOR >= 2,
             conflictDelays: P_CONFLICT_DELAYS,
-            closeFreesLocks: P_CLOSE_FREES_LOCKS
+            closeFreesLocks: P_CLOSE_FREES_LOCKS,
+            layoutWholeFile: P_LAYOUT_WHOLE_FILE
         }
         all {
             // ref: in-memory share roots are 0777; the root mode is not
@@ -383,8 +389,15 @@ module nfs4 {
     def usableDelegs: Set[Sid] =
         sdb.delegs.keys().filter(s => clientUsable(sdb.delegs.get(s).client))
 
+    // Layouts do not pin their file (see pinnedInos), so one can outlive the
+    // inode it describes.  Such a layout is unusable for generation: reaching
+    // it means a PUTFH of a removed ino, and the model deliberately leaves the
+    // position of that STALE open -- PUTFH may report it or defer to the first
+    // use (R-CORE-102) -- so the generator must not present one.
     def usableLayouts: Set[Sid] =
-        sdb.layouts.keys().filter(s => clientUsable(sdb.layouts.get(s).client))
+        sdb.layouts.keys().filter(s =>
+            clientUsable(sdb.layouts.get(s).client) and
+            fsLive(fs, sdb.layouts.get(s).file))
 
     def openSel(s: Sid): SidSel =
         SelRef({ sid: s, kind: KOpen, argSeq: 0 })
@@ -1436,6 +1449,10 @@ module nfs4 {
         },
     }
 
+    // The presented seqid is drawn from {current, stale, zero}: current is
+    // the ordinary return, and the other two are the two rejections a layout
+    // stateid has that no other stateid does (RFC 8881 12.5.3 / 18.44.3), so
+    // both are worth reaching.
     action pnfsLayoutreturn = all {
         MINOR >= 1,
         usableLayouts.size() > 0,
@@ -1444,9 +1461,11 @@ module nfs4 {
             val l = sdb.layouts.get(s)
             nondet lo = oneOf(0.to(MAX_BLOCKS - 1))
             nondet len = oneOf(1.to(MAX_BLOCKS))
+            nondet k = oneOf(0.to(6))
+            val sq = if (k < 5) l.seq else if (k == 5) l.seq - 1 else 0
             runC(withSess(l.client,
                 [ RPutfh(l.file),
-                  RLayoutreturn({ sid: s, argSeq: 0, lo: lo,
+                  RLayoutreturn({ sid: s, argSeq: sq, lo: lo,
                                   hi: imin(lo + len, MAX_BLOCKS) }) ]))
         },
     }
@@ -1466,8 +1485,17 @@ module nfs4 {
         },
     }
 
+    // GETDEVICEINFO takes a deviceid4, and the only way a client learns one
+    // is from a layout it already holds (RFC 8881 12.2.10 / 18.40): there is
+    // no "enumerate the devices" op a client may rely on (GETDEVICELIST is
+    // deprecated).  So against a pNFS server this is only reachable once some
+    // layout exists -- that is when a harness driving a real MDS has a real
+    // deviceid to send.  Against a server without pNFS the deviceid is never
+    // looked at: the op is rejected as unsupported first, and that rejection
+    // is worth generating, so the gate applies only where pNFS is on.
     action pnfsDeviceinfo = all {
         MINOR >= 1,
+        not(caps.pnfs) or sdb.layouts.keys().size() > 0,
         readyClients.size() > 0,
         {
             nondet c = oneOf(readyClients)
@@ -1910,6 +1938,24 @@ module nfs4 {
         delegReturn, delegReturn, delegReturn, delegReturn,
         closeOpen, closeOpen,
         nsGetattr, nsGetattr,
+    }
+
+    // pNFS-focused: the layout lifecycle (get / return / commit /
+    // deviceinfo) against the opens and namespace churn that create and
+    // invalidate layouts.  LAYOUTGET is weighted up because every other
+    // layout op needs a layout to exist first, and the file set is small so
+    // the two clients collide on the same files routinely -- which is where
+    // layout recall and cross-client stateid handling live.
+    action stepPnfs = any {
+        setupExchangeId, setupCreateSession,
+        reclaimComplete,
+        nsCreate, nsRemove, nsGetattr,
+        openNew, openNew, openFh, closeOpen,
+        pnfsLayoutget, pnfsLayoutget, pnfsLayoutget, pnfsLayoutget,
+        pnfsLayoutreturn, pnfsLayoutreturn,
+        pnfsLayoutcommit, pnfsLayoutcommit,
+        pnfsDeviceinfo, pnfsDeviceinfo,
+        ioRead, ioWrite, ioCommit, ioSetattrSize,
     }
 
     // Data-path heavy: I/O, sparse ops, copies, layouts.
