@@ -61,10 +61,22 @@ module smb2state {
     // granted and broken with epoch 0 (smb_proc_create.c `grant->is_v2`,
     // smb_proc_oplock_break.c "a v1 lease breaks with epoch 0"; pinned by the
     // ground-truth probe section O9).
+    //
+    // `grant` says whether this lease is a real GRANT or a bare RqLs reply.
+    // The two look identical once a lease is at state NONE, and they are not:
+    // a lease that held caching and was broken to NONE still EXISTS -- it is
+    // still bound to its key, and a later open under that key joins it -- while
+    // a bare RqLs (leasing not advertised, or a W/H-without-R request) never
+    // established anything and binds nothing.  chimera draws exactly this line
+    // by only creating a grant object when the open actually asks for caching
+    // bits (smb_proc_create.c, `req_vfs != 0`); without the flag the model
+    // cannot tell the two apart and gets the lease-key binding wrong in one
+    // direction or the other.
     type Caching =
         | CNone
         | COplock(OplockLevel)
-        | CLease({ key: LeaseKey, st: LeaseState, epoch: int, v2: bool })
+        | CLease({ key: LeaseKey, st: LeaseState, epoch: int, v2: bool,
+                   grant: bool })
 
     // ------------------------------------------------------------------
     // Caching-bit algebra
@@ -134,7 +146,7 @@ module smb2state {
             | CNone => CNone
             | COplock(_) => COplock(oplockOfBits(b))
             | CLease(x) => CLease({ key: x.key, st: b, epoch: x.epoch,
-                                    v2: x.v2 })
+                                    v2: x.v2, grant: x.grant })
         }
 
     // Advance the epoch of a v2 lease (once per break EVENT).  A v1 lease and
@@ -143,7 +155,7 @@ module smb2state {
         match c {
             | CLease(x) =>
                 if (x.v2) CLease({ key: x.key, st: x.st, epoch: x.epoch + 1,
-                                   v2: true })
+                                   v2: true, grant: x.grant })
                 else c
             | _ => c
         }
@@ -153,6 +165,12 @@ module smb2state {
 
     pure def leaseKeyOf(c: Caching): LeaseKey =
         match c { | CLease(x) => x.key | _ => -1 }
+
+    // Is there an actual lease here -- one that was granted, and so is bound to
+    // its key until its last open closes?  A bare RqLs reply is a CLease too,
+    // but it established nothing and binds nothing (see `grant` on Caching).
+    pure def isLeaseGrantEstablished(c: Caching): bool =
+        match c { | CLease(x) => x.grant | _ => false }
 
     // ------------------------------------------------------------------
     // Sessions, trees, opens

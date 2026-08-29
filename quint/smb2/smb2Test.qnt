@@ -507,6 +507,56 @@ module smb2Test {
             .then(runM(one(1, 1, ackKeep(1, false, BITS_NONE))))
             .expect(stAt(0) == ST_INVALID_DEVICE_STATE)
 
+    // A lease that has been broken to NONE is still a LEASE: it stays bound to
+    // its key until its last open closes, and a later open under that key joins
+    // it rather than minting a new one.  Regression test -- the model used to
+    // drop the binding the moment the state hit NONE, so the re-open below
+    // produced a brand new v2 lease at a fresh epoch under a key already bound
+    // to a v1 lease.  Caught by replaying the corpus against chimera, which
+    // reported the existing lease (v1, epoch 0) exactly as MS-SMB2 3.3.5.9.8
+    // requires.
+    //
+    // The join also UPGRADES: the re-open asks for caching the lease no longer
+    // holds, and gets it back, at the lease's own version.
+    run leaseSurvivesBreakToNoneTest =
+        boot2Run
+            // Session 0 takes a v1 lease under key 5 on "s", caching R.
+            .then(runM(one(0, 0, create(ROOT, "s", DispCreate, ACCESS_RW,
+                                        SHARE_RW, false,
+                                        OrLease({ key: 5, r: true, w: false,
+                                                  h: false, v2: false,
+                                                  epoch: 0 })))))
+            .expect(stAt(0) == ST_SUCCESS and asCreate(resAt(0)).fid == 0)
+            .expect(match asCreate(resAt(0)).caching {
+                | CLease(x) => x.st.r and x.key == 5 and not(x.v2)
+                | _ => false })
+            // A peer write recalls it to NONE.  The open stays open.
+            .then(runM(one(1, 1, create(ROOT, "s", DispOpen, ACCESS_RW,
+                                        SHARE_RW, false, OrNone))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .then(runM(one(1, 1, CWrite({ fid: FidRef(1), off: 0, len: 1,
+                                          pat: 7 }))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .expect(cachingLevelNone(sdb.opens.get(0).caching))
+            // ... and it is still a lease bound to key 5, not a dead entry.
+            .expect(match sdb.opens.get(0).caching {
+                | CLease(x) => x.key == 5 and not(x.v2)
+                | _ => false })
+            // Re-open under the SAME key, now asking v2.  This must JOIN the
+            // existing v1 lease -- reporting its version, so epoch 0 -- and not
+            // mint a v2 lease at epoch 2.
+            .then(runM(one(0, 0, create(ROOT, "s", DispOpen, ACCESS_R,
+                                        SHARE_RW, false,
+                                        OrLease({ key: 5, r: true, w: false,
+                                                  h: false, v2: true,
+                                                  epoch: 1 })))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .expect(match asCreate(resAt(0)).caching {
+                | CLease(x) => x.key == 5 and not(x.v2) and x.epoch == 0 and
+                               // upgraded back to R by the join
+                               x.st.r and not(x.st.w) and not(x.st.h)
+                | _ => false })
+
     // A lease grants RWH to a sole opener; write caching (W) is only handed
     // to a sole opener (discretion).  A v2 lease is granted at the client's
     // epoch + 1 (MS-SMB2 3.3.5.9.11; probe O7 observed epoch 2 for a request
@@ -617,11 +667,13 @@ module smb2Test {
                 val bare = sdb.with("opens", sdb.opens.setBy(0, o =>
                                o.with("caching", CLease({ key: 1, st: BITS_NONE,
                                                           epoch: 3,
-                                                          v2: true }))))
+                                                          v2: true,
+                                                          grant: false }))))
                 val cached = sdb.with("opens", sdb.opens.setBy(0, o =>
                                  o.with("caching", CLease({ key: 1, st: BITS_R,
                                                             epoch: 3,
-                                                            v2: true }))))
+                                                            v2: true,
+                                                            grant: true }))))
                 stCapsRespected(bare, false, false) and
                 not(stCapsRespected(cached, false, false)) and
                 not(stCapsRespected(cached, true, false)) and

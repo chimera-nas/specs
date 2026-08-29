@@ -489,9 +489,23 @@ module smb2ops {
     // REQUEST's version when there is no grant to inherit one from.
     pure def grantUnderKey(sdb: StateDB, f: Ino, self: FileId,
                            k: LeaseKey, sess: SessionId): Caching = {
+        // A lease binds its key for as long as the lease EXISTS, which is not
+        // the same as holding caching right now.  This used to require the
+        // member to be above level NONE, so a lease that was granted and then
+        // broken to NONE stopped binding -- and the next open under that key
+        // minted a brand new lease, at a new version, under a key already bound
+        // to the old one.  (Found replaying against chimera: a v1 lease on 'a'
+        // under key 1, broken to NONE but still open, was re-opened v2 under
+        // the same key; the model answered a fresh v2 lease at epoch 2 where
+        // the server correctly reported the existing v1 lease at epoch 0.)
+        //
+        // MS-SMB2 3.3.5.9.8 identifies a lease by (client, lease key); a
+        // LeaseState of NONE does not destroy it while an open still references
+        // it.  It is the `grant` flag, not the current state, that says whether
+        // there is a lease here at all -- a bare RqLs reply binds nothing.
         val members = opensOfFile(sdb, f).exclude(Set(self)).filter(fid =>
+            isLeaseGrantEstablished(sdb.opens.get(fid).caching) and
             leaseKeyOf(sdb.opens.get(fid).caching) == k and
-            not(cachingLevelNone(sdb.opens.get(fid).caching)) and
             sdb.opens.get(fid).session == sess)
         if (members.size() == 0) CNone
         else sdb.opens.get(members.fold(-1, (acc, x) =>
@@ -600,18 +614,22 @@ module smb2ops {
                 else COplock(oplockOfBits(capForceLevel2(caps, BITS_R)))
             | OrLease(x) => {
                 val joined = grantUnderKey(sdb, f, self, x.key, sess)
+                // What this open would be granted on its own.  Computed for
+                // both arms: the fresh grant takes it as-is, and the join uses
+                // it as the ceiling for an upgrade.
+                //
+                // An RqLs open with leasing disabled still reports a lease --
+                // with state NONE (the bare-RqLs path), so nothing is cached
+                // and no break can ever stall a peer.
+                val req = if (not(caps.leases) or not(x.r)) BITS_NONE
+                          else capForceLevel2(caps, { r: x.r, w: x.w,
+                                                      h: x.h })
+                // W caching only to a sole opener (MS-FSA 2.1.5.18.1, the
+                // mandate above); H caching only when no non-lease peer
+                // open owns the handle (probe O12, discretion).
+                val st = { r: req.r, w: req.w and sole,
+                           h: req.h and not(capsHandle) }
                 if (not(isLeaseGrant(joined))) {
-                    // Fresh grant.  An RqLs open with leasing disabled still
-                    // reports a lease -- with state NONE (the bare-RqLs path),
-                    // so nothing is cached and no break can ever stall a peer.
-                    val req = if (not(caps.leases) or not(x.r)) BITS_NONE
-                              else capForceLevel2(caps, { r: x.r, w: x.w,
-                                                          h: x.h })
-                    // W caching only to a sole opener (MS-FSA 2.1.5.18.1, the
-                    // mandate above); H caching only when no non-lease peer
-                    // open owns the handle (probe O12, discretion).
-                    val st = { r: req.r, w: req.w and sole,
-                               h: req.h and not(capsHandle) }
                     CLease({ key: x.key,
                              st: st,
                              // A v2 lease is granted at the client's epoch + 1
@@ -630,8 +648,45 @@ module smb2ops {
                              epoch: if (not(x.v2)) 0
                                     else if (bitsEmpty(st)) x.epoch
                                     else x.epoch + 1,
-                             v2: x.v2 })
-                } else joined
+                             v2: x.v2,
+                             // A real grant exactly when caching was actually
+                             // established -- chimera's `req_vfs != 0`.  A
+                             // bare RqLs reply is not a lease and binds no key.
+                             grant: not(bitsEmpty(st)) })
+                } else
+                    // Joining an existing lease under this key.  A join never
+                    // REDUCES the lease (MS-SMB2 3.3.5.9.8; probe O7), and it
+                    // may RAISE it: an open asking for caching the lease does
+                    // not hold yet upgrades it, which is what chimera's claim
+                    // core does (vfs_claim.c R31 -- upgrade to a strict
+                    // superset, only when grantable without breaking another
+                    // owner) and what the epoch exists to version
+                    // (3.3.5.9.11: the epoch tracks changes to the lease
+                    // STATE).  The union with `st` gives both halves at once:
+                    // it can only add bits, and only ones this open would have
+                    // been granted anyway.
+                    //
+                    // The upgrade matters most exactly where the join does: a
+                    // lease broken to NONE that is still bound to its key.
+                    // Re-opening under that key returns the lease to the
+                    // caching it can now hold rather than leaving it dead.
+                    match joined {
+                        | CLease(j) => {
+                            val up = { r: j.st.r or st.r,
+                                       w: j.st.w or st.w,
+                                       h: j.st.h or st.h }
+                            if (bitsEq(up, j.st)) joined
+                            else CLease({ key: j.key, st: up,
+                                          // The lease keeps the version it was
+                                          // established with -- the response
+                                          // follows the LEASE, not this
+                                          // request -- so a v1 lease stays
+                                          // unversioned at epoch 0.
+                                          epoch: if (j.v2) j.epoch + 1 else 0,
+                                          v2: j.v2, grant: true })
+                        }
+                        | _ => joined
+                    }
             }
         }
     }
