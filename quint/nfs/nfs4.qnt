@@ -1303,10 +1303,18 @@ module nfs4 {
             val l = sdb.locks.get(s)
             nondet lo = oneOf(0.to(LOCK_BYTES - 2))
             nondet len = oneOf(1.to(4))
+            // Also unlock the whole file (offset 0, length to-EOF).  The
+            // sub-range draws above cannot reach it -- len tops out at 4, so
+            // a to-EOF unlock only ever starts at lo >= 4 -- yet it is the
+            // shape a client sends for fcntl F_UNLCK with l_len 0, and the
+            // one nfstest_lock uses between its two-process cases.
+            nondet whole = oneOf(Set(false, true))
+            val ulo = if (whole) 0 else lo
+            val uhi = if (whole) LOCK_BYTES else imin(lo + len, LOCK_BYTES)
             runC(withSess(l.client,
                 [ RPutfh(l.file),
                   RLocku({ sid: s, argSeq: 0, lseq: lseqFor(l.client, l.owner),
-                           lo: lo, hi: imin(lo + len, LOCK_BYTES) }) ]))
+                           lo: ulo, hi: uhi }) ]))
         },
     }
 

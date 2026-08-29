@@ -380,6 +380,25 @@ def analyze(trace_files):
 # baseline can be raised on purpose rather than by accident.
 # --------------------------------------------------------------------------
 
+def load_lock_bytes(model_dir):
+    """The model's LOCK_BYTES, parsed from the model rather than copied.
+
+    The replay harness turns a lock range whose end reaches LOCK_BYTES into
+    the NFSv4 to-EOF length sentinel, so this is what distinguishes a
+    whole-file unlock from a bounded one.
+    """
+    path = os.path.join(model_dir, "nfs4.qnt")
+    try:
+        with open(path) as f:
+            for ln in f:
+                m = re.match(r"\s*pure val LOCK_BYTES\s*=\s*(\d+)", ln)
+                if m:
+                    return int(m.group(1))
+    except OSError:
+        pass
+    raise TraceFormatError("LOCK_BYTES not found in the model")
+
+
 def load_status_names(model_dir):
     """code -> NFS4ERR name, parsed from the model itself.
 
@@ -416,7 +435,7 @@ def load_trace4(path):
     return states
 
 
-def classify_compound4(lab, names, buckets):
+def classify_compound4(lab, names, buckets, lock_bytes):
     """One COMPOUND -> buckets: compound status, and per-op result status."""
     def nm(code):
         return names.get(code, f"code{code}")
@@ -432,9 +451,24 @@ def classify_compound4(lab, names, buckets):
         st = r["value"].get("st", 0) if isinstance(r["value"], dict) else 0
         buckets.add(f"v4:{r['tag']}:{nm(st)}")
 
+    # Argument-shape bucket: an unlock of the whole file (offset 0, length the
+    # harness sends as the to-EOF sentinel).  This is what a client emits for
+    # fcntl F_UNLCK with l_len 0 -- the commonest unlock there is -- and the
+    # generator could not reach it for a long time, because its sub-range draws
+    # only ever reached EOF from a non-zero offset.  Bucketing the shape means
+    # the ratchet notices if it ever stops being produced again.
+    for o in lab["ops"]:
+        if o.get("tag") != "RLocku":
+            continue
+        v = o.get("value")
+        if isinstance(v, dict) and v.get("lo") == 0 \
+                and v.get("hi", 0) >= lock_bytes:
+            buckets.add("v4:x:locku-whole-file")
+
 
 def analyze4(trace_files, model_dir):
     names = load_status_names(model_dir)
+    lock_bytes = load_lock_bytes(model_dir)
     total = {}
     steps = 0
     for path in trace_files:
@@ -444,7 +478,7 @@ def analyze4(trace_files, model_dir):
                 continue
             steps += 1
             here = set()
-            classify_compound4(lab["value"], names, here)
+            classify_compound4(lab["value"], names, here, lock_bytes)
             for b in here:
                 total[b] = total.get(b, 0) + 1
     return total, steps
