@@ -114,6 +114,7 @@ v4:SReadlink:OK
 v4:SReclaimComplete:COMPLETE_ALREADY
 v4:SReclaimComplete:OK
 v4:SReleaseLockowner:LOCKS_HELD
+v4:SReleaseLockowner:OK
 v4:SRemove:BADCHAR
 v4:SRemove:BADNAME
 v4:SRemove:DELAY
@@ -216,3 +217,4 @@ v4:compound:nops:4
 v4:compound:nops:5
 v4:compound:nops:6
 v4:compound:tagged
+v4:x:locku-whole-file
