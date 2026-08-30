@@ -21,14 +21,20 @@ divergence in that server — and both are worth having written down.
 | harness | server under test | suite |
 |---------|-------------------|-------|
 | [`samba/`](samba/) | Samba `smbd` | `quint/smb2` |
+| [`nfs/`](nfs/) | NFS-Ganesha `ganesha.nfsd`; Linux knfsd (in a KVM guest) | `quint/nfs` (nfs3, nfs4) |
 
-Only Samba's record lives here. A consuming project's own divergences belong in
-that project, next to the code that has to change -- and because the corpus is
-generated unconditionally, nothing about one server's behavior is encoded in
-what gets generated for everyone.
+Only the third-party servers' records live here. A consuming project's own
+divergences belong in that project, next to the code that has to change --
+and because the corpus is generated unconditionally, nothing about one
+server's behavior is encoded in what gets generated for everyone.
 
 ## samba
 
 `ctest -L samba` replays the generated SMB2 corpus against a private Samba
 instance. See [`samba/README.md`](samba/README.md) for how it runs, what it
 checks, and the divergences found so far.
+
+## nfs
+
+`ctest -L ganesha` replays the generated NFSv3 and NFSv4 corpora against a
+private NFS-Ganesha instance per trace. See [`nfs/README.md`](nfs/README.md).

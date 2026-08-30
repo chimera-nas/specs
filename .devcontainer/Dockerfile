@@ -38,9 +38,18 @@ RUN if [ -n "$APT_MIRROR" ]; then \
 #                           without a default generator cmake fails outright.
 # nodejs/npm             -- quint itself
 # samba/smbclient        -- the server under test for the samba MBT suite
-# iproute2               -- `ip netns`, which is how the samba tests get to run
-#                           in parallel (each smbd binds :445 in its own
-#                           network namespace)
+# nfs-ganesha + FSALs    -- the server under test for the NFS conformance
+#                           suite (harness/nfs): a userspace NFSv3/v4.0/4.1/
+#                           4.2 server nobody consulted while writing the NFS
+#                           models.  The VFS FSAL exports a real directory
+#                           (xattrs, holes and fallocate behave as the model
+#                           expects); MEM is the fallback when the container's
+#                           filesystem cannot hand out file handles.
+# rpcbind                -- ganesha registers its NFSv3 side programs (MOUNT,
+#                           NLM) with a portmapper; one runs per test netns.
+# iproute2               -- `ip netns`, which is how the samba and ganesha
+#                           tests get to run in parallel (each server binds its
+#                           ports in its own network namespace)
 # python3-pip            -- the replay harness's SMB2 client (see below)
 # reuse                  -- the SPDX lint this repo's CI enforces
 RUN apt-get -y update && \
@@ -50,7 +59,8 @@ RUN apt-get -y update && \
         cmake ninja-build make git curl ca-certificates less vim psmisc jq \
         python3 python3-pip python3-venv nodejs npm reuse \
         iproute2 net-tools tshark tcpdump procps \
-        samba smbclient samba-common-bin libsmbclient && \
+        samba smbclient samba-common-bin libsmbclient \
+        nfs-ganesha nfs-ganesha-vfs nfs-ganesha-mem rpcbind && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # The replay harness speaks SMB2 through `smbprotocol`, a pure-Python SMB2/3
@@ -105,6 +115,13 @@ RUN printf "module warm {\n  var n: int\n  action init = n' = 0\n  action step =
 # keeps a stray system smbd from ever competing for :445.
 RUN systemctl disable smbd nmbd winbind 2>/dev/null || true; \
     rm -f /etc/samba/smb.conf
+
+# Likewise for ganesha and rpcbind: the NFS harness writes a private
+# ganesha.conf per test and runs its own rpcbind inside the test's namespace.
+# The packaged units must never come up on their own and compete for :2049 /
+# :111 on the host network.
+RUN systemctl disable nfs-ganesha rpcbind rpcbind.socket 2>/dev/null || true; \
+    [ -e /etc/mtab ] || ln -s /proc/self/mounts /etc/mtab
 
 ENV LC_ALL=C.UTF-8
 ENV LANG=C.UTF-8

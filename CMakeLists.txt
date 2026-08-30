@@ -397,20 +397,24 @@ add_test(NAME coverage/nfs4
 
 # Only when specs is the project being built, not when it is a subdirectory of
 # a consumer.  A consuming project embeds this repo to get the CORPUS; its test
-# suite is about ITS server, and silently adding nine Samba tests to it would
-# make a Samba divergence fail someone else's build -- with a test they did not
-# write, against a server they are not shipping.  (Chimera's devcontainer
-# carries samba for smbtorture, so this is not hypothetical: without the guard
-# its `ctest` picks these up the moment it builds specs from source instead of
-# fetching the bundle.)  SPECS_SAMBA_TESTS forces the question either way.
+# suite is about ITS server, and silently adding third-party conformance tests
+# to it would make a Samba or Ganesha divergence fail someone else's build --
+# with a test they did not write, against a server they are not shipping.
+# (Chimera's devcontainer carries samba for smbtorture, so this is not
+# hypothetical: without the guard its `ctest` picks these up the moment it
+# builds specs from source instead of fetching the bundle.)  The SPECS_*_TESTS
+# options force the question either way.
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    set(_samba_default ON)
+    set(_conformance_default ON)
 else()
-    set(_samba_default OFF)
+    set(_conformance_default OFF)
 endif()
 option(SPECS_SAMBA_TESTS
        "Register the Samba conformance suite (default: on only when specs is \
-the top-level project)" ${_samba_default})
+the top-level project)" ${_conformance_default})
+option(SPECS_GANESHA_TESTS
+       "Register the NFS-Ganesha conformance suite (default: on only when \
+specs is the top-level project)" ${_conformance_default})
 
 set(SAMBA_HARNESS ${CMAKE_CURRENT_SOURCE_DIR}/harness/samba)
 
@@ -418,6 +422,28 @@ set(SAMBA_HARNESS ${CMAKE_CURRENT_SOURCE_DIR}/harness/samba)
 # creates and deletes a real network namespace), and a consumer that is never
 # going to register these tests should not pay for them -- nor have its
 # configure step create namespaces as a side effect.
+if(SPECS_SAMBA_TESTS OR SPECS_GANESHA_TESTS)
+    # Can we create a network namespace?  If not the tests still run,
+    # serialized on the host network.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        execute_process(
+            COMMAND bash -c "set -e; n=specs_netns_probe_$$; ip netns add \"$n\"; ip netns delete \"$n\""
+            RESULT_VARIABLE NETNS_PROBE OUTPUT_QUIET ERROR_QUIET)
+    else()
+        set(NETNS_PROBE 1)
+    endif()
+    if(NETNS_PROBE EQUAL 0)
+        set(CONFORMANCE_NETNS TRUE)
+    else()
+        set(CONFORMANCE_NETNS FALSE)
+        if(REQUIRE_NETNS_TESTS)
+            message(FATAL_ERROR
+                "REQUIRE_NETNS_TESTS=ON but `ip netns add` failed (need "
+                "CAP_NET_ADMIN / root).  Run privileged, or drop the flag.")
+        endif()
+    endif()
+endif()
+
 if(SPECS_SAMBA_TESTS)
     find_program(SMBD_BIN NAMES smbd
                  PATHS /usr/sbin /usr/local/sbin
@@ -430,16 +456,6 @@ if(SPECS_SAMBA_TESTS)
     execute_process(COMMAND ${Python3_EXECUTABLE} -c "import smbprotocol"
                     RESULT_VARIABLE HAVE_SMBPROTOCOL
                     OUTPUT_QUIET ERROR_QUIET)
-
-    # Can we create a network namespace?  If not the tests still run,
-    # serialized on the host network.
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        execute_process(
-            COMMAND bash -c "set -e; n=specs_netns_probe_$$; ip netns add \"$n\"; ip netns delete \"$n\""
-            RESULT_VARIABLE NETNS_PROBE OUTPUT_QUIET ERROR_QUIET)
-    else()
-        set(NETNS_PROBE 1)
-    endif()
 endif()
 
 if(NOT SPECS_SAMBA_TESTS)
@@ -452,18 +468,12 @@ elseif(NOT HAVE_SMBPROTOCOL EQUAL 0)
     message(STATUS "samba MBT tests: disabled "
             "(python module 'smbprotocol' not installed)")
 else()
-    if(NETNS_PROBE EQUAL 0)
-        set(SAMBA_NETNS TRUE)
+    set(SAMBA_NETNS ${CONFORMANCE_NETNS})
+    if(SAMBA_NETNS)
         message(STATUS "samba MBT tests: enabled (${SMBD_BIN}, netns isolated)")
     else()
-        set(SAMBA_NETNS FALSE)
         message(STATUS "samba MBT tests: enabled (${SMBD_BIN}, no netns -- "
                 "serialized on the host network)")
-        if(REQUIRE_NETNS_TESTS)
-            message(FATAL_ERROR
-                "REQUIRE_NETNS_TESTS=ON but `ip netns add` failed (need "
-                "CAP_NET_ADMIN / root).  Run privileged, or drop the flag.")
-        endif()
     endif()
 
     # batch name | trace glob.  One per specs_gen batch above -- ALL of them,
@@ -509,6 +519,111 @@ else()
                 RESOURCE_LOCK samba_smb_port)
             set_property(TEST ${tname} APPEND PROPERTY
                 ENVIRONMENT "SPECS_SAMBA_NO_NETNS=1")
+        endif()
+    endforeach()
+endif()
+
+# ---------------------------------------------------------------------------
+# NFS-Ganesha conformance (harness/nfs)
+#
+# The NFS counterpart of the Samba suite: replay the generated NFSv3 and
+# NFSv4 corpora against a real NFS-Ganesha server -- a userspace
+# implementation nobody consulted while writing the NFS models -- and compare
+# every reply to the result the model baked into the trace.  Disagreements are
+# findings: a model bug, or a Ganesha divergence recorded with a citation in
+# harness/nfs/ganesha_deviations.py.  A NEW one turns the suite red.
+#
+# One ctest per generated batch, as for Samba.  Each test runs its own
+# rpcbind and a fresh ganesha PER TRACE inside a private network namespace
+# (the export is an ext4 image the test loop-mounts), so the batches run
+# concurrently.  Without CAP_NET_ADMIN they serialize under one RESOURCE_LOCK.
+# ---------------------------------------------------------------------------
+set(NFS_HARNESS ${CMAKE_CURRENT_SOURCE_DIR}/harness/nfs)
+
+if(SPECS_GANESHA_TESTS)
+    find_program(GANESHA_BIN NAMES ganesha.nfsd
+                 PATHS /usr/bin /usr/sbin /usr/local/bin
+                 DOC "NFS-Ganesha, the server under test for the NFS MBT suite")
+    find_program(RPCBIND_BIN NAMES rpcbind
+                 PATHS /sbin /usr/sbin
+                 DOC "rpcbind, which ganesha registers its NFSv3 programs with")
+endif()
+
+if(NOT SPECS_GANESHA_TESTS)
+    message(STATUS
+        "ganesha MBT tests: not registered (specs is a subdirectory of "
+        "${CMAKE_PROJECT_NAME}; -DSPECS_GANESHA_TESTS=ON to register them)")
+elseif(NOT GANESHA_BIN)
+    message(STATUS "ganesha MBT tests: disabled (ganesha.nfsd not found)")
+elseif(NOT RPCBIND_BIN)
+    message(STATUS "ganesha MBT tests: disabled (rpcbind not found)")
+else()
+    if(CONFORMANCE_NETNS)
+        message(STATUS "ganesha MBT tests: enabled (${GANESHA_BIN}, netns isolated)")
+    else()
+        message(STATUS "ganesha MBT tests: enabled (${GANESHA_BIN}, no netns -- "
+                "serialized on the host network)")
+    endif()
+
+    # suite | batch name | trace glob | extra environment.  One per specs_gen
+    # batch above -- ALL of them, including the ones this harness cannot drive
+    # (a SKIP keeps the gap visible).  The Deleg batches need delegations
+    # enabled on the server; the pNFS batches need a metadata server, which a
+    # single-node ganesha over a local filesystem is not, so they SKIP.
+    set(GANESHA_BATCHES
+        "nfs3|step128|step_128_*.itf.json|"
+        "nfs3|step256|step_256_*.itf.json|"
+        "nfs3|churn128|stepChurn_128_*.itf.json|"
+        "nfs3|churn256|stepChurn_256_*.itf.json|"
+        "nfs3|dir|stepDir_128_*.itf.json|"
+        "nfs3|excl|stepExcl_128_*.itf.json|")
+    foreach(inst nfs4Memfs42 nfs4Memfs41 nfs4Memfs40)
+        foreach(fs step stepState stepNamespace stepData stepTypes)
+            list(APPEND GANESHA_BATCHES
+                 "nfs4|${inst}_${fs}|${inst}_${fs}_80_*.itf.json|")
+        endforeach()
+    endforeach()
+    list(APPEND GANESHA_BATCHES
+         "nfs4|nfs4Memfs42_stepData42|nfs4Memfs42_stepData42_80_*.itf.json|"
+         "nfs4|nfs4Memfs42Deleg_stepDeleg|nfs4Memfs42Deleg_stepDeleg_80_*.itf.json|SPECS_NFS_DELEG=1"
+         "nfs4|nfs4Memfs41Deleg_stepDeleg|nfs4Memfs41Deleg_stepDeleg_80_*.itf.json|SPECS_NFS_DELEG=1"
+         "nfs4pnfs|nfs4Pnfs42_stepPnfs|nfs4Pnfs42_stepPnfs_80_*.itf.json|"
+         "nfs4pnfs|nfs4Pnfs41_stepPnfs|nfs4Pnfs41_stepPnfs_80_*.itf.json|")
+
+    foreach(b ${GANESHA_BATCHES})
+        string(REPLACE "|" ";" parts "${b}")
+        list(GET parts 0 suite)
+        list(GET parts 1 bname)
+        list(GET parts 2 bglob)
+        list(LENGTH parts nparts)
+        set(extra_env)
+        if(nparts GREATER 3)
+            list(GET parts 3 extra_env)
+        endif()
+        if(suite STREQUAL "nfs4pnfs")
+            set(replayer nfs4)
+        else()
+            set(replayer ${suite})
+        endif()
+        set(tname ganesha/${suite}/${bname})
+        add_test(NAME ${tname}
+                 COMMAND ${NFS_HARNESS}/run_nfs_mbt.sh ganesha ${replayer}
+                         ${T}/${suite} ${bglob})
+        # TIMEOUT: up to 10 traces, each on a fresh server, at 80-256 steps
+        # against a real server -- minutes, not seconds.
+        set_tests_properties(${tname} PROPERTIES
+            LABELS "ganesha;${suite};mbt"
+            TIMEOUT 1800
+            SKIP_RETURN_CODE 77
+            ENVIRONMENT "GANESHA=${GANESHA_BIN};RPCBIND=${RPCBIND_BIN}")
+        if(extra_env)
+            set_property(TEST ${tname} APPEND PROPERTY ENVIRONMENT "${extra_env}")
+        endif()
+        if(NOT CONFORMANCE_NETNS)
+            set_tests_properties(${tname} PROPERTIES
+                RESOURCE_LOCK nfs_server_ports)
+            set_property(TEST ${tname} APPEND PROPERTY
+                ENVIRONMENT "SPECS_NFS_NO_NETNS=1")
         endif()
     endforeach()
 endif()
