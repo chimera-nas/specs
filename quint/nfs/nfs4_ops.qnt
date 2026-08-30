@@ -895,14 +895,21 @@ module nfs4ops {
 
     // READLINK (RFC 7530 16.25 / RFC 8881 18.24): directory -> ISDIR,
     // other non-symlink -> INVAL ("should" wording).
+    // READLINK on a non-symlink is NFS4ERR_INVAL under RFC 7530 16.25.4
+    // ("should return NFS4ERR_INVAL if the object is not a symbolic link" --
+    // a directory is not a symbolic link) and NFS4ERR_WRONG_TYPE under
+    // RFC 8881 18.24.4.  No special NFS4ERR_ISDIR case: the standards name a
+    // single status for every non-symlink target, and both the Linux server
+    // and NFS-Ganesha return it.
     pure def opReadlink(a: Acc): Acc = {
         val g = fhGate(a)
         if (g != OK) emit(a, SReadlink({ st: g, target: "" }))
         else {
             val nd = cfhNode(a)
-            if (nd.ftype == FDir) emit(a, SReadlink({ st: E_ISDIR, target: "" }))
-            else if (nd.ftype != FLnk)
-                emit(a, SReadlink({ st: E_INVAL, target: "" }))
+            if (nd.ftype != FLnk)
+                emit(a, SReadlink({
+                    st: if (a.minor == 0) E_INVAL else E_WRONG_TYPE,
+                    target: "" }))
             else emit(a, SReadlink({ st: OK, target: nd.target }))
         }
     }
@@ -912,10 +919,56 @@ module nfs4ops {
     // harness runs as root over AUTH_SYS, and the model predicts
     // access == supported == requested (the reference implementation grants
     // root everything; within RFC discretion, as in the v3 model).
+    // The ACCESS4_* bit for each request class, and the bitwise AND the reply
+    // masking needs (Quint has no native bitwise operator).
+    pure val ACCESS4_READ    = 1
+    pure val ACCESS4_LOOKUP  = 2
+    pure val ACCESS4_MODIFY  = 4
+    pure val ACCESS4_EXTEND  = 8
+    pure val ACCESS4_DELETE  = 16
+    pure val ACCESS4_EXECUTE = 32
+    pure def iand(x: int, y: int): int =
+        List(1, 2, 4, 8, 16, 32).foldl(0, (acc, b) =>
+            if ((x / b) % 2 == 1 and (y / b) % 2 == 1) acc + b else acc)
+    // Any execute bit set in a mode (owner/group/other x).
+    pure def anyExec(m: int): bool =
+        (m % 2 == 1) or ((m / 8) % 2 == 1) or ((m / 64) % 2 == 1)
+
+    // ACCESS (RFC 7530 16.1 / RFC 8881 18.1).  `supported` is the requested
+    // bits the server can evaluate for the object's TYPE: ACCESS4_LOOKUP has
+    // no meaning for a non-directory and ACCESS4_EXECUTE none for a directory
+    // (RFC 8881 18.1.4), so each is dropped for the wrong type.  `access` is
+    // the granted subset -- the harness runs as root over AUTH_SYS, and root
+    // is granted every evaluated class EXCEPT ACCESS4_EXECUTE on a file with
+    // no execute bit anywhere in its mode (RFC 8881 18.1.4: the server MUST
+    // NOT set ACCESS4_EXECUTE unless at least one execute bit is set).  This
+    // is what the reference implementation, NFS-Ganesha and the Linux kernel
+    // server all do; the model formerly returned the full requested mask.
+    // The bits meaningful for the object type (matches the reference
+    // implementation's chimera_nfs4_access_meaningful, RFC 8881 18.1.4):
+    // a directory drops EXECUTE and keeps LOOKUP+DELETE; a non-directory
+    // keeps EXECUTE and drops LOOKUP (no meaning off a directory) AND DELETE
+    // (deletability is a property of the parent, which an ACCESS on the
+    // object itself cannot check, so the server reports it 0 -- RFC 8881
+    // 18.1.4 permits DELETE = 0).
+    pure def accessMeaningful(ft: Ftype): int =
+        if (ft == FDir) ACCESS4_READ + ACCESS4_LOOKUP + ACCESS4_MODIFY +
+                        ACCESS4_EXTEND + ACCESS4_DELETE
+        else ACCESS4_READ + ACCESS4_MODIFY + ACCESS4_EXTEND + ACCESS4_EXECUTE
+
     pure def opAccess(a: Acc, mask: int): Acc = {
         val g = fhGate(a)
         if (g != OK) emit(a, SAccess({ st: g, supported: 0, access: 0 }))
-        else emit(a, SAccess({ st: OK, supported: mask, access: mask }))
+        else {
+            val nd = cfhNode(a)
+            val supported = iand(mask, accessMeaningful(nd.ftype))
+            val access =
+                if (iand(supported, ACCESS4_EXECUTE) == ACCESS4_EXECUTE and
+                    not(anyExec(nd.mode)))
+                    supported - ACCESS4_EXECUTE
+                else supported
+            emit(a, SAccess({ st: OK, supported: supported, access: access }))
+        }
     }
 
     // READDIR (RFC 7530 16.24 / RFC 8881 18.23): single-shot with a large

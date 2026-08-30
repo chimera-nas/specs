@@ -108,8 +108,8 @@ v4:SReadPlus:OK
 v4:SReaddir:NOTDIR
 v4:SReaddir:OK
 v4:SReadlink:INVAL
-v4:SReadlink:ISDIR
 v4:SReadlink:OK
+v4:SReadlink:WRONG_TYPE
 v4:SReclaimComplete:COMPLETE_ALREADY
 v4:SReclaimComplete:OK
 v4:SReleaseLockowner:LOCKS_HELD

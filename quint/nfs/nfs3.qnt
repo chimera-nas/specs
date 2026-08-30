@@ -368,11 +368,48 @@ module nfs3 {
     // annotated rather than CANDIDATE-FIX.
     // ------------------------------------------------------------------
 
+    // ACCESS3_* request bits and the bitwise AND the reply masking needs
+    // (Quint has no native bitwise operator).
+    pure val ACCESS3_READ    = 1
+    pure val ACCESS3_LOOKUP  = 2
+    pure val ACCESS3_MODIFY  = 4
+    pure val ACCESS3_EXTEND  = 8
+    pure val ACCESS3_DELETE  = 16
+    pure val ACCESS3_EXECUTE = 32
+    pure def iand3(x: int, y: int): int =
+        List(1, 2, 4, 8, 16, 32).foldl(0, (acc, b) =>
+            if ((x / b) % 2 == 1 and (y / b) % 2 == 1) acc + b else acc)
+    pure def anyExec3(m: int): bool =
+        (m % 2 == 1) or ((m / 8) % 2 == 1) or ((m / 64) % 2 == 1)
+
+    // The ACCESS reply for `mask` on `node`, run as root over AUTH_SYS.
+    // RFC 1813 3.3.4: ACCESS3_LOOKUP and ACCESS3_EXECUTE "have no meaning" for,
+    // respectively, a non-directory and a directory, and ACCESS3_DELETE names
+    // a property of the parent an ACCESS on the object cannot check -- so each
+    // is dropped for the type that cannot carry it.  Of what remains, root is
+    // granted every class EXCEPT EXECUTE on a file with no execute bit set in
+    // its mode (POSIX: even root needs one execute bit).  This is what the
+    // Linux kernel server and NFS-Ganesha both return; the model formerly
+    // echoed the full requested mask.
+    pure def accessReply3(node: Node, mask: int): int = {
+        val meaningful =
+            if (node.ftype == TDir)
+                ACCESS3_READ + ACCESS3_LOOKUP + ACCESS3_MODIFY +
+                ACCESS3_EXTEND + ACCESS3_DELETE
+            else ACCESS3_READ + ACCESS3_MODIFY + ACCESS3_EXTEND + ACCESS3_EXECUTE
+        val supported = iand3(mask, meaningful)
+        if (iand3(supported, ACCESS3_EXECUTE) == ACCESS3_EXECUTE and
+            not(anyExec3(node.mode)))
+            supported - ACCESS3_EXECUTE
+        else supported
+    }
+
     action applyAccess(o: Fid, mask: int): bool = all {
         fs' = fs,
         removed' = removed,
         nextFid' = nextFid,
-        lastOp' = OAccess({ obj: o, mask: mask, status: OK, access: mask }),
+        lastOp' = OAccess({ obj: o, mask: mask, status: OK,
+                            access: accessReply3(fs.get(o), mask) }),
     }
 
     action access = {
