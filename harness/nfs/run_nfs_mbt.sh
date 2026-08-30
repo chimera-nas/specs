@@ -501,7 +501,7 @@ if [ "$SERVER" = "knfsd" ]; then
     # model's root), and `insecure` admits the replayer's high source ports.
     GUEST_CMD="\
 set -x; \
-mkdir -p /export /reset; \
+mkdir -p /export /reset; chmod 0777 /export; \
 modprobe 9pnet_virtio 2>/dev/null; modprobe 9p 2>/dev/null; \
 mount -t 9p -o trans=virtio,version=9p2000.L resetshare /reset || true; \
 modprobe nfsd 2>/dev/null; \
@@ -514,7 +514,7 @@ rpc.nfsd 8; rpc.mountd; exportfs -a; \
 touch /reset/ready; \
 while true; do \
   if [ -f /reset/go ]; then \
-    rm -rf /export/* /export/.[!.]* 2>/dev/null; \
+    rm -rf /export/* /export/.[!.]* 2>/dev/null; chmod 0777 /export; \
     exportfs -f 2>/dev/null; sync; \
     rm -f /reset/go; touch /reset/done; \
   fi; \
