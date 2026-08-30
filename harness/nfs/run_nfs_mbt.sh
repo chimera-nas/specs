@@ -77,9 +77,13 @@ TIMEOUT=${SPECS_NFS_TIMEOUT:-600}
 USE_NETNS=1
 [ "${SPECS_NFS_NO_NETNS:-0}" = "1" ] && USE_NETNS=0
 
-NFS_PORT=2049
-MNT_PORT=20048
-NLM_PORT=32803
+NFS_BASE_PORT=2049
+MNT_BASE_PORT=20048
+NLM_BASE_PORT=32803
+# Set per trace by ganesha_start (base + rotating offset).
+NFS_PORT=$NFS_BASE_PORT
+MNT_PORT=$MNT_BASE_PORT
+NLM_PORT=$NLM_BASE_PORT
 
 NETNS_NAME="specs_nfs_$$_$(date +%s%N)"
 SESSION_DIR=$(mktemp -d "${TMPDIR:-/tmp}/specs_nfs_XXXXXX")
@@ -345,8 +349,13 @@ EOF
 
 ganesha_start() {
     START_SEQ=$((START_SEQ + 1))
+    local off=$((START_SEQ % 50))
+    NFS_PORT=$((NFS_BASE_PORT + off))
+    MNT_PORT=$((MNT_BASE_PORT + off))
+    NLM_PORT=$((NLM_BASE_PORT + off))
     GANESHA_PID_FILE="${SESSION_DIR}/run/ganesha.${START_SEQ}.pid"
     rm -f "$GANESHA_PID_FILE"
+    ganesha_conf
     # Fresh export contents and recovery state for every trace.
     rm -rf "${SHARE_PATH:?}"/* "${SHARE_PATH:?}"/.[!.]* 2>/dev/null || true
     rm -rf "${SESSION_DIR}/recovery"
@@ -405,7 +414,6 @@ if [ "$SERVER" = "knfsd" ]; then
 fi
 
 ganesha_prepare
-ganesha_conf
 
 echo "=== $(server_version) | $SUITE | fsal ${FSAL} | traces ${TRACE_GLOB} ==="
 
@@ -428,20 +436,21 @@ if [ ${#TRACES[@]} -eq 0 ]; then
     exit 77
 fi
 
-ARGS=()
-[ "${SPECS_NFS_SURVEY:-0}" = "1" ] && ARGS+=(--keep-going)
+BASE_ARGS=(--server 127.0.0.1 --server-kind "$SERVER")
+[ "${SPECS_NFS_SURVEY:-0}" = "1" ] && BASE_ARGS+=(--keep-going)
 case "$SUITE" in
-    nfs4)
-        REPLAYER="${HERE}/nfs4_replay.py"
-        ARGS+=(--server 127.0.0.1 --port "$NFS_PORT" --export /
-               --server-kind "$SERVER")
-        ;;
-    nfs3)
-        REPLAYER="${HERE}/nfs3_replay.py"
-        ARGS+=(--server 127.0.0.1 --port "$NFS_PORT" --mount-port "$MNT_PORT"
-               --export "$SHARE_PATH" --server-kind "$SERVER")
-        ;;
+    nfs4) REPLAYER="${HERE}/nfs4_replay.py" ;;
+    nfs3) REPLAYER="${HERE}/nfs3_replay.py" ;;
 esac
+
+# The per-trace port arguments (NFS_PORT etc. are set by ganesha_start).
+replay_args() {
+    case "$SUITE" in
+        nfs4) echo --port "$NFS_PORT" --export / ;;
+        nfs3) echo --port "$NFS_PORT" --mount-port "$MNT_PORT" \
+                   --export "$SHARE_PATH" ;;
+    esac
+}
 
 n_ok=0; n_skip=0; n_fail=0; n_other=0
 EPOCH="$$-$(date +%s)"
@@ -451,8 +460,9 @@ for t in "${TRACES[@]}"; do
         n_fail=$((n_fail + 1))
         continue
     fi
-    run_in_ns timeout "$TIMEOUT" python3 "$REPLAYER" "${ARGS[@]}" \
-        --owner-epoch "${EPOCH}" --trace "$t"
+    # shellcheck disable=SC2046  # replay_args intentionally word-splits
+    run_in_ns timeout "$TIMEOUT" python3 "$REPLAYER" "${BASE_ARGS[@]}" \
+        $(replay_args) --owner-epoch "${EPOCH}" --trace "$t"
     rc=$?
     if [ "$rc" = "0" ]; then
         n_ok=$((n_ok + 1))
@@ -465,12 +475,14 @@ for t in "${TRACES[@]}"; do
             tail -40 "$GANESHA_LOG" 2>/dev/null || true
         fi
     fi
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    if [ -n "$SERVER_PID" ] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
         echo "=== ganesha exited during $(basename "$t") ==="
-        cat "$GANESHA_OUT"
-        tail -60 "$GANESHA_LOG" 2>/dev/null || true
+        if [ "${SPECS_NFS_SERVER_LOG:-0}" = "1" ]; then
+            cat "$GANESHA_OUT"
+            tail -60 "$GANESHA_LOG" 2>/dev/null || true
+        fi
         SERVER_PID=""
-        [ "$rc" = "0" ] && n_fail=$((n_fail + 1))
+        [ "$rc" = "0" ] && { n_ok=$((n_ok - 1)); n_fail=$((n_fail + 1)); }
     fi
     stop_server
 done
