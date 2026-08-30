@@ -381,11 +381,12 @@ class Replayer:
                 and op["status"] == NFS3_OK:
             # RFC 1813 3.3.18 ordering only: free <= total, avail <= free
             # for bytes; total > 0.  Files may all be 0 ("unknown").
+            # RFC 1813 3.3.18 ordering only: avail <= free <= total (bytes
+            # and files).  A total of 0 is permitted -- it means "unknown" --
+            # so it is not asserted to be positive.
             if not (res["abytes"] <= res["fbytes"] <= res["tbytes"]):
                 self.fnd(mism, "bytes", "abytes <= fbytes <= tbytes",
                          (res["abytes"], res["fbytes"], res["tbytes"]))
-            if res["tbytes"] == 0:
-                self.fnd(mism, "tbytes", "> 0", 0)
             if not (res["afiles"] <= res["ffiles"] <= res["tfiles"]):
                 self.fnd(mism, "files", "afiles <= ffiles <= tfiles",
                          (res["afiles"], res["ffiles"], res["tfiles"]))

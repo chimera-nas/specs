@@ -109,7 +109,7 @@ NFS4 = Registry("ganesha/nfs4", [
 # a coordinated regenerate.
 GN_1_ACCESS_TYPE_MASK = Deviation(
     id="GN-1-access-type-mask",
-    verdict=MODEL,
+    verdict=SERVER,
     spec="RFC 1813 3.3.4 (EXECUTE 'no meaning for a directory'; LOOKUP 'no "
          "meaning for non-directory objects')",
     summary="ACCESS access mask drops the type-irrelevant bits; the model "
@@ -120,6 +120,31 @@ GN_1_ACCESS_TYPE_MASK = Deviation(
     field="access",
 )
 
+# GN-2: LINK of a directory answers NFS3ERR_BADTYPE, not NFS3ERR_ISDIR.
+# Hard-linking a directory is refused by every server, but the status is not
+# pinned: RFC 1813 3.3.15 lists neither ISDIR nor a POSIX EPERM among LINK's
+# errors, so servers differ -- the reference implementation (and this model)
+# answer ISDIR, ganesha answers BADTYPE, and the Linux server answers yet
+# another.  Recorded as a ganesha divergence from the model's pick; once the
+# knfsd harness lands it becomes the tiebreaker for whether the model should
+# assert a *set* of acceptable statuses here rather than one.  Note the v4
+# LINK path is unaffected -- ganesha's NFSv4 LINK of a directory does return
+# NFS4ERR_ISDIR, matching the model.  Status-only, so replay continues.
+GN_2_LINK_DIR_BADTYPE = Deviation(
+    id="GN-2-link-dir-badtype",
+    verdict=SERVER,
+    spec="RFC 1813 3.3.15 (LINK; the directory-source status is unspecified)",
+    summary="LINK of a directory returns NFS3ERR_BADTYPE instead of "
+            "NFS3ERR_ISDIR",
+    root_cause="ganesha refuses a directory hard link with BADTYPE",
+    candidate_fix="none required (defensible); revisit whether the model "
+                  "should accept a status set once knfsd is the tiebreaker",
+    ops=("OLink",),
+    expected_status=NFS3ERR_ISDIR,
+    actual_status=NFS3ERR_BADTYPE,
+)
+
 NFS3 = Registry("ganesha/nfs3", [
     GN_1_ACCESS_TYPE_MASK,
+    GN_2_LINK_DIR_BADTYPE,
 ])

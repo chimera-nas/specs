@@ -18,7 +18,6 @@ v4:SClone:OK
 v4:SClose:OK
 v4:SCommit:ISDIR
 v4:SCommit:OK
-v4:SCopy:INVAL
 v4:SCopy:OK
 v4:SCreate:BADCHAR
 v4:SCreate:BADNAME

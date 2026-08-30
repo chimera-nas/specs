@@ -87,6 +87,7 @@ SHARE_PATH="${SESSION_DIR}/share"
 SHARE_MOUNTED=0
 SERVER_PID=""
 RPCBIND_PID=""
+START_SEQ=0
 OUR_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ' || true)
 
 run_in_ns() {
@@ -343,6 +344,9 @@ EOF
 }
 
 ganesha_start() {
+    START_SEQ=$((START_SEQ + 1))
+    GANESHA_PID_FILE="${SESSION_DIR}/run/ganesha.${START_SEQ}.pid"
+    rm -f "$GANESHA_PID_FILE"
     # Fresh export contents and recovery state for every trace.
     rm -rf "${SHARE_PATH:?}"/* "${SHARE_PATH:?}"/.[!.]* 2>/dev/null || true
     rm -rf "${SESSION_DIR}/recovery"
@@ -357,7 +361,7 @@ ganesha_start() {
     # -F foreground, -x fatal on config errors, -p a pidfile of our own so
     # concurrent instances never fight over /var/run/ganesha.
     run_in_server_ns setsid "$GANESHA" -F -x -f "$GANESHA_CONF" -L "$GANESHA_LOG" \
-        -N "NIV_${LOGLEVEL}" -p "${SESSION_DIR}/run/ganesha.pid" \
+        -N "NIV_${LOGLEVEL}" -p "$GANESHA_PID_FILE" \
         > "$GANESHA_OUT" 2>&1 &
     SERVER_PID=$!
     if ! wait_port "$NFS_PORT" "$SERVER_PID" ganesha; then
