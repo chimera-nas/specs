@@ -1593,15 +1593,27 @@ module nfs4 {
             nondet p = oneOf(clonePairs)
             val so = sdb.opens.get(p.src)
             val dofs = sdb.opens.get(p.dst)
-            nondet srcOff = oneOf(0.to(MAX_BLOCKS - 1))
             nondet dstOff = oneOf(0.to(MAX_BLOCKS - 1))
             nondet cnt = oneOf(1.to(2))
-            // The source range is deliberately allowed to run past the end of
-            // the source file: RFC 7862 15.2.3 makes a source offset past the
-            // source size NFS4ERR_INVAL, and opCopy predicts it.  The server
-            // used to answer NFS4_OK, which is why this shape was suppressed
-            // here; it validates the range now, so the corpus asserts it and
-            // the v4:SCopy:INVAL bucket stays covered.
+            // COPY has two outcome classes and only a handful of draws per
+            // corpus to reach both, so pick between them rather than hoping a
+            // uniform offset lands in each.  Drawing srcOff over the block
+            // space alone did produce both -- the files these walks build are
+            // a few blocks long, so most offsets ran past the source EOF --
+            // but only barely, and any shift in the walk starved one class and
+            // cost the ratchet a bucket.
+            //
+            // One draw in three aims inside the source, for NFS4_OK.  The rest
+            // range over the block space, where a source offset past the
+            // source size is NFS4ERR_INVAL (RFC 7862 15.2.3): opCopy predicts
+            // that and the server validates the range, so the corpus asserts
+            // it rather than suppressing the shape.
+            val srcSize = fsGet(fs, so.file).sizeBlocks
+            nondet wideOff = oneOf(0.to(MAX_BLOCKS - 1))
+            nondet nearOff = oneOf(0.to(imax(0, srcSize - cnt)))
+            nondet aimInside = oneOf(0.to(2))
+            val srcOff = if (aimInside == 0 and srcSize >= cnt) nearOff
+                         else wideOff
             if (delegOther(dofs.file, dofs.client) or
                 delegOtherWrite(so.file, so.client))
                 runC(withSess(dofs.client, [ RPutfh(dofs.file), RGetattr ]))
@@ -1986,19 +1998,14 @@ module nfs4 {
 
     // RFC 7862 data operations (READ_PLUS, IO_ADVISE, WRITE_SAME, CLONE).
     //
-    // A dedicated flavor rather than an addition to stepData, for two
-    // reasons.  First, stepData carries neither reclaimComplete nor nsCreate,
-    // so every OPEN in it returns NFS4ERR_GRACE and `files` stays empty --
-    // every data action's guard fails and the flavor generates nothing but
-    // setup churn.  Second, once those are supplied the walk reaches
-    // pre-existing model/server divergences in SETATTR-size and COPY that are
-    // unrelated to these operations; keeping this flavor separate exercises
-    // the 7862 ops without asserting on them.
-    //
-    // The mix deliberately builds the state these ops need: files (nsCreate),
-    // opens on two files for one client (cloneOpenPair), written blocks
-    // (ioWrite) and holes/unwritten extents (sparseAllocate, sparseDeallocate)
-    // so READ_PLUS has both DATA and HOLE runs to classify.
+    // A dedicated flavor rather than an addition to stepData: these four
+    // want a differently-shaped file than stepData's I/O mix produces.  The
+    // draws deliberately build it -- files (nsCreate), opens on two files
+    // for one client (cloneOpenPair), written blocks (ioWrite) and
+    // holes/unwritten extents (sparseAllocate, sparseDeallocate) -- so that
+    // READ_PLUS has both DATA and HOLE runs to classify and CLONE has a
+    // source with something in it.  Folding that into stepData would dilute
+    // both mixes.
     action stepData42 = any {
         setupExchangeId, setupCreateSession,
         reclaimComplete, reclaimComplete,
@@ -2012,10 +2019,17 @@ module nfs4 {
         nsGetattr,
     }
 
+    // I/O and the per-file operations built on it.
+    //
+    // openConfirm is load-bearing on 4.0, where an unconfirmed open is
+    // unusable: without it every I/O in a 4.0 walk falls back to the
+    // anonymous stateid and the open-stateid paths of READ, WRITE, COMMIT and
+    // SETATTR-size go untouched.  (4.1+ needs no counterpart -- reclaimFirst
+    // already takes the walk out of grace before this body runs.)
     action stepDataBody = any {
         setupSetclientid, setupSetclientidConfirm,
         setupExchangeId, setupCreateSession,
-        openNew, closeOpen,
+        openNew, openConfirm, closeOpen,
         ioRead, ioRead, ioWrite, ioWrite, ioCommit, ioSetattrSize,
         sparseAllocate, sparseDeallocate, sparseSeek, sparseSeek,
         copyRange, copyRange,
