@@ -408,10 +408,226 @@ server_version() {
 # conformance work; the batches report SKIP until it lands so the gap stays
 # attributable to the harness.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# knfsd: the Linux kernel NFS server, in a KVM guest.
+#
+# The guest (a chimera-nas/kvm-test-base image, >= v1.10.0, which carries
+# nfs-kernel-server) boots as the SERVER; the replay client runs on the host
+# side of a TAP link, in this test's network namespace, and drives the guest
+# at 10.0.0.2.  This inverts the usual chimera KVM wrapper, where the guest is
+# the client and chimera the host server.
+#
+# One guest per batch, not per trace: a VM boot is seconds and NFSv4 grace is
+# entered once, so the per-trace reset is done in-guest instead.  A 9p share
+# is the control channel -- the host drops a "go" marker, the guest clears its
+# export and flushes the filehandle cache, then acks -- which needs neither an
+# ssh key (the image's keys are guest-internal) nor an NFS-level walk (leftover
+# open state would make that unreliable).  Distinct per-trace client owners
+# (the replayer salts them) keep one trace's NFSv4 state from touching the
+# next; whatever lingers expires with the short lease.
+#
+# Environment (beyond the common set):
+#   KVM_VMLINUZ / KVM_ROOTFS   guest kernel + rootfs (CMake resolves them from
+#                              the fetched image; required)
+#   SPECS_KVM_GRACE            knfsd grace/lease seconds in the guest (default
+#                              10; the replayer's GRACE retry covers the first
+#                              trace's wait)
 if [ "$SERVER" = "knfsd" ]; then
-    echo "knfsd replay is not implemented yet in this harness" >&2
-    exit 77
+    VMLINUZ=${KVM_VMLINUZ:-}
+    ROOTFS=${KVM_ROOTFS:-}
+    if [ -z "$VMLINUZ" ] || [ -z "$ROOTFS" ] || [ ! -s "$VMLINUZ" ] \
+            || [ ! -s "$ROOTFS" ]; then
+        echo "knfsd: no guest image (set KVM_VMLINUZ / KVM_ROOTFS)" >&2
+        exit 77
+    fi
+    if [ ! -e /dev/kvm ]; then
+        echo "knfsd: /dev/kvm is not available" >&2
+        exit 77
+    fi
+    if [ "$USE_NETNS" != "1" ]; then
+        echo "knfsd: a network namespace is required (the guest needs a TAP)" >&2
+        exit 77
+    fi
+
+    ARCH=$(uname -m)
+    if [ "$ARCH" = "aarch64" ]; then
+        QEMU_BIN=qemu-system-aarch64
+        QEMU_MACHINE="-machine virt"
+        QEMU_CONSOLE=ttyAMA0
+        ROOT_DEV=/dev/vda
+    else
+        QEMU_BIN=qemu-system-x86_64
+        QEMU_MACHINE="-M microvm,acpi=on,rtc=on,pit=on,pcie=on"
+        QEMU_CONSOLE=ttyS0
+        ROOT_DEV=/dev/vda
+    fi
+    if ! command -v "$QEMU_BIN" >/dev/null 2>&1; then
+        echo "knfsd: $QEMU_BIN not found" >&2
+        exit 77
+    fi
+
+    TAP_NAME="tapk$$"
+    HOST_IP=10.0.0.1
+    GUEST_IP=10.0.0.2
+    GRACE=${SPECS_KVM_GRACE:-10}
+    RESET_DIR="${SESSION_DIR}/reset"
+    QEMU_LOG="${SESSION_DIR}/qemu-serial.log"
+    QEMU_OUT="${SESSION_DIR}/qemu.out"
+    QEMU_PID=""
+    mkdir -p "$RESET_DIR"
+
+    knfsd_cleanup() {
+        if [ -n "$QEMU_PID" ]; then
+            kill "$QEMU_PID" 2>/dev/null || true
+            for _ in $(seq 1 30); do
+                kill -0 "$QEMU_PID" 2>/dev/null || break
+                sleep 0.1
+            done
+            kill -9 "$QEMU_PID" 2>/dev/null || true
+            wait "$QEMU_PID" 2>/dev/null || true
+        fi
+    }
+    # Chain onto the EXIT/INT/TERM trap already installed for the netns.
+    trap 'knfsd_cleanup; cleanup' EXIT INT TERM
+
+    # Host side of the TAP.
+    ip netns exec "${NETNS_NAME}" ip tuntap add dev "$TAP_NAME" mode tap
+    ip netns exec "${NETNS_NAME}" ip addr add "${HOST_IP}/24" dev "$TAP_NAME"
+    ip netns exec "${NETNS_NAME}" ip link set "$TAP_NAME" up
+
+    # The in-guest server bring-up + per-trace reset loop, passed on the kernel
+    # command line.  NFSv4 grace/lease are lowered so the one grace window this
+    # batch pays is short; the export is fsid=0 so PUTROOTFH lands on it (the
+    # model's root), and `insecure` admits the replayer's high source ports.
+    GUEST_CMD="\
+set -x; \
+mkdir -p /export /reset; \
+modprobe 9pnet_virtio 2>/dev/null; modprobe 9p 2>/dev/null; \
+mount -t 9p -o trans=virtio,version=9p2000.L resetshare /reset || true; \
+modprobe nfsd 2>/dev/null; \
+mount -t nfsd nfsd /proc/fs/nfsd 2>/dev/null || true; \
+echo ${GRACE} > /proc/fs/nfsd/nfsv4leasetime 2>/dev/null || true; \
+echo ${GRACE} > /proc/fs/nfsd/nfsv4gracetime 2>/dev/null || true; \
+rpcbind || true; sleep 0.3; \
+exportfs -o rw,no_root_squash,insecure,no_subtree_check,fsid=0,sync ${GUEST_IP%.*}.0/24:/export; \
+rpc.nfsd 8; rpc.mountd; exportfs -a; \
+touch /reset/ready; \
+while true; do \
+  if [ -f /reset/go ]; then \
+    rm -rf /export/* /export/.[!.]* 2>/dev/null; \
+    exportfs -f 2>/dev/null; sync; \
+    rm -f /reset/go; touch /reset/done; \
+  fi; \
+  sleep 0.05; \
+done"
+
+    QEMU_INITRD=""
+    # shellcheck disable=SC2086
+    ip netns exec "${NETNS_NAME}" "$QEMU_BIN" \
+        -enable-kvm -smp 4 -m 1G -cpu host \
+        -kernel "$VMLINUZ" $QEMU_INITRD $QEMU_MACHINE -nodefaults \
+        -drive file="$ROOTFS",if=virtio,format=qcow2,snapshot=on \
+        -netdev tap,id=net0,ifname="$TAP_NAME",script=no,downscript=no \
+        -device virtio-net-pci,netdev=net0,romfile="" \
+        -fsdev local,id=resetfs,path="$RESET_DIR",security_model=none \
+        -device virtio-9p-pci,fsdev=resetfs,mount_tag=resetshare \
+        -serial file:"$QEMU_LOG" -nographic -no-reboot \
+        -append "root=${ROOT_DEV} rw console=${QEMU_CONSOLE} net.ifnames=0 biosdevname=0 quiet mitigations=off tsc=reliable panic=-1 guest_ip=${GUEST_IP} test_cmd=\"${GUEST_CMD}\" init=/init.sh" \
+        > "$QEMU_OUT" 2>&1 &
+    QEMU_PID=$!
+
+    # Ready when nfsd answers on :2049 (which means the whole bring-up ran).
+    # The /reset/ready marker is not required here -- 9p write-visibility can
+    # lag, and a live :2049 is the real signal -- but the reset round-trip
+    # below does depend on the 9p channel working.
+    ready=0
+    for _ in $(seq 1 1200); do
+        if ip netns exec "${NETNS_NAME}" bash -c \
+               "exec 3<>/dev/tcp/${GUEST_IP}/2049" 2>/dev/null; then
+            ready=1; break
+        fi
+        if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+            echo "knfsd: the guest exited before it was ready" >&2
+            cat "$QEMU_OUT" 2>/dev/null || true
+            tail -60 "$QEMU_LOG" 2>/dev/null || true
+            exit 1
+        fi
+        sleep 0.1
+    done
+    if [ "$ready" != "1" ]; then
+        echo "knfsd: the guest never served NFS on ${GUEST_IP}:2049" >&2
+        cat "$QEMU_OUT" 2>/dev/null || true
+        tail -80 "$QEMU_LOG" 2>/dev/null || true
+        exit 1
+    fi
+
+    # Clear the export in-guest via the 9p control channel.
+    knfsd_reset() {
+        rm -f "${RESET_DIR}/done"
+        touch "${RESET_DIR}/go"
+        local i
+        for i in $(seq 1 200); do
+            [ -f "${RESET_DIR}/done" ] && return 0
+            sleep 0.05
+        done
+        echo "knfsd: the guest did not acknowledge a reset" >&2
+        return 1
+    }
+
+    echo "=== knfsd (guest $(basename "$ROOTFS")) | $SUITE | traces ${TRACE_GLOB} ==="
+
+    if [ -n "${SPECS_NFS_EXEC:-}" ]; then
+        knfsd_reset || true
+        run_in_ns env \
+            SPECS_NFS_SERVER="$GUEST_IP" SPECS_NFS_PORT=2049 \
+            SPECS_NFS_MOUNT_PORT=0 SPECS_NFS_EXPORT=/export \
+            SPECS_NFS_PATH=/export SPECS_NFS_HARNESS="$HERE" \
+            timeout "$TIMEOUT" bash -c "$SPECS_NFS_EXEC"
+        exit $?
+    fi
+
+    # shellcheck disable=SC2086
+    TRACES=( $(compgen -G "${TRACE_DIR}/${TRACE_GLOB}" || true) )
+    if [ ${#TRACES[@]} -eq 0 ]; then
+        echo "no traces matched ${TRACE_DIR}/${TRACE_GLOB}" >&2
+        exit 77
+    fi
+
+    K_ARGS=(--server "$GUEST_IP" --server-kind knfsd)
+    [ "${SPECS_NFS_SURVEY:-0}" = "1" ] && K_ARGS+=(--keep-going)
+    case "$SUITE" in
+        nfs4) REPLAYER="${HERE}/nfs4_replay.py"; K_ARGS+=(--port 2049 --export /) ;;
+        nfs3) REPLAYER="${HERE}/nfs3_replay.py"
+              K_ARGS+=(--port 2049 --mount-port 0 --export /export) ;;
+    esac
+
+    n_ok=0; n_skip=0; n_fail=0
+    EPOCH="$$-$(date +%s)"
+    for t in "${TRACES[@]}"; do
+        if ! knfsd_reset; then
+            echo "$(basename "$t"): ERROR guest reset failed"
+            n_fail=$((n_fail + 1)); continue
+        fi
+        run_in_ns timeout "$TIMEOUT" python3 "$REPLAYER" "${K_ARGS[@]}" \
+            --owner-epoch "${EPOCH}" --trace "$t"
+        rc=$?
+        if [ "$rc" = "0" ]; then n_ok=$((n_ok + 1))
+        elif [ "$rc" = "77" ]; then n_skip=$((n_skip + 1))
+        else n_fail=$((n_fail + 1)); fi
+        if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+            echo "=== knfsd guest died during $(basename "$t") ==="
+            tail -60 "$QEMU_LOG" 2>/dev/null || true
+            QEMU_PID=""
+            break
+        fi
+    done
+
+    echo "=== batch ${TRACE_GLOB}: ${#TRACES[@]} trace(s): ok ${n_ok}, skipped ${n_skip}, failed ${n_fail} ==="
+    [ "$n_fail" != "0" ] && exit 1
+    [ "$n_skip" = "${#TRACES[@]}" ] && exit 77
+    exit 0
 fi
+
 
 ganesha_prepare
 

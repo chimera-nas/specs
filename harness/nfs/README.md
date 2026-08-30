@@ -18,7 +18,7 @@ informative — either the model is wrong, or the server is.
 | server | how it runs | suites |
 |--------|-------------|--------|
 | NFS-Ganesha (`ganesha.nfsd`, userspace) | in the devcontainer, one fresh instance per trace in a private network namespace, exporting a loop-mounted ext4 image through the VFS FSAL | `nfs3`, `nfs4`, `nfs4pnfs` |
-| Linux knfsd | a `kvm-test-base` guest booted per batch (needs `/dev/kvm`) — *not wired yet; the batches report SKIP* | `nfs3`, `nfs4` |
+| Linux knfsd | a `kvm-test-base` guest (>= v1.10.0) booted per batch, driven over a TAP link; needs `/dev/kvm` and qemu, and SKIPs without them | `nfs3`, `nfs4` |
 
 Both outcomes of a disagreement are recorded, and the suite distinguishes
 them:
@@ -39,7 +39,15 @@ next to the harness: [`ganesha_deviations.py`](ganesha_deviations.py) and
 
 ```
 ctest --test-dir build -L ganesha         # one test per generated batch
+ctest --test-dir build -L knfsd           # same corpus, against the Linux kernel server
 ```
+
+The knfsd suite boots a `chimera-nas/kvm-test-base` guest (the image is fetched
+by CI and pointed at with `-DKVM_IMAGE_DIR`), runs `rpc.nfsd` inside it with a
+short NFSv4 grace, and drives it from the host side of a TAP link at
+`10.0.0.2`.  One guest serves a whole batch; the export is cleared between
+traces over a 9p control channel (the guest's keys are internal, so there is no
+host->guest ssh, and an NFS-level walk would trip over leftover open state).
 
 Or by hand:
 

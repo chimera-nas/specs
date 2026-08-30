@@ -415,6 +415,15 @@ the top-level project)" ${_conformance_default})
 option(SPECS_GANESHA_TESTS
        "Register the NFS-Ganesha conformance suite (default: on only when \
 specs is the top-level project)" ${_conformance_default})
+option(SPECS_KNFSD_TESTS
+       "Register the Linux kernel NFS server (knfsd) conformance suite \
+(default: on only when specs is the top-level project AND a KVM guest image \
+is provided via KVM_IMAGE_DIR)" ${_conformance_default})
+# Directory holding the kvm-test-base guest (vmlinuz + rootfs.qcow2) the knfsd
+# suite boots.  CI fetches the image with oras and points this at it; without
+# it the knfsd tests do not register.
+set(KVM_IMAGE_DIR "" CACHE PATH
+    "Directory with the KVM guest image (vmlinuz, rootfs.qcow2) for knfsd.")
 
 set(SAMBA_HARNESS ${CMAKE_CURRENT_SOURCE_DIR}/harness/samba)
 
@@ -626,4 +635,81 @@ else()
                 ENVIRONMENT "SPECS_NFS_NO_NETNS=1")
         endif()
     endforeach()
+endif()
+
+# ---------------------------------------------------------------------------
+# knfsd conformance (harness/nfs, SERVER=knfsd)
+#
+# The same corpus, replayed against the Linux kernel NFS server booted in a
+# KVM guest -- a third, unrelated reference beside Ganesha and the model.  The
+# guest image (chimera-nas/kvm-test-base >= v1.10.0, which carries
+# nfs-kernel-server) is fetched by CI and its directory passed in KVM_IMAGE_DIR;
+# each batch boots one guest and drives it from the host side of a TAP link,
+# resetting the export between traces over a 9p control channel.  Needs
+# /dev/kvm at run time (the runner SKIPs without it) and qemu on the host.
+# ---------------------------------------------------------------------------
+if(NOT SPECS_KNFSD_TESTS)
+    message(STATUS
+        "knfsd MBT tests: not registered (specs is a subdirectory of "
+        "${CMAKE_PROJECT_NAME}; -DSPECS_KNFSD_TESTS=ON with -DKVM_IMAGE_DIR to "
+        "register them)")
+elseif(NOT KVM_IMAGE_DIR OR NOT EXISTS "${KVM_IMAGE_DIR}/vmlinuz"
+       OR NOT EXISTS "${KVM_IMAGE_DIR}/rootfs.qcow2")
+    message(STATUS
+        "knfsd MBT tests: disabled (no KVM guest image; set KVM_IMAGE_DIR to a "
+        "directory with vmlinuz + rootfs.qcow2)")
+else()
+    find_program(QEMU_BIN NAMES qemu-system-x86_64 qemu-system-aarch64
+                 DOC "qemu, which boots the knfsd guest")
+    if(NOT QEMU_BIN)
+        message(STATUS "knfsd MBT tests: disabled (qemu-system not found)")
+    else()
+        message(STATUS "knfsd MBT tests: enabled (guest ${KVM_IMAGE_DIR}, "
+                "${QEMU_BIN})")
+        # The same batches the ganesha suite drives (the corpus is shared); the
+        # knfsd runner boots a guest per batch instead of a server per trace.
+        set(KNFSD_BATCHES
+            "nfs3|step128|step_128_*.itf.json"
+            "nfs3|step256|step_256_*.itf.json"
+            "nfs3|churn128|stepChurn_128_*.itf.json"
+            "nfs3|churn256|stepChurn_256_*.itf.json"
+            "nfs3|dir|stepDir_128_*.itf.json"
+            "nfs3|excl|stepExcl_128_*.itf.json")
+        foreach(inst nfs4Memfs42 nfs4Memfs41 nfs4Memfs40)
+            foreach(fs step stepState stepNamespace stepData stepTypes)
+                list(APPEND KNFSD_BATCHES
+                     "nfs4|${inst}_${fs}|${inst}_${fs}_80_*.itf.json")
+            endforeach()
+        endforeach()
+        list(APPEND KNFSD_BATCHES
+             "nfs4|nfs4Memfs42_stepData42|nfs4Memfs42_stepData42_80_*.itf.json")
+
+        foreach(b ${KNFSD_BATCHES})
+            string(REPLACE "|" ";" parts "${b}")
+            list(GET parts 0 suite)
+            list(GET parts 1 bname)
+            list(GET parts 2 bglob)
+            set(tname knfsd/${suite}/${bname})
+            add_test(NAME ${tname}
+                     COMMAND ${NFS_HARNESS}/run_nfs_mbt.sh knfsd ${suite}
+                             ${T}/${suite} ${bglob})
+            # A guest boot plus up to ~10 traces, each resetting the export:
+            # minutes.  SKIP_RETURN_CODE 77 lets the runner report "no /dev/kvm
+            # here" or "no guest image" as a ctest SKIP.
+            set_tests_properties(${tname} PROPERTIES
+                LABELS "knfsd;${suite};mbt"
+                TIMEOUT 1800
+                SKIP_RETURN_CODE 77
+                ENVIRONMENT "KVM_VMLINUZ=${KVM_IMAGE_DIR}/vmlinuz;KVM_ROOTFS=${KVM_IMAGE_DIR}/rootfs.qcow2")
+            # Every knfsd batch boots a guest that binds the same TAP subnet and
+            # NFS ports; without a netns per test they would collide, so if the
+            # netns is unavailable they serialize under one lock.
+            if(NOT CONFORMANCE_NETNS)
+                set_tests_properties(${tname} PROPERTIES
+                    RESOURCE_LOCK nfs_server_ports)
+                set_property(TEST ${tname} APPEND PROPERTY
+                    ENVIRONMENT "SPECS_NFS_NO_NETNS=1")
+            endif()
+        endforeach()
+    endif()
 endif()

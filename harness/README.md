@@ -21,7 +21,7 @@ divergence in that server — and both are worth having written down.
 | harness | server under test | suite |
 |---------|-------------------|-------|
 | [`samba/`](samba/) | Samba `smbd` | `quint/smb2` |
-| [`nfs/`](nfs/) | NFS-Ganesha `ganesha.nfsd`; Linux knfsd (in a KVM guest) | `quint/nfs` (nfs3, nfs4) |
+| [`nfs/`](nfs/) | NFS-Ganesha `ganesha.nfsd`; the Linux kernel NFS server (knfsd) in a KVM guest | `quint/nfs` (nfs3, nfs4) |
 
 Only the third-party servers' records live here. A consuming project's own
 divergences belong in that project, next to the code that has to change --
@@ -37,4 +37,6 @@ checks, and the divergences found so far.
 ## nfs
 
 `ctest -L ganesha` replays the generated NFSv3 and NFSv4 corpora against a
-private NFS-Ganesha instance per trace. See [`nfs/README.md`](nfs/README.md).
+private NFS-Ganesha instance per trace; `ctest -L knfsd` replays the same corpus
+against the Linux kernel NFS server booted in a KVM guest. See
+[`nfs/README.md`](nfs/README.md).

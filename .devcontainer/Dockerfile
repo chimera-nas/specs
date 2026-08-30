@@ -50,6 +50,10 @@ RUN if [ -n "$APT_MIRROR" ]; then \
 # iproute2               -- `ip netns`, which is how the samba and ganesha
 #                           tests get to run in parallel (each server binds its
 #                           ports in its own network namespace)
+# qemu-system-x86/utils  -- the KVM guest that runs the Linux kernel NFS server
+#                           (knfsd) for the NFS conformance suite.  x86 only, as
+#                           in the chimera devcontainer: KVM acceleration needs
+#                           a matching host, so the knfsd tests run on amd64.
 # python3-pip            -- the replay harness's SMB2 client (see below)
 # reuse                  -- the SPDX lint this repo's CI enforces
 RUN apt-get -y update && \
@@ -60,7 +64,8 @@ RUN apt-get -y update && \
         python3 python3-pip python3-venv nodejs npm reuse \
         iproute2 net-tools tshark tcpdump procps \
         samba smbclient samba-common-bin libsmbclient \
-        nfs-ganesha nfs-ganesha-vfs nfs-ganesha-mem rpcbind && \
+        nfs-ganesha nfs-ganesha-vfs nfs-ganesha-mem rpcbind \
+        qemu-system-x86 qemu-utils && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # The replay harness speaks SMB2 through `smbprotocol`, a pure-Python SMB2/3
