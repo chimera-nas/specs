@@ -95,10 +95,40 @@ GD_3_READLINK_DIR_INVAL = Deviation(
     actual_status=NFS4ERR_INVAL,
 )
 
+# GD-4: the wide VERIFY / NVERIFY assert an implementation-specific status.
+# opVerifyWide sends the server's whole supported-attribute bitmap with an
+# EMPTY value blob to drive the attribute marshaller without predicting a
+# single value, and then relies on the reference implementation's length
+# guard (out_len == attr_vals.len is false) to decide the comparison "not
+# equal" -- so it predicts NFS4ERR_NOT_SAME for VERIFY and NFS4_OK for
+# NVERIFY.  Ganesha reads the empty value blob as "no attributes to compare",
+# which trivially matches, so it answers the opposite: NFS4_OK for VERIFY and
+# NFS4ERR_SAME for NVERIFY.  Both are defensible readings of a deliberately
+# under-specified request (RFC 7530 16.15 / RFC 8881 18.31 do not say what an
+# attrmask with fewer values than bits means), so the model is the one to
+# change -- send a well-formed value blob, or stop asserting the status of
+# the wide variant and only exercise the marshaller.  Recorded as MODEL,
+# reconcilable (VERIFY/NVERIFY change no state), pending that coordinated fix.
+GD_4_VERIFY_WIDE_EMPTY = Deviation(
+    id="GD-4-verify-wide-empty-blob",
+    verdict=MODEL,
+    spec="RFC 7530 16.15 / RFC 8881 18.31 (VERIFY/NVERIFY; an attrmask with "
+         "fewer values than bits is unspecified)",
+    summary="the wide VERIFY/NVERIFY predict NOT_SAME/OK from an empty value "
+            "blob; ganesha reads the empty blob as a trivial match (OK/SAME)",
+    root_cause="opVerifyWide encodes the reference server's length-guard "
+               "behaviour for an empty value blob",
+    candidate_fix="model: send a well-formed value blob for the wide "
+                  "VERIFY/NVERIFY, or drop the status assertion and keep only "
+                  "the marshaller exercise",
+    ops=("SVerify", "SNverify"),
+)
+
 NFS4 = Registry("ganesha/nfs4", [
     GD_1_CHANGE_GRANULARITY,
     GD_2_ACCESS_TYPE_MASK,
     GD_3_READLINK_DIR_INVAL,
+    GD_4_VERIFY_WIDE_EMPTY,
 ])
 
 # GN-1: the v3 ACCESS reply masks the type-irrelevant bits, exactly as
