@@ -445,7 +445,9 @@ module posixops {
         | SReadlinkR({ e: int, tgt: SymTarget })
         | SUmaskR({ e: int, old: int })
         | SGetflR({ e: int, acc: AccMode, appendF: bool })
-        | SGetlkR({ e: int, conflict: bool, cpid: Pid, cw: bool })
+        | SGetlkR({ e: int, conflict: bool, cpid: Pid, cw: bool,
+                    cowners: Set[Pid], cwowners: Set[Pid],
+                    crowners: Set[Pid] })
         | SDirR({ e: int, sid: StreamId })
         | SNamesR({ e: int, names: Set[Name] })
 
@@ -1378,7 +1380,8 @@ module posixops {
                          hi: int): Out =
         if (not(fdLive(ps, p, fd)))
             out(fs, ps, SGetlkR({ e: EBADF, conflict: false, cpid: -1,
-                                  cw: false }))
+                                  cw: false, cowners: Set(),
+                                  cwowners: Set(), crowners: Set() }))
         else {
             val o = fdOfd(ps, p, fd)
             val i = o.ino
@@ -1393,13 +1396,19 @@ module posixops {
                 | CGetlk =>
                     if (lk == LkUn)
                         out(fs, ps, SGetlkR({ e: EINVAL, conflict: false,
-                                              cpid: -1, cw: false }))
+                                              cpid: -1, cw: false,
+                                              cowners: Set(),
+                                              cwowners: Set(),
+                                              crowners: Set() }))
                     else {
                         val owners = lockConflictOwners(ps, p, i, lo, hi,
                                                         lkType(lk))
                         if (owners.size() == 0)
                             out(fs, ps, SGetlkR({ e: OK, conflict: false,
-                                                  cpid: -1, cw: false }))
+                                                  cpid: -1, cw: false,
+                                                  cowners: Set(),
+                                                  cwowners: Set(),
+                                                  crowners: Set() }))
                         else {
                             // POSIX lets the server report ANY blocking
                             // lock; the model reports the lowest-pid owner
@@ -1413,8 +1422,34 @@ module posixops {
                                 a or (m.keys().contains(b) and
                                       m.get(b) == LWrite)
                             })
+                            // POSIX lets the server name ANY of the locks
+                            // that would block the request, so the checkable
+                            // facts are the SET of blocking owners and, per
+                            // owner, which lock TYPES it blocks with -- an
+                            // owner holding both a read and a write lock in
+                            // the range may legitimately be reported either
+                            // way, so it appears in both sets.  Only bytes
+                            // that actually block count: a read request is
+                            // blocked by write locks alone.  cpid/cw remain
+                            // the lowest-pid pick, and are not assertable.
+                            val cwo = owners.filter(q =>
+                                range(lo, hi).foldl(false, (a, b) => {
+                                    val m = lockBytes(ps, q, i)
+                                    a or (m.keys().contains(b) and
+                                          m.get(b) == LWrite)
+                                }))
+                            val cro = owners.filter(q =>
+                                range(lo, hi).foldl(false, (a, b) => {
+                                    val m = lockBytes(ps, q, i)
+                                    a or (m.keys().contains(b) and
+                                          m.get(b) == LRead and
+                                          lkType(lk) == LWrite)
+                                }))
                             out(fs, ps, SGetlkR({ e: OK, conflict: true,
-                                                  cpid: cp, cw: cwr }))
+                                                  cpid: cp, cw: cwr,
+                                                  cowners: owners,
+                                                  cwowners: cwo,
+                                                  crowners: cro }))
                         }
                     }
                 | CSetlk =>
