@@ -810,7 +810,9 @@ module nfs4ops {
         if (g != OK) emit(a, SLookupp({ st: g, parent: -1 }))
         else {
             val nd = cfhNode(a)
-            if (nd.ftype != FDir)
+            if (nd.ftype == FLnk)
+                emit(a, SLookupp({ st: E_SYMLINK, parent: -1 }))
+            else if (nd.ftype != FDir)
                 emit(a, SLookupp({ st: E_NOTDIR, parent: -1 }))
             else if (a.cfh == ROOT)
                 emit(a, SLookupp({ st: E_NOENT, parent: -1 }))
@@ -886,7 +888,8 @@ module nfs4ops {
         else if (ns != OK) emit(a, SSecinfo({ st: ns }))
         else {
             val nd = cfhNode(a)
-            if (nd.ftype != FDir) emit(a, SSecinfo({ st: E_NOTDIR }))
+            if (nd.ftype == FLnk) emit(a, SSecinfo({ st: E_SYMLINK }))
+            else if (nd.ftype != FDir) emit(a, SSecinfo({ st: E_NOTDIR }))
             else if (not(fsHasEnt(a.fs, a.cfh, n)))
                 emit(a, SSecinfo({ st: E_NOENT }))
             else emit(a.with("cfh", -1), SSecinfo({ st: OK }))
@@ -895,21 +898,22 @@ module nfs4ops {
 
     // READLINK (RFC 7530 16.25 / RFC 8881 18.24): directory -> ISDIR,
     // other non-symlink -> INVAL ("should" wording).
-    // READLINK on a non-symlink is NFS4ERR_INVAL under RFC 7530 16.25.4
-    // ("should return NFS4ERR_INVAL if the object is not a symbolic link" --
-    // a directory is not a symbolic link) and NFS4ERR_WRONG_TYPE under
-    // RFC 8881 18.24.4.  No special NFS4ERR_ISDIR case: the standards name a
-    // single status for every non-symlink target, and both the Linux server
-    // and NFS-Ganesha return it.
+    // READLINK on a non-symlink is NFS4ERR_INVAL.  RFC 7530 16.25.4 names it
+    // outright ("should return NFS4ERR_INVAL if the object is not a symbolic
+    // link" -- a directory is not a symbolic link); RFC 8881 18.24.4 later
+    // recommends NFS4ERR_WRONG_TYPE, but only as a SHOULD, and every server
+    // this corpus is replayed against (NFS-Ganesha and the Linux kernel
+    // server) kept the original INVAL for all minor versions -- so the model
+    // predicts INVAL rather than recording the same permitted divergence on
+    // every server.  No special NFS4ERR_ISDIR case: one status covers every
+    // non-symlink target.
     pure def opReadlink(a: Acc): Acc = {
         val g = fhGate(a)
         if (g != OK) emit(a, SReadlink({ st: g, target: "" }))
         else {
             val nd = cfhNode(a)
             if (nd.ftype != FLnk)
-                emit(a, SReadlink({
-                    st: if (a.minor == 0) E_INVAL else E_WRONG_TYPE,
-                    target: "" }))
+                emit(a, SReadlink({ st: E_INVAL, target: "" }))
             else emit(a, SReadlink({ st: OK, target: nd.target }))
         }
     }
@@ -979,7 +983,8 @@ module nfs4ops {
         if (g != OK) emit(a, SReaddir({ st: g, names: Set() }))
         else {
             val nd = cfhNode(a)
-            if (nd.ftype != FDir) emit(a, SReaddir({ st: E_NOTDIR, names: Set() }))
+            if (nd.ftype == FLnk) emit(a, SReaddir({ st: E_SYMLINK, names: Set() }))
+            else if (nd.ftype != FDir) emit(a, SReaddir({ st: E_NOTDIR, names: Set() }))
             else emit(a, SReaddir({ st: OK, names: nd.ents.keys() }))
         }
     }
@@ -1020,6 +1025,8 @@ module nfs4ops {
         if (g != OK) emit(a, SRemove({ st: g, cinfo: { before: 0, after: 0 } }))
         else if (ns != OK)
             emit(a, SRemove({ st: ns, cinfo: { before: 0, after: 0 } }))
+        else if (cfhNode(a).ftype == FLnk)
+            emit(a, SRemove({ st: E_SYMLINK, cinfo: { before: 0, after: 0 } }))
         else {
             // Delegations held by other clients on the victim force a
             // recall; REMOVE observes NFS4ERR_DELAY until they return
@@ -1057,6 +1064,9 @@ module nfs4ops {
         else if (nameStatus(ar.newname) != OK)
             emit(a, SRename({ st: nameStatus(ar.newname),
                               cinfoS: zero, cinfoT: zero }))
+        else if (fsGet(a.fs, a.sfh).ftype == FLnk or
+                 fsGet(a.fs, a.cfh).ftype == FLnk)
+            emit(a, SRename({ st: E_SYMLINK, cinfoS: zero, cinfoT: zero }))
         else {
             // Rename-over unlinks the target: other-client delegations on
             // it force a recall + NFS4ERR_DELAY, mirroring REMOVE.  (The
@@ -1091,6 +1101,8 @@ module nfs4ops {
             emit(a, SLink({ st: E_STALE, cinfo: zero }))
         else if (nameStatus(n) != OK)
             emit(a, SLink({ st: nameStatus(n), cinfo: zero }))
+        else if (fsGet(a.fs, a.cfh).ftype == FLnk)
+            emit(a, SLink({ st: E_SYMLINK, cinfo: zero }))
         else {
             val o = fsLink(a.fs, a.sfh, a.cfh, n)
             emit(a.with("fs", o.fs2), SLink({ st: fsStatus(o.st), cinfo: o.cinfo }))
@@ -1534,7 +1546,8 @@ module nfs4ops {
                 }
             | OCNull(n) => {
                 val dnd = cfhNode(a)
-                if (dnd.ftype != FDir) base.with("st", E_NOTDIR)
+                if (dnd.ftype == FLnk) base.with("st", E_SYMLINK)
+                else if (dnd.ftype != FDir) base.with("st", E_NOTDIR)
                 else {
                     val present = fsHasEnt(a.fs, a.cfh, n)
                     val child = if (present) fsChild(a.fs, a.cfh, n) else -1

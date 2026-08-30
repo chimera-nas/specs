@@ -82,9 +82,32 @@ GD_4_VERIFY_WIDE_EMPTY = Deviation(
     ops=("SVerify", "SNverify"),
 )
 
+# GD-5: OPEN of an existing non-regular, non-symlink target (a FIFO, socket
+# or device node) answers NFS4ERR_SYMLINK instead of NFS4ERR_WRONG_TYPE.
+# RFC 8881 18.16.4 gives NFS4ERR_SYMLINK its specific meaning -- the target is
+# a symbolic link -- and NFS4ERR_WRONG_TYPE for any other type mismatch, which
+# is what the model predicts on 4.1+.  Ganesha returns the older RFC 7530
+# generic NFS4ERR_SYMLINK for every non-directory special file, a FIFO
+# included.  Status-only, so replay continues.
+GD_5_OPEN_SPECIAL_SYMLINK = Deviation(
+    id="GD-5-open-special-as-symlink",
+    verdict=SERVER,
+    spec="RFC 8881 18.16.4 (a non-symlink type mismatch is NFS4ERR_WRONG_TYPE; "
+         "NFS4ERR_SYMLINK is specifically for a symbolic link)",
+    summary="OPEN of a FIFO/socket/device target returns NFS4ERR_SYMLINK "
+            "instead of NFS4ERR_WRONG_TYPE",
+    root_cause="ganesha uses the RFC 7530 generic SYMLINK for every "
+               "non-directory special open target",
+    candidate_fix="none required (RFC 8881's WRONG_TYPE is a SHOULD)",
+    ops=("SOpen",),
+    expected_status=NFS4ERR_WRONG_TYPE,
+    actual_status=NFS4ERR_SYMLINK,
+)
+
 NFS4 = Registry("ganesha/nfs4", [
     GD_1_CHANGE_GRANULARITY,
     GD_4_VERIFY_WIDE_EMPTY,
+    GD_5_OPEN_SPECIAL_SYMLINK,
 ])
 
 
