@@ -44,24 +44,6 @@ KN_1_NAME_HANDLING = Deviation(
                    NFS4ERR_NOENT, NFS4_OK, NFS4ERR_EXIST),
 )
 
-# KN-2: CREATE into a symlink parent.  The model (once it checks the parent
-# type before the object type) and ganesha answer NFS4ERR_SYMLINK; knfsd
-# frames the symlink-as-directory as NFS4ERR_NOTDIR (RFC 7530 16.4 / RFC 8881
-# 18.4 do not pin it).  Nothing is created, so replay continues.
-KN_2_CREATE_PARENT_FIRST = Deviation(
-    id="KN-2-create-parent-before-type",
-    verdict=SERVER,
-    spec="RFC 7530 16.4 / RFC 8881 18.4 (CREATE; the type vs parent check "
-         "order is unspecified)",
-    summary="CREATE into a symlink parent reports NFS4ERR_NOTDIR where the "
-            "model (and ganesha) report NFS4ERR_SYMLINK",
-    root_cause="knfsd frames a symlink used as a directory as NOTDIR, not "
-               "SYMLINK",
-    candidate_fix="none required (defensible)",
-    ops=("SCreate",),
-    expected_status=NFS4ERR_SYMLINK,
-    actual_status=NFS4ERR_NOTDIR,
-)
 
 
 # KN-3: LINK of a directory source -> NFS4ERR_NOTDIR, the knfsd side of GD-9
@@ -172,7 +154,6 @@ KN_7_UNCONFIRMED_OPEN_LOST = Deviation(
 
 NFS4 = Registry("knfsd/nfs4", [
     KN_1_NAME_HANDLING,
-    KN_2_CREATE_PARENT_FIRST,
     KN_3_LINK_DIR_NOTDIR,
     KN_4_RENEW_EXPIRED,
     KN_5_RENAME_SYMLINK_NOTDIR,

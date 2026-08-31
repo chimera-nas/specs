@@ -160,27 +160,24 @@ GD_7_SETATTR_SHARE_DENIED = Deviation(
     actual_status=NFS4ERR_SHARE_DENIED,
 )
 
-# GD-8: CREATE of a regular file (an illegal object type for CREATE, which is
-# for non-regular objects only) into a non-directory parent.  The request is
-# doubly invalid -- bad object type AND bad parent -- and RFC 7530 16.4 /
-# RFC 8881 18.4 do not order the two checks.  The model reports the object
-# type first (NFS4ERR_BADTYPE); ganesha reports the parent first
-# (NFS4ERR_SYMLINK for a symlink parent, NFS4ERR_NOTDIR for any other
-# non-directory).  Nothing is created either way, so replay continues.
-GD_8_CREATE_PARENT_FIRST = Deviation(
-    id="GD-8-create-parent-before-type",
+# GD-8: CREATE whose parent (current filehandle) is a symbolic link answers
+# NFS4ERR_SYMLINK.  The model, knfsd and chimera all treat a symlink current
+# filehandle as a non-directory and answer NFS4ERR_NOTDIR (RFC 7530 16.4.4
+# does not list NFS4ERR_SYMLINK for CREATE); ganesha singles the symlink out.
+# Nothing is created, so replay continues.
+GD_8_CREATE_SYMLINK_PARENT = Deviation(
+    id="GD-8-create-symlink-parent",
     verdict=SERVER,
-    spec="RFC 7530 16.4 / RFC 8881 18.4 (CREATE; the type vs parent check "
-         "order is unspecified)",
-    summary="CREATE of a regular file into a non-directory parent reports the "
-            "parent (SYMLINK/NOTDIR) where the model reports the type (BADTYPE)",
-    root_cause="ganesha validates the current filehandle's type before the "
-               "requested object type",
-    candidate_fix="none required (defensible); the model could check the "
-                  "parent type first to match",
+    spec="RFC 7530 16.4.4 / RFC 8881 18.4 (CREATE; NFS4ERR_SYMLINK is not "
+         "listed, and a symlink current filehandle is a non-directory)",
+    summary="CREATE into a symlink parent reports NFS4ERR_SYMLINK where the "
+            "model (and knfsd and chimera) report NFS4ERR_NOTDIR",
+    root_cause="ganesha singles out a symlink current filehandle instead of "
+               "reporting the generic not-a-directory status",
+    candidate_fix="none required (defensible)",
     ops=("SCreate",),
-    expected_status=NFS4ERR_BADTYPE,
-    actual_status=(NFS4ERR_SYMLINK, NFS4ERR_NOTDIR),
+    expected_status=NFS4ERR_NOTDIR,
+    actual_status=NFS4ERR_SYMLINK,
 )
 
 # GD-9: LINK whose saved (source) filehandle is a directory answers
@@ -311,7 +308,7 @@ NFS4 = Registry("ganesha/nfs4", [
     GD_5_OPEN_SPECIAL_SYMLINK,
     GD_6_NAME_HANDLING,
     GD_7_SETATTR_SHARE_DENIED,
-    GD_8_CREATE_PARENT_FIRST,
+    GD_8_CREATE_SYMLINK_PARENT,
     GD_9_LINK_DIR_NOTDIR,
     GD_10_RENEW_EXPIRED,
     GD_11_WRONG_TYPE,
