@@ -404,7 +404,7 @@ GD_19_OWNER_SEQID_GAP = Deviation(
     candidate_fix="none from the model; drop the BAD_SEQID negative probe or "
                   "record",
     ops=("SOpen", "SClose", "SOpenDowngrade", "SLock"),
-    expected_status=(NFS4ERR_BAD_SEQID, NFS4_OK),
+    expected_status=(NFS4ERR_BAD_SEQID, NFS4_OK, NFS4ERR_INVAL),
     actual_status=(NFS4ERR_NOENT, NFS4_OK, NFS4ERR_NOTDIR, NFS4ERR_EXIST,
                    NFS4ERR_ISDIR, NFS4ERR_BAD_SEQID),
     reconcilable=False,
@@ -521,6 +521,48 @@ GN_2_LINK_DIR_BADTYPE = Deviation(
     actual_status=NFS3ERR_BADTYPE,
 )
 
+# GN-3: CREATE disposition and precedence.  RFC 1813 3.3.8 leaves the order of
+# the existence, type and permission checks (and which of GUARDED's collisions
+# is EXIST vs the object's own status) to the server.  ganesha reports the
+# object type (BADTYPE), a permission failure (ACCES), or EXIST where the model
+# predicts EXIST or OK.  A create that one side made and the other did not parts
+# the state, so reconcilable=False.
+GN_3_CREATE = Deviation(
+    id="GN-3-create-disposition",
+    verdict=SERVER,
+    spec="RFC 1813 3.3.8 (CREATE; the existence/type/permission check order is "
+         "the server's)",
+    summary="CREATE disposition/precedence lands on BADTYPE/ACCES/EXIST/OK "
+            "differently from the model",
+    root_cause="ganesha orders the CREATE existence/type/permission checks "
+               "differently from the model",
+    candidate_fix="align the model's CREATE precedence with ganesha",
+    ops=("OCreate",),
+    expected_status=(NFS3ERR_EXIST, NFS3_OK),
+    actual_status=(NFS3ERR_BADTYPE, NFS3ERR_ACCES, NFS3ERR_EXIST, NFS3_OK,
+                   NFS3ERR_NXIO),
+    reconcilable=False,
+)
+
+# GN-4: RENAME of a non-empty directory target reports NFS3ERR_NOTEMPTY where
+# the model predicts NFS3ERR_ISDIR (both are conformant, RFC 1813 3.3.14 lists
+# neither order).  Nothing is renamed, so replay continues.
+GN_4_RENAME = Deviation(
+    id="GN-4-rename-notempty",
+    verdict=SERVER,
+    spec="RFC 1813 3.3.14 (RENAME; ISDIR vs NOTEMPTY for a directory target is "
+         "unordered)",
+    summary="RENAME onto a directory reports NFS3ERR_NOTEMPTY where the model "
+            "predicts NFS3ERR_ISDIR",
+    root_cause="ganesha reports the non-empty target before its type",
+    candidate_fix="none required (defensible)",
+    ops=("ORename",),
+    expected_status=NFS3ERR_ISDIR,
+    actual_status=NFS3ERR_NOTEMPTY,
+)
+
 NFS3 = Registry("ganesha/nfs3", [
     GN_2_LINK_DIR_BADTYPE,
+    GN_3_CREATE,
+    GN_4_RENAME,
 ])

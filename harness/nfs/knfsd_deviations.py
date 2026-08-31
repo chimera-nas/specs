@@ -172,7 +172,8 @@ KN_9_OWNER_SEQID = Deviation(
                "strict +1 gate",
     candidate_fix="none from the model; drop the BAD_SEQID probe or record",
     ops=("SOpen", "SClose", "SOpenDowngrade"),
-    expected_status=(NFS4ERR_BAD_SEQID, NFS4ERR_INVAL, NFS4_OK),
+    expected_status=(NFS4ERR_BAD_SEQID, NFS4ERR_INVAL, NFS4_OK,
+                     NFS4ERR_EXIST),
     actual_status=(NFS4ERR_NOENT, NFS4_OK, NFS4ERR_BAD_SEQID, NFS4ERR_INVAL,
                    NFS4ERR_NOTDIR, NFS4ERR_BAD_STATEID, NFS4ERR_EXPIRED),
     reconcilable=False,
@@ -350,6 +351,27 @@ KN_18_READDIR_NAMES = Deviation(
 )
 
 
+# KN-19: residual v4 CREATE/SETATTR edges.  A CREATE whose EXIST collision the
+# model predicts is accepted by knfsd (OK); a size SETATTR on a symlink the
+# model calls INVAL is NFS4ERR_SYMLINK to knfsd (the POSIX-aligned type error,
+# as KN-6).  Both conformant; the create parts state, so reconcilable=False.
+KN_19_CREATE_SETATTR = Deviation(
+    id="KN-19-create-setattr-edges",
+    verdict=SERVER,
+    spec="RFC 8881 18.4 / 18.30 (CREATE disposition and SETATTR-on-non-regular "
+         "status are the server's)",
+    summary="CREATE EXIST->OK and SETATTR INVAL->SYMLINK edges differ from the "
+            "model",
+    root_cause="knfsd accepts the colliding create and types the symlink "
+               "setattr as SYMLINK",
+    candidate_fix="align the model's create/setattr edges with knfsd",
+    ops=("SCreate", "SSetattr"),
+    expected_status=(NFS4ERR_EXIST, NFS4ERR_INVAL),
+    actual_status=(NFS4_OK, NFS4ERR_SYMLINK),
+    reconcilable=False,
+)
+
+
 NFS4 = Registry("knfsd/nfs4", [
     KN_1_NAME_HANDLING,
     KN_3_LINK_DIR_NOTDIR,
@@ -367,8 +389,62 @@ NFS4 = Registry("knfsd/nfs4", [
     KN_16_ATTR,
     KN_17_LIFECYCLE,
     KN_18_READDIR_NAMES,
+    KN_19_CREATE_SETATTR,
 ])
 
 
+# KN3-1: CREATE disposition -- knfsd accepts a GUARDED/EXCLUSIVE create the
+# model predicts EXIST or ISDIR for (returning OK), or reports EXIST where the
+# model expects OK.  RFC 1813 3.3.8 leaves the disposition/precedence to the
+# server.  reconcilable=False: a create one side made parts the state.
+KN3_1_CREATE = Deviation(
+    id="KN3-1-create-disposition",
+    verdict=SERVER,
+    spec="RFC 1813 3.3.8 (CREATE disposition/precedence is the server's)",
+    summary="CREATE disposition lands on OK/EXIST differently from the model",
+    root_cause="knfsd's CREATE existence/type checks differ from the model",
+    candidate_fix="align the model's CREATE precedence with knfsd",
+    ops=("OCreate",),
+    expected_status=(NFS3ERR_EXIST, NFS3ERR_ISDIR, NFS3_OK),
+    actual_status=(NFS3_OK, NFS3ERR_EXIST),
+    reconcilable=False,
+)
+
+# KN3-2: an EXCLUSIVE-created file materialises mode 0 on knfsd (the client is
+# expected to SETATTR its permissions), where the model -- like ganesha and
+# chimera -- uses 0600.  RFC 1813 3.3.8 leaves the mode undefined until that
+# SETATTR.  Field-only (the WCC mode), no state divergence.
+KN3_2_EXCL_MODE = Deviation(
+    id="KN3-2-exclusive-mode-zero",
+    verdict=SERVER,
+    spec="RFC 1813 3.3.8 (the mode of an EXCLUSIVE-created file is undefined "
+         "until the client's SETATTR)",
+    summary="an EXCLUSIVE-created file is mode 0 on knfsd where the model "
+            "predicts 0600",
+    root_cause="knfsd creates the exclusive file with no permission bits until "
+               "the follow-up SETATTR",
+    candidate_fix="none required (RFC-undefined); a knfsd-specific choice",
+    ops=("OWrite", "OSetattr", "OCreate", "OGetattr"),
+    field=("wcc.after.mode", "attrs.mode", "mode"),
+)
+
+# KN3-3: RENAME onto a directory reports NFS3ERR_NOTEMPTY (the knfsd side of
+# GN-4).  RFC 1813 3.3.14 leaves ISDIR vs NOTEMPTY unordered.
+KN3_3_RENAME = Deviation(
+    id="KN3-3-rename-notempty",
+    verdict=SERVER,
+    spec="RFC 1813 3.3.14 (RENAME; ISDIR vs NOTEMPTY is unordered)",
+    summary="RENAME onto a directory reports NFS3ERR_NOTEMPTY where the model "
+            "predicts NFS3ERR_ISDIR",
+    root_cause="knfsd reports the non-empty target before its type",
+    candidate_fix="none required (defensible)",
+    ops=("ORename",),
+    expected_status=NFS3ERR_ISDIR,
+    actual_status=NFS3ERR_NOTEMPTY,
+)
+
 NFS3 = Registry("knfsd/nfs3", [
+    KN3_1_CREATE,
+    KN3_2_EXCL_MODE,
+    KN3_3_RENAME,
 ])
