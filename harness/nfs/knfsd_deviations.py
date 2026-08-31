@@ -154,6 +154,164 @@ KN_7_UNCONFIRMED_OPEN_LOST = Deviation(
 
 
 
+# KN-9: open-owner seqid enforcement, both directions.  The model drives a
+# deliberate +2 gap expecting NFS4ERR_BAD_SEQID (nfs4_ops.qnt oseq: seqid + 2);
+# knfsd processes the OPEN instead (NOENT / the object status).  Conversely,
+# where the model expects a name/other status knfsd sometimes answers BAD_SEQID
+# from its own owner bookkeeping.  RFC 7530 9.1.7 makes exactly-+1 sequencing a
+# server enforcement point the two sides police differently.  reconcilable=False:
+# the owner seqid parts, so the trace stops here.
+KN_9_OWNER_SEQID = Deviation(
+    id="KN-9-owner-seqid-enforcement",
+    verdict=SERVER,
+    spec="RFC 7530 9.1.7 (open-owner seqid must be exactly one greater; "
+         "enforcement is the server's)",
+    summary="open-owner seqid: knfsd processes a gap the model calls BAD_SEQID, "
+            "or answers BAD_SEQID where the model expects another status",
+    root_cause="knfsd's open-owner seqid bookkeeping diverges from the model's "
+               "strict +1 gate",
+    candidate_fix="none from the model; drop the BAD_SEQID probe or record",
+    ops=("SOpen", "SClose", "SOpenDowngrade"),
+    expected_status=(NFS4ERR_BAD_SEQID, NFS4ERR_INVAL, NFS4_OK),
+    actual_status=(NFS4ERR_NOENT, NFS4_OK, NFS4ERR_BAD_SEQID, NFS4ERR_INVAL,
+                   NFS4ERR_NOTDIR, NFS4ERR_BAD_STATEID),
+    reconcilable=False,
+)
+
+# KN-10: share reservation / open-attempt enforcement.  A second OPEN that the
+# model predicts SHARE_DENIED against a deny reservation, or predicts OK, knfsd
+# instead allows (OK) or rejects (NFS4ERR_INVAL) per its own share bookkeeping.
+# RFC 8881 9.7 makes share-reservation conflict detection the server's; an OPEN
+# knfsd accepts that the model did not creates divergent state, so
+# reconcilable=False.
+KN_10_SHARE = Deviation(
+    id="KN-10-share-reservation-enforcement",
+    verdict=SERVER,
+    spec="RFC 8881 9.7 (share-reservation conflict detection is the server's)",
+    summary="a second OPEN's share outcome (SHARE_DENIED/OK/INVAL) differs from "
+            "the model's prediction",
+    root_cause="knfsd's share-reservation bookkeeping differs from the model's",
+    candidate_fix="align the model's share-conflict rule with knfsd",
+    ops=("SOpen",),
+    expected_status=(NFS4ERR_SHARE_DENIED, NFS4_OK),
+    actual_status=(NFS4_OK, NFS4ERR_INVAL, NFS4ERR_SHARE_DENIED),
+    reconcilable=False,
+)
+
+# KN-11: open-mode vs lock/IO enforcement -- the knfsd side of GD-15.  A READ or
+# WRITE through a stateid whose open the model thinks lacks the matching access
+# is OPENMODE/LOCKED to the model but allowed by knfsd, or the reverse.  RFC 8881
+# 9.1.2 leaves the exact match under-specified.  Status-only.
+KN_11_OPENMODE = Deviation(
+    id="KN-11-openmode-lock-vs-io",
+    verdict=BOTH,
+    spec="RFC 8881 9.1.2 (NFS4ERR_OPENMODE; the open-access/lock-type match is "
+         "under-specified)",
+    summary="READ/WRITE vs the stateid's open access: model and knfsd enforce "
+            "OPENMODE/LOCKED in opposite directions",
+    root_cause="the model and knfsd calibrate the open-access-vs-IO check "
+               "differently",
+    candidate_fix="pin the model's opRead/opWrite openmode rule to knfsd's",
+    ops=("SRead", "SWrite", "SLock"),
+    expected_status=(NFS4_OK, NFS4ERR_OPENMODE, NFS4ERR_LOCKED),
+    actual_status=(NFS4ERR_OPENMODE, NFS4_OK, NFS4ERR_BAD_STATEID,
+                   NFS4ERR_OLD_STATEID),
+)
+
+# KN-12: RENEW of a lapsed lease succeeds (NFS4_OK) where the model, having
+# retired the client id, predicts STALE_CLIENTID -- the OK-valued companion of
+# KN-4.  RFC 7530 16.30.4 / 9.6.3: how long a lapsed client id survives, and
+# whether a late RENEW still refreshes it, is the server's to time.
+KN_12_RENEW_OK = Deviation(
+    id="KN-12-renew-ok",
+    verdict=SERVER,
+    spec="RFC 7530 16.30.4 / 9.6.3 (a lapsed client id's survival is the "
+         "server's to time)",
+    summary="RENEW of a lapsed lease succeeds where the model predicts "
+            "STALE_CLIENTID",
+    root_cause="knfsd still holds the client id and refreshes it",
+    candidate_fix="none required (defensible)",
+    ops=("SRenew",),
+    expected_status=NFS4ERR_STALE_CLIENTID,
+    actual_status=NFS4_OK,
+)
+
+# KN-13: LOOKUP of a malformed-UTF-8 component answers NFS4ERR_ACCESS -- the
+# knfsd side of KN-1's name-handling latitude, landing on ACCESS rather than a
+# name-error code or NOENT.  RFC 7530 12.7 / 12.8 leave malformed-name handling
+# to the server.
+KN_13_NAME_ACCESS = Deviation(
+    id="KN-13-name-access",
+    verdict=SERVER,
+    spec="RFC 7530 12.7 / 12.8 (malformed-UTF-8 component handling is the "
+         "server's)",
+    summary="LOOKUP of a malformed component returns NFS4ERR_ACCESS where the "
+            "model predicts NFS4ERR_BADCHAR",
+    root_cause="knfsd maps the component to an access failure",
+    candidate_fix="none required (both conformant)",
+    ops=("SLookup",),
+    expected_status=NFS4ERR_BADCHAR,
+    actual_status=NFS4ERR_ACCESS,
+)
+
+# KN-14: a byte-range LOCKT during the grace period answers NFS4ERR_GRACE where
+# the model, which does not model the reclaim grace window for LOCKT, predicts
+# the ordinary result (OK or the conflicting-lock ISDIR/DENIED).  RFC 7530
+# 9.6.2 / RFC 8881 8.4.2 make LOCKT reject with GRACE until reclaim completes.
+KN_14_LOCKT_GRACE = Deviation(
+    id="KN-14-lockt-grace",
+    verdict=SERVER,
+    spec="RFC 7530 9.6.2 / RFC 8881 8.4.2 (operations reject with NFS4ERR_GRACE "
+         "until the reclaim grace period ends)",
+    summary="LOCKT during the grace window returns NFS4ERR_GRACE where the "
+            "model predicts the ordinary result",
+    root_cause="the model does not gate LOCKT behind the reclaim grace window",
+    candidate_fix="model: gate LOCKT on grace as OPEN already is",
+    ops=("SLockt",),
+    expected_status=(NFS4_OK, NFS4ERR_ISDIR),
+    actual_status=NFS4ERR_GRACE,
+)
+
+# KN-15: change-attribute consistency -- the knfsd side of GD-1/GD-14.  knfsd's
+# change attribute is the object's coarse ctime, so two mutations within a tick
+# report the same value, or the value advances between two reads the model
+# treats as unchanged.  RFC 7530 5.8.1.4 requires it differ on every change.
+KN_15_CHANGE = Deviation(
+    id="KN-15-change-coarse-ctime",
+    verdict=SERVER,
+    spec="RFC 7530 5.8.1.4 / RFC 8881 5.8.1.4 (change must differ after any "
+         "modification)",
+    summary="knfsd's change attribute (coarse ctime) is non-injective against "
+            "the model's abstract change",
+    root_cause="knfsd change = ctime; a tick boundary makes it collide or "
+               "advance untracked",
+    candidate_fix="a per-object modification counter (as GD-1)",
+    ops=("SCreate", "SLink", "SRemove", "SRename", "SGetattr", "SOpen"),
+    field=("cinfo.before", "cinfo.after", "cinfoS.before", "cinfoT.before",
+           "change"),
+    context=lambda f, ctx: ("unchanged on the wire" in f.detail or
+                            "reported two wire values" in f.detail),
+)
+
+# KN-16: GETATTR mode/nlink on a directory whose link count or mode knfsd tracks
+# differently from the model (a subdirectory bumps a POSIX directory's nlink to
+# 3; the model keeps 2).  RFC 7530 5.8 leaves nlink's exact accounting to the
+# filesystem.  Field-only, reconcilable.
+KN_16_ATTR = Deviation(
+    id="KN-16-dir-attr-accounting",
+    verdict=SERVER,
+    spec="RFC 7530 5.8.1 (numlinks/mode follow the backing filesystem's "
+         "accounting)",
+    summary="GETATTR nlink/mode on a directory differs from the model's "
+            "abstract accounting",
+    root_cause="knfsd's ext4 export counts a directory's subdirectories in "
+               "nlink where the model keeps a flat 2",
+    candidate_fix="model: count subdirectories in a directory's nlink",
+    ops=("SGetattr",),
+    field=("nlink", "mode"),
+)
+
+
 NFS4 = Registry("knfsd/nfs4", [
     KN_1_NAME_HANDLING,
     KN_3_LINK_DIR_NOTDIR,
@@ -161,6 +319,14 @@ NFS4 = Registry("knfsd/nfs4", [
     KN_5_RENAME_SYMLINK_NOTDIR,
     KN_6_WRONG_TYPE,
     KN_7_UNCONFIRMED_OPEN_LOST,
+    KN_9_OWNER_SEQID,
+    KN_10_SHARE,
+    KN_11_OPENMODE,
+    KN_12_RENEW_OK,
+    KN_13_NAME_ACCESS,
+    KN_14_LOCKT_GRACE,
+    KN_15_CHANGE,
+    KN_16_ATTR,
 ])
 
 

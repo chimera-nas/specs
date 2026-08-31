@@ -283,6 +283,134 @@ GD_13_OPEN_EXIST_PRECEDENCE = Deviation(
 )
 
 
+# GD-14: extend GD-1's change-attribute reconciliation to its other facet.
+# check_change also fires "abstract change X reported two wire values" when the
+# wire change advances for an object the model did not mutate in that step
+# (coarse ctime crossing a tick boundary between two reads).  Same root cause
+# and RFC clause as GD-1; recorded here for the OPEN/GETATTR path.
+GD_14_CHANGE_ADVANCED = Deviation(
+    id="GD-14-change-advanced-untracked",
+    verdict=SERVER,
+    spec="RFC 7530 5.8.1.4 / RFC 8881 5.8.1.4 (change): coarse ctime makes the "
+         "value non-injective against the model's abstract change",
+    summary="the wire change advances where the model recorded no mutation "
+            "(the ctime-granularity dual of GD-1)",
+    root_cause="FSAL_VFS change = ctime in ns; a tick boundary moves it "
+               "between two reads the model treats as unchanged",
+    candidate_fix="a per-object modification counter (as GD-1)",
+    ops=("SOpen", "SGetattr", "SCreate", "SRemove", "SRename", "SLink"),
+    field=("cinfo.after", "cinfo.before", "cinfoS.before", "cinfoT.before",
+           "change"),
+    context=lambda f, ctx: "reported two wire values" in f.detail,
+)
+
+# GD-15: open-mode vs lock/IO enforcement.  RFC 8881 9.1.2 requires the stateid's
+# open to allow the access a READ/WRITE/LOCK needs (NFS4ERR_OPENMODE otherwise),
+# but leaves how strictly a lock's type is matched to the open's share access
+# under-specified.  The model and ganesha draw the line differently in both
+# directions: a READ_LT lock on a write-only open is OPENMODE to ganesha but
+# allowed by the model, and a READ through a stateid the model thinks lacks
+# READ is OPENMODE to the model but allowed by ganesha.  Status-only.
+GD_15_OPENMODE = Deviation(
+    id="GD-15-openmode-lock-vs-io",
+    verdict=BOTH,
+    spec="RFC 8881 9.1.2 (NFS4ERR_OPENMODE; the exact open-access/lock-type "
+         "match is under-specified)",
+    summary="READ/LOCK vs the stateid's open access: model and ganesha enforce "
+            "NFS4ERR_OPENMODE in opposite directions",
+    root_cause="the model and ganesha calibrate the open-access-vs-lock/IO "
+               "check differently",
+    candidate_fix="pin the model's opLock/opRead openmode rule to ganesha's",
+    ops=("SLock", "SRead", "SWrite"),
+    expected_status=(NFS4_OK, NFS4ERR_OPENMODE),
+    actual_status=(NFS4ERR_OPENMODE, NFS4_OK),
+)
+
+# GD-16: EXCLUSIVE open verifier lifecycle and share-vs-create precedence.  The
+# model stores the exclusive verifier in time_modify and predicts idempotent
+# EXIST/OK on a same/different-verifier retry; ganesha's own verifier bookkeeping
+# and its share-reservation check land on the opposite EXIST<->OK, or on
+# SHARE_DENIED where the model has not yet noticed the reservation.  RFC 7530
+# 16.16 leaves the verifier's storage and the create-vs-share order to the
+# server.  reconcilable=False: an open that one side created and the other did
+# not parts the state, so the trace stops here rather than cascading.
+GD_16_EXCL_VERIFIER = Deviation(
+    id="GD-16-exclusive-verifier-lifecycle",
+    verdict=SERVER,
+    spec="RFC 7530 16.16 / RFC 8881 18.16 (EXCLUSIVE verifier storage and the "
+         "create-vs-share-reservation order are the server's)",
+    summary="EXCLUSIVE-open retry lands on the opposite EXIST/OK, or on "
+            "SHARE_DENIED, from the model's verifier/share prediction",
+    root_cause="ganesha's exclusive-verifier bookkeeping and share check differ "
+               "from the model's time_modify-based prediction",
+    candidate_fix="align the model's exclusive-verifier storage with ganesha",
+    ops=("SOpen",),
+    expected_status=(NFS4ERR_EXIST, NFS4_OK),
+    actual_status=(NFS4_OK, NFS4ERR_EXIST, NFS4ERR_SHARE_DENIED),
+    reconcilable=False,
+)
+
+# GD-17: OPEN's OPEN4_RESULT_CONFIRM flag.  On 4.1+ there is no OPEN_CONFIRM, so
+# the model predicts needConfirm=false; ganesha sets the flag in a case the
+# model does not (or vice versa).  The confirm handshake is 4.0-only, so the
+# flag on 4.1+ changes nothing observable -- field-only, reconcilable.
+GD_17_RFLAGS_CONFIRM = Deviation(
+    id="GD-17-open-rflags-confirm",
+    verdict=SERVER,
+    spec="RFC 8881 18.16 (OPEN4_RESULT_CONFIRM is meaningful only for the "
+         "4.0 OPEN_CONFIRM handshake)",
+    summary="OPEN's confirm flag differs from the model's needConfirm "
+            "prediction where it has no observable effect",
+    root_cause="ganesha's OPEN4_RESULT_CONFIRM bookkeeping differs from the "
+               "model's needConfirm",
+    candidate_fix="none required (no observable effect off 4.0)",
+    ops=("SOpen",),
+    field="rflags_confirm",
+)
+
+# GD-18: the wide GETATTR (every supported attribute at once) answers
+# NFS4ERR_INVAL.  ganesha rejects the whole-bitmap request that the model, which
+# asks only for the attributes it can predict, treats as OK.  RFC 8881 18.7
+# lets a server reject an attribute request it cannot satisfy; status-only.
+GD_18_GETATTR_WIDE_INVAL = Deviation(
+    id="GD-18-getattr-wide-inval",
+    verdict=SERVER,
+    spec="RFC 8881 18.7.3 (GETATTR may reject an unsupported attribute "
+         "combination)",
+    summary="the whole-bitmap wide GETATTR returns NFS4ERR_INVAL where the "
+            "model predicts OK",
+    root_cause="ganesha rejects the full supported-attribute bitmap request",
+    candidate_fix="model: narrow the wide GETATTR to attributes ganesha "
+                  "marshals without INVAL",
+    ops=("SGetattrWide",),
+    expected_status=NFS4_OK,
+    actual_status=NFS4ERR_INVAL,
+)
+
+# GD-19: the model deliberately drives NFS4ERR_BAD_SEQID by sending an OPEN
+# owner-seqid two past the last (nfs4_ops.qnt oseq: seqid + 2), but ganesha does
+# not fail the gap -- it processes the OPEN and answers on the name/existence
+# (NOENT, or the object status).  RFC 7530 9.1.7 makes strict +1 sequencing a
+# server enforcement point that this ganesha build does not police.
+# reconcilable=False: the owner seqid then parts, so the trace stops here.
+GD_19_OWNER_SEQID_GAP = Deviation(
+    id="GD-19-owner-seqid-gap-unpoliced",
+    verdict=SERVER,
+    spec="RFC 7530 9.1.7 (the open-owner seqid must be exactly one greater; "
+         "enforcement is the server's)",
+    summary="an OPEN owner-seqid gap the model predicts NFS4ERR_BAD_SEQID for "
+            "is processed by ganesha (NOENT / the object status)",
+    root_cause="this ganesha build does not police the +1 open-owner seqid gap",
+    candidate_fix="none from the model; drop the BAD_SEQID negative probe or "
+                  "record",
+    ops=("SOpen", "SClose", "SOpenDowngrade"),
+    expected_status=NFS4ERR_BAD_SEQID,
+    actual_status=(NFS4ERR_NOENT, NFS4_OK, NFS4ERR_NOTDIR, NFS4ERR_EXIST,
+                   NFS4ERR_ISDIR),
+    reconcilable=False,
+)
+
+
 NFS4 = Registry("ganesha/nfs4", [
     GD_1_CHANGE_GRANULARITY,
     GD_4_VERIFY_WIDE_EMPTY,
@@ -294,6 +422,12 @@ NFS4 = Registry("ganesha/nfs4", [
     GD_11_WRONG_TYPE,
     GD_12_CONFIRMED_R,
     GD_13_OPEN_EXIST_PRECEDENCE,
+    GD_14_CHANGE_ADVANCED,
+    GD_15_OPENMODE,
+    GD_16_EXCL_VERIFIER,
+    GD_17_RFLAGS_CONFIRM,
+    GD_18_GETATTR_WIDE_INVAL,
+    GD_19_OWNER_SEQID_GAP,
 ])
 
 
