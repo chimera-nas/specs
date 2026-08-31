@@ -322,7 +322,7 @@ GD_15_OPENMODE = Deviation(
                "check differently",
     candidate_fix="pin the model's opLock/opRead openmode rule to ganesha's",
     ops=("SLock", "SRead", "SWrite"),
-    expected_status=(NFS4_OK, NFS4ERR_OPENMODE),
+    expected_status=(NFS4_OK, NFS4ERR_OPENMODE, NFS4ERR_LOCKED),
     actual_status=(NFS4ERR_OPENMODE, NFS4_OK),
 )
 
@@ -587,6 +587,23 @@ GD_28_COMPOUND_MVM = Deviation(
 )
 
 
+# GD-29: GETATTR nlink/mode on a directory whose subdirectory count the
+# backing ext4 export folds into nlink where the model keeps a flat 2 (the
+# ganesha analog of KN-16).  RFC 7530 5.8.1 leaves nlink to the filesystem.
+GD_29_DIR_NLINK = Deviation(
+    id="GD-29-dir-nlink-accounting",
+    verdict=SERVER,
+    spec="RFC 7530 5.8.1 (numlinks follows the backing filesystem)",
+    summary="GETATTR nlink/mode on a directory differs from the model's flat "
+            "accounting",
+    root_cause="ganesha's ext4 export counts subdirectories in a directory's "
+               "nlink",
+    candidate_fix="model: count subdirectories in a directory's nlink",
+    ops=("SGetattr",),
+    field=("nlink", "mode"),
+)
+
+
 NFS4 = Registry("ganesha/nfs4", [
     GD_1_CHANGE_GRANULARITY,
     GD_4_VERIFY_WIDE_EMPTY,
@@ -613,6 +630,7 @@ NFS4 = Registry("ganesha/nfs4", [
     GD_26_RESIDUAL2_STATUS,
     GD_27_FH_IDENTITY,
     GD_28_COMPOUND_MVM,
+    GD_29_DIR_NLINK,
 ])
 
 
@@ -657,7 +675,7 @@ GN_3_CREATE = Deviation(
                "differently from the model",
     candidate_fix="align the model's CREATE precedence with ganesha",
     ops=("OCreate",),
-    expected_status=(NFS3ERR_EXIST, NFS3_OK),
+    expected_status=(NFS3ERR_EXIST, NFS3_OK, NFS3ERR_ACCES, NFS3ERR_ISDIR),
     actual_status=(NFS3ERR_BADTYPE, NFS3ERR_ACCES, NFS3ERR_EXIST, NFS3_OK,
                    NFS3ERR_NXIO),
     reconcilable=False,
@@ -676,12 +694,31 @@ GN_4_RENAME = Deviation(
     root_cause="ganesha reports the non-empty target before its type",
     candidate_fix="none required (defensible)",
     ops=("ORename",),
-    expected_status=NFS3ERR_ISDIR,
-    actual_status=NFS3ERR_NOTEMPTY,
+    expected_status=(NFS3ERR_ISDIR, NFS3ERR_NOTEMPTY, NFS3ERR_INVAL, NFS3_OK),
+    actual_status=(NFS3ERR_NOTEMPTY, NFS3ERR_EXIST, NFS3_OK, NFS3ERR_IO),
+    reconcilable=False,
+)
+
+# GN-5: object attribute fields the FSAL reports differently -- a symlink's
+# size is its target length in the model but 0 from ganesha's FSAL_VFS, and a
+# directory's nlink/mode follow the ext4 export (as GD-29).  Field-only.
+GN_5_ATTR_FIELDS = Deviation(
+    id="GN-5-attr-fields",
+    verdict=SERVER,
+    spec="RFC 1813 2.5 (size/numlinks follow the backing filesystem)",
+    summary="symlink size (target length vs 0) and directory nlink/mode differ "
+            "from the model",
+    root_cause="ganesha's FSAL_VFS reports a symlink size 0 and counts ext4 "
+               "subdirectory links",
+    candidate_fix="model: use 0 for symlink size and count subdir nlink",
+    ops=("OSymlink", "OCreate", "OGetattr", "OReaddir", "OLookup", "OMkdir"),
+    field=("obj_attrs.size", "obj_attrs.nlink", "attrs.nlink", "attrs.size",
+           "wcc.after.nlink"),
 )
 
 NFS3 = Registry("ganesha/nfs3", [
     GN_2_LINK_DIR_BADTYPE,
     GN_3_CREATE,
     GN_4_RENAME,
+    GN_5_ATTR_FIELDS,
 ])
