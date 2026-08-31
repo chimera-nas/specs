@@ -214,6 +214,7 @@ class Replayer:
         self.sid_other = {}           # model Sid -> wire `other`
         self.sid_owner = {}           # model Sid -> (client, owner)
         self.sid_client = {}          # model Sid -> wire clientid
+        self.sid_seq = {}             # model Sid -> wire stateid seqid
         self.chg = {}                 # ino -> {abstract change -> wire}
         self.replay_cache = {}        # (model sess, slot) -> raw reply
         self.deviceid = None
@@ -278,6 +279,11 @@ class Replayer:
 
     def learn_sid(self, sid, wire, mism, expect_seq=None, what="stateid"):
         seq, other = wire
+        # OPEN_CONFIRM must echo the OPEN stateid unchanged, seqid
+        # included (RFC 7530 9.1.4.2 -- the first stateid has seqid 1).
+        # Remember it so ROpenConfirm sends the real seqid rather than a
+        # forced 0, which a strict server (knfsd) rejects as OLD_STATEID.
+        self.sid_seq[sid] = seq
         known = self.sid_other.get(sid)
         if known is None:
             for osid, oother in self.sid_other.items():
@@ -462,8 +468,9 @@ class Replayer:
                                owner_bytes("oo", v["owner"]),
                                openhow, wclaim)
         if tag == "ROpenConfirm":
-            return c4.enc_open_confirm((0, self.sid_of(v["sid"])),
-                                       v["oseq"])
+            return c4.enc_open_confirm(
+                (self.sid_seq.get(v["sid"], 0), self.sid_of(v["sid"])),
+                v["oseq"])
         if tag == "ROpenDowngrade":
             return c4.enc_open_downgrade(
                 (v["argSeq"], self.sid_of(v["sid"])), v["oseq"],
