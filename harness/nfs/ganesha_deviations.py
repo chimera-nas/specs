@@ -474,6 +474,44 @@ GD_22_FIELD = Deviation(
 )
 
 
+# GD-23: compound-level structural divergences.  The model over-validates the
+# compound tag (a malformed-UTF-8 tag makes the whole compound NFS4ERR_INVAL
+# with no results), and predicts a result for a sole-op rule (BIND_CONN_TO_
+# SESSION NOT_ONLY_OP) that ganesha rejects at the connection level with zero
+# results.  RFC 8881 2.2 leaves compound-tag validation to the server, and the
+# reply's result count follows the server's processing.  Compound-level only.
+GD_23_COMPOUND = Deviation(
+    id="GD-23-compound-tag-and-shape",
+    verdict=SERVER,
+    spec="RFC 8881 2.2 (the compound tag is opaque UTF-8 the server need not "
+         "police; the result count follows server processing)",
+    summary="a compound's result count or status differs (tag validation / "
+            "BIND_CONN sole-op) with no per-op finding",
+    root_cause="ganesha does not reject a malformed tag and shapes the reply "
+               "differently on the BIND_CONN edge",
+    candidate_fix="model: relax compound-tag validation to match the servers",
+    ops=("compound",),
+    field="results",
+    expected_value=(0, 1),
+    actual_value=(0, 1),
+)
+
+# GD-24: the compound status the model predicts INVAL (malformed tag) that
+# ganesha answers OK, paired with GD-23's result-count row.
+GD_24_COMPOUND_STATUS = Deviation(
+    id="GD-24-compound-tag-status",
+    verdict=SERVER,
+    spec="RFC 8881 2.2 (compound-tag validation is the server's)",
+    summary="a malformed-tag compound the model calls NFS4ERR_INVAL is OK to "
+            "ganesha",
+    root_cause="ganesha does not reject a malformed compound tag",
+    candidate_fix="model: relax compound-tag validation",
+    ops=("compound",),
+    expected_status=NFS4ERR_INVAL,
+    actual_status=NFS4_OK,
+)
+
+
 NFS4 = Registry("ganesha/nfs4", [
     GD_1_CHANGE_GRANULARITY,
     GD_4_VERIFY_WIDE_EMPTY,
@@ -494,6 +532,8 @@ NFS4 = Registry("ganesha/nfs4", [
     GD_20_LIFECYCLE,
     GD_21_RESIDUAL,
     GD_22_FIELD,
+    GD_23_COMPOUND,
+    GD_24_COMPOUND_STATUS,
 ])
 
 

@@ -372,6 +372,39 @@ KN_19_CREATE_SETATTR = Deviation(
 )
 
 
+# KN-20/21: compound-level structural divergences -- the knfsd side of
+# GD-23/24.  knfsd does not reject a malformed compound tag, so a compound the
+# model predicts NFS4ERR_INVAL with no results is processed (OK, one result).
+# RFC 8881 2.2 leaves tag validation to the server.  Compound-level only.
+KN_20_COMPOUND_STATUS = Deviation(
+    id="KN-20-compound-tag-status",
+    verdict=SERVER,
+    spec="RFC 8881 2.2 (compound-tag validation is the server's)",
+    summary="a malformed-tag compound the model calls NFS4ERR_INVAL is OK to "
+            "knfsd",
+    root_cause="knfsd does not reject a malformed compound tag",
+    candidate_fix="model: relax compound-tag validation",
+    ops=("compound",),
+    expected_status=NFS4ERR_INVAL,
+    actual_status=NFS4_OK,
+)
+
+KN_21_COMPOUND_RESULTS = Deviation(
+    id="KN-21-compound-tag-results",
+    verdict=SERVER,
+    spec="RFC 8881 2.2 (the result count follows server processing of a tag "
+         "the model would have rejected)",
+    summary="a compound's result count differs (knfsd processed a tag the "
+            "model rejected)",
+    root_cause="knfsd returns a result for a compound the model dropped whole",
+    candidate_fix="model: relax compound-tag validation",
+    ops=("compound",),
+    field="results",
+    expected_value=(0, 1),
+    actual_value=(0, 1),
+)
+
+
 NFS4 = Registry("knfsd/nfs4", [
     KN_1_NAME_HANDLING,
     KN_3_LINK_DIR_NOTDIR,
@@ -390,6 +423,8 @@ NFS4 = Registry("knfsd/nfs4", [
     KN_17_LIFECYCLE,
     KN_18_READDIR_NAMES,
     KN_19_CREATE_SETATTR,
+    KN_20_COMPOUND_STATUS,
+    KN_21_COMPOUND_RESULTS,
 ])
 
 
@@ -424,8 +459,8 @@ KN3_2_EXCL_MODE = Deviation(
     root_cause="knfsd creates the exclusive file with no permission bits until "
                "the follow-up SETATTR",
     candidate_fix="none required (RFC-undefined); a knfsd-specific choice",
-    ops=("OWrite", "OSetattr", "OCreate", "OGetattr"),
-    field=("wcc.after.mode", "attrs.mode", "mode"),
+    ops=("OWrite", "OSetattr", "OCreate", "OGetattr", "ORead"),
+    field=("wcc.after.mode", "attrs.mode", "mode", "file_attributes.mode"),
 )
 
 # KN3-3: RENAME onto a directory reports NFS3ERR_NOTEMPTY (the knfsd side of
