@@ -303,6 +303,27 @@ class Replayer:
         if wire_sid[0] != expect_seq:
             self.fnd(mism, op, "seqid", expect_seq, wire_sid[0])
 
+    def wire_seq(self, sid, arg_seq):
+        """Seqid to put in a request stateid for a *sequenced* op.
+
+        The model predicts it exactly (arg_seq), but its absolute seqid
+        numbering can drift from the server's once OPEN_CONFIRM / DOWNGRADE
+        / LOCKU have bumped the live stateid, so prefer the seqid the server
+        last handed us for this Sid.  arg_seq 0 is the deliberate "current
+        stateid" wildcard (and LAYOUTRETURN's forbidden zero) -- keep it.
+        """
+        if arg_seq == 0:
+            return 0
+        return self.sid_seq.get(sid, arg_seq)
+
+    def relearn_seq(self, req, wire):
+        """Track the seqid the server bumped a stateid to.  Called from the
+        OPEN_CONFIRM / OPEN_DOWNGRADE / LOCKU reply handlers, which run only
+        on matched success, so wire['stateid'] is the fresh confirmed value.
+        """
+        if req is not None and "sid" in req.get("value", {}):
+            self.sid_seq[req["value"]["sid"]] = wire["stateid"][0]
+
     def check_change(self, op, ino, abstract, wire, mism, what):
         """Per-ino change-attribute consistency (never predict values)."""
         if ino is None:
@@ -473,11 +494,13 @@ class Replayer:
                 v["oseq"])
         if tag == "ROpenDowngrade":
             return c4.enc_open_downgrade(
-                (v["argSeq"], self.sid_of(v["sid"])), v["oseq"],
+                (self.wire_seq(v["sid"], v["argSeq"]), self.sid_of(v["sid"])),
+                v["oseq"],
                 v["access"], v["deny"])
         if tag == "RClose":
-            return c4.enc_close(v["oseq"],
-                                (v["argSeq"], self.sid_of(v["sid"])))
+            return c4.enc_close(
+                v["oseq"],
+                (self.wire_seq(v["sid"], v["argSeq"]), self.sid_of(v["sid"])))
         if tag == "RRead":
             return c4.enc_read(self.resolve_sel(v["sel"]),
                                v["off"] * BLOCK_SIZE, v["len"] * BLOCK_SIZE)
@@ -509,8 +532,9 @@ class Replayer:
                                 owner_bytes("lo", v["lockOwner"]))
         if tag == "RLocku":
             off, length = lock_range(v["lo"], v["hi"])
-            return c4.enc_locku(v["lseq"], (v["argSeq"],
-                                            self.sid_of(v["sid"])),
+            return c4.enc_locku(v["lseq"],
+                                (self.wire_seq(v["sid"], v["argSeq"]),
+                                 self.sid_of(v["sid"])),
                                 off, length)
         if tag == "RDelegreturn":
             return c4.enc_delegreturn((v["argSeq"], self.sid_of(v["sid"])))
@@ -721,8 +745,10 @@ class Replayer:
             self.check_deleg(v["deleg"], wire, mism)
         elif tag == "SOpenConfirm":
             self.check_seq_only(tag, wire["stateid"], v["seq"], mism)
+            self.relearn_seq(req, wire)
         elif tag == "SOpenDowngrade":
             self.check_seq_only(tag, wire["stateid"], v["seq"], mism)
+            self.relearn_seq(req, wire)
         elif tag == "SRead":
             data = expand(v["blocks"])
             if wire["eof"] != v["eof"]:
@@ -753,6 +779,7 @@ class Replayer:
                            expect_seq=v["seq"], what=tag)
         elif tag == "SLocku":
             self.check_seq_only(tag, wire["stateid"], v["seq"], mism)
+            self.relearn_seq(req, wire)
         elif tag == "SLayoutget":
             self.learn_sid(v["sid"], wire["stateid"], mism,
                            expect_seq=v["seq"], what=tag)
