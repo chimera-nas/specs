@@ -174,7 +174,7 @@ KN_9_OWNER_SEQID = Deviation(
     ops=("SOpen", "SClose", "SOpenDowngrade"),
     expected_status=(NFS4ERR_BAD_SEQID, NFS4ERR_INVAL, NFS4_OK),
     actual_status=(NFS4ERR_NOENT, NFS4_OK, NFS4ERR_BAD_SEQID, NFS4ERR_INVAL,
-                   NFS4ERR_NOTDIR, NFS4ERR_BAD_STATEID),
+                   NFS4ERR_NOTDIR, NFS4ERR_BAD_STATEID, NFS4ERR_EXPIRED),
     reconcilable=False,
 )
 
@@ -249,7 +249,7 @@ KN_13_NAME_ACCESS = Deviation(
             "model predicts NFS4ERR_BADCHAR",
     root_cause="knfsd maps the component to an access failure",
     candidate_fix="none required (both conformant)",
-    ops=("SLookup",),
+    ops=("SLookup", "SRename", "SRemove"),
     expected_status=NFS4ERR_BADCHAR,
     actual_status=NFS4ERR_ACCESS,
 )
@@ -312,6 +312,44 @@ KN_16_ATTR = Deviation(
 )
 
 
+# KN-17: client-id and object lifecycle cascades.  A SETCLIENTID_CONFIRM whose
+# id the model still holds but knfsd has retired answers STALE_CLIENTID; a LINK
+# whose source the model created leniently (KN-1) but knfsd never did answers
+# NOENT.  Both follow from an upstream recorded deviation parting the state.
+# reconcilable=False.
+KN_17_LIFECYCLE = Deviation(
+    id="KN-17-clientid-object-lifecycle",
+    verdict=SERVER,
+    spec="RFC 7530 16.34 / 8.2 (client-id and filehandle validity track the "
+         "server's lifecycle)",
+    summary="SETCLIENTID_CONFIRM STALE_CLIENTID / LINK NOENT where the model "
+            "expects OK, after upstream state parted",
+    root_cause="an upstream recorded deviation left knfsd without a client id "
+               "or object the model still holds",
+    candidate_fix="none (downstream of the recorded upstream deviation)",
+    ops=("SSetclientidConfirm", "SLink"),
+    expected_status=NFS4_OK,
+    actual_status=(NFS4ERR_STALE_CLIENTID, NFS4ERR_NOENT),
+    reconcilable=False,
+)
+
+# KN-18: READDIR returns a different set of names than the model expects, once
+# a leniently-accepted malformed name (KN-1) is present in the directory on
+# knfsd but not in the model (or vice versa).  Field-only.
+KN_18_READDIR_NAMES = Deviation(
+    id="KN-18-readdir-names",
+    verdict=SERVER,
+    spec="RFC 7530 12.7 (malformed-name acceptance, KN-1) feeds through to the "
+         "directory listing",
+    summary="READDIR lists a different name set than the model, from a "
+            "leniently-accepted malformed name",
+    root_cause="knfsd holds a malformed name the model rejected (KN-1)",
+    candidate_fix="none (downstream of KN-1)",
+    ops=("SReaddir",),
+    field="names",
+)
+
+
 NFS4 = Registry("knfsd/nfs4", [
     KN_1_NAME_HANDLING,
     KN_3_LINK_DIR_NOTDIR,
@@ -327,6 +365,8 @@ NFS4 = Registry("knfsd/nfs4", [
     KN_14_LOCKT_GRACE,
     KN_15_CHANGE,
     KN_16_ATTR,
+    KN_17_LIFECYCLE,
+    KN_18_READDIR_NAMES,
 ])
 
 

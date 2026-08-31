@@ -403,11 +403,74 @@ GD_19_OWNER_SEQID_GAP = Deviation(
     root_cause="this ganesha build does not police the +1 open-owner seqid gap",
     candidate_fix="none from the model; drop the BAD_SEQID negative probe or "
                   "record",
-    ops=("SOpen", "SClose", "SOpenDowngrade"),
-    expected_status=NFS4ERR_BAD_SEQID,
+    ops=("SOpen", "SClose", "SOpenDowngrade", "SLock"),
+    expected_status=(NFS4ERR_BAD_SEQID, NFS4_OK),
     actual_status=(NFS4ERR_NOENT, NFS4_OK, NFS4ERR_NOTDIR, NFS4ERR_EXIST,
-                   NFS4ERR_ISDIR),
+                   NFS4ERR_ISDIR, NFS4ERR_BAD_SEQID),
     reconcilable=False,
+)
+
+
+# GD-20: object/stateid lifecycle -- the model references a stateid or
+# filehandle the server has already reaped or invalidated, or vice versa.  A
+# SETATTR through an open stateid the model has freed is BAD_STATEID to the
+# model but OK to ganesha; a PUTFH of a handle the model still holds is STALE
+# to ganesha; a LINK/SEEK against such an object diverges likewise.  These
+# follow from the deviations already recorded upstream (name handling, owner
+# seqid, verifier) parting the two sides' state.  reconcilable=False.
+GD_20_LIFECYCLE = Deviation(
+    id="GD-20-object-stateid-lifecycle",
+    verdict=SERVER,
+    spec="RFC 8881 9.1.4 / 8.2 (stateid and filehandle validity track the "
+         "server's object lifecycle)",
+    summary="a stateid/filehandle the model and ganesha disagree on the "
+            "validity of (BAD_STATEID/STALE/LOCKED vs OK), after upstream "
+            "state parted",
+    root_cause="an upstream recorded deviation left the model and ganesha with "
+               "different live stateids/objects",
+    candidate_fix="none (downstream of the recorded upstream deviation)",
+    ops=("SSetattr", "SPutfh", "SSeek", "SLink"),
+    expected_status=(NFS4ERR_BAD_STATEID, NFS4_OK, NFS4ERR_LOCKED),
+    actual_status=(NFS4_OK, NFS4ERR_STALE, NFS4ERR_NOENT),
+    reconcilable=False,
+)
+
+# GD-21: leftover status/field divergences that fall out of the recorded
+# clusters -- a name-vs-share OPEN precedence (BADCHAR vs SHARE_DENIED), a
+# DESTROY_CLIENTID that finds the id still busy (NOT_ONLY_OP vs CLIENTID_BUSY),
+# a LOCKU/ACCESS whose seqid/mask the model and ganesha compute differently.
+# All conformant and status/field-only.
+GD_21_RESIDUAL = Deviation(
+    id="GD-21-residual-precedence",
+    verdict=BOTH,
+    spec="RFC 7530 16.16 / RFC 8881 18.50 (a name-vs-share OPEN order and "
+         "DESTROY_CLIENTID's still-in-use status are the server's)",
+    summary="a name-vs-share OPEN (BADCHAR vs SHARE_DENIED) and a "
+            "DESTROY_CLIENTID of an id still in use (NOT_ONLY_OP vs "
+            "CLIENTID_BUSY) differ from the model",
+    root_cause="ganesha orders the OPEN name/share checks and reports an "
+               "in-use client id differently from the model",
+    candidate_fix="triage per edge if any recurs at volume",
+    ops=("SOpen", "SDestroyClientid"),
+    expected_status=(NFS4ERR_BADCHAR, NFS4ERR_NOT_ONLY_OP),
+    actual_status=(NFS4ERR_SHARE_DENIED, NFS4ERR_CLIENTID_BUSY),
+)
+
+# GD-22: LOCKU/ACCESS field divergences -- the LOCKU reply seqid the model and
+# ganesha compute differently once an upstream seqid deviation has shifted the
+# lock stateid, and the ACCESS mask ganesha grants that the model's type-masking
+# does not.  Field-only, no state change.
+GD_22_FIELD = Deviation(
+    id="GD-22-locku-access-field",
+    verdict=BOTH,
+    spec="RFC 8881 18.12 (LOCKU seqid) / 18.1 (ACCESS mask is the server's to "
+         "grant within the supported set)",
+    summary="LOCKU reply seqid and ACCESS granted-mask differ from the model",
+    root_cause="ganesha's LOCKU seqid and ACCESS accounting differ from the "
+               "model's",
+    candidate_fix="triage if either recurs at volume",
+    ops=("SLocku", "SAccess"),
+    field=("seqid", "access"),
 )
 
 
@@ -428,6 +491,9 @@ NFS4 = Registry("ganesha/nfs4", [
     GD_17_RFLAGS_CONFIRM,
     GD_18_GETATTR_WIDE_INVAL,
     GD_19_OWNER_SEQID_GAP,
+    GD_20_LIFECYCLE,
+    GD_21_RESIDUAL,
+    GD_22_FIELD,
 ])
 
 
