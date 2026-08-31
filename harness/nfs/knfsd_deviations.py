@@ -44,25 +44,22 @@ KN_1_NAME_HANDLING = Deviation(
                    NFS4ERR_NOENT, NFS4_OK, NFS4ERR_EXIST),
 )
 
-# KN-2: CREATE of a regular file into a non-directory parent -- the doubly
-# invalid request of GD-8.  RFC 7530 16.4 / RFC 8881 18.4 do not order the
-# object-type and parent checks; the model reports the type (NFS4ERR_BADTYPE)
-# and knfsd reports the parent (NFS4ERR_NOTDIR -- knfsd does not single out a
-# symlink parent the way ganesha does).  Nothing is created, so replay
-# continues.
+# KN-2: CREATE into a symlink parent.  The model (once it checks the parent
+# type before the object type) and ganesha answer NFS4ERR_SYMLINK; knfsd
+# frames the symlink-as-directory as NFS4ERR_NOTDIR (RFC 7530 16.4 / RFC 8881
+# 18.4 do not pin it).  Nothing is created, so replay continues.
 KN_2_CREATE_PARENT_FIRST = Deviation(
     id="KN-2-create-parent-before-type",
     verdict=SERVER,
     spec="RFC 7530 16.4 / RFC 8881 18.4 (CREATE; the type vs parent check "
          "order is unspecified)",
-    summary="CREATE of a regular file into a non-directory parent reports "
-            "NFS4ERR_NOTDIR where the model reports NFS4ERR_BADTYPE",
-    root_cause="knfsd validates the current filehandle's type before the "
-               "requested object type",
-    candidate_fix="none required (defensible); the model could check the "
-                  "parent type first to match",
+    summary="CREATE into a symlink parent reports NFS4ERR_NOTDIR where the "
+            "model (and ganesha) report NFS4ERR_SYMLINK",
+    root_cause="knfsd frames a symlink used as a directory as NOTDIR, not "
+               "SYMLINK",
+    candidate_fix="none required (defensible)",
     ops=("SCreate",),
-    expected_status=NFS4ERR_BADTYPE,
+    expected_status=NFS4ERR_SYMLINK,
     actual_status=NFS4ERR_NOTDIR,
 )
 
@@ -81,8 +78,10 @@ KN_3_LINK_DIR_NOTDIR = Deviation(
     candidate_fix="switch the model (and nfs4Test) to NOTDIR -- both servers "
                   "agree on it -- or keep ISDIR and this record",
     ops=("SLink",),
-    expected_status=NFS4ERR_ISDIR,
-    actual_status=NFS4ERR_NOTDIR,
+    expected_status=(NFS4ERR_ISDIR, NFS4ERR_INVAL, NFS4ERR_BADNAME,
+                     NFS4ERR_BADCHAR),
+    actual_status=(NFS4ERR_NOTDIR, NFS4ERR_ISDIR, NFS4ERR_INVAL,
+                   NFS4ERR_BADNAME, NFS4ERR_BADCHAR),
 )
 
 # KN-4: RENEW of a lapsed lease -> NFS4ERR_EXPIRED, the knfsd side of GD-10.
@@ -123,12 +122,32 @@ KN_5_RENAME_SYMLINK_NOTDIR = Deviation(
     actual_status=NFS4ERR_NOTDIR,
 )
 
+# KN-6: the knfsd side of GD-11 -- a wrong-type operation on 4.1+ comes back
+# as the POSIX-aligned ISDIR/INVAL/SYMLINK, never the model's 4.1+
+# NFS4ERR_WRONG_TYPE (RFC 8881's SHOULD).  Status-only, so replay continues.
+KN_6_WRONG_TYPE = Deviation(
+    id="KN-6-wrong-type-posix-status",
+    verdict=SERVER,
+    spec="RFC 8881 (NFS4ERR_WRONG_TYPE is a SHOULD; the POSIX-aligned "
+         "ISDIR/INVAL/SYMLINK are equally conformant)",
+    summary="a wrong-type op returns ISDIR/INVAL/SYMLINK where the model, "
+            "following the 4.1+ SHOULD, predicts NFS4ERR_WRONG_TYPE",
+    root_cause="knfsd reports the object's natural POSIX-aligned status, "
+               "never NFS4ERR_WRONG_TYPE",
+    candidate_fix="none required (both conformant)",
+    ops=("SSetattr", "SWrite", "SRead", "SOpen", "SLayoutget"),
+    expected_status=NFS4ERR_WRONG_TYPE,
+    actual_status=(NFS4ERR_ISDIR, NFS4ERR_INVAL, NFS4ERR_SYMLINK),
+)
+
+
 NFS4 = Registry("knfsd/nfs4", [
     KN_1_NAME_HANDLING,
     KN_2_CREATE_PARENT_FIRST,
     KN_3_LINK_DIR_NOTDIR,
     KN_4_RENEW_EXPIRED,
     KN_5_RENAME_SYMLINK_NOTDIR,
+    KN_6_WRONG_TYPE,
 ])
 
 

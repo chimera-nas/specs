@@ -194,14 +194,18 @@ GD_9_LINK_DIR_NOTDIR = Deviation(
     verdict=SERVER,
     spec="RFC 7530 16.9.4 (LINK; ISDIR is listed, but the directory-source "
          "status is effectively unspecified and servers differ)",
-    summary="LINK of a directory source returns NFS4ERR_NOTDIR instead of "
-            "the model's NFS4ERR_ISDIR",
-    root_cause="ganesha refuses a directory hard link with NOTDIR",
+    summary="LINK of a directory source: the name-vs-source-type precedence "
+            "and the source-type code (ISDIR/NOTDIR) both differ from the model",
+    root_cause="ganesha's LINK precedence is inconsistent across cases -- it "
+               "answers the name error or the source NOTDIR in an order the "
+               "model, which validates the name then reports ISDIR, cannot match",
     candidate_fix="switch the model (and nfs4Test) to NOTDIR -- both servers "
                   "agree on it -- or keep ISDIR and this record",
     ops=("SLink",),
-    expected_status=NFS4ERR_ISDIR,
-    actual_status=NFS4ERR_NOTDIR,
+    expected_status=(NFS4ERR_ISDIR, NFS4ERR_INVAL, NFS4ERR_BADNAME,
+                     NFS4ERR_BADCHAR),
+    actual_status=(NFS4ERR_NOTDIR, NFS4ERR_ISDIR, NFS4ERR_INVAL,
+                   NFS4ERR_BADNAME, NFS4ERR_BADCHAR),
 )
 
 # GD-10: RENEW of a lease that has lapsed answers NFS4ERR_EXPIRED where the
@@ -228,6 +232,30 @@ GD_10_RENEW_EXPIRED = Deviation(
     actual_status=NFS4ERR_EXPIRED,
 )
 
+# GD-11: a wrong-type operation on 4.1+ answers the POSIX-aligned status
+# (NFS4ERR_ISDIR / NFS4ERR_INVAL / NFS4ERR_SYMLINK) where the model predicts
+# NFS4ERR_WRONG_TYPE.  RFC 8881 makes WRONG_TYPE a SHOULD for a type mismatch
+# (e.g. 18.32.3 for the size attribute), and the model takes it on 4.1+ (4.0
+# has no such code); neither real server implements it, so a size SETATTR or a
+# WRITE on a non-regular object, an OPEN of a special file, and the like come
+# back as the file's natural error instead.  GD-5 recorded the OPEN case
+# specifically; this is the general form.  Status-only, so replay continues.
+GD_11_WRONG_TYPE = Deviation(
+    id="GD-11-wrong-type-posix-status",
+    verdict=SERVER,
+    spec="RFC 8881 (NFS4ERR_WRONG_TYPE is a SHOULD for a type mismatch; the "
+         "POSIX-aligned ISDIR/INVAL/SYMLINK are equally conformant)",
+    summary="a wrong-type op returns ISDIR/INVAL/SYMLINK where the model, "
+            "following the 4.1+ SHOULD, predicts NFS4ERR_WRONG_TYPE",
+    root_cause="ganesha reports the object's natural POSIX-aligned status, "
+               "never NFS4ERR_WRONG_TYPE",
+    candidate_fix="none required (both conformant); the model could drop "
+                  "WRONG_TYPE for the POSIX-aligned codes on all minors",
+    ops=("SSetattr", "SWrite", "SRead", "SOpen", "SLayoutget"),
+    expected_status=NFS4ERR_WRONG_TYPE,
+    actual_status=(NFS4ERR_ISDIR, NFS4ERR_INVAL, NFS4ERR_SYMLINK),
+)
+
 NFS4 = Registry("ganesha/nfs4", [
     GD_1_CHANGE_GRANULARITY,
     GD_4_VERIFY_WIDE_EMPTY,
@@ -237,6 +265,7 @@ NFS4 = Registry("ganesha/nfs4", [
     GD_8_CREATE_PARENT_FIRST,
     GD_9_LINK_DIR_NOTDIR,
     GD_10_RENEW_EXPIRED,
+    GD_11_WRONG_TYPE,
 ])
 
 
