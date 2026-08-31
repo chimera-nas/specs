@@ -1104,10 +1104,16 @@ module nfs4ops {
             emit(a, SLink({ st: E_NOFILEHANDLE, cinfo: zero }))
         else if (not(fsLive(a.fs, a.sfh)) or not(fsLive(a.fs, a.cfh)))
             emit(a, SLink({ st: E_STALE, cinfo: zero }))
-        else if (nameStatus(n) != OK)
-            emit(a, SLink({ st: nameStatus(n), cinfo: zero }))
         else if (fsGet(a.fs, a.cfh).ftype == FLnk)
             emit(a, SLink({ st: E_SYMLINK, cinfo: zero }))
+        // The type of the source (saved) filehandle is checked before the
+        // name: hard-linking a directory is NFS4ERR_ISDIR, which both the
+        // Linux server and NFS-Ganesha report ahead of a malformed newname
+        // (RFC 7530 16.9 leaves the ordering open; the servers agree).
+        else if (fsGet(a.fs, a.sfh).ftype == FDir)
+            emit(a, SLink({ st: E_ISDIR, cinfo: zero }))
+        else if (nameStatus(n) != OK)
+            emit(a, SLink({ st: nameStatus(n), cinfo: zero }))
         else {
             val o = fsLink(a.fs, a.sfh, a.cfh, n)
             emit(a.with("fs", o.fs2), SLink({ st: fsStatus(o.st), cinfo: o.cinfo }))
@@ -1607,8 +1613,11 @@ module nfs4ops {
                             // regular file is idempotent success; any
                             // other existing object is EXIST
                             // (RFC 7530 16.16.5 / RFC 8881 18.16.3).
-                            // The file mode after exclusive create is the
-                            // server's derivation (0644 canonically).
+                            // The mode of an exclusive-created file is
+                            // undefined until the client's follow-up SETATTR
+                            // (RFC 7530 16.16.5); a POSIX-filesystem backend
+                            // creates it owner-only (0600).  chimera's memfs
+                            // uses 0644, now a chimera divergence.
                             if (present and childT == FReg and
                                 fsGet(a.fs, child).xverf == x.verf and
                                 x.verf != 0)
@@ -1618,7 +1627,7 @@ module nfs4ops {
                             else if (present) base.with("st", E_EXIST)
                             else {
                                 val o = fsMknode(a.fs, a.cfh, n,
-                                                 mkExclFile(420, x.verf, 0))
+                                                 mkExclFile(384, x.verf, 0))
                                 base.with("file", o.ino).with("fs2", o.fs2)
                                     .with("cinfo", o.cinfo)
                             }

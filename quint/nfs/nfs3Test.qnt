@@ -44,7 +44,14 @@ module nfs3Test {
             .then(applyCreateExcl(ROOT, "x", 1))
             .expect(lastOp == OCreate({ dir: ROOT, name: "x", cmode: Exclusive,
                                         mode: -1, verf: 1, status: OK, obj: 1 , cred: ROOT_CRED }))
-            .expect(fs.get(1).mode == 420 and fs.get(1).xverf == 1)
+            // Exclusive CREATE carries no mode -- RFC 1813 3.3.8 smuggles the
+            // verifier through sattr, so the server picks the created mode.
+            // Both real POSIX servers the harness replays against (knfsd,
+            // ganesha VFS) create it 0600 -- owner-only until the client's
+            // follow-up SETATTR -- which is also the safer default for a file
+            // whose permissions are not yet set.  chimera's memfs uses 0644;
+            // that is a chimera divergence from the model, not a model bug.
+            .expect(fs.get(1).mode == 384 and fs.get(1).xverf == 1)
             // same verifier -> idempotent success, same object
             .then(applyCreateExcl(ROOT, "x", 1))
             .expect(lastOp == OCreate({ dir: ROOT, name: "x", cmode: Exclusive,

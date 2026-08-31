@@ -502,9 +502,13 @@ module nfs3 {
     }
 
     // EXCLUSIVE create (RFC 1813 3.3.8).  A fresh exclusive create succeeds
-    // and the file materializes with mode 0644 (420, empirically observed
-    // 2026-08-08; the sattr in an exclusive create is the verifier, not a
-    // mode).  RFC 1813: a retry that presents the *same* verifier as the
+    // and the file materializes with mode 0600 (384): RFC 1813 3.3.8 leaves
+    // the mode of an exclusive-created file undefined until the client's
+    // follow-up SETATTR (the sattr in an exclusive create carries the
+    // verifier, not a mode), and a POSIX-filesystem backend creates it
+    // owner-only.  The reference implementation's in-memory backend uses
+    // 0644 instead, which now shows as a chimera divergence.
+    // RFC 1813: a retry that presents the *same* verifier as the
     // create in progress "should" succeed idempotently and return the same
     // object; a different verifier gives NFS3ERR_EXIST.  The reference
     // implementation returns
@@ -532,7 +536,7 @@ module nfs3 {
             }
         } else all {
             fs' = fs
-                .put(nextFid, exclFile(420, v, ROOT_CRED))
+                .put(nextFid, exclFile(384, v, ROOT_CRED))
                 .setBy(d, dn => dn.with("ents", dn.ents.put(n, nextFid))),
             removed' = removed,
             nextFid' = nextFid + 1,

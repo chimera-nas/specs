@@ -49,7 +49,6 @@ v4:SGetxattr:NOXATTR
 v4:SGetxattr:OK
 v4:SIoAdvise:OK
 v4:SLayoutget:NOTSUPP
-v4:SLink:BADCHAR
 v4:SLink:BADNAME
 v4:SLink:EXIST
 v4:SLink:INVAL
