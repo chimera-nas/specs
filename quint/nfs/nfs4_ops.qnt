@@ -1003,6 +1003,15 @@ module nfs4ops {
         if (g != OK) emit(a, SCreate(bad))
         else if (nameStatus(ar.name) != OK)
             emit(a, SCreate(bad.with("st", nameStatus(ar.name))))
+        // The current filehandle must be a usable directory before the
+        // requested object type is considered (RFC 7530 16.4 / RFC 8881
+        // 18.4): a symlink there is NFS4ERR_SYMLINK, any other non-directory
+        // is NFS4ERR_NOTDIR, and both outrank the BADTYPE of an illegal
+        // ctype.  knfsd answers NOTDIR for the symlink case too (KN-2).
+        else if (cfhNode(a).ftype == FLnk)
+            emit(a, SCreate(bad.with("st", E_SYMLINK)))
+        else if (cfhNode(a).ftype != FDir)
+            emit(a, SCreate(bad.with("st", E_NOTDIR)))
         else if (ar.ctype == FReg)
             emit(a, SCreate(bad.with("st", E_BADTYPE)))
         else {

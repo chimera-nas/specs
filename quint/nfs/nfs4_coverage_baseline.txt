@@ -28,6 +28,7 @@ v4:SCreate:INVAL
 v4:SCreate:NAMETOOLONG
 v4:SCreate:NOTDIR
 v4:SCreate:OK
+v4:SCreate:SYMLINK
 v4:SCreateSession:OK
 v4:SDeallocate:ISDIR
 v4:SDeallocate:LOCKED
