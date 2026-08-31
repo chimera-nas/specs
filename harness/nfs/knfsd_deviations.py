@@ -141,6 +141,35 @@ KN_6_WRONG_TYPE = Deviation(
 )
 
 
+# KN-7: an OPEN whose stateid still awaits OPEN_CONFIRM does not survive an
+# intervening SETCLIENTID on knfsd -- the later OPEN_CONFIRM (and any I/O or
+# CLOSE on that stateid) comes back NFS4ERR_OLD_STATEID / NFS4ERR_BAD_STATEID.
+# The model keeps the unconfirmed open valid: RFC 7530 16.33.5 / 16.34 purge a
+# rebooted client's state at SETCLIENTID_CONFIRM, not at SETCLIENTID, so it
+# still expects the confirm to succeed.  This is reconcilable=False: the
+# server and model states have genuinely parted (the stateid is gone on one
+# side), so the trace is abandoned at the confirm rather than cascading
+# NFS4ERR_*_STATEID through every following op.  Candidate for a dedicated
+# v4.0 client-lifecycle model-fidelity pass.
+KN_7_UNCONFIRMED_OPEN_LOST = Deviation(
+    id="KN-7-unconfirmed-open-across-setclientid",
+    verdict=SERVER,
+    spec="RFC 7530 16.33.5 / 16.34 (a rebooted client's state is purged at "
+         "SETCLIENTID_CONFIRM, not at SETCLIENTID)",
+    summary="an OPEN_CONFIRM (and later I/O/CLOSE) on a stateid from an "
+            "unconfirmed OPEN that an intervening SETCLIENTID preceded returns "
+            "OLD_STATEID/BAD_STATEID where the model expects success",
+    root_cause="knfsd drops an unconfirmed open's stateid when the client "
+               "issues a new SETCLIENTID before confirming it",
+    candidate_fix="a dedicated v4.0 client-lifecycle pass: decide whether the "
+                  "model should drop an unconfirmed open across SETCLIENTID",
+    ops=("SOpenConfirm",),
+    expected_status=NFS4_OK,
+    actual_status=(NFS4ERR_OLD_STATEID, NFS4ERR_BAD_STATEID),
+    reconcilable=False,
+)
+
+
 NFS4 = Registry("knfsd/nfs4", [
     KN_1_NAME_HANDLING,
     KN_2_CREATE_PARENT_FIRST,
@@ -148,6 +177,7 @@ NFS4 = Registry("knfsd/nfs4", [
     KN_4_RENEW_EXPIRED,
     KN_5_RENAME_SYMLINK_NOTDIR,
     KN_6_WRONG_TYPE,
+    KN_7_UNCONFIRMED_OPEN_LOST,
 ])
 
 

@@ -148,13 +148,14 @@ GD_7_SETATTR_SHARE_DENIED = Deviation(
     verdict=SERVER,
     spec="RFC 8881 9.1.4.3 (special stateid vs a conflicting OPEN) / 18.30 "
          "(SETATTR): the conflict is NFS4ERR_LOCKED",
-    summary="a size SETATTR through the anonymous stateid against a deny-write "
-            "share reservation returns SHARE_DENIED instead of LOCKED",
+    summary="a size SETATTR / ALLOCATE / DEALLOCATE through the anonymous "
+            "stateid against a deny-write share reservation returns "
+            "SHARE_DENIED instead of LOCKED",
     root_cause="ganesha reports the share-reservation conflict with "
                "NFS4ERR_SHARE_DENIED rather than the size op's NFS4ERR_LOCKED",
     candidate_fix="ganesha: return NFS4ERR_LOCKED for a special-stateid size "
                   "change that hits a share reservation",
-    ops=("SSetattr",),
+    ops=("SSetattr", "SAllocate", "SDeallocate"),
     expected_status=NFS4ERR_LOCKED,
     actual_status=NFS4ERR_SHARE_DENIED,
 )
