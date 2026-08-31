@@ -67,9 +67,68 @@ KN_2_CREATE_PARENT_FIRST = Deviation(
 )
 
 
+# KN-3: LINK of a directory source -> NFS4ERR_NOTDIR, the knfsd side of GD-9
+# (both real servers agree on NOTDIR where the model and RFC 7530 16.9.4 pick
+# NFS4ERR_ISDIR).  Nothing is linked, so replay continues.
+KN_3_LINK_DIR_NOTDIR = Deviation(
+    id="KN-3-link-dir-notdir",
+    verdict=SERVER,
+    spec="RFC 7530 16.9.4 (LINK; the directory-source status is effectively "
+         "unspecified and servers differ)",
+    summary="LINK of a directory source returns NFS4ERR_NOTDIR instead of "
+            "the model's NFS4ERR_ISDIR",
+    root_cause="knfsd refuses a directory hard link with NOTDIR",
+    candidate_fix="switch the model (and nfs4Test) to NOTDIR -- both servers "
+                  "agree on it -- or keep ISDIR and this record",
+    ops=("SLink",),
+    expected_status=NFS4ERR_ISDIR,
+    actual_status=NFS4ERR_NOTDIR,
+)
+
+# KN-4: RENEW of a lapsed lease -> NFS4ERR_EXPIRED, the knfsd side of GD-10.
+# RFC 7530 16.30.4 / 9.6.3 leave EXPIRED vs STALE_CLIENTID to the server; the
+# client re-establishes state either way, so replay continues.
+KN_4_RENEW_EXPIRED = Deviation(
+    id="KN-4-renew-expired",
+    verdict=SERVER,
+    spec="RFC 7530 16.30.4 / 9.6.3 (RENEW; EXPIRED vs STALE_CLIENTID for a "
+         "lapsed lease is the server's to time)",
+    summary="RENEW of a lapsed lease returns NFS4ERR_EXPIRED where the model "
+            "predicts NFS4ERR_STALE_CLIENTID",
+    root_cause="knfsd retains the client id past the lease and reports "
+               "EXPIRED; the model retires it and reports STALE_CLIENTID",
+    candidate_fix="none required (defensible); the model could retain a "
+                  "lapsed client id briefly to match",
+    ops=("SRenew",),
+    expected_status=NFS4ERR_STALE_CLIENTID,
+    actual_status=NFS4ERR_EXPIRED,
+)
+
+# KN-5: RENAME across a symlink directory -> NFS4ERR_NOTDIR.  When the source
+# or target directory handle names a symlink, the model reports NFS4ERR_SYMLINK
+# (matching ganesha), but knfsd reports NFS4ERR_NOTDIR -- a symlink is not a
+# directory (RFC 7530 16.27.4 lists NOTDIR; the symlink-vs-notdir framing is
+# the server's).  Nothing is renamed, so replay continues.
+KN_5_RENAME_SYMLINK_NOTDIR = Deviation(
+    id="KN-5-rename-symlink-notdir",
+    verdict=SERVER,
+    spec="RFC 7530 16.27.4 (RENAME; NOTDIR is listed, and symlink-vs-notdir "
+         "for a symlink directory handle is the server's framing)",
+    summary="RENAME with a symlink source/target directory returns "
+            "NFS4ERR_NOTDIR instead of the model's NFS4ERR_SYMLINK",
+    root_cause="knfsd frames a symlink used as a directory as NOTDIR",
+    candidate_fix="none required (defensible)",
+    ops=("SRename",),
+    expected_status=NFS4ERR_SYMLINK,
+    actual_status=NFS4ERR_NOTDIR,
+)
+
 NFS4 = Registry("knfsd/nfs4", [
     KN_1_NAME_HANDLING,
     KN_2_CREATE_PARENT_FIRST,
+    KN_3_LINK_DIR_NOTDIR,
+    KN_4_RENEW_EXPIRED,
+    KN_5_RENAME_SYMLINK_NOTDIR,
 ])
 
 

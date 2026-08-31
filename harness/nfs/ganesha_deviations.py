@@ -182,6 +182,52 @@ GD_8_CREATE_PARENT_FIRST = Deviation(
     actual_status=(NFS4ERR_SYMLINK, NFS4ERR_NOTDIR),
 )
 
+# GD-9: LINK whose saved (source) filehandle is a directory answers
+# NFS4ERR_NOTDIR, not the NFS4ERR_ISDIR the model predicts.  Hard-linking a
+# directory is refused by every server; RFC 7530 16.9.4 lists NFS4ERR_ISDIR
+# for LINK and the model (and its self-test) pick it, but both real servers
+# report NOTDIR -- a not-a-directory framing of the same refusal.  Recorded
+# against the model's pick; a candidate for switching the model to NOTDIR
+# since knfsd and ganesha agree.  Nothing is linked, so replay continues.
+GD_9_LINK_DIR_NOTDIR = Deviation(
+    id="GD-9-link-dir-notdir",
+    verdict=SERVER,
+    spec="RFC 7530 16.9.4 (LINK; ISDIR is listed, but the directory-source "
+         "status is effectively unspecified and servers differ)",
+    summary="LINK of a directory source returns NFS4ERR_NOTDIR instead of "
+            "the model's NFS4ERR_ISDIR",
+    root_cause="ganesha refuses a directory hard link with NOTDIR",
+    candidate_fix="switch the model (and nfs4Test) to NOTDIR -- both servers "
+                  "agree on it -- or keep ISDIR and this record",
+    ops=("SLink",),
+    expected_status=NFS4ERR_ISDIR,
+    actual_status=NFS4ERR_NOTDIR,
+)
+
+# GD-10: RENEW of a lease that has lapsed answers NFS4ERR_EXPIRED where the
+# model predicts NFS4ERR_STALE_CLIENTID.  The model drops a client id the
+# moment a superseding SETCLIENTID retires its incarnation, so RENEW of the
+# retired id is STALE_CLIENTID; ganesha keeps the id past the lease and
+# reports the lease itself as EXPIRED (RFC 7530 16.30.4 lists both, and
+# 9.6.3 leaves how long an expired-lease client id survives to the server).
+# Timing-adjacent, like GD-1: recorded whenever it fires; the client
+# re-establishes state either way, so replay continues.
+GD_10_RENEW_EXPIRED = Deviation(
+    id="GD-10-renew-expired",
+    verdict=SERVER,
+    spec="RFC 7530 16.30.4 / 9.6.3 (RENEW; EXPIRED vs STALE_CLIENTID for a "
+         "lapsed lease is the server's to time)",
+    summary="RENEW of a lapsed lease returns NFS4ERR_EXPIRED where the model "
+            "predicts NFS4ERR_STALE_CLIENTID",
+    root_cause="ganesha retains the client id past the lease and reports "
+               "EXPIRED; the model retires it and reports STALE_CLIENTID",
+    candidate_fix="none required (defensible); the model could retain a "
+                  "lapsed client id briefly to match",
+    ops=("SRenew",),
+    expected_status=NFS4ERR_STALE_CLIENTID,
+    actual_status=NFS4ERR_EXPIRED,
+)
+
 NFS4 = Registry("ganesha/nfs4", [
     GD_1_CHANGE_GRANULARITY,
     GD_4_VERIFY_WIDE_EMPTY,
@@ -189,6 +235,8 @@ NFS4 = Registry("ganesha/nfs4", [
     GD_6_NAME_HANDLING,
     GD_7_SETATTR_SHARE_DENIED,
     GD_8_CREATE_PARENT_FIRST,
+    GD_9_LINK_DIR_NOTDIR,
+    GD_10_RENEW_EXPIRED,
 ])
 
 
