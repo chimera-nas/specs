@@ -152,6 +152,26 @@ KN_7_UNCONFIRMED_OPEN_LOST = Deviation(
 )
 
 
+# KN-8: CREATE into a symlink parent -> NFS4ERR_SYMLINK, the knfsd side of
+# GD-8.  Both real servers single out a symlink current filehandle where the
+# model (and chimera) answer the generic NFS4ERR_NOTDIR; RFC 7530 16.4.4 does
+# not list SYMLINK for CREATE, so either is conformant.  Nothing is created.
+KN_8_CREATE_SYMLINK_PARENT = Deviation(
+    id="KN-8-create-symlink-parent",
+    verdict=SERVER,
+    spec="RFC 7530 16.4.4 / RFC 8881 18.4 (CREATE; NFS4ERR_SYMLINK is not "
+         "listed, and a symlink current filehandle is a non-directory)",
+    summary="CREATE into a symlink parent reports NFS4ERR_SYMLINK where the "
+            "model reports the generic NFS4ERR_NOTDIR",
+    root_cause="knfsd singles out a symlink current filehandle instead of the "
+               "generic not-a-directory status",
+    candidate_fix="none required (defensible)",
+    ops=("SCreate",),
+    expected_status=NFS4ERR_NOTDIR,
+    actual_status=NFS4ERR_SYMLINK,
+)
+
+
 NFS4 = Registry("knfsd/nfs4", [
     KN_1_NAME_HANDLING,
     KN_3_LINK_DIR_NOTDIR,
@@ -159,6 +179,7 @@ NFS4 = Registry("knfsd/nfs4", [
     KN_5_RENAME_SYMLINK_NOTDIR,
     KN_6_WRONG_TYPE,
     KN_7_UNCONFIRMED_OPEN_LOST,
+    KN_8_CREATE_SYMLINK_PARENT,
 ])
 
 
