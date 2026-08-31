@@ -1104,16 +1104,16 @@ module nfs4ops {
             emit(a, SLink({ st: E_NOFILEHANDLE, cinfo: zero }))
         else if (not(fsLive(a.fs, a.sfh)) or not(fsLive(a.fs, a.cfh)))
             emit(a, SLink({ st: E_STALE, cinfo: zero }))
-        else if (fsGet(a.fs, a.cfh).ftype == FLnk)
-            emit(a, SLink({ st: E_SYMLINK, cinfo: zero }))
-        // The type of the source (saved) filehandle is checked before the
-        // name: hard-linking a directory is NFS4ERR_ISDIR, which both the
-        // Linux server and NFS-Ganesha report ahead of a malformed newname
-        // (RFC 7530 16.9 leaves the ordering open; the servers agree).
-        else if (fsGet(a.fs, a.sfh).ftype == FDir)
-            emit(a, SLink({ st: E_ISDIR, cinfo: zero }))
+        // A malformed newname is validated before the source type: the
+        // Linux server reports the name (NEMPTY -> INVAL, NDOT -> BADNAME)
+        // ahead of the directory-source ISDIR (RFC 7530 16.9 leaves the
+        // ordering open).  The directory-source status itself is ISDIR
+        // (RFC 7530 16.9.4), produced by fsLink below; both real servers
+        // answer NFS4ERR_NOTDIR there instead -- recorded, not modelled.
         else if (nameStatus(n) != OK)
             emit(a, SLink({ st: nameStatus(n), cinfo: zero }))
+        else if (fsGet(a.fs, a.cfh).ftype == FLnk)
+            emit(a, SLink({ st: E_SYMLINK, cinfo: zero }))
         else {
             val o = fsLink(a.fs, a.sfh, a.cfh, n)
             emit(a.with("fs", o.fs2), SLink({ st: fsStatus(o.st), cinfo: o.cinfo }))
