@@ -264,7 +264,12 @@ class Replayer:
         if sel["tag"] == "SelBypass":
             return c4.BYPASS_STATEID
         r = sel["value"]
-        return (r["argSeq"], self.sid_of(r["sid"]))
+        # A SelRef names a real (open/lock) stateid.  The model's argSeq 0
+        # means "the current seqid", but (0, real_other) is NOT the all-zeros
+        # wildcard -- a strict server reads it as literal seqid 0, which is
+        # OLD once OPEN_CONFIRM/LOCK have advanced the stateid.  Send the seqid
+        # the server last handed us for this Sid, as a conforming client does.
+        return (self.sid_seq.get(r["sid"], r["argSeq"]), self.sid_of(r["sid"]))
 
     def sid_of(self, sid):
         other = self.sid_other.get(sid)
@@ -308,12 +313,12 @@ class Replayer:
 
         The model predicts it exactly (arg_seq), but its absolute seqid
         numbering can drift from the server's once OPEN_CONFIRM / DOWNGRADE
-        / LOCKU have bumped the live stateid, so prefer the seqid the server
-        last handed us for this Sid.  arg_seq 0 is the deliberate "current
-        stateid" wildcard (and LAYOUTRETURN's forbidden zero) -- keep it.
+        / LOCKU have bumped the live stateid, so send the seqid the server
+        last handed us for this Sid.  arg_seq 0 on a real stateid is the
+        model's "current seqid", not the all-zeros wildcard, so it too maps to
+        the tracked seqid (a strict server rejects a literal 0 as OLD).  Falls
+        back to arg_seq for a Sid we have not learned a wire seqid for.
         """
-        if arg_seq == 0:
-            return 0
         return self.sid_seq.get(sid, arg_seq)
 
     def relearn_seq(self, req, wire):
