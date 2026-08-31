@@ -549,6 +549,44 @@ GD_26_RESIDUAL2_STATUS = Deviation(
 )
 
 
+# GD-27: filehandle-identity and a compound status edge downstream of the
+# recorded object-lifecycle deviations.  When an upstream deviation left the
+# model and ganesha with different live objects, a GETFH sees a different
+# filehandle for the abstract object, and a compound the model predicts
+# NFS4ERR_MINOR_VERS_MISMATCH ganesha answers NFS4ERR_INVAL.  Field/status-only,
+# downstream of the recorded upstream deviation.
+GD_27_FH_IDENTITY = Deviation(
+    id="GD-27-fh-identity-and-compound",
+    verdict=SERVER,
+    spec="RFC 8881 4.2.1 (a filehandle's persistence tracks the object) / 2.2 "
+         "(minorversion vs INVAL is the server's)",
+    summary="GETFH filehandle identity, and a compound MINOR_VERS_MISMATCH vs "
+            "INVAL, differ from the model after upstream state parted",
+    root_cause="an upstream recorded deviation left ganesha with a different "
+               "object/minorversion handling than the model",
+    candidate_fix="none (downstream of the recorded upstream deviation)",
+    ops=("SGetfh", "compound"),
+    field=("fh_identity",),
+    context=lambda f, ctx: f.kind == "fh_identity",
+)
+
+# GD-28: the compound-status companion of GD-27.
+GD_28_COMPOUND_MVM = Deviation(
+    id="GD-28-compound-minorversion",
+    verdict=SERVER,
+    spec="RFC 8881 2.2 (a bad minorversion vs a malformed compound is the "
+         "server's to distinguish)",
+    summary="a compound the model calls NFS4ERR_OP_NOT_IN_SESSION is "
+            "NFS4ERR_INVAL to ganesha",
+    root_cause="ganesha reports INVAL where the model predicts "
+               "OP_NOT_IN_SESSION for an op used outside a session",
+    candidate_fix="none required (defensible)",
+    ops=("compound",),
+    expected_status=NFS4ERR_OP_NOT_IN_SESSION,
+    actual_status=NFS4ERR_INVAL,
+)
+
+
 NFS4 = Registry("ganesha/nfs4", [
     GD_1_CHANGE_GRANULARITY,
     GD_4_VERIFY_WIDE_EMPTY,
@@ -573,6 +611,8 @@ NFS4 = Registry("ganesha/nfs4", [
     GD_24_COMPOUND_STATUS,
     GD_25_RESIDUAL2,
     GD_26_RESIDUAL2_STATUS,
+    GD_27_FH_IDENTITY,
+    GD_28_COMPOUND_MVM,
 ])
 
 

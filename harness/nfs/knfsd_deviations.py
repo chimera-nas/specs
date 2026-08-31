@@ -474,8 +474,10 @@ KN3_2_EXCL_MODE = Deviation(
     root_cause="knfsd creates the exclusive file with no permission bits until "
                "the follow-up SETATTR",
     candidate_fix="none required (RFC-undefined); a knfsd-specific choice",
-    ops=("OWrite", "OSetattr", "OCreate", "OGetattr", "ORead"),
-    field=("wcc.after.mode", "attrs.mode", "mode", "file_attributes.mode"),
+    ops=("OWrite", "OSetattr", "OCreate", "OGetattr", "ORead",
+         "OReaddir"),
+    field=("wcc.after.mode", "attrs.mode", "mode",
+           "file_attributes.mode", "readdirplus[a].mode"),
 )
 
 # KN3-3: RENAME onto a directory reports NFS3ERR_NOTEMPTY (the knfsd side of
