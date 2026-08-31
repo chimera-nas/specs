@@ -1004,12 +1004,14 @@ module nfs4ops {
         else if (nameStatus(ar.name) != OK)
             emit(a, SCreate(bad.with("st", nameStatus(ar.name))))
         // The current filehandle must be a usable directory before the
-        // requested object type is considered (RFC 7530 16.4 / RFC 8881
-        // 18.4): a non-directory current filehandle is NFS4ERR_NOTDIR, which
-        // outranks the BADTYPE of an illegal ctype.  A symlink there is a
-        // NOTDIR too -- RFC 7530 16.4.4 does not list NFS4ERR_SYMLINK for
-        // CREATE, and knfsd and chimera both answer NOTDIR; NFS-Ganesha's
-        // NFS4ERR_SYMLINK for the symlink case is the recorded outlier (GD-8).
+        // requested object type is considered (RFC 7530 16.4 / RFC 8881 18.4):
+        // a symlink current filehandle is NFS4ERR_SYMLINK, any other
+        // non-directory is NFS4ERR_NOTDIR, and both outrank the BADTYPE of an
+        // illegal ctype.  Both real servers (ganesha and the Linux server)
+        // answer SYMLINK for a symlink parent; chimera answers the generic
+        // NFS4ERR_NOTDIR, recorded on the chimera side (D4-17).
+        else if (cfhNode(a).ftype == FLnk)
+            emit(a, SCreate(bad.with("st", E_SYMLINK)))
         else if (cfhNode(a).ftype != FDir)
             emit(a, SCreate(bad.with("st", E_NOTDIR)))
         else if (ar.ctype == FReg)
