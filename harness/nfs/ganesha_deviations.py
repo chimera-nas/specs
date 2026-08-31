@@ -256,6 +256,54 @@ GD_11_WRONG_TYPE = Deviation(
     actual_status=(NFS4ERR_ISDIR, NFS4ERR_INVAL, NFS4ERR_SYMLINK),
 )
 
+# GD-12: a repeat EXCHANGE_ID of an already-confirmed client (same co_ownerid
+# and verifier) returns the client id with EXGID4_FLAG_CONFIRMED_R clear.
+# RFC 8881 18.35.4 sets that flag when the server already holds a confirmed
+# record for the owner+verifier, which the model predicts; ganesha returns the
+# same client id (no client-id divergence) but leaves the flag false.  The
+# client stays confirmed either way, so replay continues.
+GD_12_CONFIRMED_R = Deviation(
+    id="GD-12-exchange-id-confirmed-r",
+    verdict=SERVER,
+    spec="RFC 8881 18.35.4 (EXGID4_FLAG_CONFIRMED_R is set for a repeat "
+         "EXCHANGE_ID of a confirmed owner+verifier)",
+    summary="a repeat EXCHANGE_ID of a confirmed client leaves confirmed_r "
+            "false where the model predicts true",
+    root_cause="ganesha does not report CONFIRMED_R on a second EXCHANGE_ID "
+               "for an already-confirmed client id",
+    candidate_fix="none required from the model's side; a ganesha behaviour",
+    ops=("SExchangeId",),
+    field="confirmed_r",
+    expected_value=True,
+    actual_value=False,
+)
+
+# GD-13: OPEN with GUARDED4 or EXCLUSIVE4 over an existing non-regular target,
+# or over a share-reservation conflict, reports the target's type error
+# (NFS4ERR_ISDIR / NFS4ERR_SYMLINK) or NFS4ERR_SHARE_DENIED where the model
+# reports NFS4ERR_EXIST.  The model keeps the fail-if-exists dispositions on
+# the RFC-literal / POSIX O_EXCL reading -- an existing name is EXIST whatever
+# its type -- and checks the share reservation only after resolve; ganesha
+# reports the type or the share conflict first.  RFC 7530 16.16.4 / RFC 8881
+# 18.16.4 list all of these without ordering them.  The OPEN fails either way,
+# so replay continues.
+GD_13_OPEN_EXIST_PRECEDENCE = Deviation(
+    id="GD-13-open-exist-precedence",
+    verdict=SERVER,
+    spec="RFC 7530 16.16.4 / RFC 8881 18.16.4 (OPEN; EXIST vs the target "
+         "type vs a share conflict are listed without a pinned order)",
+    summary="a GUARDED/EXCLUSIVE OPEN over an existing dir/symlink or a share "
+            "conflict returns ISDIR/SYMLINK/SHARE_DENIED, not the model's EXIST",
+    root_cause="ganesha checks the target type and the share reservation "
+               "before the create-exclusivity existence check",
+    candidate_fix="none required (defensible); the model keeps the RFC-literal "
+                  "EXIST for a fail-if-exists disposition",
+    ops=("SOpen",),
+    expected_status=NFS4ERR_EXIST,
+    actual_status=(NFS4ERR_ISDIR, NFS4ERR_SYMLINK, NFS4ERR_SHARE_DENIED),
+)
+
+
 NFS4 = Registry("ganesha/nfs4", [
     GD_1_CHANGE_GRANULARITY,
     GD_4_VERIFY_WIDE_EMPTY,
@@ -266,6 +314,8 @@ NFS4 = Registry("ganesha/nfs4", [
     GD_9_LINK_DIR_NOTDIR,
     GD_10_RENEW_EXPIRED,
     GD_11_WRONG_TYPE,
+    GD_12_CONFIRMED_R,
+    GD_13_OPEN_EXIST_PRECEDENCE,
 ])
 
 
