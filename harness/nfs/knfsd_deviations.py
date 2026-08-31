@@ -250,7 +250,7 @@ KN_13_NAME_ACCESS = Deviation(
             "model predicts NFS4ERR_BADCHAR",
     root_cause="knfsd maps the component to an access failure",
     candidate_fix="none required (both conformant)",
-    ops=("SLookup", "SRename", "SRemove"),
+    ops=("SLookup", "SRename", "SRemove", "SSecinfo"),
     expected_status=NFS4ERR_BADCHAR,
     actual_status=NFS4ERR_ACCESS,
 )
@@ -328,7 +328,7 @@ KN_17_LIFECYCLE = Deviation(
     root_cause="an upstream recorded deviation left knfsd without a client id "
                "or object the model still holds",
     candidate_fix="none (downstream of the recorded upstream deviation)",
-    ops=("SSetclientidConfirm", "SLink"),
+    ops=("SSetclientidConfirm", "SLink", "SRename"),
     expected_status=NFS4_OK,
     actual_status=(NFS4ERR_STALE_CLIENTID, NFS4ERR_NOENT),
     reconcilable=False,
@@ -405,6 +405,20 @@ KN_21_COMPOUND_RESULTS = Deviation(
 )
 
 
+# KN-22: the ACCESS granted-mask differs from the model's type-masking, as
+# GD-22 records for ganesha.  Field-only.
+KN_22_ACCESS = Deviation(
+    id="KN-22-access-mask",
+    verdict=BOTH,
+    spec="RFC 8881 18.1 (ACCESS grants within the server's supported set)",
+    summary="ACCESS granted-mask differs from the model",
+    root_cause="knfsd's ACCESS accounting differs from the model's type-masking",
+    candidate_fix="triage if it recurs at volume",
+    ops=("SAccess",),
+    field="access",
+)
+
+
 NFS4 = Registry("knfsd/nfs4", [
     KN_1_NAME_HANDLING,
     KN_3_LINK_DIR_NOTDIR,
@@ -425,6 +439,7 @@ NFS4 = Registry("knfsd/nfs4", [
     KN_19_CREATE_SETATTR,
     KN_20_COMPOUND_STATUS,
     KN_21_COMPOUND_RESULTS,
+    KN_22_ACCESS,
 ])
 
 

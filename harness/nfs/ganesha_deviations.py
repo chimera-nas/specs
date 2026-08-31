@@ -512,6 +512,43 @@ GD_24_COMPOUND_STATUS = Deviation(
 )
 
 
+# GD-25: residual field/status edges -- READDIR lists a leniently-accepted
+# malformed name the model rejected (like KN-18), BIND_CONN_TO_SESSION accepts a
+# channel direction the model calls INVAL, and a LINK/name error lands on a
+# different code.  All downstream of the recorded name/dir latitude.
+GD_25_RESIDUAL2 = Deviation(
+    id="GD-25-readdir-bindconn-residual",
+    verdict=SERVER,
+    spec="RFC 8881 18.34 (BIND_CONN direction) / 12.7 (malformed-name "
+         "acceptance feeds READDIR and LINK)",
+    summary="READDIR name set, BIND_CONN direction (INVAL->OK), and a residual "
+            "LINK name-error code differ from the model",
+    root_cause="ganesha accepts a malformed name/direction the model rejects",
+    candidate_fix="none (downstream of the recorded name/dir latitude)",
+    ops=("SReaddir", "SBindConnToSession", "SLink"),
+    field=("names",),
+    expected_value=None,
+    actual_value=None,
+    context=lambda f, ctx: f.kind == "names",
+)
+
+# GD-26: the status companions of GD-25 (BIND_CONN INVAL->OK, LINK name code).
+GD_26_RESIDUAL2_STATUS = Deviation(
+    id="GD-26-bindconn-link-status",
+    verdict=SERVER,
+    spec="RFC 8881 18.34 (BIND_CONN direction validation is the server's) / "
+         "RFC 7530 16.9.4 (LINK name error)",
+    summary="BIND_CONN accepts a direction (INVAL->OK) and a LINK name error "
+            "lands on a different code",
+    root_cause="ganesha validates the BIND_CONN direction and the LINK name "
+               "differently from the model",
+    candidate_fix="none required (defensible)",
+    ops=("SBindConnToSession", "SLink"),
+    expected_status=(NFS4ERR_INVAL, 63),
+    actual_status=(NFS4_OK, NFS4ERR_ISDIR),
+)
+
+
 NFS4 = Registry("ganesha/nfs4", [
     GD_1_CHANGE_GRANULARITY,
     GD_4_VERIFY_WIDE_EMPTY,
@@ -534,6 +571,8 @@ NFS4 = Registry("ganesha/nfs4", [
     GD_22_FIELD,
     GD_23_COMPOUND,
     GD_24_COMPOUND_STATUS,
+    GD_25_RESIDUAL2,
+    GD_26_RESIDUAL2_STATUS,
 ])
 
 
