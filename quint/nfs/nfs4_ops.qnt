@@ -876,11 +876,15 @@ module nfs4ops {
     // predicts the status only -- the flavor list is export policy, not
     // filesystem state, so there is no SSecinfo comparator arm.
     //
-    // The interesting part is the side effect: SECINFO **consumes the current
-    // filehandle** (RFC 7530 16.31.3 / RFC 8881 18.29.3 -- chimera zeroes
-    // req->fhlen in secinfo_complete), so a following op that needs a cfh
-    // must answer NFS4ERR_NOFILEHANDLE.  That is the model's only generator
-    // of a cfh-less op today.
+    // The interesting part is the side effect on the current filehandle, and
+    // it is minor-version-specific: RFC 8881 18.29.3 says SECINFO **consumes**
+    // the current filehandle (a following op that needs one gets
+    // NFS4ERR_NOFILEHANDLE), but RFC 7530 16.31.3 says it is **retained** ("On
+    // success, the current filehandle retains its value").  Both NFS-Ganesha
+    // and the Linux kernel server retain it on 4.0, so the model consumes only
+    // on 4.1+.  (The reference implementation zeroes req->fhlen for every
+    // minor, which now shows as a chimera divergence on 4.0.)  This is the
+    // model's only generator of a cfh-less op.
     pure def opSecinfo(a: Acc, n: Name): Acc = {
         val g = fhGate(a)
         val ns = nameStatus(n)
@@ -892,7 +896,8 @@ module nfs4ops {
             else if (nd.ftype != FDir) emit(a, SSecinfo({ st: E_NOTDIR }))
             else if (not(fsHasEnt(a.fs, a.cfh, n)))
                 emit(a, SSecinfo({ st: E_NOENT }))
-            else emit(a.with("cfh", -1), SSecinfo({ st: OK }))
+            else emit(if (a.minor >= 1) a.with("cfh", -1) else a,
+                      SSecinfo({ st: OK }))
         }
     }
 
