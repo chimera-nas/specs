@@ -810,7 +810,9 @@ module nfs4ops {
         if (g != OK) emit(a, SLookupp({ st: g, parent: -1 }))
         else {
             val nd = cfhNode(a)
-            if (nd.ftype != FDir)
+            if (nd.ftype == FLnk)
+                emit(a, SLookupp({ st: E_SYMLINK, parent: -1 }))
+            else if (nd.ftype != FDir)
                 emit(a, SLookupp({ st: E_NOTDIR, parent: -1 }))
             else if (a.cfh == ROOT)
                 emit(a, SLookupp({ st: E_NOENT, parent: -1 }))
@@ -874,11 +876,15 @@ module nfs4ops {
     // predicts the status only -- the flavor list is export policy, not
     // filesystem state, so there is no SSecinfo comparator arm.
     //
-    // The interesting part is the side effect: SECINFO **consumes the current
-    // filehandle** (RFC 7530 16.31.3 / RFC 8881 18.29.3 -- chimera zeroes
-    // req->fhlen in secinfo_complete), so a following op that needs a cfh
-    // must answer NFS4ERR_NOFILEHANDLE.  That is the model's only generator
-    // of a cfh-less op today.
+    // The interesting part is the side effect on the current filehandle, and
+    // it is minor-version-specific: RFC 8881 18.29.3 says SECINFO **consumes**
+    // the current filehandle (a following op that needs one gets
+    // NFS4ERR_NOFILEHANDLE), but RFC 7530 16.31.3 says it is **retained** ("On
+    // success, the current filehandle retains its value").  Both NFS-Ganesha
+    // and the Linux kernel server retain it on 4.0, so the model consumes only
+    // on 4.1+.  (The reference implementation zeroes req->fhlen for every
+    // minor, which now shows as a chimera divergence on 4.0.)  This is the
+    // model's only generator of a cfh-less op.
     pure def opSecinfo(a: Acc, n: Name): Acc = {
         val g = fhGate(a)
         val ns = nameStatus(n)
@@ -886,22 +892,32 @@ module nfs4ops {
         else if (ns != OK) emit(a, SSecinfo({ st: ns }))
         else {
             val nd = cfhNode(a)
-            if (nd.ftype != FDir) emit(a, SSecinfo({ st: E_NOTDIR }))
+            if (nd.ftype == FLnk) emit(a, SSecinfo({ st: E_SYMLINK }))
+            else if (nd.ftype != FDir) emit(a, SSecinfo({ st: E_NOTDIR }))
             else if (not(fsHasEnt(a.fs, a.cfh, n)))
                 emit(a, SSecinfo({ st: E_NOENT }))
-            else emit(a.with("cfh", -1), SSecinfo({ st: OK }))
+            else emit(if (a.minor >= 1) a.with("cfh", -1) else a,
+                      SSecinfo({ st: OK }))
         }
     }
 
     // READLINK (RFC 7530 16.25 / RFC 8881 18.24): directory -> ISDIR,
     // other non-symlink -> INVAL ("should" wording).
+    // READLINK on a non-symlink is NFS4ERR_INVAL.  RFC 7530 16.25.4 names it
+    // outright ("should return NFS4ERR_INVAL if the object is not a symbolic
+    // link" -- a directory is not a symbolic link); RFC 8881 18.24.4 later
+    // recommends NFS4ERR_WRONG_TYPE, but only as a SHOULD, and every server
+    // this corpus is replayed against (NFS-Ganesha and the Linux kernel
+    // server) kept the original INVAL for all minor versions -- so the model
+    // predicts INVAL rather than recording the same permitted divergence on
+    // every server.  No special NFS4ERR_ISDIR case: one status covers every
+    // non-symlink target.
     pure def opReadlink(a: Acc): Acc = {
         val g = fhGate(a)
         if (g != OK) emit(a, SReadlink({ st: g, target: "" }))
         else {
             val nd = cfhNode(a)
-            if (nd.ftype == FDir) emit(a, SReadlink({ st: E_ISDIR, target: "" }))
-            else if (nd.ftype != FLnk)
+            if (nd.ftype != FLnk)
                 emit(a, SReadlink({ st: E_INVAL, target: "" }))
             else emit(a, SReadlink({ st: OK, target: nd.target }))
         }
@@ -912,10 +928,56 @@ module nfs4ops {
     // harness runs as root over AUTH_SYS, and the model predicts
     // access == supported == requested (the reference implementation grants
     // root everything; within RFC discretion, as in the v3 model).
+    // The ACCESS4_* bit for each request class, and the bitwise AND the reply
+    // masking needs (Quint has no native bitwise operator).
+    pure val ACCESS4_READ    = 1
+    pure val ACCESS4_LOOKUP  = 2
+    pure val ACCESS4_MODIFY  = 4
+    pure val ACCESS4_EXTEND  = 8
+    pure val ACCESS4_DELETE  = 16
+    pure val ACCESS4_EXECUTE = 32
+    pure def iand(x: int, y: int): int =
+        List(1, 2, 4, 8, 16, 32).foldl(0, (acc, b) =>
+            if ((x / b) % 2 == 1 and (y / b) % 2 == 1) acc + b else acc)
+    // Any execute bit set in a mode (owner/group/other x).
+    pure def anyExec(m: int): bool =
+        (m % 2 == 1) or ((m / 8) % 2 == 1) or ((m / 64) % 2 == 1)
+
+    // ACCESS (RFC 7530 16.1 / RFC 8881 18.1).  `supported` is the requested
+    // bits the server can evaluate for the object's TYPE: ACCESS4_LOOKUP has
+    // no meaning for a non-directory and ACCESS4_EXECUTE none for a directory
+    // (RFC 8881 18.1.4), so each is dropped for the wrong type.  `access` is
+    // the granted subset -- the harness runs as root over AUTH_SYS, and root
+    // is granted every evaluated class EXCEPT ACCESS4_EXECUTE on a file with
+    // no execute bit anywhere in its mode (RFC 8881 18.1.4: the server MUST
+    // NOT set ACCESS4_EXECUTE unless at least one execute bit is set).  This
+    // is what the reference implementation, NFS-Ganesha and the Linux kernel
+    // server all do; the model formerly returned the full requested mask.
+    // The bits meaningful for the object type (matches the reference
+    // implementation's chimera_nfs4_access_meaningful, RFC 8881 18.1.4):
+    // a directory drops EXECUTE and keeps LOOKUP+DELETE; a non-directory
+    // keeps EXECUTE and drops LOOKUP (no meaning off a directory) AND DELETE
+    // (deletability is a property of the parent, which an ACCESS on the
+    // object itself cannot check, so the server reports it 0 -- RFC 8881
+    // 18.1.4 permits DELETE = 0).
+    pure def accessMeaningful(ft: Ftype): int =
+        if (ft == FDir) ACCESS4_READ + ACCESS4_LOOKUP + ACCESS4_MODIFY +
+                        ACCESS4_EXTEND + ACCESS4_DELETE
+        else ACCESS4_READ + ACCESS4_MODIFY + ACCESS4_EXTEND + ACCESS4_EXECUTE
+
     pure def opAccess(a: Acc, mask: int): Acc = {
         val g = fhGate(a)
         if (g != OK) emit(a, SAccess({ st: g, supported: 0, access: 0 }))
-        else emit(a, SAccess({ st: OK, supported: mask, access: mask }))
+        else {
+            val nd = cfhNode(a)
+            val supported = iand(mask, accessMeaningful(nd.ftype))
+            val access =
+                if (iand(supported, ACCESS4_EXECUTE) == ACCESS4_EXECUTE and
+                    not(anyExec(nd.mode)))
+                    supported - ACCESS4_EXECUTE
+                else supported
+            emit(a, SAccess({ st: OK, supported: supported, access: access }))
+        }
     }
 
     // READDIR (RFC 7530 16.24 / RFC 8881 18.23): single-shot with a large
@@ -926,7 +988,8 @@ module nfs4ops {
         if (g != OK) emit(a, SReaddir({ st: g, names: Set() }))
         else {
             val nd = cfhNode(a)
-            if (nd.ftype != FDir) emit(a, SReaddir({ st: E_NOTDIR, names: Set() }))
+            if (nd.ftype == FLnk) emit(a, SReaddir({ st: E_SYMLINK, names: Set() }))
+            else if (nd.ftype != FDir) emit(a, SReaddir({ st: E_NOTDIR, names: Set() }))
             else emit(a, SReaddir({ st: OK, names: nd.ents.keys() }))
         }
     }
@@ -940,6 +1003,17 @@ module nfs4ops {
         if (g != OK) emit(a, SCreate(bad))
         else if (nameStatus(ar.name) != OK)
             emit(a, SCreate(bad.with("st", nameStatus(ar.name))))
+        // The current filehandle must be a usable directory before the
+        // requested object type is considered (RFC 7530 16.4 / RFC 8881 18.4):
+        // a symlink current filehandle is NFS4ERR_SYMLINK, any other
+        // non-directory is NFS4ERR_NOTDIR, and both outrank the BADTYPE of an
+        // illegal ctype.  Both real servers (ganesha and the Linux server)
+        // answer SYMLINK for a symlink parent; chimera answers the generic
+        // NFS4ERR_NOTDIR, recorded on the chimera side (D4-17).
+        else if (cfhNode(a).ftype == FLnk)
+            emit(a, SCreate(bad.with("st", E_SYMLINK)))
+        else if (cfhNode(a).ftype != FDir)
+            emit(a, SCreate(bad.with("st", E_NOTDIR)))
         else if (ar.ctype == FReg)
             emit(a, SCreate(bad.with("st", E_BADTYPE)))
         else {
@@ -967,6 +1041,8 @@ module nfs4ops {
         if (g != OK) emit(a, SRemove({ st: g, cinfo: { before: 0, after: 0 } }))
         else if (ns != OK)
             emit(a, SRemove({ st: ns, cinfo: { before: 0, after: 0 } }))
+        else if (cfhNode(a).ftype == FLnk)
+            emit(a, SRemove({ st: E_SYMLINK, cinfo: { before: 0, after: 0 } }))
         else {
             // Delegations held by other clients on the victim force a
             // recall; REMOVE observes NFS4ERR_DELAY until they return
@@ -1004,6 +1080,9 @@ module nfs4ops {
         else if (nameStatus(ar.newname) != OK)
             emit(a, SRename({ st: nameStatus(ar.newname),
                               cinfoS: zero, cinfoT: zero }))
+        else if (fsGet(a.fs, a.sfh).ftype == FLnk or
+                 fsGet(a.fs, a.cfh).ftype == FLnk)
+            emit(a, SRename({ st: E_SYMLINK, cinfoS: zero, cinfoT: zero }))
         else {
             // Rename-over unlinks the target: other-client delegations on
             // it force a recall + NFS4ERR_DELAY, mirroring REMOVE.  (The
@@ -1036,8 +1115,16 @@ module nfs4ops {
             emit(a, SLink({ st: E_NOFILEHANDLE, cinfo: zero }))
         else if (not(fsLive(a.fs, a.sfh)) or not(fsLive(a.fs, a.cfh)))
             emit(a, SLink({ st: E_STALE, cinfo: zero }))
+        // A malformed newname is validated before the source type: the
+        // Linux server reports the name (NEMPTY -> INVAL, NDOT -> BADNAME)
+        // ahead of the directory-source ISDIR (RFC 7530 16.9 leaves the
+        // ordering open).  The directory-source status itself is ISDIR
+        // (RFC 7530 16.9.4), produced by fsLink below; both real servers
+        // answer NFS4ERR_NOTDIR there instead -- recorded, not modelled.
         else if (nameStatus(n) != OK)
             emit(a, SLink({ st: nameStatus(n), cinfo: zero }))
+        else if (fsGet(a.fs, a.cfh).ftype == FLnk)
+            emit(a, SLink({ st: E_SYMLINK, cinfo: zero }))
         else {
             val o = fsLink(a.fs, a.sfh, a.cfh, n)
             emit(a.with("fs", o.fs2), SLink({ st: fsStatus(o.st), cinfo: o.cinfo }))
@@ -1491,7 +1578,8 @@ module nfs4ops {
                 }
             | OCNull(n) => {
                 val dnd = cfhNode(a)
-                if (dnd.ftype != FDir) base.with("st", E_NOTDIR)
+                if (dnd.ftype == FLnk) base.with("st", E_SYMLINK)
+                else if (dnd.ftype != FDir) base.with("st", E_NOTDIR)
                 else {
                     val present = fsHasEnt(a.fs, a.cfh, n)
                     val child = if (present) fsChild(a.fs, a.cfh, n) else -1
@@ -1546,8 +1634,11 @@ module nfs4ops {
                             // regular file is idempotent success; any
                             // other existing object is EXIST
                             // (RFC 7530 16.16.5 / RFC 8881 18.16.3).
-                            // The file mode after exclusive create is the
-                            // server's derivation (0644 canonically).
+                            // The mode of an exclusive-created file is
+                            // undefined until the client's follow-up SETATTR
+                            // (RFC 7530 16.16.5); a POSIX-filesystem backend
+                            // creates it owner-only (0600).  chimera's memfs
+                            // uses 0644, now a chimera divergence.
                             if (present and childT == FReg and
                                 fsGet(a.fs, child).xverf == x.verf and
                                 x.verf != 0)
@@ -1557,7 +1648,7 @@ module nfs4ops {
                             else if (present) base.with("st", E_EXIST)
                             else {
                                 val o = fsMknode(a.fs, a.cfh, n,
-                                                 mkExclFile(420, x.verf, 0))
+                                                 mkExclFile(384, x.verf, 0))
                                 base.with("file", o.ino).with("fs2", o.fs2)
                                     .with("cinfo", o.cinfo)
                             }

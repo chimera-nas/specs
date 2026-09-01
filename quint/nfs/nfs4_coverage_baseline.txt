@@ -28,6 +28,7 @@ v4:SCreate:INVAL
 v4:SCreate:NAMETOOLONG
 v4:SCreate:NOTDIR
 v4:SCreate:OK
+v4:SCreate:SYMLINK
 v4:SCreateSession:OK
 v4:SDeallocate:ISDIR
 v4:SDeallocate:LOCKED
@@ -58,6 +59,7 @@ v4:SLink:INVAL
 v4:SLink:ISDIR
 v4:SLink:NOTDIR
 v4:SLink:OK
+v4:SLink:SYMLINK
 v4:SListxattrs:OK
 v4:SLock:BAD_SEQID
 v4:SLock:DENIED
@@ -78,6 +80,7 @@ v4:SLookup:SYMLINK
 v4:SLookupp:NOENT
 v4:SLookupp:NOTDIR
 v4:SLookupp:OK
+v4:SLookupp:SYMLINK
 v4:SNverify:OK
 v4:SNverify:SAME
 v4:SOpen:BADCHAR
@@ -110,8 +113,8 @@ v4:SRead:WRONG_TYPE
 v4:SReadPlus:OK
 v4:SReaddir:NOTDIR
 v4:SReaddir:OK
+v4:SReaddir:SYMLINK
 v4:SReadlink:INVAL
-v4:SReadlink:ISDIR
 v4:SReadlink:OK
 v4:SReclaimComplete:COMPLETE_ALREADY
 v4:SReclaimComplete:OK
@@ -126,6 +129,7 @@ v4:SRemove:NOENT
 v4:SRemove:NOTDIR
 v4:SRemove:NOTEMPTY
 v4:SRemove:OK
+v4:SRemove:SYMLINK
 v4:SRemovexattr:NOXATTR
 v4:SRemovexattr:OK
 v4:SRename:BADCHAR
@@ -135,6 +139,7 @@ v4:SRename:NAMETOOLONG
 v4:SRename:NOENT
 v4:SRename:NOTDIR
 v4:SRename:OK
+v4:SRename:SYMLINK
 v4:SRenew:OK
 v4:SRenew:STALE_CLIENTID
 v4:SRestorefh:OK

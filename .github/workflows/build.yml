@@ -18,6 +18,9 @@ on:
 env:
   APT_MIRROR: http://repository.mdh.quantum.com/repository/pkgs/ubuntu
   DOCKER_MIRROR: repository.mdh.quantum.com/
+  # The kvm-test-base guest the knfsd conformance job boots (it carries
+  # nfs-kernel-server as of v1.10.0).  amd64 only -- KVM needs a matching host.
+  KNFSD_IMAGE: ghcr.io/chimera-nas/kvm-test-base:ubuntu2404-v1.10.0-amd64
 
 jobs:
   # Heavy: simulates every model to generate the corpus, then runs the coverage
@@ -67,8 +70,8 @@ jobs:
       - name: Install oras
         uses: oras-project/setup-oras@v1
 
-      # -LE samba: the Samba conformance suite is the `samba` job's business and
-      # needs a live smbd; this job gates the corpus itself.
+      # -LE samba|ganesha: the conformance suites are the `samba` and `ganesha`
+      # jobs' business and need live servers; this job gates the corpus itself.
       - name: Generate the corpus, gate it, and bundle it
         run: |
           docker run --rm -v "$PWD:/specs" -w /specs specs-dev:${{ github.sha }} \
@@ -76,7 +79,7 @@ jobs:
               set -e
               cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
               cmake --build build -j"$(nproc)"
-              ctest --test-dir build --output-on-failure -LE samba
+              ctest --test-dir build --output-on-failure -LE "samba|ganesha|knfsd"
               cmake --build build --target bundle
             '
 
@@ -154,6 +157,151 @@ jobs:
               if [ "$rc" != 0 ]; then
                 echo "=== ctest exited $rc; LastTest.log ==="
                 tail -400 build/Testing/Temporary/LastTest.log 2>/dev/null || true
+              fi
+              exit $rc
+            '
+
+  # Replay the generated NFSv3 and NFSv4 corpora against a real NFS-Ganesha
+  # server, for the same reason the samba job exists: the NFS models were
+  # written alongside one implementation, and an unrelated one is the cheapest
+  # way to find where the two agreed on something the RFCs never said.
+  # Privileged: each batch runs its servers in a network namespace and
+  # loop-mounts an ext4 image for the export.
+  ganesha:
+    runs-on: arc-amd64
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver: docker-container
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["repository.mdh.quantum.com:5001"]
+
+      - name: Build the devcontainer image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: .devcontainer/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: specs-dev:${{ github.sha }}
+          cache-from: type=registry,ref=repository.mdh.quantum.com:5004/cache/specs-dev:amd64
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=registry,ref=repository.mdh.quantum.com:5004/cache/specs-dev:amd64,mode=max' || '' }}
+          build-args: |
+            APT_MIRROR=${{ env.APT_MIRROR }}
+            DOCKER_MIRROR=${{ env.DOCKER_MIRROR }}
+
+      # What this runner can host, recorded once per run so a SKIP has a
+      # visible cause: the kernel NFS server needs /dev/kvm (a guest) or a host
+      # nfsd module; ganesha needs loop devices for its export.
+      - name: Probe the runner
+        run: |
+          echo "kernel: $(uname -r)"
+          ls -l /dev/kvm 2>&1 || true
+          grep -E '^(nfsd|nfs|loop) ' /proc/modules || echo "no nfsd/loop modules listed"
+          ls /dev/loop-control /dev/loop0 2>&1 || true
+          docker run --rm --privileged specs-dev:${{ github.sha }} \
+            bash -c 'ls -l /dev/kvm /dev/loop-control 2>&1; ganesha.nfsd -v | head -1'
+
+      - name: Generate the corpus
+        run: |
+          docker run --rm --privileged -v "$PWD:/specs" -w /specs specs-dev:${{ github.sha }} \
+            bash -c '
+              set -e
+              cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+              cmake --build build -j"$(nproc)"
+            '
+
+      - name: Replay the corpus against ganesha
+        run: |
+          docker run --rm --privileged -v "$PWD:/specs" -w /specs specs-dev:${{ github.sha }} \
+            bash -c '
+              ctest --test-dir build -L ganesha -V --no-tests=error -j 4
+              rc=$?
+              if [ "$rc" != 0 ]; then
+                echo "=== ctest exited $rc; LastTest.log ==="
+                tail -600 build/Testing/Temporary/LastTest.log 2>/dev/null || true
+              fi
+              exit $rc
+            '
+
+  # Replay the corpus against the Linux kernel NFS server (knfsd), booted in a
+  # KVM guest -- a third, unrelated reference beside Ganesha and the model.
+  # Privileged (which exposes /dev/kvm, as chimera's KVM jobs rely on) and
+  # amd64 only.  The guest image is fetched with oras on the host and bind
+  # mounted; each batch boots one guest and drives it over a TAP link.
+  knfsd:
+    runs-on: arc-amd64
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver: docker-container
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["repository.mdh.quantum.com:5001"]
+
+      - name: Build the devcontainer image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: .devcontainer/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: specs-dev:${{ github.sha }}
+          cache-from: type=registry,ref=repository.mdh.quantum.com:5004/cache/specs-dev:amd64
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=registry,ref=repository.mdh.quantum.com:5004/cache/specs-dev:amd64,mode=max' || '' }}
+          build-args: |
+            APT_MIRROR=${{ env.APT_MIRROR }}
+            DOCKER_MIRROR=${{ env.DOCKER_MIRROR }}
+
+      - name: Install oras
+        uses: oras-project/setup-oras@v1
+
+      # The guest is an opaque OCI artifact (vmlinuz + initrd + rootfs.qcow2),
+      # pulled on the host; the container only needs the files, not oras.
+      - name: Fetch the knfsd guest image
+        run: |
+          mkdir -p kvm-image
+          oras pull "${KNFSD_IMAGE}" --output kvm-image
+          ls -l kvm-image
+
+      - name: Probe the runner
+        run: |
+          echo "kernel: $(uname -r)"
+          ls -l /dev/kvm 2>&1 || echo "no /dev/kvm on the host"
+
+      - name: Generate the corpus
+        run: |
+          docker run --rm --privileged -v "$PWD:/specs" -w /specs specs-dev:${{ github.sha }} \
+            bash -c '
+              set -e
+              cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+              cmake --build build -j"$(nproc)"
+            '
+
+      - name: Replay the corpus against knfsd
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD:/specs" -v "$PWD/kvm-image:/kvm-image:ro" \
+            -w /specs specs-dev:${{ github.sha }} \
+            bash -c '
+              cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                    -DSPECS_KNFSD_TESTS=ON -DKVM_IMAGE_DIR=/kvm-image
+              ctest --test-dir build -L knfsd -V --no-tests=error -j 2
+              rc=$?
+              if [ "$rc" != 0 ]; then
+                echo "=== ctest exited $rc; LastTest.log ==="
+                tail -600 build/Testing/Temporary/LastTest.log 2>/dev/null || true
               fi
               exit $rc
             '

@@ -371,11 +371,48 @@ module nfs3 {
     // annotated rather than CANDIDATE-FIX.
     // ------------------------------------------------------------------
 
+    // ACCESS3_* request bits and the bitwise AND the reply masking needs
+    // (Quint has no native bitwise operator).
+    pure val ACCESS3_READ    = 1
+    pure val ACCESS3_LOOKUP  = 2
+    pure val ACCESS3_MODIFY  = 4
+    pure val ACCESS3_EXTEND  = 8
+    pure val ACCESS3_DELETE  = 16
+    pure val ACCESS3_EXECUTE = 32
+    pure def iand3(x: int, y: int): int =
+        List(1, 2, 4, 8, 16, 32).foldl(0, (acc, b) =>
+            if ((x / b) % 2 == 1 and (y / b) % 2 == 1) acc + b else acc)
+    pure def anyExec3(m: int): bool =
+        (m % 2 == 1) or ((m / 8) % 2 == 1) or ((m / 64) % 2 == 1)
+
+    // The ACCESS reply for `mask` on `node`, run as root over AUTH_SYS.
+    // RFC 1813 3.3.4: ACCESS3_LOOKUP and ACCESS3_EXECUTE "have no meaning" for,
+    // respectively, a non-directory and a directory, and ACCESS3_DELETE names
+    // a property of the parent an ACCESS on the object cannot check -- so each
+    // is dropped for the type that cannot carry it.  Of what remains, root is
+    // granted every class EXCEPT EXECUTE on a file with no execute bit set in
+    // its mode (POSIX: even root needs one execute bit).  This is what the
+    // Linux kernel server and NFS-Ganesha both return; the model formerly
+    // echoed the full requested mask.
+    pure def accessReply3(node: Node, mask: int): int = {
+        val meaningful =
+            if (node.ftype == TDir)
+                ACCESS3_READ + ACCESS3_LOOKUP + ACCESS3_MODIFY +
+                ACCESS3_EXTEND + ACCESS3_DELETE
+            else ACCESS3_READ + ACCESS3_MODIFY + ACCESS3_EXTEND + ACCESS3_EXECUTE
+        val supported = iand3(mask, meaningful)
+        if (iand3(supported, ACCESS3_EXECUTE) == ACCESS3_EXECUTE and
+            not(anyExec3(node.mode)))
+            supported - ACCESS3_EXECUTE
+        else supported
+    }
+
     action applyAccess(o: Fid, mask: int): bool = all {
         fs' = fs,
         removed' = removed,
         nextFid' = nextFid,
-        lastOp' = OAccess({ obj: o, mask: mask, status: OK, access: mask }),
+        lastOp' = OAccess({ obj: o, mask: mask, status: OK,
+                            access: accessReply3(fs.get(o), mask) }),
     }
 
     action access = {
@@ -468,9 +505,13 @@ module nfs3 {
     }
 
     // EXCLUSIVE create (RFC 1813 3.3.8).  A fresh exclusive create succeeds
-    // and the file materializes with mode 0644 (420, empirically observed
-    // 2026-08-08; the sattr in an exclusive create is the verifier, not a
-    // mode).  RFC 1813: a retry that presents the *same* verifier as the
+    // and the file materializes with mode 0600 (384): RFC 1813 3.3.8 leaves
+    // the mode of an exclusive-created file undefined until the client's
+    // follow-up SETATTR (the sattr in an exclusive create carries the
+    // verifier, not a mode), and a POSIX-filesystem backend creates it
+    // owner-only.  The reference implementation's in-memory backend uses
+    // 0644 instead, which now shows as a chimera divergence.
+    // RFC 1813: a retry that presents the *same* verifier as the
     // create in progress "should" succeed idempotently and return the same
     // object; a different verifier gives NFS3ERR_EXIST.  The reference
     // implementation returns
@@ -498,7 +539,7 @@ module nfs3 {
             }
         } else all {
             fs' = fs
-                .put(nextFid, exclFile(420, v, ROOT_CRED))
+                .put(nextFid, exclFile(384, v, ROOT_CRED))
                 .setBy(d, dn => dn.with("ents", dn.ents.put(n, nextFid))),
             removed' = removed,
             nextFid' = nextFid + 1,
