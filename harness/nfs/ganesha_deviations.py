@@ -299,8 +299,8 @@ GD_14_CHANGE_ADVANCED = Deviation(
                "between two reads the model treats as unchanged",
     candidate_fix="a per-object modification counter (as GD-1)",
     ops=("SOpen", "SGetattr", "SCreate", "SRemove", "SRename", "SLink"),
-    field=("cinfo.after", "cinfo.before", "cinfoS.before", "cinfoT.before",
-           "change"),
+    field=("cinfo.after", "cinfo.before", "cinfoS.before", "cinfoS.after",
+           "cinfoT.before", "cinfoT.after", "change"),
     context=lambda f, ctx: "reported two wire values" in f.detail,
 )
 
@@ -711,9 +711,10 @@ GN_5_ATTR_FIELDS = Deviation(
     root_cause="ganesha's FSAL_VFS reports a symlink size 0 and counts ext4 "
                "subdirectory links",
     candidate_fix="model: use 0 for symlink size and count subdir nlink",
-    ops=("OSymlink", "OCreate", "OGetattr", "OReaddir", "OLookup", "OMkdir"),
+    ops=("OSymlink", "OCreate", "OGetattr", "OReaddir", "OLookup", "OMkdir",
+         "OReadlink", "OLink", "OAccess"),
     field=("obj_attrs.size", "obj_attrs.nlink", "attrs.nlink", "attrs.size",
-           "wcc.after.nlink"),
+           "wcc.after.nlink", "file_attributes.size", "readdirplus[b].size"),
 )
 
 NFS3 = Registry("ganesha/nfs3", [
