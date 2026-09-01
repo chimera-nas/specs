@@ -666,6 +666,47 @@ GD_32_OPEN_SEQID_VS_SYMLINK = Deviation(
     actual_status=NFS4ERR_SYMLINK,
 )
 
+# GD-33: SEEK for the next hole at or past EOF.  RFC 7862 15.11.3 makes
+# NFS4ERR_NXIO the answer when sa_offset is at or beyond the file's size; the
+# model returns it, ganesha instead reports success with an offset (a hole it
+# located earlier in the file).  A read of that offset returns the same bytes
+# either way, so the disagreement is confined to the SEEK reply.
+GD_33_SEEK_HOLE_PAST_EOF = Deviation(
+    id="GD-33-seek-hole-past-eof",
+    verdict=SERVER,
+    spec="RFC 7862 15.11.3: SEEK is NFS4ERR_NXIO when sa_offset is at or past "
+         "the file size",
+    summary="SEEK(hole) at/past EOF answers OK where the model expects NXIO",
+    root_cause="ganesha's FSAL SEEK does not return NXIO for an at/past-EOF "
+               "starting offset",
+    candidate_fix=None,
+    ops=("SSeek",),
+    expected_status=NFS4ERR_NXIO,
+    actual_status=NFS4_OK,
+)
+
+# GD-34: a 256-byte compound tag (the model's "NLONG" tag test).  RFC 8881 2.2
+# leaves the compound tag opaque with no maximum, so the model accepts it, but
+# both reference servers cap it below 256 bytes -- ganesha returns
+# NFS4ERR_INVAL for the whole compound, and knfsd rejects the message at the
+# RPC layer (GARBAGE_ARGS), which the harness handles at the send.  The
+# result-count difference is already GD-23; this covers the compound status.
+GD_34_LONG_TAG = Deviation(
+    id="GD-34-long-compound-tag",
+    verdict=SERVER,
+    spec="RFC 8881 2.2: the compound tag is opaque with no maximum length; the "
+         "servers impose an implementation tag-length limit",
+    summary="a 256-byte compound tag the model accepts is NFS4ERR_INVAL to "
+            "ganesha (GARBAGE_ARGS to knfsd)",
+    root_cause="both reference servers cap the compound tag below 256 bytes; "
+               "the model treats it as opaque and accepts it",
+    candidate_fix="model: cap the compound tag to the servers' limit",
+    ops=("compound",),
+    expected_status=NFS4_OK,
+    actual_status=NFS4ERR_INVAL,
+    context=lambda f, ctx: ctx["lab"].get("tagName") == "NLONG",
+)
+
 
 NFS4 = Registry("ganesha/nfs4", [
     GD_1_CHANGE_GRANULARITY,
@@ -697,6 +738,8 @@ NFS4 = Registry("ganesha/nfs4", [
     GD_30_READ_STALE_HOLE,
     GD_31_DESTROY_CLIENTID_BUSY,
     GD_32_OPEN_SEQID_VS_SYMLINK,
+    GD_33_SEEK_HOLE_PAST_EOF,
+    GD_34_LONG_TAG,
 ])
 
 
