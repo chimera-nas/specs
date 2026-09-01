@@ -603,6 +603,69 @@ GD_29_DIR_NLINK = Deviation(
     field=("nlink", "mode"),
 )
 
+# GD-30: a READ returns stale non-zero data for a block the model (and chimera's
+# memfs, which passes the same trace) reads as a hole.  Root-caused on
+# nfs4Memfs41_stepData: a name is written (symbol 3 into a block), the name is
+# unlinked and re-created (an exclusive OPEN of the same name later in the
+# trace), and a READ of the new, empty file returns the *old* file's bytes.
+# ganesha's FSAL_VFS over ext4 recycles the unlinked inode and serves its
+# residual data for the recreated name, where the model reads the fresh file as
+# holes.  Matched only when the model expected a hole (byte 0x0), so a genuine
+# data corruption -- where the model expects real bytes -- still fails.
+GD_30_READ_STALE_HOLE = Deviation(
+    id="GD-30-read-stale-after-recreate",
+    verdict=SERVER,
+    spec="RFC 7530 5.8 / POSIX: a freshly created file reads as zero-fill "
+         "(holes)",
+    summary="READ returns a recycled inode's stale bytes for a block the "
+            "model reads as a hole",
+    root_cause="ganesha's FSAL_VFS over ext4 recycles an unlinked file's inode "
+               "and serves its residual data for the recreated name",
+    candidate_fix="invalidate the FSAL data cache on unlink/create of a "
+                  "recycled inode",
+    ops=("SRead", "SReadPlus"),
+    field=("data",),
+    context=lambda f, ctx: "expected byte 0x0" in f.detail,
+)
+
+# GD-31: DESTROY_CLIENTID against a client that still owns sessions or state.
+# RFC 8881 18.50.3 makes NFS4ERR_CLIENTID_BUSY the required answer then; the
+# model destroys the clientid unconditionally.  ganesha enforces the RFC
+# precondition, so its CLIENTID_BUSY is the more-correct answer.
+GD_31_DESTROY_CLIENTID_BUSY = Deviation(
+    id="GD-31-destroy-clientid-busy",
+    verdict=SERVER,
+    spec="RFC 8881 18.50.3: DESTROY_CLIENTID is NFS4ERR_CLIENTID_BUSY while the "
+         "client owns sessions or state",
+    summary="DESTROY_CLIENTID answers CLIENTID_BUSY where the model expects OK",
+    root_cause="ganesha enforces the RFC precondition that no sessions/state "
+               "remain; the model destroys the clientid unconditionally",
+    candidate_fix="model: gate DESTROY_CLIENTID on the client being quiescent",
+    ops=("SDestroyClientid",),
+    expected_status=0,
+    actual_status=NFS4ERR_CLIENTID_BUSY,
+)
+
+# GD-32: OPEN(no-create) that both names a symlink and carries a stale owner
+# seqid.  RFC 7530 16.16 orders neither the owner-seqid check nor component
+# resolution, so either error is conformant: the model reports the seqid first
+# (NFS4ERR_BAD_SEQID), ganesha the resolution (NFS4ERR_SYMLINK).  Nothing opens
+# either way.
+GD_32_OPEN_SEQID_VS_SYMLINK = Deviation(
+    id="GD-32-open-seqid-vs-symlink",
+    verdict=SERVER,
+    spec="RFC 7530 16.16.5 / 8.1.5: BAD_SEQID and SYMLINK both apply to this "
+         "OPEN and their precedence is unspecified",
+    summary="OPEN of a symlink with a stale owner seqid: model BAD_SEQID vs "
+            "ganesha SYMLINK",
+    root_cause="unordered error precedence between the owner-seqid check and "
+               "component resolution",
+    candidate_fix=None,
+    ops=("SOpen",),
+    expected_status=NFS4ERR_BAD_SEQID,
+    actual_status=NFS4ERR_SYMLINK,
+)
+
 
 NFS4 = Registry("ganesha/nfs4", [
     GD_1_CHANGE_GRANULARITY,
@@ -631,6 +694,9 @@ NFS4 = Registry("ganesha/nfs4", [
     GD_27_FH_IDENTITY,
     GD_28_COMPOUND_MVM,
     GD_29_DIR_NLINK,
+    GD_30_READ_STALE_HOLE,
+    GD_31_DESTROY_CLIENTID_BUSY,
+    GD_32_OPEN_SEQID_VS_SYMLINK,
 ])
 
 

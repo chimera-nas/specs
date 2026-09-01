@@ -323,12 +323,12 @@ KN_17_LIFECYCLE = Deviation(
     verdict=SERVER,
     spec="RFC 7530 16.34 / 8.2 (client-id and filehandle validity track the "
          "server's lifecycle)",
-    summary="SETCLIENTID_CONFIRM STALE_CLIENTID / LINK NOENT where the model "
-            "expects OK, after upstream state parted",
+    summary="SETCLIENTID_CONFIRM STALE_CLIENTID / LINK|RENAME|LOOKUP NOENT "
+            "where the model expects OK, after upstream state parted",
     root_cause="an upstream recorded deviation left knfsd without a client id "
                "or object the model still holds",
     candidate_fix="none (downstream of the recorded upstream deviation)",
-    ops=("SSetclientidConfirm", "SLink", "SRename"),
+    ops=("SSetclientidConfirm", "SLink", "SRename", "SLookup"),
     expected_status=NFS4_OK,
     actual_status=(NFS4ERR_STALE_CLIENTID, NFS4ERR_NOENT),
     reconcilable=False,
