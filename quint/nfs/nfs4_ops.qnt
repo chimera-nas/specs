@@ -1316,6 +1316,16 @@ module nfs4ops {
                     // are the cached ones).
                     emit(a, SSequence({ st: OK, replay: true }))
                       .with("done", true)
+                | SeqUncachedRetry =>
+                    // The SEQUENCE reply is always cached, so it answers
+                    // NFS4_OK; NFS4ERR_RETRY_UNCACHED_REP goes on the
+                    // operation after it (RFC 8881 2.10.6.1.3), which is why
+                    // the compound stops here rather than continuing.  Not
+                    // generated -- every retransmitted compound in these
+                    // traces asked for its reply to be cached -- so the
+                    // harness has no encoding for it.
+                    emit(a, SSequence({ st: OK, replay: false }))
+                      .with("done", true)
                 | SeqFalseRetry =>
                     emit(a, SSequence({ st: E_SEQ_FALSE_RETRY, replay: false }))
                 | SeqMisordered =>

@@ -342,6 +342,42 @@ foreach(b ${S3_BATCHES})
 endforeach()
 
 # ---------------------------------------------------------------------------
+# NFSDRC -- the duplicate-request caches of NFSv3 and NFSv4.0 (nfsdrc_run.qnt).
+#
+# Four self-tests, two corpora.  nfsdrcRef is the server with the NFSv3 cache
+# on; nfsdrcNoV3 is the same server with it off, which is the shipped default
+# and is worth a corpus of its own because "the switch does nothing" and "the
+# switch works" are indistinguishable without one.  The other two profiles
+# describe servers no available transport can produce (two peer addresses) or
+# that we do not want to be (a key that ignores the credential), and stay under
+# `quint test`.
+# ---------------------------------------------------------------------------
+file(GLOB NFSDRC_QNT ${Q}/nfsdrc/*.qnt)
+specs_selftest(nfsdrcTestRef       ${Q}/nfsdrc/nfsdrcTest.qnt nfsdrcTestRef       200 NFSDRC_QNT)
+specs_selftest(nfsdrcTestNoV3      ${Q}/nfsdrc/nfsdrcTest.qnt nfsdrcTestNoV3      200 NFSDRC_QNT)
+specs_selftest(nfsdrcTestTwoAddr   ${Q}/nfsdrc/nfsdrcTest.qnt nfsdrcTestTwoAddr   200 NFSDRC_QNT)
+specs_selftest(nfsdrcTestCredBlind ${Q}/nfsdrc/nfsdrcTest.qnt nfsdrcTestCredBlind 200 NFSDRC_QNT)
+set(NFSDRC_GATE ${SELFTEST_nfsdrcTestRef} ${SELFTEST_nfsdrcTestNoV3}
+                ${SELFTEST_nfsdrcTestTwoAddr} ${SELFTEST_nfsdrcTestCredBlind})
+
+# profile | steps | ntraces | seed.  Long runs on purpose: the NFSv4.0 cache
+# holds sixteen entries per connection, and reaching its eviction bound takes
+# more distinct requests on one connection than a short walk produces.
+set(NFSDRC_BATCHES
+  "nfsdrcRef|100|6|0x1"  "nfsdrcRef|160|4|0x2"
+  "nfsdrcRef|100|4|0x3"  "nfsdrcNoV3|100|3|0x4")
+foreach(b ${NFSDRC_BATCHES})
+    string(REPLACE "|" ";" parts "${b}")
+    list(GET parts 0 profile)
+    list(GET parts 1 steps)
+    list(GET parts 2 nt)
+    list(GET parts 3 seed)
+    specs_gen(nfsdrc ${Q}/nfsdrc/nfsdrc_run.qnt ${profile} step ${steps}
+              ${nt} ${seed} "${profile}_${steps}_${seed}_{seq}"
+              NFSDRC_GATE NFSDRC_QNT)
+endforeach()
+
+# ---------------------------------------------------------------------------
 # Aggregate + bundle
 # ---------------------------------------------------------------------------
 add_custom_target(specs_traces ALL DEPENDS ${ALL_TRACES})
@@ -362,6 +398,8 @@ add_test(NAME coverage/smb2
     COMMAND ${Python3_EXECUTABLE} ${Q}/smb2/coverage.py ${T}/smb2)
 add_test(NAME coverage/nfsaux
     COMMAND ${Python3_EXECUTABLE} ${Q}/nfsaux/coverage.py ${T}/nfsaux)
+add_test(NAME coverage/nfsdrc
+    COMMAND ${Python3_EXECUTABLE} ${Q}/nfsdrc/coverage.py ${T}/nfsdrc)
 
 # The NFSv4 gate is a *ratchet* rather than a fixed bucket list.  The v4
 # generator keeps growing, and every branch added to a step flavor shifts the

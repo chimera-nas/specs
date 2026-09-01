@@ -138,6 +138,12 @@ module nfs4 {
     var sdb: StateDB
     var caps: Caps
     var tag: int
+    /// The compound just sent, so that a retransmit can be exactly that
+    /// compound again: the same operations, the same slot and sequence id, and
+    /// the same request identity.  A request built afresh that happened to
+    /// look similar would not be a retransmit and a replier is right to treat
+    /// it as new.
+    var prev: { valid: bool, tag: int, ops: List[OpReq] }
     var lastOp: Label
 
     action init = {
@@ -181,6 +187,7 @@ module nfs4 {
             sdb' = sdbInit,
             caps' = c,
             tag' = 1,
+            prev' = { valid: false, tag: 0, ops: [] },
             // The harness reads the assumed capability profile from this
             // label and reconciles it against the live advertisement
             // before replaying step 1 (skip on mismatch unless the
@@ -201,12 +208,12 @@ module nfs4 {
             sdb' = out.sdb2,
             caps' = caps,
             tag' = tag + 1,
+            prev' = { valid: true, tag: tag, ops: ops },
             lastOp' = LCompound({ tag: tag, tagName: "", ops: ops,
                                   status: out.status,
                                   results: out.results }),
         }
     }
-
 
     // The COMPOUND tag (RFC 7530 16.2.3 / RFC 8881 16.2.3) is a utf8str_cs
     // that chimera validates *before any operation runs*: a malformed tag is
@@ -228,6 +235,11 @@ module nfs4 {
             t == "NUMIXT" or t == "NUMIXS") E_INVAL
         else OK
 
+    // Tagged compounds are not recorded for retransmission: replayPrev
+    // rebuilds the request with an empty tag name, so only untagged compounds
+    // are eligible, and a tagged one in between invalidates the record rather
+    // than leaving `prev` pointing at a compound that is no longer the
+    // previous one on the wire.
     action runTagged(t: str, ops: List[OpReq]): bool =
         if (tagStatus(t) != OK)
             all {
@@ -235,6 +247,7 @@ module nfs4 {
                 sdb' = sdb,
                 caps' = caps,
                 tag' = tag + 1,
+                prev' = { valid: false, tag: 0, ops: [] },
                 lastOp' = LCompound({ tag: tag, tagName: t, ops: ops,
                                       status: E_INVAL, results: [] }),
             }
@@ -245,11 +258,48 @@ module nfs4 {
                 sdb' = out.sdb2,
                 caps' = caps,
                 tag' = tag + 1,
+                prev' = { valid: false, tag: 0, ops: [] },
                 lastOp' = LCompound({ tag: tag, tagName: t, ops: ops,
                                       status: out.status,
                                       results: out.results }),
             }
         }
+
+    /**
+     * Send the previous compound again, unchanged.
+     *
+     * This is the only way to reach the session reply cache, and until there
+     * was a step for it the cache was specified and never exercised: every
+     * other step takes the slot's next sequence id, so no two requests ever
+     * shared one.  RFC 8881 Section 2.10.6.2 is what a client is allowed to do
+     * here -- retry after losing a connection -- and Section 2.10.6.1 is what
+     * the replier must then do: recognise the sequence id as the one already
+     * recorded on the slot and answer from the cache without executing.
+     *
+     * The request identity is `prev.tag` and not a fresh one, because this is
+     * the same request.  The model's evaluation of it is what predicts the
+     * replay; the harness compares the server's reply against the one it
+     * recorded for the original, which is the property that matters and is not
+     * something the model can state for it.
+     */
+    action replayPrev: bool = all {
+        prev.valid,
+        MINOR > 0,
+        {
+            val out = evalCompound(fs, sdb, MINOR, caps, prev.tag, prev.ops)
+            all {
+                fs' = out.fs2,
+                sdb' = out.sdb2,
+                caps' = caps,
+                tag' = tag,
+                prev' = prev,
+                lastOp' = LCompound({ tag: prev.tag, tagName: "",
+                                      ops: prev.ops,
+                                      status: out.status,
+                                      results: out.results }),
+            }
+        },
+    }
 
     // Newest session of a client; -1 if none.
     def sessOf(c: ClientId): SessId =
@@ -1843,6 +1893,7 @@ module nfs4 {
         setupCreateSession,
         reclaimAgain,
         seqMisordered,
+        replayPrev,
         destroySession,
         destroyClientid,
         nsLookup,

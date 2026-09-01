@@ -36,6 +36,8 @@ v4:SDelegreturn:OK
 v4:SDestroyClientid:CLIENTID_BUSY
 v4:SDestroyClientid:NOT_ONLY_OP
 v4:SDestroyClientid:OK
+v4:SDestroyClientid:STALE_CLIENTID
+v4:SDestroySession:BADSESSION
 v4:SDestroySession:NOT_ONLY_OP
 v4:SDestroySession:OK
 v4:SExchangeId:OK
@@ -54,7 +56,6 @@ v4:SLink:BADNAME
 v4:SLink:EXIST
 v4:SLink:INVAL
 v4:SLink:ISDIR
-v4:SLink:NAMETOOLONG
 v4:SLink:NOTDIR
 v4:SLink:OK
 v4:SListxattrs:OK
@@ -64,6 +65,7 @@ v4:SLock:OK
 v4:SLockt:DENIED
 v4:SLockt:ISDIR
 v4:SLockt:OK
+v4:SLockt:WRONG_TYPE
 v4:SLocku:OK
 v4:SLookup:BADCHAR
 v4:SLookup:BADNAME
@@ -175,6 +177,7 @@ v4:SWriteSame:OK
 v4:SWriteSame:UNION_NOTSUPP
 v4:compound:BADCHAR
 v4:compound:BADNAME
+v4:compound:BADSESSION
 v4:compound:BADTYPE
 v4:compound:BAD_SEQID
 v4:compound:BAD_STATEID

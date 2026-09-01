@@ -308,14 +308,17 @@ module nfs3 {
     // The action and Op variant are retained (the `removed` set still feeds
     // the RENAME/unlink logic) but staleGetattr is excluded from `step`;
     // stale-FH behaviour is deferred to a dedicated, allocation-aware
-    // phase-3 probe.  Two facts worth pinning there: a syntactically bogus
-    // handle returns NFS3ERR_STALE, whereas a validly-decoded-but-freed
-    // handle returns NFS3ERR_NOENT (RFC 1813 would use STALE for both).
+    // phase-3 probe.  Both a syntactically bogus handle and a
+    // validly-decoded-but-freed one return NFS3ERR_STALE, which is what
+    // RFC 1813 section 3.3 describes -- "the file referred to by that file
+    // handle no longer exists".  A handle whose object is still pinned by an
+    // open resolves and is not stale at all, which is the case the probe has
+    // to be allocation-aware to separate.
     action applyStaleGetattr(o: Fid): bool = all {
         fs' = fs,
         removed' = removed,
         nextFid' = nextFid,
-        lastOp' = OStaleGetattr({ obj: o, status: ERR_NOENT }),
+        lastOp' = OStaleGetattr({ obj: o, status: ERR_STALE }),
     }
 
     // ------------------------------------------------------------------
