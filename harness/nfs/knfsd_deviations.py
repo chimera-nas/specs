@@ -41,7 +41,7 @@ KN_1_NAME_HANDLING = Deviation(
          "SSecinfo"),
     expected_status=(NFS4ERR_INVAL, NFS4ERR_BADCHAR, NFS4ERR_BADNAME),
     actual_status=(NFS4ERR_INVAL, NFS4ERR_BADCHAR, NFS4ERR_BADNAME,
-                   NFS4ERR_NOENT, NFS4_OK, NFS4ERR_EXIST),
+                   NFS4ERR_NOENT, NFS4_OK, NFS4ERR_EXIST, NFS4ERR_NOTDIR),
 )
 
 

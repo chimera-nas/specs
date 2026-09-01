@@ -685,6 +685,25 @@ GD_33_SEEK_HOLE_PAST_EOF = Deviation(
     actual_status=NFS4_OK,
 )
 
+# GD-35: the offset facet of GD-33.  Where a SEEK does succeed, ganesha's FSAL
+# reports the next hole/data boundary at a different (often earlier) offset than
+# the model's block-granular sparse map -- RFC 7862 15.11.3 leaves the exact
+# boundary to the filesystem's allocation.  A read from the model's offset
+# returns the same bytes, so the disagreement is confined to the SEEK reply's
+# offset field.
+GD_35_SEEK_OFFSET = Deviation(
+    id="GD-35-seek-offset",
+    verdict=SERVER,
+    spec="RFC 7862 15.11.3: the SEEK result offset follows the filesystem's "
+         "own hole/data allocation",
+    summary="SEEK reports a different next-hole/data offset than the model",
+    root_cause="ganesha's FSAL sparse map differs from the model's block-granular "
+               "one",
+    candidate_fix=None,
+    ops=("SSeek",),
+    field=("offset", "eof"),
+)
+
 # GD-34: a 256-byte compound tag (the model's "NLONG" tag test).  RFC 8881 2.2
 # leaves the compound tag opaque with no maximum, so the model accepts it, but
 # both reference servers cap it below 256 bytes -- ganesha returns
@@ -740,6 +759,7 @@ NFS4 = Registry("ganesha/nfs4", [
     GD_32_OPEN_SEQID_VS_SYMLINK,
     GD_33_SEEK_HOLE_PAST_EOF,
     GD_34_LONG_TAG,
+    GD_35_SEEK_OFFSET,
 ])
 
 
