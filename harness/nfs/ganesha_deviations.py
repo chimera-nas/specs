@@ -299,8 +299,8 @@ GD_14_CHANGE_ADVANCED = Deviation(
                "between two reads the model treats as unchanged",
     candidate_fix="a per-object modification counter (as GD-1)",
     ops=("SOpen", "SGetattr", "SCreate", "SRemove", "SRename", "SLink"),
-    field=("cinfo.after", "cinfo.before", "cinfoS.before", "cinfoT.before",
-           "change"),
+    field=("cinfo.after", "cinfo.before", "cinfoS.before", "cinfoS.after",
+           "cinfoT.before", "cinfoT.after", "change"),
     context=lambda f, ctx: "reported two wire values" in f.detail,
 )
 
@@ -603,6 +603,129 @@ GD_29_DIR_NLINK = Deviation(
     field=("nlink", "mode"),
 )
 
+# GD-30: a READ returns stale non-zero data for a block the model (and chimera's
+# memfs, which passes the same trace) reads as a hole.  Root-caused on
+# nfs4Memfs41_stepData: a name is written (symbol 3 into a block), the name is
+# unlinked and re-created (an exclusive OPEN of the same name later in the
+# trace), and a READ of the new, empty file returns the *old* file's bytes.
+# ganesha's FSAL_VFS over ext4 recycles the unlinked inode and serves its
+# residual data for the recreated name, where the model reads the fresh file as
+# holes.  Matched only when the model expected a hole (byte 0x0), so a genuine
+# data corruption -- where the model expects real bytes -- still fails.
+GD_30_READ_STALE_HOLE = Deviation(
+    id="GD-30-read-stale-after-recreate",
+    verdict=SERVER,
+    spec="RFC 7530 5.8 / POSIX: a freshly created file reads as zero-fill "
+         "(holes)",
+    summary="READ returns a recycled inode's stale bytes for a block the "
+            "model reads as a hole",
+    root_cause="ganesha's FSAL_VFS over ext4 recycles an unlinked file's inode "
+               "and serves its residual data for the recreated name",
+    candidate_fix="invalidate the FSAL data cache on unlink/create of a "
+                  "recycled inode",
+    ops=("SRead", "SReadPlus"),
+    field=("data",),
+    context=lambda f, ctx: "expected byte 0x0" in f.detail,
+)
+
+# GD-31: DESTROY_CLIENTID against a client that still owns sessions or state.
+# RFC 8881 18.50.3 makes NFS4ERR_CLIENTID_BUSY the required answer then; the
+# model destroys the clientid unconditionally.  ganesha enforces the RFC
+# precondition, so its CLIENTID_BUSY is the more-correct answer.
+GD_31_DESTROY_CLIENTID_BUSY = Deviation(
+    id="GD-31-destroy-clientid-busy",
+    verdict=SERVER,
+    spec="RFC 8881 18.50.3: DESTROY_CLIENTID is NFS4ERR_CLIENTID_BUSY while the "
+         "client owns sessions or state",
+    summary="DESTROY_CLIENTID answers CLIENTID_BUSY where the model expects OK",
+    root_cause="ganesha enforces the RFC precondition that no sessions/state "
+               "remain; the model destroys the clientid unconditionally",
+    candidate_fix="model: gate DESTROY_CLIENTID on the client being quiescent",
+    ops=("SDestroyClientid",),
+    expected_status=0,
+    actual_status=NFS4ERR_CLIENTID_BUSY,
+)
+
+# GD-32: OPEN(no-create) that both names a symlink and carries a stale owner
+# seqid.  RFC 7530 16.16 orders neither the owner-seqid check nor component
+# resolution, so either error is conformant: the model reports the seqid first
+# (NFS4ERR_BAD_SEQID), ganesha the resolution (NFS4ERR_SYMLINK).  Nothing opens
+# either way.
+GD_32_OPEN_SEQID_VS_SYMLINK = Deviation(
+    id="GD-32-open-seqid-vs-symlink",
+    verdict=SERVER,
+    spec="RFC 7530 16.16.5 / 8.1.5: BAD_SEQID and SYMLINK both apply to this "
+         "OPEN and their precedence is unspecified",
+    summary="OPEN of a symlink with a stale owner seqid: model BAD_SEQID vs "
+            "ganesha SYMLINK",
+    root_cause="unordered error precedence between the owner-seqid check and "
+               "component resolution",
+    candidate_fix=None,
+    ops=("SOpen",),
+    expected_status=NFS4ERR_BAD_SEQID,
+    actual_status=NFS4ERR_SYMLINK,
+)
+
+# GD-33: SEEK for the next hole at or past EOF.  RFC 7862 15.11.3 makes
+# NFS4ERR_NXIO the answer when sa_offset is at or beyond the file's size; the
+# model returns it, ganesha instead reports success with an offset (a hole it
+# located earlier in the file).  A read of that offset returns the same bytes
+# either way, so the disagreement is confined to the SEEK reply.
+GD_33_SEEK_HOLE_PAST_EOF = Deviation(
+    id="GD-33-seek-hole-past-eof",
+    verdict=SERVER,
+    spec="RFC 7862 15.11.3: SEEK is NFS4ERR_NXIO when sa_offset is at or past "
+         "the file size",
+    summary="SEEK(hole) at/past EOF answers OK where the model expects NXIO",
+    root_cause="ganesha's FSAL SEEK does not return NXIO for an at/past-EOF "
+               "starting offset",
+    candidate_fix=None,
+    ops=("SSeek",),
+    expected_status=NFS4ERR_NXIO,
+    actual_status=NFS4_OK,
+)
+
+# GD-35: the offset facet of GD-33.  Where a SEEK does succeed, ganesha's FSAL
+# reports the next hole/data boundary at a different (often earlier) offset than
+# the model's block-granular sparse map -- RFC 7862 15.11.3 leaves the exact
+# boundary to the filesystem's allocation.  A read from the model's offset
+# returns the same bytes, so the disagreement is confined to the SEEK reply's
+# offset field.
+GD_35_SEEK_OFFSET = Deviation(
+    id="GD-35-seek-offset",
+    verdict=SERVER,
+    spec="RFC 7862 15.11.3: the SEEK result offset follows the filesystem's "
+         "own hole/data allocation",
+    summary="SEEK reports a different next-hole/data offset than the model",
+    root_cause="ganesha's FSAL sparse map differs from the model's block-granular "
+               "one",
+    candidate_fix=None,
+    ops=("SSeek",),
+    field=("offset", "eof"),
+)
+
+# GD-34: a 256-byte compound tag (the model's "NLONG" tag test).  RFC 8881 2.2
+# leaves the compound tag opaque with no maximum, so the model accepts it, but
+# both reference servers cap it below 256 bytes -- ganesha returns
+# NFS4ERR_INVAL for the whole compound, and knfsd rejects the message at the
+# RPC layer (GARBAGE_ARGS), which the harness handles at the send.  The
+# result-count difference is already GD-23; this covers the compound status.
+GD_34_LONG_TAG = Deviation(
+    id="GD-34-long-compound-tag",
+    verdict=SERVER,
+    spec="RFC 8881 2.2: the compound tag is opaque with no maximum length; the "
+         "servers impose an implementation tag-length limit",
+    summary="a 256-byte compound tag the model accepts is NFS4ERR_INVAL to "
+            "ganesha (GARBAGE_ARGS to knfsd)",
+    root_cause="both reference servers cap the compound tag below 256 bytes; "
+               "the model treats it as opaque and accepts it",
+    candidate_fix="model: cap the compound tag to the servers' limit",
+    ops=("compound",),
+    expected_status=NFS4_OK,
+    actual_status=NFS4ERR_INVAL,
+    context=lambda f, ctx: ctx["lab"].get("tagName") == "NLONG",
+)
+
 
 NFS4 = Registry("ganesha/nfs4", [
     GD_1_CHANGE_GRANULARITY,
@@ -631,6 +754,12 @@ NFS4 = Registry("ganesha/nfs4", [
     GD_27_FH_IDENTITY,
     GD_28_COMPOUND_MVM,
     GD_29_DIR_NLINK,
+    GD_30_READ_STALE_HOLE,
+    GD_31_DESTROY_CLIENTID_BUSY,
+    GD_32_OPEN_SEQID_VS_SYMLINK,
+    GD_33_SEEK_HOLE_PAST_EOF,
+    GD_34_LONG_TAG,
+    GD_35_SEEK_OFFSET,
 ])
 
 
@@ -711,9 +840,10 @@ GN_5_ATTR_FIELDS = Deviation(
     root_cause="ganesha's FSAL_VFS reports a symlink size 0 and counts ext4 "
                "subdirectory links",
     candidate_fix="model: use 0 for symlink size and count subdir nlink",
-    ops=("OSymlink", "OCreate", "OGetattr", "OReaddir", "OLookup", "OMkdir"),
+    ops=("OSymlink", "OCreate", "OGetattr", "OReaddir", "OLookup", "OMkdir",
+         "OReadlink", "OLink", "OAccess"),
     field=("obj_attrs.size", "obj_attrs.nlink", "attrs.nlink", "attrs.size",
-           "wcc.after.nlink"),
+           "wcc.after.nlink", "file_attributes.size", "readdirplus[b].size"),
 )
 
 NFS3 = Registry("ganesha/nfs3", [

@@ -1002,7 +1002,21 @@ class Replayer:
         delays = 0
         graces = 0
         while True:
-            rep = self.c.compound(self.minor, encoded, tag=tag_bytes)
+            try:
+                rep = self.c.compound(self.minor, encoded, tag=tag_bytes)
+            except (c4.RpcError, c4.XdrError):
+                # A 256-byte compound tag (tagName "NLONG"): both reference
+                # servers cap the tag well below 256 bytes.  knfsd rejects the
+                # message at the RPC layer (GARBAGE_ARGS -> RpcError); ganesha
+                # decodes it and returns NFS4ERR_INVAL, reconciled as GD-34.
+                # RFC 8881 2.2 sets no maximum tag length, so the model accepts
+                # it.  Record the server's limit and skip this one compound.
+                if lab.get("tagName") == "NLONG":
+                    self.deviations_hit["GD-34-long-compound-tag"] = \
+                        self.deviations_hit.get(
+                            "GD-34-long-compound-tag", 0) + 1
+                    return None
+                raise
             self.compounds += 1
             transient = None
             for i, r in enumerate(rep["results"]):
