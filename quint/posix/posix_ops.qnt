@@ -1057,7 +1057,18 @@ module posixops {
         val at = atStart(fs, ps, p, dfd, pth)
         if (at.e != OK) { e: at.e, par: -1, leaf: "" }
         else {
-            val r = resolve(fs, caps, cr, at.start, pth, false)
+            // Resolve with the trailing slash suppressed.  A trailing slash
+            // normally forces the final component to be followed and to be
+            // a directory (ENOTDIR otherwise, XBD 4.16), but on the create
+            // path the final component is judged, not traversed: XSH mkdir
+            // and symlink both list EEXIST as "the named file exists" with
+            // no qualification, and Linux answers EEXIST for `mkdir("f/")`,
+            // `mkdir("dangling/")` and `symlink(t, "f/")` alike.  Only when
+            // nothing is there does the slash matter, and slashOk below is
+            // what says whether this caller tolerates it.  Found by
+            // replaying this corpus at ext4.
+            val r = resolve(fs, caps, cr, at.start, pth.with("slash", false),
+                            false)
             if (r.err != OK) { e: r.err, par: -1, leaf: "" }
             else if (r.ino != -1) { e: EEXIST, par: -1, leaf: "" }
             else if (pth.slash and not(slashOk))
@@ -1475,15 +1486,26 @@ module posixops {
         }
 
     // lockf: exclusive locks only, section starts at the current offset
-    // (len 0 = to end, modeled as the whole span), requires a descriptor
-    // open for writing.
+    // (len 0 = to end, modeled as the whole span).
+    //
+    // Write access is required only by the two commands that TAKE a lock.
+    // XSH lockf's EBADF condition is "fildes is not a valid open file
+    // descriptor; or function is F_LOCK or F_TLOCK and fildes is not a
+    // valid file descriptor open for writing" -- F_ULOCK and F_TEST are
+    // deliberately absent from that list, and Linux (where lockf is a
+    // glibc wrapper over fcntl F_SETLK / F_GETLK) accepts both on a
+    // read-only descriptor.  Found by replaying this corpus at ext4.
+    pure def lockfTakes(cmd: LockfCmd): bool =
+        cmd == LfLock or cmd == LfTlock
+
     pure def opLockf(fs: Fs, ps: Pstate, caps: Caps, p: Pid, fd: Fd,
                      cmd: LockfCmd, len: int): Out =
         if (not(fdLive(ps, p, fd))) outErr(fs, ps, EBADF)
         else {
             val o = fdOfd(ps, p, fd)
             val i = o.ino
-            if (not(accWrites(o.acc))) outErr(fs, ps, EBADF)
+            if (lockfTakes(cmd) and not(accWrites(o.acc)))
+                outErr(fs, ps, EBADF)
             else if (fs.inodes.get(i).ftype != FReg) outErr(fs, ps, EINVAL)
             else if (len < 0) outErr(fs, ps, EINVAL)
             else {

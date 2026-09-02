@@ -15,6 +15,8 @@
 //                     feature fails instead of passing vacuously
 //   posixLinuxish     the common Linux deviations forced on, for testing
 //                     against Linux-behaving backends
+//   posixExt4         Linux + ext4 exactly as measured, for the ext4
+//                     conformance suite (harness/posix)
 //
 // Simulate:  quint run posix_run.qnt --main=posixDefault --invariant=inv
 
@@ -184,6 +186,50 @@ module posixFuse {
         P_CHOWN_SUPP_GROUP = FeatOff,
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
+        P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
+        P_ERR_LOCK_AGAIN = FeatMandatory
+    ).* from "./posix"
+    import posixops.* from "./posix_ops"
+}
+
+// Linux + ext4, pinned to `harness/posix/posix_replay.py --probe` measured
+// on a 6.x kernel over a strictatime-mounted ext4 (2026-09-02).  This is the
+// profile the ext4 conformance suite replays, and the reason it is worth
+// replaying: three knobs differ from every backend the model was developed
+// against, so the corpus generated here exercises branches no other instance
+// reaches.
+//
+//   * P_PWRITE_APPENDS on.  Linux's pwrite() through an O_APPEND descriptor
+//     appends instead of writing at the given offset -- a documented
+//     divergence from POSIX XSH pwrite, which the model carries as a policy
+//     knob rather than a fault.
+//   * P_SGID_INHERIT on.  A new subdirectory of a set-group-ID directory
+//     inherits S_ISGID (XSH mkdir leaves this to the implementation).
+//   * P_ERR_STICKY_ACCES off.  A sticky-directory refusal is EPERM, where
+//     the in-memory backends answer EACCES; XSH unlink names both.
+//
+// F_CLONE_RANGE is off because ext4 has no reflink (FICLONERANGE answers
+// EOPNOTSUPP).  P_STRICT_ATIME holds only under the strictatime mount option
+// the runner passes; relatime would make an atime mark depend on how the
+// previous mtime compares, which is a mount policy rather than a filesystem
+// one.  F_ROOT stays explorable: the harness chooses the credentials, so
+// both draws are real.
+module posixExt4 {
+    import posix(
+        F_COPY_RANGE = FeatMandatory,
+        F_CLONE_RANGE = FeatOff,
+        F_SEEK_HOLE = FeatMandatory,
+        F_ROOT = FeatIfAdvertised,
+        P_GID_FROM_PARENT = FeatOff,
+        P_SGID_INHERIT = FeatMandatory,
+        P_WRITE_CLEARS_SETIDS = FeatMandatory,
+        P_PWRITE_APPENDS = FeatMandatory,
+        P_RENAME_CTIME = FeatMandatory,
+        P_STRICT_ATIME = FeatMandatory,
+        P_STICKY_WRITE_ARM = FeatOff,
+        P_CHOWN_SUPP_GROUP = FeatMandatory,
+        P_ERR_NOTEMPTY = FeatMandatory,
+        P_ERR_STICKY_ACCES = FeatOff,
         P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
         P_ERR_LOCK_AGAIN = FeatMandatory
     ).* from "./posix"

@@ -221,6 +221,15 @@ set(POSIX_BATCHES
   "posixFuse|fuse_|stepLinks|128|5|0x1"   "posixFuse|fuse_|stepFds|128|5|0x1"
   "posixFuse|fuse_|stepTooLong|128|4|0x1" "posixFuse|fuse_|stepPrefix|128|5|0x1"
   "posixFuse|fuse_|stepFallocate|128|4|0x1"
+  "posixExt4|ext4_|step|128|10|0x1"       "posixExt4|ext4_|step|128|6|0x2"
+  "posixExt4|ext4_|step|256|3|0x100"      "posixExt4|ext4_|step|512|2|0x5"
+  "posixExt4|ext4_|stepNamespace|128|4|0x1" "posixExt4|ext4_|stepNamespace|256|2|0x9"
+  "posixExt4|ext4_|stepDescriptors|128|4|0x1" "posixExt4|ext4_|stepMetadata|128|4|0x1"
+  "posixExt4|ext4_|stepDirs|128|3|0x1"    "posixExt4|ext4_|stepData|128|4|0x1"
+  "posixExt4|ext4_|stepLocks|128|6|0x1"   "posixExt4|ext4_|stepPerms|128|5|0x1"
+  "posixExt4|ext4_|stepLinks|128|5|0x1"   "posixExt4|ext4_|stepFds|128|5|0x1"
+  "posixExt4|ext4_|stepTooLong|128|4|0x1" "posixExt4|ext4_|stepPrefix|128|5|0x1"
+  "posixExt4|ext4_|stepFallocate|128|4|0x1"
 )
 foreach(b ${POSIX_BATCHES})
     string(REPLACE "|" ";" parts "${b}")
@@ -549,6 +558,10 @@ option(SPECS_KNFSD_TESTS
        "Register the Linux kernel NFS server (knfsd) conformance suite \
 (default: on only when specs is the top-level project AND a KVM guest image \
 is provided via KVM_IMAGE_DIR)" ${_conformance_default})
+option(SPECS_EXT4_TESTS
+       "Register the Linux ext4 conformance suite (default: on only when \
+specs is the top-level project AND a KVM guest image is provided via \
+KVM_IMAGE_DIR)" ${_conformance_default})
 # Directory holding the kvm-test-base guest (vmlinuz + rootfs.qcow2) the knfsd
 # suite boots.  CI fetches the image with oras and points this at it; without
 # it the knfsd tests do not register.
@@ -842,6 +855,98 @@ else()
                 set_property(TEST ${tname} APPEND PROPERTY
                     ENVIRONMENT "SPECS_NFS_NO_NETNS=1")
             endif()
+        endforeach()
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# ext4 conformance (harness/posix)
+#
+# The POSIX counterpart of the Samba and NFS suites: replay the generated
+# POSIX corpus against a real ext4 filesystem, in a KVM guest, and compare
+# every syscall's outcome to the result the model baked into the trace.
+# Disagreements are findings -- a model bug, or a Linux/ext4 divergence
+# recorded with a citation in harness/posix/ext4_deviations.py.  A NEW one
+# turns the suite red.
+#
+# A guest rather than a container, because the POSIX corpus is not a protocol:
+# driving it needs a filesystem the harness may mount, a kernel it may set
+# sysctls on, and root to fork the per-credential workers -- none of which
+# the devcontainer the other suites run in can offer reproducibly.  The guest
+# image is the same chimera-nas/kvm-test-base one the knfsd suite boots
+# (KVM_IMAGE_DIR); there is no network at all, so unlike knfsd these tests
+# need no network namespace and never collide with each other.
+#
+# One ctest per generation batch, derived from POSIX_BATCHES above so the two
+# cannot drift: every posixExt4 batch generated is a batch replayed.
+# ---------------------------------------------------------------------------
+set(POSIX_HARNESS ${CMAKE_CURRENT_SOURCE_DIR}/harness/posix)
+
+if(NOT SPECS_EXT4_TESTS)
+    message(STATUS
+        "ext4 MBT tests: not registered (specs is a subdirectory of "
+        "${CMAKE_PROJECT_NAME}; -DSPECS_EXT4_TESTS=ON with -DKVM_IMAGE_DIR to "
+        "register them)")
+elseif(NOT KVM_IMAGE_DIR OR NOT EXISTS "${KVM_IMAGE_DIR}/vmlinuz"
+       OR NOT EXISTS "${KVM_IMAGE_DIR}/rootfs.qcow2")
+    message(STATUS
+        "ext4 MBT tests: disabled (no KVM guest image; set KVM_IMAGE_DIR to a "
+        "directory with vmlinuz + rootfs.qcow2)")
+else()
+    find_program(QEMU_BIN NAMES qemu-system-x86_64 qemu-system-aarch64
+                 DOC "qemu, which boots the guest the ext4 suite measures")
+    find_program(MKFS_EXT4_BIN NAMES mkfs.ext4 PATHS /sbin /usr/sbin
+                 DOC "mke2fs, which builds the filesystem under test")
+    if(NOT QEMU_BIN)
+        message(STATUS "ext4 MBT tests: disabled (qemu-system not found)")
+    elseif(NOT MKFS_EXT4_BIN)
+        message(STATUS "ext4 MBT tests: disabled (mkfs.ext4 not found)")
+    else()
+        message(STATUS "ext4 MBT tests: enabled (guest ${KVM_IMAGE_DIR}, "
+                "${QEMU_BIN})")
+
+        set(EXT4_ENV
+            "KVM_VMLINUZ=${KVM_IMAGE_DIR}/vmlinuz;KVM_ROOTFS=${KVM_IMAGE_DIR}/rootfs.qcow2")
+
+        # The pinned capability/policy profile is a measurement (see
+        # EXT4_PROFILE in posix_replay.py), and trace generation assumes it
+        # -- posix_run.qnt's posixExt4 instance pins the same values.  If the
+        # live filesystem drifts from it the corpus is not wrong, it is
+        # answering a question about a filesystem that is no longer there,
+        # and every trace would skip on the profile mismatch instead.  Check
+        # it directly so the drift is reported once, as itself.
+        add_test(NAME ext4/profile
+                 COMMAND ${POSIX_HARNESS}/run_posix_mbt.sh ${T}/posix
+                         "ext4_step_128_0x1_0.itf.json")
+        set_tests_properties(ext4/profile PROPERTIES
+            LABELS "ext4;posix;mbt"
+            TIMEOUT 600
+            SKIP_RETURN_CODE 77
+            ENVIRONMENT "${EXT4_ENV};SPECS_POSIX_CHECK_PROFILE=1")
+
+        foreach(b ${POSIX_BATCHES})
+            string(REPLACE "|" ";" parts "${b}")
+            list(GET parts 0 inst)
+            if(NOT inst STREQUAL "posixExt4")
+                continue()
+            endif()
+            list(GET parts 1 pfx)
+            list(GET parts 2 flavor)
+            list(GET parts 3 steps)
+            list(GET parts 5 seed)
+            set(tname ext4/posix/${flavor}_${steps}_${seed})
+            add_test(NAME ${tname}
+                     COMMAND ${POSIX_HARNESS}/run_posix_mbt.sh ${T}/posix
+                             "${pfx}${flavor}_${steps}_${seed}_*.itf.json")
+            # A guest boot plus up to 10 traces of 128-512 syscalls each,
+            # every one of them a real syscall on a real filesystem:
+            # minutes.  SKIP_RETURN_CODE 77 lets the runner report "no
+            # /dev/kvm here" or "no guest image" as a ctest SKIP.
+            set_tests_properties(${tname} PROPERTIES
+                LABELS "ext4;posix;mbt"
+                TIMEOUT 1800
+                SKIP_RETURN_CODE 77
+                ENVIRONMENT "${EXT4_ENV}")
         endforeach()
     endif()
 endif()
