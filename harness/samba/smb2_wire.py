@@ -25,6 +25,7 @@ from smbprotocol.tree import TreeConnect
 from smbprotocol.exceptions import SMBResponseException
 import smbprotocol.open as O
 import smbprotocol.create_contexts as CC
+import smbprotocol.change_notify as CN
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +80,41 @@ RELATED_FID = b"\xff" * 16
 # NTSTATUS values the harness itself needs to reason about.
 ST_SUCCESS = 0x00000000
 ST_PENDING = 0x00000103
+# CHANGE_NOTIFY terminal statuses (MS-SMB2 2.2.36 / 3.3.4.4).  All three are
+# severity 00 -- warnings, not errors -- and each carries the ordinary
+# CHANGE_NOTIFY response body.
+ST_NOTIFY_CLEANUP = 0x0000010B
+ST_NOTIFY_ENUM_DIR = 0x0000010C
+ST_CANCELLED = 0xC0000120
+
+# SMB2_WATCH_TREE (MS-SMB2 2.2.35).
+SMB2_WATCH_TREE = 0x0001
+
+# CompletionFilter bits (MS-SMB2 2.2.35), by the model's name for each.
+COMPLETION_FILTER = {
+    "fileName": 0x00000001,
+    "dirName": 0x00000002,
+    "attributes": 0x00000004,
+    "size": 0x00000008,
+    "lastWrite": 0x00000010,
+    "lastAccess": 0x00000020,
+    "creation": 0x00000040,
+    "ea": 0x00000080,
+    "security": 0x00000100,
+    "streamName": 0x00000200,
+    "streamSize": 0x00000400,
+    "streamWrite": 0x00000800,
+}
+
+# How long to wait for a CHANGE_NOTIFY completion the model says is owed.
+#
+# Generous on purpose, and it costs nothing when the server is behaving: the
+# wait ends the moment the completion lands.  It has to be generous because
+# Samba's delivery is CROSS-PROCESS -- the smbd that ran the mutation tells
+# notifyd, which tells the smbd holding the watch -- so no round trip on the
+# watcher's own connection can prove the hop has happened.  Waiting is the
+# only honest way to distinguish "not yet" from "never".
+NOTIFY_TIMEOUT = 10
 
 # No modeled request may legitimately take this long: every lock in the
 # generated corpus carries FAIL_IMMEDIATELY, and nothing else blocks.  A reply
@@ -174,6 +210,86 @@ class Conn:
         out.unpack(resp['data'].get_value())
         return ST_SUCCESS, out
 
+    # -- posted (asynchronous) requests ------------------------------------
+    #
+    # A CHANGE_NOTIFY is the only modeled request that may not be answered at
+    # all until something ELSE happens, possibly on another connection.  So it
+    # is POSTED and left outstanding, and the three questions the model asks
+    # about it -- did it park, has it completed, what did it say -- are each
+    # answered separately below.
+    #
+    # These read `Request.response` / `Request.response_event` directly rather
+    # than going through Connection.receive(wait=False).  That is not a
+    # shortcut: receive() with wait=False POPS the request from
+    # outstanding_requests, and smbprotocol's receive worker looks every
+    # incoming header up in exactly that table -- so a request retired at its
+    # interim would make the eventual final response kill the worker thread
+    # with a KeyError.
+
+    def post(self, req, tid):
+        """Send a request and leave it outstanding.  Returns the handle."""
+        return self.conn.send(req, sid=self.sid, tid=tid)
+
+    def first_status(self, hdr, timeout=RECV_TIMEOUT):
+        """Status of the FIRST response to a posted request.
+
+        ST_PENDING means the server PARKED it: an async interim went out and
+        the real answer comes whenever the watched directory changes.  Anything
+        else is the answer itself.  None means nothing came at all, which is a
+        wedge rather than an outcome.
+        """
+        if not hdr.response_event.wait(timeout=timeout):
+            return None
+        return hdr.response['status'].get_value() & 0xFFFFFFFF
+
+    def has_completed(self, hdr):
+        """Has the FINAL response to a parked request landed?  Never blocks."""
+        resp = hdr.response
+        if resp is None:
+            return False
+        return (resp['status'].get_value() & 0xFFFFFFFF) != ST_PENDING
+
+    def collect(self, hdr, parse=None, timeout=NOTIFY_TIMEOUT):
+        """Wait for the final response to a parked request.
+
+        Returns (status, parsed-or-None), or (None, None) if nothing arrived
+        within `timeout`.  A CHANGE_NOTIFY's terminal statuses are all
+        warnings, which smbprotocol raises on like any non-success -- the
+        status is the answer here, not an error, so they are caught and
+        reported as data.
+        """
+        try:
+            resp = self.conn.receive(hdr, timeout=timeout)
+        except SMBResponseException as e:
+            return _status_of(e), None
+        except Exception:
+            return None, None
+        if parse is None:
+            return ST_SUCCESS, resp
+        out = parse()
+        out.unpack(resp['data'].get_value())
+        return ST_SUCCESS, out
+
+    def cancel_posted(self, hdr):
+        """SMB2 CANCEL the posted request (MS-SMB2 3.2.4.24).
+
+        Addressed by AsyncId once the interim has been seen, which smbprotocol
+        records on the request; CANCEL itself is never answered, so there is
+        nothing to wait for here -- what it produces is STATUS_CANCELLED on the
+        request it hit.
+        """
+        hdr.cancel()
+
+    def echo(self, tid):
+        """One ECHO round trip: a barrier against this connection's own event
+        loop.  It proves the server processed everything queued for this
+        connection before the echo -- which is what makes "nothing more is
+        coming" a measurement rather than a guess, for anything this smbd
+        already knows about."""
+        from smbprotocol.connection import SMB2Echo
+        hdr = self.conn.send(SMB2Echo(), sid=self.sid, tid=tid)
+        self.conn.receive(hdr, timeout=RECV_TIMEOUT)
+
     def send_chain(self, reqs, tid, related, parsers):
         """Send `reqs` as one compound message; return [(status, parsed), ...].
 
@@ -236,7 +352,13 @@ def req_create(name, disposition, access, share_access, options,
     r['create_disposition'] = disposition
     r['create_options'] = options
     r['requested_oplock_level'] = oplock_level
-    r['buffer_path'] = name.encode('utf-16-le')
+    # An EMPTY relative path names the share ROOT itself, which is how a client
+    # gets a directory handle at all -- and the only way to watch the directory
+    # every generated name lives in.  smbprotocol spells that as the two-byte
+    # sentinel its _name_length helper recognises (it reports NameLength 0 for
+    # exactly this value, per MS-SMB2 2.2.13's "the Buffer field MUST contain
+    # at least one byte"); an actually-empty bytes value fails to pack.
+    r['buffer_path'] = (name.encode('utf-16-le') if name else b"\x00\x00")
     contexts = []
     if lease is not None:
         # RqLs (MS-SMB2 2.2.13.2.8 / 2.2.13.2.10).  The request goes on the
@@ -402,9 +524,62 @@ def req_set_rename(fid, new_name, replace_if_exists=False):
     return _req_set(fid, FILE_RENAME_INFORMATION, buf + name)
 
 
+def req_change_notify(fid, watch_tree, output_buffer_length,
+                      completion_filter_names):
+    """SMB2 CHANGE_NOTIFY (MS-SMB2 2.2.35).
+
+    Returned like every other builder, but it is never sent through the
+    ordinary send-and-receive path: whether it answers at once or parks behind
+    an async interim is the outcome under test, so the caller posts it and
+    looks (Conn.post / Conn.first_status).
+    """
+    cf = 0
+    for n in completion_filter_names:
+        try:
+            cf |= COMPLETION_FILTER[n]
+        except KeyError:
+            raise WireError("unknown CompletionFilter bit %r" % (n,))
+    r = CN.SMB2ChangeNotifyRequest()
+    r['flags'] = SMB2_WATCH_TREE if watch_tree else 0
+    r['output_buffer_length'] = output_buffer_length
+    r['file_id'] = fid
+    r['completion_filter'] = cf
+    r['reserved'] = 0
+    return r, CN.SMB2ChangeNotifyResponse
+
+
 # ---------------------------------------------------------------------------
 # Reply decoding
 # ---------------------------------------------------------------------------
+
+# The CHANGE_NOTIFY response parser, named so the replayer can pass it to
+# Conn.collect without importing smbprotocol itself.
+CN_RESPONSE = CN.SMB2ChangeNotifyResponse
+
+
+def parse_notify_records(resp):
+    """FILE_NOTIFY_INFORMATION records from a CHANGE_NOTIFY response body.
+
+    Returns [(action, name), ...] in wire order.  Order is part of the
+    assertion, not incidental: the records describe a SEQUENCE of changes, and
+    a rename's OLD_NAME/NEW_NAME pair would be indistinguishable from two
+    unrelated renames without it.
+    """
+    if resp is None:
+        return []
+    buf = resp['buffer'].get_value()
+    out = []
+    off = 0
+    while off + 12 <= len(buf):
+        nxt, action, name_len = struct.unpack("<III", buf[off:off + 12])
+        if off + 12 + name_len > len(buf):
+            break
+        name = buf[off + 12:off + 12 + name_len].decode("utf-16-le")
+        out.append((action, name))
+        if nxt == 0:
+            break
+        off += nxt
+    return out
 
 def parse_standard_info(resp):
     """FileStandardInformation -> dict (MS-FSCC 2.4.41)."""

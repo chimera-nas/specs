@@ -182,6 +182,15 @@ class Replayer:
         self.nabandoned = 0
         self.nskipped = 0
         self.skip_reasons = {}
+        # Posted CHANGE_NOTIFY requests, by the model FileId whose handle they
+        # watch: {model_fid: [(Conn, request-handle), ...]}, oldest first.
+        # A LIST, because a handle may carry several at once (MS-FSA 2.1.5.9
+        # keeps them on Open.PendingNotifyChanges) and they are answered in
+        # order -- which is what the model's `seq` names.
+        self.notify_pending = {}
+        # Requests a CANCEL has already taken off the queue, waiting for their
+        # STATUS_CANCELLED completion to be matched.
+        self.cancelled = []
         self.trace = "<none>"
         self.step = 0
         self.warned_no_qfid = False
@@ -419,6 +428,10 @@ class Replayer:
             return "SET_DISPOSITION del=%s" % v["del"]
         if tag == "CSetRename":
             return "SET_RENAME -> '%s'" % v["newname"]
+        if tag == "CNotify":
+            return ("CHANGE_NOTIFY cf=%s obl=%d%s"
+                    % ("+".join(sorted(jset(v["cf"]))) or "-",
+                       jint(v["obl"]), " tree" if v["watchTree"] else ""))
         return tag
 
     def check(self, cmd, res, status, parsed, conn):
@@ -629,6 +642,30 @@ class Replayer:
                       "%d -- the server changed the object's identity where "
                       "the model kept it", what, model_ino, known, idx)
 
+    def prune_identity(self):
+        """Forget the on-disk id of every model inode that no longer exists.
+
+        The bijection is between LIVE objects.  Once the model removes an
+        inode, the backing filesystem is free to hand the same on-disk id to
+        the next object created -- and does, routinely, on ext4.  Keeping the
+        retired binding would report that legitimate reuse as the server
+        "reusing an id already bound", which is the opposite of what this
+        oracle is for.
+
+        Driven off the model's own post-state rather than off the commands, so
+        it is exact: an inode is gone when the model says it is gone, however
+        it went (a delete-on-close last close, or a rename that orphaned a
+        replaced target).
+        """
+        if self.post_sdb is None:
+            return
+        fs = self.post_sdb.get("fs")
+        if not fs:
+            return
+        live = set(jmap(fs.get("inodes")).keys())
+        for mino in [m for m in self.ino_of if m not in live]:
+            self.model_of_ino.pop(self.ino_of.pop(mino), None)
+
     def check_read(self, cv, rv, parsed, what):
         data = parsed['buffer'].get_value()
         exp_blocks = [jint(b) for b in rv["blocks"]]
@@ -702,6 +739,23 @@ class Replayer:
                 raise RuntimeError("harness limit: %s inside a compound" % tag0)
             return self.do_lifecycle(tag0, cmds[0], results[0], msess, mtree)
 
+        # CHANGE_NOTIFY and its CANCEL are their own shapes: the first may not
+        # be answered until something else happens, and the second is never
+        # answered at all.  Neither can go through send_chain, which receives
+        # every request it sends.
+        if tag0 in ("CNotify", "CCancel"):
+            if n != 1:
+                raise RuntimeError("harness limit: %s inside a compound" % tag0)
+            conn = self.sessions.get(msess)
+            if conn is None or conn.dead:
+                raise Abort()
+            tent = self.trees.get(mtree)
+            if tent is None:
+                raise Abort()
+            if tag0 == "CNotify":
+                return self.do_notify(cmds[0], results[0], conn, tent[1])
+            return self.do_cancel(cmds[0], results[0])
+
         conn = self.sessions.get(msess)
         if conn is None or conn.dead:
             raise Abort()
@@ -721,6 +775,216 @@ class Replayer:
         for i in range(n):
             status, parsed = outs[i]
             self.check(cmds[i], results[i], status, parsed, conn)
+
+    # -- CHANGE_NOTIFY -----------------------------------------------------
+
+    def do_notify(self, cmd, res, conn, tid):
+        """Arm a watch, and record WHICH of the two answers the server chose.
+
+        That choice is the assertion.  The model's `parked` says the directory
+        was quiet and the request had to wait; a server that answered inline
+        instead has either invented an event or lost one, and the two sides
+        then disagree about whether a request is outstanding -- so every later
+        completion check on this handle would be reporting that rather than a
+        new fact.
+        """
+        v = jval(cmd)
+        rv = jval(res)
+        mfid = jint(jval(v["fid"])) if jtag(v["fid"]) == "FidRef" else None
+        exp = jint(rv["st"]) & 0xFFFFFFFF
+        exp_parked = bool(rv["parked"])
+        what = self.describe(cmd)
+
+        if mfid is None:
+            raise RuntimeError("harness limit: CHANGE_NOTIFY on a related fid")
+        ent = self.fids.get(mfid)
+        if ent is None:
+            raise Abort()
+
+        req, parser = W.req_change_notify(
+            ent[1], v["watchTree"], jint(v["obl"]), jset(v["cf"]))
+        hdr = conn.post(req, tid)
+        st = conn.first_status(hdr)
+        if st is None:
+            raise RuntimeError(
+                "no reply and no interim to a CHANGE_NOTIFY on model fid %d "
+                "after %ds -- the server neither answered nor parked it"
+                % (mfid, W.RECV_TIMEOUT))
+
+        got_parked = (st == W.ST_PENDING)
+        if got_parked != exp_parked:
+            # Whether a request parks is decided by what is BUFFERED, so a
+            # disagreement here is a disagreement about the event stream --
+            # the same root cause as a status or record divergence, and it
+            # goes to the same registry rather than being a special case.
+            d = DEV.find("RNotify", exp, st & 0xFFFFFFFF, None, None, None,
+                         v, rv, {})
+            msg = ("%s: model expected %s, the server %s"
+                   % (what, "a park (async interim)" if exp_parked
+                      else "an inline answer",
+                      "parked" if got_parked else "answered inline"))
+            if d is None:
+                self.mism("%s", msg)
+            else:
+                self.deviation(d, "%s (%s)", msg, d.summary)
+                self.abort_cause = d
+            raise Abort()
+
+        if got_parked:
+            self.notify_pending.setdefault(mfid, []).append((conn, hdr))
+            return
+
+        # Answered inline.  Retire the request and compare what it said.
+        st, parsed = conn.collect(hdr, parser, timeout=W.RECV_TIMEOUT)
+        if not self.check_status("RNotify", exp, st & 0xFFFFFFFF, v, rv, what):
+            return
+        if st == W.ST_SUCCESS:
+            self.check_notify_records(what, rv["recs"],
+                                      W.parse_notify_records(parsed))
+
+    def do_cancel(self, cmd, res):
+        """CANCEL the request parked on this handle (MS-SMB2 3.2.4.24).
+
+        There is no reply to check -- CANCEL is never answered -- so the
+        assertion is the STATUS_CANCELLED completion it produces, which the
+        message's notes carry.
+        """
+        v = jval(cmd)
+        found = bool(jval(res)["found"])
+        mfid = jint(jval(v)) if jtag(v) == "FidRef" else None
+        if not found:
+            # The model hit nothing parked, so there is no AsyncId to name and
+            # nothing the wire could report.
+            return
+        q = self.notify_pending.get(mfid)
+        if not q:
+            self.mism("CANCEL fid %s: the model says a request is parked, the "
+                      "harness never saw one", mfid)
+            return
+        # The OLDEST outstanding request, which is the one the model cancels.
+        conn, hdr = q.pop(0)
+        conn.cancel_posted(hdr)
+        self.cancelled.append((mfid, conn, hdr))
+
+    def check_notify_records(self, what, model_recs, wire_recs):
+        """Compare FILE_NOTIFY_INFORMATION records, in order."""
+        exp = [(jint(r["act"]), r["name"]) for r in model_recs]
+        if exp == wire_recs:
+            return
+        d = DEV.find("RNotify", None, None, "recs", exp, wire_recs,
+                     None, None,
+                     {"model_recs": exp, "wire_recs": wire_recs})
+        ctx = {"model_recs": exp, "wire_recs": wire_recs}
+        if d is None:
+            self.mism("%s records: model %r wire %r", what, exp, wire_recs)
+            return
+        self.deviation(d, "%s records: model %r wire %r (%s)",
+                       what, exp, wire_recs, d.summary)
+        if not d.is_reconcilable(None, None, ctx):
+            self.abort_cause = d
+            raise Abort()
+
+    def check_notes(self, notes):
+        """Every async CHANGE_NOTIFY completion this message owed, and no
+        others.
+
+        The model records them on the MESSAGE rather than in any command's
+        reply because that is where they belong: a completion is an
+        unsolicited message on the WATCHER's connection, and the watcher is
+        usually not the client whose command caused it.
+        """
+        # A CANCEL's completion is owed by a request already taken off the
+        # queue, so it is matched from there rather than by position.
+        owed = []
+        for n in jset(notes):
+            owed.append((jint(n["fid"]), jint(n["seq"]), n))
+        owed.sort()
+
+        # Highest position first, so popping one does not renumber the rest.
+        for mfid, seq, note in sorted(owed, key=lambda t: (t[0], -t[1])):
+            exp = jint(note["st"]) & 0xFFFFFFFF
+            what = "CHANGE_NOTIFY on fid %d" % mfid
+            if exp == W.ST_CANCELLED:
+                ent = None
+                for i, (f, c, h) in enumerate(self.cancelled):
+                    if f == mfid:
+                        ent = (c, h)
+                        self.cancelled.pop(i)
+                        break
+            else:
+                q = self.notify_pending.get(mfid) or []
+                ent = q.pop(seq) if seq < len(q) else None
+            if ent is None:
+                self.mism("%s: the model completed a request the harness "
+                          "never saw park", what)
+                continue
+            conn, hdr = ent
+            st, parsed = conn.collect(hdr, W.CN_RESPONSE)
+            if st is None:
+                # A completion that never comes is a disagreement about the
+                # event stream like any other -- Samba buffers a different set
+                # of changes, or stopped watching for the class this request
+                # asked about -- so it goes to the registry rather than being
+                # a special case that can only fail.
+                d = DEV.find("RNotifyAsync", exp, None, None, None, None,
+                             None, None, {})
+                msg = ("%s: model predicted status 0x%08x, the server sent no "
+                       "completion within %ds" % (what, exp, W.NOTIFY_TIMEOUT))
+                if d is None:
+                    self.mism("%s", msg)
+                else:
+                    self.deviation(d, "%s (%s)", msg, d.summary)
+                    self.abort_cause = d
+                    raise Abort()
+                continue
+            if not self.check_status("RNotifyAsync", exp, st & 0xFFFFFFFF,
+                                     None, None, what):
+                continue
+            if st == W.ST_SUCCESS:
+                self.check_notify_records(what, note["recs"],
+                                          W.parse_notify_records(parsed))
+
+        # Nothing else may have completed.  An extra completion is as much a
+        # bug as a missing one: it means a watcher was woken for a change it
+        # had filtered out, or woken twice for one change.
+        #
+        # An ECHO barrier settles what the watcher's own smbd already holds.
+        # It cannot settle the cross-process hop from the mutating smbd through
+        # notifyd, so a completion still in that pipe is caught at the NEXT
+        # message rather than here -- attributed one step late, but never
+        # missed.  The positive checks above carry a real wait for exactly that
+        # reason; only this negative one is best-effort.
+        settled = set()
+        for mfid, q in list(self.notify_pending.items()):
+            for conn, hdr in list(q):
+                if id(conn) not in settled:
+                    settled.add(id(conn))
+                    try:
+                        conn.echo(self.tid_of(conn))
+                    except Exception:
+                        pass
+                if conn.has_completed(hdr):
+                    st, _ = conn.collect(hdr, None, timeout=1)
+                    d = DEV.find("RNotifyAsync", None, (st or 0) & 0xFFFFFFFF,
+                                 None, None, None, None, None, {})
+                    msg = ("CHANGE_NOTIFY on fid %d: the server completed a "
+                           "request the model says is still parked (status "
+                           "0x%08x)" % (mfid, (st or 0) & 0xFFFFFFFF))
+                    q.remove((conn, hdr))
+                    if d is None:
+                        self.mism("%s", msg)
+                    else:
+                        self.deviation(d, "%s (%s)", msg, d.summary)
+                        self.abort_cause = d
+                        raise Abort()
+
+    def tid_of(self, conn):
+        """Any live tree id on `conn` -- an ECHO needs one, and which one it
+        is does not matter (the barrier is per connection)."""
+        for _mtree, (c, tid) in self.trees.items():
+            if c is conn:
+                return tid
+        return 0
 
     def do_lifecycle(self, tag, cmd, res, msess, mtree):
         rv = jval(res)
@@ -813,6 +1077,33 @@ class Replayer:
                 except OSError:
                     pass
 
+    # Commands this harness has no implementation for.  The caching and
+    # durable instances are already declined by their capability profile
+    # above, so these are the leftovers: the transport-drop and reconnect
+    # transitions, which no registered batch generates and which would need
+    # the harness to model a client identity surviving its connection.
+    UNIMPLEMENTED = ("CDisconnect", "CReconnect", "CBreakAck")
+
+    def unsupported_shapes(self, states):
+        """Why this harness cannot drive `states`, by name; empty if it can.
+
+        Checked BEFORE any of the trace is driven, so a gap is reported as the
+        harness limit it is rather than discovered as an exception halfway
+        through -- which reads as a corpus bug and leaves the share in
+        whatever state the trace got it to.
+        """
+        found = set()
+        key = last_op_key(states[0])
+        for st in states[1:]:
+            lo = st.get(key)
+            if not lo or jtag(lo) != "LMsg":
+                continue
+            for cmd in jval(lo)["msg"]["cmds"]:
+                tag = jtag(cmd)
+                if tag in self.UNIMPLEMENTED:
+                    found.add(tag)
+        return sorted(found)
+
     def run_trace(self, path):
         self.trace = os.path.basename(path)
         with open(path) as f:
@@ -838,9 +1129,23 @@ class Replayer:
                 self.skip_reasons[c] = self.skip_reasons.get(c, 0) + 1
                 return
 
+        # Not every gap is a capability the profile turns on.  A trace can
+        # carry a COMMAND this harness does not implement, or a request shape
+        # its client library cannot even encode, on an instance whose caps are
+        # all off.  Say so per trace and by NAME, the same way the capability
+        # skips do, so the gap stays visible and attributable to the harness.
+        unimpl = self.unsupported_shapes(states)
+        if unimpl:
+            self.nskipped += 1
+            for u in unimpl:
+                self.skip_reasons[u] = self.skip_reasons.get(u, 0) + 1
+            return
+
         before = self.nmismatch
         self.abort_cause = None
         self.abort_unrecorded = False
+        self.notify_pending.clear()
+        self.cancelled = []
         self.drop_connections()
         self.reset_share()
         try:
@@ -852,7 +1157,14 @@ class Replayer:
                 # The model's state AFTER this message, for the oracles that
                 # compare state rather than replies.
                 self.post_sdb = st.get(skey) if skey else None
-                self.do_message(jval(lo))
+                v = jval(lo)
+                self.do_message(v)
+                self.prune_identity()
+                # The CHANGE_NOTIFY completions this message owed, on whatever
+                # connections had a request parked.  Checked per message and
+                # not per command: a completion belongs to no command slot.
+                if v.get("notes") is not None:
+                    self.check_notes(v["notes"])
             self.ncomplete += 1
         except Abort:
             self.nabandoned += 1
@@ -917,7 +1229,8 @@ def main():
 
     if r.nskipped:
         print("# %d of %d trace(s) skipped -- this harness does not implement "
-              "the capabilities their profile turns on: %s"
+              "what they need (a capability their profile turns on, or a "
+              "command they carry): %s"
               % (r.nskipped, len(traces),
                  ", ".join("%s x%d" % (k, v)
                            for k, v in sorted(r.skip_reasons.items()))))

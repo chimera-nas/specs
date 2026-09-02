@@ -31,6 +31,7 @@
 module smb2ops {
 
     import nfs4fs.* from "../nfs/nfs4_fs"
+    import smb2notify.* from "./smb2_notify"
     import smb2state.* from "./smb2_state"
 
     // ------------------------------------------------------------------
@@ -73,6 +74,13 @@ module smb2ops {
     pure val ST_INVALID_OPLOCK_PROTOCOL = 0xC00000E3
     pure val ST_REQUEST_NOT_ACCEPTED = 0xC00000D0
     pure val ST_INVALID_DEVICE_STATE = 0xC0000184
+    // CHANGE_NOTIFY arms (MS-SMB2 3.3.5.19).  ST_NOTIFY_CLEANUP and
+    // ST_NOTIFY_ENUM_DIR are defined with the watch layer in smb2_notify.qnt,
+    // beside the rules that produce them.
+    pure val ST_NOT_IMPLEMENTED = 0xC0000002
+    pure val ST_CANCELLED = 0xC0000120
+    pure val ST_INSUFFICIENT_RESOURCES = 0xC000009A
+    pure val ST_INTERNAL_ERROR = 0xC00000E5
 
     // CreateAction (MS-SMB2 2.2.14).
     pure val ACT_SUPERSEDED = 0
@@ -257,6 +265,18 @@ module smb2ops {
         // retained mask the break asked for.
         | CBreakAck({ fid: FidSel, asLease: bool, ackLevel: OplockLevel,
                       ackState: LeaseState })
+        // CHANGE_NOTIFY (MS-SMB2 2.2.35).  `cf` is the CompletionFilter as a
+        // set of named bits, `obl` the OutputBufferLength in BYTES -- the
+        // model computes record sizes exactly (smb2notify.recSize), so a
+        // buffer that is one record short is a modeled outcome and not a
+        // guess.
+        | CNotify({ fid: FidSel, cf: Set[str], watchTree: bool, obl: int })
+        // CANCEL (MS-SMB2 2.2.30) of the CHANGE_NOTIFY parked on `fid`.
+        // CANCEL itself is never answered (3.3.5.17); what it produces is the
+        // STATUS_CANCELLED completion of the request it targets, which the
+        // model reports in the message's notify notes like any other async
+        // completion.
+        | CCancel(FidSel)
 
     type AttrSnap = { ftype: Ftype, nlink: int, sizeBlocks: int,
                       change: int, deletePending: bool }
@@ -290,6 +310,17 @@ module smb2ops {
         | RSetRename({ st: int, breaks: Set[BreakNote] })
         | RQueryBasic({ st: int, attrs: AttrSnap })
         | RBreakAck({ st: int })
+        // A CHANGE_NOTIFY answers in one of two shapes and the difference is
+        // the whole point of the command: either it completes NOW (there were
+        // buffered events, or the watch is in a terminal state) carrying
+        // `recs`, or it PARKS -- an async interim STATUS_PENDING and no reply
+        // until something happens.  `parked` names which, and is checked
+        // against the interim the connection actually saw.
+        | RNotify({ st: int, parked: bool, recs: List[NotifyRec] })
+        // CANCEL produces no reply at all.  `found` records whether it hit a
+        // parked request, which is what decides whether a CANCELLED completion
+        // appears in the message's notes.
+        | RCancel({ found: bool })
 
     // ------------------------------------------------------------------
     // FsStatus -> NTSTATUS (MS-FSA 2.1.5.1 status mapping)
@@ -386,6 +417,19 @@ module smb2ops {
         val dnode = fs.inodes.get(dir)
         if (dnode.ftype != FDir)
             { fs2: fs, st: ST_NOT_A_DIRECTORY, ino: -1, act: 0 }
+        // An EMPTY relative path names `dir` itself -- the share root when
+        // `dir` is ROOT.  This is how an SMB client gets a handle on a
+        // DIRECTORY at all: there is no path-based directory command, so
+        // enumerating a share, or watching it for changes, starts with a
+        // CREATE of "".  It is always an open of something that exists, so
+        // there is nothing to create and nothing to truncate; a disposition
+        // that insists on creating is a parameter error.  (The generator draws
+        // only FILE_OPEN, so the error arm is pinned by smb2Test rather than
+        // by the corpus.)
+        else if (name == "")
+            if (disp == DispOpen or disp == DispOpenIf)
+                { fs2: fs, st: ST_SUCCESS, ino: dir, act: ACT_OPENED }
+            else { fs2: fs, st: ST_INVALID_PARAMETER, ino: -1, act: 0 }
         else {
             val ex = fsHasEnt(fs, dir, name)
             val ino = if (ex) fsChild(fs, dir, name) else -1
@@ -711,8 +755,73 @@ module smb2ops {
         cs: int,
         replay: bool,
         done: bool,
-        results: List[Res]
+        results: List[Res],
+        // CHANGE_NOTIFY completions this message owes.  They are gathered here
+        // rather than emitted into `results` because they belong to no command
+        // slot: an async completion is an unsolicited message on the WATCHER's
+        // connection, which is usually not the connection that ran the
+        // command.  Teardown commands (CLOSE, TREE_DISCONNECT, LOGOFF) add
+        // theirs as they run; the event-driven ones are added by evalMsg once
+        // every command has raised its events.
+        notes: Set[NotifyNote],
+        // Position of the command being dispatched within the compound, and
+        // how many there are.  Needed by exactly one rule: a CHANGE_NOTIFY
+        // that would go async anywhere but the LAST slot of a multi-command
+        // compound is failed outright (MS-SMB2 <159>/<162>).
+        ci: int,
+        nc: int
     }
+
+    // ------------------------------------------------------------------
+    // Raising change notifications (MS-FSA "Object Store Report Change")
+    // ------------------------------------------------------------------
+
+    // Raise a change on directory `d`.  Buffering is the state layer's job;
+    // this only names the classes, which is where the fidelity lives.
+    pure def accEmitEv(acc: Acc, d: Ino, cls: Set[str], name: Name,
+                       oldName: Name): Acc =
+        acc.with("sdb", stEmitEv(acc.sdb, d, cls, name, oldName))
+
+    // What an OPEN reports to watchers of the directory it opened in
+    // (MS-FSA 2.1.5.1).  Three outcomes and only three, keyed on the
+    // CreateAction the open actually took rather than on the disposition it
+    // asked for:
+    //
+    //   CREATED      the entry appeared -- FILE_ADDED, plus STREAM_NAME for a
+    //                regular file, whose default $DATA stream appears with it
+    //   OVERWRITTEN  the entry was already there and its data was replaced,
+    //   SUPERSEDED   which is a MODIFIED, not an ADDED
+    //   OPENED       nothing.  Opening a file does not change the directory
+    //                that holds it, and a watcher must not be woken for it.
+    pure def createNotifyCls(act: int, isDir: bool): Set[str] =
+        if (act == ACT_CREATED)
+            if (isDir) Set(EV_DIR_ADDED)
+            else Set(EV_FILE_ADDED, EV_STREAM_NAME)
+        else if (act == ACT_OVERWRITTEN or act == ACT_SUPERSEDED)
+            Set(EV_FILE_MODIFIED, EV_SIZE, EV_ATTRS, EV_STREAM_SIZE)
+        else Set()
+
+    // Complete and drop the watches of handles that are going away with their
+    // session, tree or handle.  MS-SMB2 3.3.4.4: STATUS_NOTIFY_CLEANUP, which
+    // carries whatever records were buffered -- the client is told what it
+    // missed on the way out, not merely that it is over.
+    pure def accCleanupWatches(acc: Acc, fids: Set[FileId]): Acc =
+        fids.fold(acc, (a, f) => {
+            val r = stCleanupWatch(a.sdb, f)
+            a.with("sdb", r.sdb2).with("notes", a.notes.union(r.notes))
+        })
+
+    // The transport went away instead.  The watches die with it and NOTHING is
+    // sent: there is no connection left to carry a completion, and a server
+    // that tried would be writing into a closed bind.
+    pure def accDropWatches(acc: Acc, fids: Set[FileId]): Acc =
+        acc.with("sdb", fids.fold(acc.sdb, (d, f) => stDropWatch(d, f)))
+
+    pure def opensOfSess(sdb: StateDB, se: SessionId): Set[FileId] =
+        sdb.opens.keys().filter(f => sdb.opens.get(f).session == se)
+
+    pure def opensOfTree(sdb: StateDB, t: TreeId): Set[FileId] =
+        sdb.opens.keys().filter(f => sdb.opens.get(f).tree == t)
 
     pure def resolveFid(acc: Acc, sel: FidSel): FileId =
         match sel {
@@ -748,6 +857,11 @@ module smb2ops {
             | RBreakAck(x) => x.st
             | RDisconnect(x) => x.st
             | RReconnect(x) => x.st
+            | RNotify(x) => x.st
+            // CANCEL has no status: it has no reply.  SUCCESS keeps a related
+            // compound running, which is what the wire does -- the slot simply
+            // produces nothing.
+            | RCancel(_) => ST_SUCCESS
         }
 
     // Which FileId a command RESOLVES, or -1 when it resolves none.
@@ -771,6 +885,7 @@ module smb2ops {
             | CSetRename(x) => resolveFid(acc, x.fid)
             | CQueryBasic(sel) => resolveFid(acc, sel)
             | CBreakAck(x) => if (x.asLease) -1 else resolveFid(acc, x.fid)
+            | CNotify(x) => resolveFid(acc, x.fid)
             | _ => -1
         }
 
@@ -798,6 +913,8 @@ module smb2ops {
             | CBreakAck(x) => doCmdBreakAck(acc, x)
             | CDisconnect => doCmdDisconnect(acc)
             | CReconnect(x) => doCmdReconnectSession(acc, x.prev)
+            | CNotify(x) => doCmdNotify(acc, x)
+            | CCancel(sel) => doCmdCancel(acc, sel)
         }
     }
 
@@ -846,9 +963,11 @@ module smb2ops {
         if (not(sessOk(acc)))
             emit(acc, RDisconnect({ st: ST_USER_SESSION_DELETED }),
                  ST_USER_SESSION_DELETED)
-        else
-            emit(acc.with("sdb", doDisconnect(acc.sdb, acc.sess)),
+        else {
+            val a1 = accDropWatches(acc, opensOfSess(acc.sdb, acc.sess))
+            emit(a1.with("sdb", doDisconnect(a1.sdb, a1.sess)),
                  RDisconnect({ st: ST_SUCCESS }), ST_SUCCESS)
+        }
 
     // A fresh connection + session presenting `prev`'s ClientGuid.  `prev` need
     // not still exist -- the usual case is that it does not, because the
@@ -877,9 +996,11 @@ module smb2ops {
         if (not(sessOk(acc)))
             emit(acc, RLogoff({ st: ST_USER_SESSION_DELETED }),
                  ST_USER_SESSION_DELETED)
-        else
-            emit(acc.with("sdb", doLogoff(acc.sdb, acc.sess)),
+        else {
+            val a1 = accCleanupWatches(acc, opensOfSess(acc.sdb, acc.sess))
+            emit(a1.with("sdb", doLogoff(a1.sdb, a1.sess)),
                  RLogoff({ st: ST_SUCCESS }), ST_SUCCESS)
+        }
 
     pure def doCmdTreeConnect(acc: Acc, share: int): Acc =
         if (not(sessOk(acc)))
@@ -895,9 +1016,11 @@ module smb2ops {
         if (not(treeOk(acc)))
             emit(acc, RTreeDisconnect({ st: ST_NETWORK_NAME_DELETED }),
                  ST_NETWORK_NAME_DELETED)
-        else
-            emit(acc.with("sdb", doTreeDisconnect(acc.sdb, acc.tree)),
+        else {
+            val a1 = accCleanupWatches(acc, opensOfTree(acc.sdb, acc.tree))
+            emit(a1.with("sdb", doTreeDisconnect(a1.sdb, a1.tree)),
                  RTreeDisconnect({ st: ST_SUCCESS }), ST_SUCCESS)
+        }
 
     // --- CREATE -------------------------------------------------------
 
@@ -1403,7 +1526,11 @@ module smb2ops {
                                                    durReqGuid(x.durable),
                                                    dec.act)
                                else sdb5
-                    emit(acc.with("sdb", sdb6).with("cfid", ins.fid),
+                    // The directory this open changed, if it changed it.
+                    val sdb7 = stEmitEv(sdb6, x.dir,
+                                        createNotifyCls(dec.act, x.isDir),
+                                        x.name, "")
+                    emit(acc.with("sdb", sdb7).with("cfid", ins.fid),
                          RCreate({ st: ST_SUCCESS, fid: ins.fid,
                                    act: dec.act, ino: dec.ino,
                                    caching: gr, breaks: n1.union(n2),
@@ -1439,8 +1566,48 @@ module smb2ops {
         if (not(acc.sdb.opens.keys().contains(fid)))
             emit(acc, RClose({ st: ST_FILE_CLOSED, gone: -1 }), ST_FILE_CLOSED)
         else {
-            val r = doClose(acc.sdb, fid)
-            emit(acc.with("sdb", r.sdb2),
+            val o = acc.sdb.opens.get(fid)
+            val wasDir = fsGet(acc.sdb.fs, o.file).ftype == FDir
+            // Does this close UNLINK?  Only the last close of a delete-pending
+            // handle whose name still resolves to its own inode does; doClose
+            // also reports `gone` when it reaps a rename-orphaned inode, and
+            // that removed no directory entry -- the entry went at rename time
+            // and was reported then, so reporting it again here would invent a
+            // REMOVED record no directory ever saw.
+            val unlinks = opensOfFile(acc.sdb, o.file).exclude(Set(fid))
+                              .size() == 0 and
+                acc.sdb.deletePending.contains(o.file) and
+                fsHasEnt(acc.sdb.fs, o.dir, o.name) and
+                fsChild(acc.sdb.fs, o.dir, o.name) == o.file
+            // The handle's own watch dies FIRST: chimera tears the notify
+            // state down at the top of the close handler, before the close
+            // path raises anything, so a watch on the directory being closed
+            // never sees the events its own close produces.
+            val a1 = accCleanupWatches(acc, Set(fid))
+            val r = doClose(a1.sdb, fid)
+            // MS-FSA 2.1.5.4: a handle that WROTE reports the file's settled
+            // size and write time to the parent on the way out -- the write
+            // changed the file, the close is what makes that change visible in
+            // the directory.
+            //
+            // ONE class, not three.  FILE_MODIFIED is reachable from both
+            // FILE_NOTIFY_CHANGE_SIZE and FILE_NOTIFY_CHANGE_LAST_WRITE
+            // (cfToMask), so a watcher of either is woken by it without the
+            // event having to name their classes.  What it deliberately does
+            // NOT raise is ATTRS: closing a file settles its length and write
+            // time, it does not change the file's attributes, and a client
+            // watching FILE_NOTIFY_CHANGE_ATTRIBUTES alone must not be woken.
+            val sdbM = if (o.modified)
+                stEmitEv(r.sdb2, o.dir, Set(EV_FILE_MODIFIED), o.name, "")
+                else r.sdb2
+            val sdbR = if (not(unlinks)) sdbM
+                else stEmitDelete(
+                         stEmitEv(sdbM, o.dir,
+                                  Set(if (wasDir) EV_DIR_REMOVED
+                                      else EV_FILE_REMOVED),
+                                  o.name, ""),
+                         o.file)
+            emit(a1.with("sdb", sdbR),
                  RClose({ st: ST_SUCCESS, gone: r.gone }), ST_SUCCESS)
         }
     }
@@ -1562,7 +1729,19 @@ module smb2ops {
                                 else Set()
                 val sdb2 = if (selfII) doBreakOne(sdb1, fid, BITS_NONE) else sdb1
                 val wr = fsWrite(sdb2.fs, o.file, x.off, x.len, x.pat)
-                emit(acc.with("sdb", sdb2.with("fs", wr.fs2)),
+                // MS-FSA 2.1.5.3: a write changes the file's data and length.
+                // Beyond the generic MODIFIED class it touches the data
+                // STREAM's contents and size, so a watcher that asked only for
+                // FILE_NOTIFY_CHANGE_STREAM_WRITE or _STREAM_SIZE must still
+                // be told -- the stream classes widen who hears about the
+                // write, they do not change what it is called
+                // (FILE_ACTION_MODIFIED either way).
+                val sdb3 = stEmitEv(doMarkModified(sdb2, fid).with("fs", wr.fs2),
+                                    o.dir,
+                                    Set(EV_FILE_MODIFIED, EV_STREAM_WRITE,
+                                        EV_STREAM_SIZE),
+                                    o.name, "")
+                emit(acc.with("sdb", sdb3),
                      RWrite({ st: ST_SUCCESS, count: x.len,
                               breaks: notes.union(selfNotes) }),
                      ST_SUCCESS)
@@ -1646,9 +1825,19 @@ module smb2ops {
             if (not(o.granted.w))
                 emit(a1, RSetEof({ st: ST_ACCESS_DENIED }), ST_ACCESS_DENIED)
             else
+                // MS-FSA 2.1.5.14.5 (SetFileEndOfFileInformation): a length
+                // change is a SIZE change and, because it changes the file's
+                // data extent, a LAST_WRITE one -- which is why the model
+                // raises FILE_MODIFIED alongside SIZE rather than treating the
+                // two filters as alternatives.
                 emit(a1.with("sdb",
-                         a1.sdb.with("fs", fsResize(a1.sdb.fs, o.file,
-                                                    x.sizeBlocks))),
+                         stEmitEv(a1.sdb.with("fs",
+                                      fsResize(a1.sdb.fs, o.file,
+                                               x.sizeBlocks)),
+                                  o.dir,
+                                  Set(EV_SIZE, EV_FILE_MODIFIED,
+                                      EV_STREAM_SIZE),
+                                  o.name, "")),
                      RSetEof({ st: ST_SUCCESS }), ST_SUCCESS)
         }
     }
@@ -1751,7 +1940,24 @@ module smb2ops {
                             oo.with("dir", x.newdir).with("name", x.newname)
                         else oo
                     }))
-                emit(acc.with("sdb", sdb2),
+                // MS-FSA 2.1.5.14.11.1.  An intra-directory rename is ONE
+                // event on that directory carrying both names, which the
+                // serializer expands into the RENAMED_OLD_NAME /
+                // RENAMED_NEW_NAME record pair.  A cross-directory move is two
+                // one-sided events: the source parent only ever learns the old
+                // name left, the destination only that the new name arrived --
+                // neither directory saw the whole move, and neither is told
+                // about the other.
+                // Which NAME filter sees it is decided by the renamed
+                // object's type, not by the fact that it was a rename.
+                val rcls = if (fsGet(sdb2.fs, o.file).ftype == FDir)
+                               Set(EV_RENAMED_DIR) else Set(EV_RENAMED_FILE)
+                val sdb3 = if (o.dir == x.newdir)
+                    stEmitEv(sdb2, o.dir, rcls, x.newname, o.name)
+                    else stEmitEv(
+                        stEmitEv(sdb2, o.dir, rcls, "", o.name),
+                        x.newdir, rcls, x.newname, "")
+                emit(acc.with("sdb", sdb3),
                      RSetRename({ st: ST_SUCCESS, breaks: notes }),
                      ST_SUCCESS)
             }
@@ -1844,23 +2050,144 @@ module smb2ops {
     }
 
     // ------------------------------------------------------------------
+    // CHANGE_NOTIFY (MS-SMB2 3.3.5.19) and its CANCEL
+    // ------------------------------------------------------------------
+
+    // Connection.MaxTransactSize.  A CHANGE_NOTIFY asking for a buffer larger
+    // than the connection can carry is refused rather than clamped: the server
+    // would otherwise arm a watch it could never satisfy.
+    pure val MAX_TRANSACT = 1048576
+
+    pure def putWatch(acc: Acc, fid: FileId, w: Watch): Acc =
+        acc.with("sdb", acc.sdb.with("watches", acc.sdb.watches.put(fid, w)))
+
+    pure def notifyErr(acc: Acc, st: int): Acc =
+        emit(acc, RNotify({ st: st, parked: false, recs: [] }), st)
+
+    pure def doCmdNotify(acc, x) = {
+        val fid = resolveFid(acc, x.fid)
+        if (not(acc.sdb.opens.keys().contains(fid)))
+            notifyErr(acc, ST_FILE_CLOSED)
+        // MS-SMB2 3.3.5.19: the watch is on a DIRECTORY.  A file handle is a
+        // parameter error, not an unsupported operation -- there is nothing
+        // about the request the server could have honoured.
+        else if (not(isDirOpen(acc, fid)))
+            notifyErr(acc, ST_INVALID_PARAMETER)
+        // ... and the handle must hold FILE_LIST_DIRECTORY, which on a
+        // directory is spelled FILE_READ_DATA.  Watching a directory is
+        // reading it, one change at a time.
+        else if (not(acc.sdb.opens.get(fid).granted.r))
+            notifyErr(acc, ST_ACCESS_DENIED)
+        else if (x.obl > MAX_TRANSACT)
+            notifyErr(acc, ST_INVALID_PARAMETER)
+        else {
+            val o = acc.sdb.opens.get(fid)
+            val known = acc.sdb.watches.keys().contains(fid)
+            // The watch is created (or RE-AIMED) before anything else can
+            // reject the request, and the order is observable: a duplicate
+            // CHANGE_NOTIFY is refused BUT still leaves the watch pointing at
+            // its filter, so the events the FIRST request eventually collects
+            // are the ones the SECOND asked for.  chimera does this in
+            // chimera_smb_change_notify (watch_create / watch_update run ahead
+            // of the state->pending check) and it is not obviously right --
+            // but it is what a client observes, so the model says it.
+            val w0 =
+                if (known) watchReaim(acc.sdb.watches.get(fid),
+                                      cfToMask(x.cf), x.watchTree)
+                else watchNew(o.file, cfToMask(x.cf), x.watchTree)
+                         // Armed on a handle to a directory that is ALREADY
+                         // gone: the delete fired before this watch existed
+                         // (the deleting client need not wait for our interim),
+                         // and the tombstone is what keeps the request from
+                         // parking on a directory that can never change again.
+                         .with("deleted", acc.sdb.tombstones.contains(o.file))
+            val accW = acc.with("sdb",
+                acc.sdb.with("watches", acc.sdb.watches.put(fid, w0)))
+            {
+                // A request already outstanding on this handle owns the ring
+                // until it is answered, so a second one parks behind it rather
+                // than draining ahead of it (MS-FSA 2.1.5.9: the requests are a
+                // LIST and they are served in order).
+                val d = if (w0.queue.length() > 0)
+                            { fired: false, st: 0, recs: [], w: w0 }
+                        else watchDrain(w0, x.cf, x.obl, false)
+                if (d.fired)
+                    // Something to say already: answer NOW.  No interim, no
+                    // park -- a CHANGE_NOTIFY is only asynchronous when the
+                    // directory happens to be quiet.
+                    emit(putWatch(accW, fid, d.w),
+                         RNotify({ st: d.st, parked: false, recs: d.recs }),
+                         d.st)
+                // MS-SMB2 <159>/<162>: a CHANGE_NOTIFY that would go
+                // ASYNCHRONOUS anywhere but the last slot of a compound is
+                // failed outright, because the server cannot split a
+                // mid-compound request off into its own async message and
+                // still deliver the slots after it.  One that completes
+                // synchronously is fine in any position, which is why this
+                // sits AFTER the drain and not before it.
+                else if (acc.nc > 1 and acc.ci != acc.nc - 1)
+                    emit(putWatch(accW, fid, d.w),
+                         RNotify({ st: ST_INTERNAL_ERROR, parked: false,
+                                   recs: [] }), ST_INTERNAL_ERROR)
+                else
+                    // Park: an interim STATUS_PENDING now, the real answer
+                    // whenever the directory changes.  Appended, so the
+                    // requests are answered in the order they were made.
+                    emit(putWatch(accW, fid, d.w.with("queue",
+                             d.w.queue.append({ cf: x.cf, obl: x.obl }))),
+                         RNotify({ st: ST_PENDING, parked: true, recs: [] }),
+                         ST_PENDING)
+            }
+        }
+    }
+
+    // CANCEL (MS-SMB2 3.3.5.17 / 3.3.4.4).  The CANCEL itself is never
+    // answered; what it produces is STATUS_CANCELLED on the request it hit.
+    //
+    // It does NOT drain the ring.  A cancelled watcher keeps whatever was
+    // buffered, so a client that cancels and re-arms sees the events it was
+    // waiting for -- which is exactly the point of cancelling rather than
+    // closing the handle.
+    pure def doCmdCancel(acc: Acc, sel: FidSel): Acc = {
+        val fid = resolveFid(acc, sel)
+        val r = stCancelNotify(acc.sdb, fid)
+        if (r.notes.size() == 0)
+            emit(acc, RCancel({ found: false }), ST_SUCCESS)
+        else
+            emit(acc.with("sdb", r.sdb2)
+                    .with("notes", acc.notes.union(r.notes)),
+                 RCancel({ found: true }), ST_SUCCESS)
+    }
+
+    // ------------------------------------------------------------------
     // Message (compound) evaluator
     // ------------------------------------------------------------------
 
     type Msg = { sess: SessionId, tree: TreeId, related: bool,
                  cs: int, replay: bool, cmds: List[Cmd] }
 
-    type MsgOutcome = { sdb2: StateDB, results: List[Res] }
+    // `notes` are the CHANGE_NOTIFY completions this message caused, on
+    // whatever connections were watching -- see Acc.notes.
+    type MsgOutcome = { sdb2: StateDB, results: List[Res],
+                        notes: Set[NotifyNote] }
 
     pure def evalMsg(sdb: StateDB, caps: Caps, msg: Msg): MsgOutcome = {
         val a0: Acc = {
             sdb: sdb, caps: caps, related: msg.related,
             sess: msg.sess, tree: msg.tree, cfid: -1,
             cs: msg.cs, replay: msg.replay,
-            done: false, results: []
+            done: false, results: [],
+            notes: Set(), ci: 0, nc: msg.cmds.length()
         }
         val aN = msg.cmds.foldl(a0, (acc, c) =>
-            if (acc.done) acc else dispatch(acc, c))
-        { sdb2: aN.sdb, results: aN.results }
+            (if (acc.done) acc else dispatch(acc, c)).with("ci", acc.ci + 1))
+        // Wake the parked watchers LAST, once every command in the message has
+        // raised its events.  A compound is one message on the wire and the
+        // server drains a woken watch once, so a compound that adds a file and
+        // then renames it delivers BOTH records in a single completion rather
+        // than firing twice -- the granularity is the message, not the command.
+        val fired = stFireNotifies(aN.sdb)
+        { sdb2: fired.sdb2, results: aN.results,
+          notes: aN.notes.union(fired.notes) }
     }
 }

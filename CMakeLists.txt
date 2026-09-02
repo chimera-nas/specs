@@ -283,6 +283,22 @@ specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Durable stepDurable 300 8 0x41
 # stamped on ordinary requests.
 specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Replay stepReplay 300 8 0x51
           "smb2Replay_stepReplay_300_0x51_{seq}" SMB2_GATE SMB2_DEPS)
+# CHANGE_NOTIFY: arm a directory watch, buffer changes against its two filters,
+# deliver or overflow them, and terminate the parked request every way it can
+# end (an event, a cancel, the handle going away).  The one flavor whose
+# interesting behavior is CROSS-CONNECTION -- one client's mutation completing
+# another client's parked request -- so it needs both sessions live at once and
+# runs deep enough for the ring to fill between requests.
+specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Base stepNotify 400 8 0x61
+          "smb2Base_stepNotify_400_0x61_{seq}" SMB2_GATE SMB2_DEPS)
+# The NAMESPACE half of the same surface: entries appearing, being renamed and
+# disappearing, watched through the two name filters and nothing else.  It is
+# the subset two independent servers agree on -- which is what lets the samba
+# harness drive it record-for-record to the end of a 400-message trace, where
+# the full flavor above diverges on Samba's event vocabulary (SD-10) and its
+# first-request-wins CompletionFilter (SD-11) within a few dozen steps.
+specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Base stepNotifyNs 400 6 0x71
+          "smb2Base_stepNotifyNs_400_0x71_{seq}" SMB2_GATE SMB2_DEPS)
 
 # ---------------------------------------------------------------------------
 # NFSAUX -- the four protocols that surround NFSv3: portmap/rpcbind, MOUNT,
@@ -537,7 +553,9 @@ else()
         "leases|smb2Leases_stepLease_300_0x21_*.itf.json"
         "forceL2|smb2ForceL2_stepLease_300_0x31_*.itf.json"
         "durable|smb2Durable_stepDurable_300_0x41_*.itf.json"
-        "replay|smb2Replay_stepReplay_300_0x51_*.itf.json")
+        "replay|smb2Replay_stepReplay_300_0x51_*.itf.json"
+        "notify|smb2Base_stepNotify_400_0x61_*.itf.json"
+        "notifyNs|smb2Base_stepNotifyNs_400_0x71_*.itf.json")
 
     foreach(b ${SAMBA_BATCHES})
         string(REPLACE "|" ";" parts "${b}")

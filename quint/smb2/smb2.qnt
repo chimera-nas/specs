@@ -19,6 +19,7 @@
 module smb2 {
 
     import nfs4fs.* from "../nfs/nfs4_fs"
+    import smb2notify.* from "./smb2_notify"
     import smb2state.* from "./smb2_state"
     import smb2ops.* from "./smb2_ops"
 
@@ -124,7 +125,14 @@ module smb2 {
 
     type Label =
         | LInit({ dialect: int, caps: Caps })
-        | LMsg({ tag: int, msg: Msg, results: List[Res] })
+        // `notes` are the CHANGE_NOTIFY completions this message caused, on
+        // whatever connections had a request parked.  They sit beside
+        // `results` rather than inside one, because an async completion
+        // belongs to no command slot: it is an unsolicited message on the
+        // WATCHER's connection, and the watcher is usually not the client
+        // whose command triggered it.
+        | LMsg({ tag: int, msg: Msg, results: List[Res],
+                 notes: Set[NotifyNote] })
 
     var sdb: StateDB
     var caps: Caps
@@ -161,7 +169,8 @@ module smb2 {
             sdb' = out.sdb2,
             caps' = caps,
             tag' = tag + 1,
-            lastOp' = LMsg({ tag: tag, msg: msg, results: out.results }),
+            lastOp' = LMsg({ tag: tag, msg: msg, results: out.results,
+                             notes: out.notes }),
         }
     }
 
@@ -193,6 +202,37 @@ module smb2 {
     // requires (MS-FSA 2.1.5.14.3 / 2.1.5.14.11.1).
     def deleteOpens: Set[FileId] =
         opens.filter(f => sdb.opens.get(f).granted.d)
+
+    // Opens on a DIRECTORY, and the subset of them a CHANGE_NOTIFY can
+    // actually be armed on: MS-SMB2 3.3.5.19 wants FILE_LIST_DIRECTORY, which
+    // on a directory handle is spelled FILE_READ_DATA.
+    def dirOpens: Set[FileId] =
+        opens.filter(f => fsGet(sdb.fs, sdb.opens.get(f).file).ftype == FDir)
+    def watchOpens: Set[FileId] =
+        dirOpens.filter(f => sdb.opens.get(f).granted.r)
+    // Names not currently in use under ROOT.  With three names in the pool and
+    // a walk that keeps creating, a rename drawn blindly nearly always
+    // collides -- so the one action whose whole purpose is to produce a
+    // RENAMED event draws its target from here instead.
+    def freeNames: Set[Name] =
+        NAMES.exclude(sdb.fs.inodes.get(ROOT).ents.keys())
+    // Names under ROOT naming a FILE that nothing currently has open.  The
+    // delete idiom (open-for-delete, close) removes such a name on its own
+    // close, so the model and chimera agree on WHEN the entry goes -- which
+    // they do not when a second handle is open, the unresolved Q-1 question
+    // (MS-FSA 2.1.5.4 keeps the entry until the last handle drops; chimera
+    // unlinks at the delete-on-close handle's close).
+    def quietNames: Set[Name] =
+        NAMES.filter(n =>
+            fsHasEnt(sdb.fs, ROOT, n) and
+            fsGet(sdb.fs, fsChild(sdb.fs, ROOT, n)).ftype != FDir and
+            opensOfFile(sdb, fsChild(sdb.fs, ROOT, n)).size() == 0)
+    def fileOpens: Set[FileId] =
+        opens.filter(f => fsGet(sdb.fs, sdb.opens.get(f).file).ftype != FDir)
+    // Handles with a CHANGE_NOTIFY currently parked -- what a CANCEL can hit,
+    // and what an event can complete.
+    def notifyParked: Set[FileId] =
+        sdb.watches.keys().filter(f => sdb.watches.get(f).queue.length() > 0)
 
     // Opens whose caching grant is mid-break (a break ack is due).
     def breakingOpens: Set[FileId] =
@@ -969,6 +1009,338 @@ module smb2 {
         },
     }
 
+    // ==================================================================
+    // CHANGE_NOTIFY (MS-SMB2 3.3.5.19; the watch layer is smb2_notify.qnt)
+    // ==================================================================
+
+    // The CompletionFilter profiles the corpus draws from.  Small and chosen
+    // so the two filters are DISTINGUISHABLE rather than merely varied: each
+    // profile admits a different slice of what the other actions raise, so a
+    // server that ignored the filter (or applied only one of the two) would
+    // deliver records some profile must not see.
+    //
+    //   CF_NAMES    entries appearing and disappearing, and renames
+    //   CF_MODIFY   size and last-write: what a WRITE or a SET_EOF changes
+    //   CF_ATTRS    metadata only -- reachable from a rename's target, not
+    //               from a write, so it is the profile that must stay QUIET
+    //               through the I/O actions
+    //   CF_STREAMS  the named-stream classes, which a write and a create
+    //               raise ALONGSIDE their generic class: this profile is the
+    //               only way to check that the stream bits widen the audience
+    //               without changing the FILE_ACTION
+    //   CF_ALL      everything, so events are never lost to the filter and a
+    //               missing record is a delivery bug rather than a filter one
+    pure val CF_NAMES = Set(CF_FILE_NAME, CF_DIR_NAME)
+    pure val CF_MODIFY = Set(CF_SIZE, CF_LAST_WRITE)
+    pure val CF_ATTRS = Set(CF_ATTRIBUTES)
+    pure val CF_STREAMS = Set(CF_STREAM_NAME, CF_STREAM_SIZE, CF_STREAM_WRITE)
+    pure val CF_SET = Set(CF_NAMES, CF_MODIFY, CF_ATTRS, CF_STREAMS, CF_ALL)
+
+    // OutputBufferLength draws, in BYTES.  Every generated name is one
+    // character, so a FILE_NOTIFY_INFORMATION record is exactly 16 bytes
+    // (smb2notify.recSize) and these are "no room at all", "one record",
+    // "two records" and "as much as anyone needs".
+    //
+    // 0 is not a degenerate case, it is a documented one: MS-SMB2 2.2.36 makes
+    // a zero-length buffer a POLL -- the client asks whether anything happened
+    // without asking what -- and it must NOT set the sticky overflow that a
+    // too-small non-zero buffer does, because nothing was lost that the client
+    // had asked to receive.  16 and 32 are where the atomic per-event fit
+    // check bites: a rename needs 32 all by itself, so it does not fit in 16
+    // however few events precede it.
+    pure val OBL_SET = Set(0, 16, 32, 4096)
+
+    // A handle on the SHARE ROOT.  The generated namespace is flat -- every
+    // name lives directly under ROOT -- so the root handle is the only place a
+    // watcher can stand and see anything at all.
+    action smbOpenDir = all {
+        trees.size() > 0,
+        opens.size() < MAX_OPENS,
+        {
+            nondet t = oneOf(trees)
+            runM(one(treeSess(t), t,
+                CCreate({ dir: ROOT, name: "", disp: DispOpen,
+                          access: ACCESS_R, share: SHARE_RWD, isDir: true,
+                          delOnClose: false, oplock: OrNone,
+                          durable: DurNone })))
+        },
+    }
+
+    // The same handle without FILE_LIST_DIRECTORY.  A perfectly good directory
+    // handle -- it can be queried, renamed through, closed -- that simply may
+    // not WATCH, and the only way to reach the ACCESS_DENIED arm of arming a
+    // watch.  Kept as its own action rather than a draw inside smbOpenDir so
+    // the flavor can weight it: a corpus where half the root handles cannot
+    // watch spends half its CHANGE_NOTIFY draws on one error arm.
+    action smbOpenDirNoRead = all {
+        trees.size() > 0,
+        opens.size() < MAX_OPENS,
+        {
+            nondet t = oneOf(trees)
+            runM(one(treeSess(t), t,
+                CCreate({ dir: ROOT, name: "", disp: DispOpen,
+                          access: ACCESS_H, share: SHARE_RWD, isDir: true,
+                          delOnClose: false, oplock: OrNone,
+                          durable: DurNone })))
+        },
+    }
+
+    // Arm a watch on a handle that has no request outstanding.  Draws over the
+    // whole (filter x buffer x watch-tree) space, so the same handle is
+    // re-armed with different filters as a trace runs -- which is what makes
+    // the ENQUEUE filter and the DELIVERY filter distinguishable: events
+    // buffered under a wide mask are drained by a narrow request.
+    action smbNotify = all {
+        watchOpens.exclude(notifyParked).size() > 0,
+        {
+            nondet f = oneOf(watchOpens.exclude(notifyParked))
+            val o = sdb.opens.get(f)
+            nondet cf = oneOf(CF_SET)
+            nondet obl = oneOf(OBL_SET)
+            nondet wt = oneOf(Set(false, true))
+            runM(one(o.session, o.tree,
+                CNotify({ fid: FidRef(f), cf: cf, watchTree: wt, obl: obl })))
+        },
+    }
+
+    // A SECOND CHANGE_NOTIFY while one is still outstanding.  It is QUEUED,
+    // not refused (MS-FSA 2.1.5.9 keeps the requests on a list), and the two
+    // are answered oldest-first, one delivery cycle each -- which is how an
+    // overlapped client keeps a directory continuously watched.  Drawn with a
+    // filter that differs from the parked request's, so the corpus contains
+    // handles whose queued requests want different things.
+    action smbNotifyDup = all {
+        notifyParked.size() > 0,
+        {
+            nondet f = oneOf(notifyParked)
+            val o = sdb.opens.get(f)
+            nondet cf = oneOf(CF_SET)
+            runM(one(o.session, o.tree,
+                CNotify({ fid: FidRef(f), cf: cf, watchTree: false,
+                          obl: 4096 })))
+        },
+    }
+
+    // Delete a file nothing else has open: the SMB unlink idiom (there is no
+    // path-based REMOVE), narrowed so its removal timing is not the Q-1 case.
+    // This is what raises FILE_REMOVED for the name-filter profiles, and the
+    // tombstone that a CHANGE_NOTIFY armed afterwards on a handle to the same
+    // object must report.
+    action smbDeleteQuiet = all {
+        trees.size() > 0,
+        opens.size() < MAX_OPENS,
+        quietNames.size() > 0,
+        {
+            nondet t = oneOf(trees)
+            nondet n = oneOf(quietNames)
+            runM({ sess: treeSess(t), tree: t, related: true, cs: 0,
+                   replay: false,
+                   cmds: [
+                       CCreate({ dir: ROOT, name: n, disp: DispOpen,
+                                 access: ACCESS_RWD, share: SHARE_RWD,
+                                 isDir: false, delOnClose: true,
+                                 oplock: OrNone, durable: DurNone }),
+                       CClose(FidRelated) ] })
+        },
+    }
+
+    // A rename that actually renames.  smbSetRenameNew draws its handle from
+    // every open and its target from every name, so in a walk that keeps the
+    // small name pool full it is nearly always ACCESS_DENIED (the handle lacks
+    // DELETE) or OBJECT_NAME_COLLISION -- neither of which raises an event.
+    // This one draws a DELETE-capable handle and a FREE name, so it produces
+    // the RENAMED record pair the name-filter profiles exist to observe.
+    action smbRenameFresh = all {
+        deleteOpens.size() > 0,
+        freeNames.size() > 0,
+        {
+            nondet f = oneOf(deleteOpens)
+            val o = sdb.opens.get(f)
+            nondet nn = oneOf(freeNames)
+            runM(one(o.session, o.tree,
+                CSetRename({ fid: FidRef(f), newdir: ROOT, newname: nn })))
+        },
+    }
+
+    // A create that varies its access and disposition but SHARES everything.
+    //
+    // The share-all part is what keeps this flavor about notifications.  A
+    // restrictive ShareAccess makes some later create fail arbitration, and a
+    // truncating create that is refused is DEVIATIONS-SMB.md CD-3 -- a
+    // non-reconcilable deviation that abandons the trace, taking the remaining
+    // hundreds of steps of notify coverage with it.  Share arbitration is
+    // stepCore's and stepShare's subject; here it is only a way to lose the
+    // trace.
+    action smbCreateShared = all {
+        trees.size() > 0,
+        liveInos.size() < MAX_OBJECTS,
+        opens.size() < MAX_OPENS,
+        {
+            nondet t = oneOf(trees)
+            nondet n = oneOf(NAMES)
+            nondet disp = oneOf(DISP_SET)
+            nondet acc = oneOf(ACCESS_SET)
+            runM(one(treeSess(t), t,
+                CCreate({ dir: ROOT, name: n, disp: disp, access: acc,
+                          share: SHARE_RWD, isDir: false, delOnClose: false,
+                          oplock: OrNone, durable: DurNone })))
+        },
+    }
+
+    // A file handle that can actually WRITE.  smbCreateShared draws its access
+    // at random, so a walk that spends its handle budget on read-only and
+    // attribute-only opens has nothing to write through -- and a CHANGE_NOTIFY
+    // corpus with no writes exercises the namespace classes only.
+    action smbCreateRW = all {
+        trees.size() > 0,
+        liveInos.size() < MAX_OBJECTS,
+        opens.size() < MAX_OPENS,
+        {
+            nondet t = oneOf(trees)
+            nondet n = oneOf(NAMES)
+            nondet disp = oneOf(Set(DispOpenIf, DispOverwriteIf, DispSupersede))
+            runM(one(treeSess(t), t,
+                CCreate({ dir: ROOT, name: n, disp: disp, access: ACCESS_RWD,
+                          share: SHARE_RWD, isDir: false, delOnClose: false,
+                          oplock: OrNone, durable: DurNone })))
+        },
+    }
+
+    // The NAME filter a given handle uses, derived from the handle so it is
+    // the SAME for every request on it.  Three profiles across the handles, so
+    // the discrimination is still exercised -- a file create must not wake a
+    // dirName watcher, and a file rename must not either -- while no single
+    // handle ever changes its filter.
+    //
+    // That last part is a concession to Samba, not a modeling choice: a
+    // handle's CompletionFilter is binding there after its first request
+    // (samba_deviations.py SD-11), so a corpus that re-aims one is comparing
+    // against a server that stopped watching.  The full stepNotify flavor does
+    // re-aim, and is where that axis is covered.
+    def nameFilterFor(f: FileId): Set[str] =
+        if (f % 3 == 0) CF_NAMES
+        else if (f % 3 == 1) Set(CF_FILE_NAME)
+        else Set(CF_DIR_NAME)
+
+    action smbNotifyNames = all {
+        watchOpens.exclude(notifyParked).size() > 0,
+        {
+            nondet f = oneOf(watchOpens.exclude(notifyParked))
+            val o = sdb.opens.get(f)
+            // Buffers that always FIT.  The overflow arithmetic is the full
+            // stepNotify flavor's subject; here it would only mean that a
+            // record Samba adds and the model does not (SD-12) tips one side
+            // into STATUS_NOTIFY_ENUM_DIR and not the other, which says
+            // nothing new and costs the rest of the trace.
+            nondet obl = oneOf(Set(4096, 65536))
+            runM(one(o.session, o.tree,
+                CNotify({ fid: FidRef(f), cf: nameFilterFor(f),
+                          watchTree: false, obl: obl })))
+        },
+    }
+
+    action smbNotifyDupNames = all {
+        notifyParked.size() > 0,
+        {
+            nondet f = oneOf(notifyParked)
+            val o = sdb.opens.get(f)
+            runM(one(o.session, o.tree,
+                CNotify({ fid: FidRef(f), cf: nameFilterFor(f),
+                          watchTree: false, obl: 4096 })))
+        },
+    }
+
+    // A CHANGE_NOTIFY through a directory handle that lacks
+    // FILE_LIST_DIRECTORY.  Its own action so the flavor can weight it: drawn
+    // from the same pool as the productive arm it would soak up most of the
+    // CHANGE_NOTIFY budget, since an attribute-only root handle is as
+    // long-lived as a readable one.
+    action smbNotifyNoRead = all {
+        dirOpens.exclude(watchOpens).size() > 0,
+        {
+            nondet f = oneOf(dirOpens.exclude(watchOpens))
+            val o = sdb.opens.get(f)
+            runM(one(o.session, o.tree,
+                CNotify({ fid: FidRef(f), cf: CF_ALL, watchTree: false,
+                          obl: 4096 })))
+        },
+    }
+
+    // A CHANGE_NOTIFY on a FILE handle.  There is no such thing as watching a
+    // file for directory changes, so this is STATUS_INVALID_PARAMETER -- and
+    // it must not arm anything, which the rest of the trace checks by
+    // continuing to mutate that file.
+    action smbNotifyFile = all {
+        fileOpens.size() > 0,
+        {
+            nondet f = oneOf(fileOpens)
+            val o = sdb.opens.get(f)
+            runM(one(o.session, o.tree,
+                CNotify({ fid: FidRef(f), cf: CF_ALL, watchTree: false,
+                          obl: 4096 })))
+        },
+    }
+
+    // An OutputBufferLength past Connection.MaxTransactSize.  Refused rather
+    // than clamped: a watch the server could never answer must not be armed.
+    //
+    // Drawn from the READ-CAPABLE handles only.  A handle that fails BOTH this
+    // check and the FILE_LIST_DIRECTORY one would report whichever the server
+    // makes first, and that order is not settled: the model checks access
+    // first, Samba checks the buffer first, and MS-SMB2 3.3.5.19 does not say.
+    // Keeping the two failures apart means each arm reports its own rule.
+    action smbNotifyHuge = all {
+        watchOpens.size() > 0,
+        {
+            nondet f = oneOf(watchOpens)
+            val o = sdb.opens.get(f)
+            runM(one(o.session, o.tree,
+                CNotify({ fid: FidRef(f), cf: CF_ALL, watchTree: false,
+                          obl: MAX_TRANSACT + 1 })))
+        },
+    }
+
+    // CANCEL the parked request (MS-SMB2 3.3.5.17).  The cancel is never
+    // answered; the request it hits completes STATUS_CANCELLED, and the
+    // BUFFERED events survive -- so a later CHANGE_NOTIFY on the same handle
+    // still collects them, which is what separates cancelling from closing.
+    action smbCancelNotify = all {
+        notifyParked.size() > 0,
+        {
+            nondet f = oneOf(notifyParked)
+            val o = sdb.opens.get(f)
+            runM(one(o.session, o.tree, CCancel(FidRef(f))))
+        },
+    }
+
+    // A CHANGE_NOTIFY that would go async in a NON-final compound slot
+    // (MS-SMB2 <159>/<162>): failed outright, while the rest of the compound
+    // is served.  The compound is deliberately UNRELATED, because that is the
+    // shape where the following slots really do still run -- a related chain
+    // would stop at the first error and the rule would be untestable.
+    //
+    // Deliberately NOT in stepNotify, and for a harness reason rather than a
+    // model one: the chimera replayer expands a modeled compound into one SMB2
+    // message per command (it threads the FileId itself rather than building a
+    // NextCommand chain), so a "mid-compound" CHANGE_NOTIFY reaches that server
+    // as an ordinary standalone request and parks, which is correct for what
+    // was actually sent and a false failure against this rule.  The rule is
+    // pinned deterministically by smb2Test.notifyMidCompoundTest instead;
+    // register this action once a replayer builds real chains.
+    action smbNotifyMidCompound = all {
+        dirOpens.size() > 0,
+        {
+            nondet f = oneOf(dirOpens)
+            val o = sdb.opens.get(f)
+            runM({ sess: o.session, tree: o.tree, related: false, cs: 0,
+                   replay: false,
+                   cmds: [
+                       CNotify({ fid: FidRef(f), cf: CF_ALL,
+                                 watchTree: false, obl: 4096 }),
+                       CQueryBasic(FidRef(f)) ] })
+        },
+    }
+
     // ------------------------------------------------------------------
     // Step distributions
     // ------------------------------------------------------------------
@@ -1470,6 +1842,75 @@ module smb2 {
         smbDisconnect,
         smbReconnect,
         smbReclaim,
+    }
+
+    // The CHANGE_NOTIFY lifecycle: arm, buffer, deliver, overflow, cancel,
+    // clean up.  Deliberately caching-free (no oplocks, no leases, no
+    // delete-on-close): a divergence here should be a NOTIFY divergence, not a
+    // break-lifecycle one that happens to have a watcher attached.
+    //
+    // The mix is chosen so watchers and mutators COMPETE.  Two sessions each
+    // hold a root handle, so a mutation by one completes a request parked by
+    // the other -- the cross-connection delivery that is the whole point of
+    // the command, and the one shape a single-connection probe cannot reach.
+    // Mutations outnumber arms roughly two to one so that the ring genuinely
+    // fills between requests rather than being drained after every change.
+    // smbSetRenameNew is deliberately absent: its target is any name but the
+    // handle's own, so it mostly COLLIDES, and a collision raises no event --
+    // it would spend the flavor's rename budget on an arm stepNs already
+    // covers.  smbRenameFresh is here instead because it always succeeds and
+    // therefore always produces the RENAMED record pair.
+    action stepNotify = any {
+        smbSessionSetup, smbTreeConnect,
+        smbOpenDir, smbOpenDir, smbOpenDirNoRead,
+        smbNotify, smbNotify, smbNotify, smbNotify,
+        smbNotifyDup, smbNotifyNoRead, smbNotifyFile, smbNotifyHuge,
+        smbCancelNotify,
+        smbCreateRW, smbCreateRW, smbCreateRW, smbCreateShared, smbMkdir,
+        smbWrite, smbWrite, smbWrite, smbSetEof, smbSetEof,
+        smbRenameFresh, smbRenameFresh, smbRenameFresh,
+        smbDeleteQuiet, smbDeleteQuiet,
+        smbClose, smbClose,
+        smbTreeDisconnect,
+    }
+
+    // The NAMESPACE half of the CHANGE_NOTIFY surface: entries appearing,
+    // being renamed and disappearing, watched through the two NAME filters and
+    // nothing else.
+    //
+    // It exists because it is the subset two independent servers agree on.
+    // The classes a mutation raises are where implementations differ in
+    // practice -- Samba reports a write as an attribute change, reports
+    // nothing at all when a modified handle closes, and reports a create as
+    // both ADDED and MODIFIED (samba_deviations.py SD-10) -- and once the two
+    // sides hold different buffered events, every later request on that handle
+    // diverges for reasons that have nothing to do with the notify logic.
+    //
+    // Restricted to the name filters, those differences become invisible: a
+    // spurious MODIFIED does not match FILE_NAME, and a missing write
+    // notification is not one this flavor asks for.  What remains -- the park,
+    // the FIFO queue, the delivery, the cancel, the cleanup, the record pair a
+    // rename expands to -- is exactly the machinery, and it is checked
+    // record-for-record against a real server rather than only against the
+    // implementation the model was written beside.
+    //
+    // One waiter per handle at a time, deliberately.  Samba reports a rename
+    // as the OLD/NEW pair PLUS a spurious REMOVED (SD-12), and an extra record
+    // shifts where one delivery ends and the next begins -- so with a queue,
+    // two servers that agree about every event can still disagree about which
+    // request each record arrived on.  The FIFO queue is covered by the full
+    // stepNotify flavor and, against Samba, by the ground-truth probes that
+    // established it.
+    action stepNotifyNs = any {
+        smbSessionSetup, smbTreeConnect,
+        smbOpenDir, smbOpenDir,
+        smbNotifyNames, smbNotifyNames, smbNotifyNames, smbNotifyNames,
+        smbCancelNotify,
+        smbCreateRW, smbCreateRW, smbMkdir,
+        smbRenameFresh, smbRenameFresh, smbRenameFresh,
+        smbDeleteQuiet, smbDeleteQuiet,
+        smbClose, smbClose,
+        smbTreeDisconnect,
     }
 
     // ------------------------------------------------------------------

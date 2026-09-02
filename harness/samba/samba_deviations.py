@@ -44,6 +44,54 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 
+FILE_ACTION_REMOVED = 0x00000002
+
+
+def _extra_removes_consumed(model_recs, wire_recs):
+    """How many of `model_recs` `wire_recs` accounts for, or None if it is not
+    "the model's records with extra REMOVEDs mixed in" at all.
+
+    Walks both in order: every wire record either matches the next model one
+    or is a FILE_ACTION_REMOVED the model did not predict.  Anything else --
+    a reordering, or an extra record of some other action -- returns None and
+    the divergence fails as unanalyzed.  A record the model expected and the
+    wire has not sent YET is not a failure here: Samba's spurious REMOVED can
+    arrive as its own delivery, which splits the model's one delivery across
+    two, and that case is separated out by reconcilability rather than by
+    pretending it did not happen.
+    """
+    if model_recs is None or wire_recs is None:
+        return None
+    i = 0
+    for got in wire_recs:
+        if i < len(model_recs) and tuple(model_recs[i]) == tuple(got):
+            i += 1
+        elif got[0] == FILE_ACTION_REMOVED:
+            continue
+        else:
+            return None
+    return i
+
+
+def _extra_removes_match(cmd, res, ctx):
+    return _extra_removes_consumed(ctx.get("model_recs"),
+                                   ctx.get("wire_recs")) is not None
+
+
+def _extra_removes_in_step(cmd, res, ctx):
+    """Reconcilable only when the whole predicted delivery arrived together.
+
+    When it did, the extra REMOVED is pure addition: both sides drained the
+    same changes in the same request and replay stays in step.  When Samba
+    delivered the spurious record ALONE, the request the model answered here
+    is answered there by the NEXT one -- the two sides are a delivery apart
+    from then on, and everything after it would be reporting that.
+    """
+    model_recs = ctx.get("model_recs")
+    got = _extra_removes_consumed(model_recs, ctx.get("wire_recs"))
+    return got is not None and model_recs is not None and got == len(model_recs)
+
+
 # NTSTATUS values referenced below (MS-ERREF 2.3.1).
 ST_SUCCESS = 0x00000000
 ST_UNSUCCESSFUL = 0xC0000001
@@ -151,6 +199,99 @@ class Deviation:
 # ---------------------------------------------------------------------------
 
 KNOWN_DEVIATIONS = [
+
+    # -- CHANGE_NOTIFY: the event vocabulary ------------------------------
+
+    Deviation(
+        id="SD-10",
+        verdict=SAMBA,
+        spec="MS-FSA 2.1.5.1.2 / 2.1.5.3 / 2.1.5.4 (change notification)",
+        summary="Samba raises a different SET of change classes than MS-FSA "
+                "for writes, closes and creates, so the two sides end up "
+                "holding different buffered events",
+        root_cause="one finding wearing three faces, each measured directly "
+                   "against this Samba with a FRESH connection and watch per "
+                   "case so no leftover buffer can contaminate it:\n"
+                   "  * a WRITE reaches a watcher filtered on `attributes` "
+                   "and reaches NEITHER `size` nor `lastWrite` -- MS-FSA "
+                   "2.1.5.3 makes a write a last-write and size change, which "
+                   "are the two filters a client would actually use for it;\n"
+                   "  * CLOSING a handle that wrote raises nothing at all, "
+                   "where MS-FSA 2.1.5.4 reports the settled size and write "
+                   "time -- so a watcher never learns the write finished;\n"
+                   "  * CREATING a file raises FILE_ACTION_MODIFIED as well "
+                   "as ADDED (measured with two waiters queued on one handle: "
+                   "the first is answered ADDED, the second MODIFIED, from a "
+                   "single FILE_CREATE).\n"
+                   "The consequence, not the reply, is what makes this "
+                   "non-reconcilable: from the first write or create onwards "
+                   "the model and Samba hold different sets of buffered "
+                   "events, so every later request on that handle diverges "
+                   "for reasons that have nothing to do with the notify logic "
+                   "under test.  The comparable subset -- namespace mutations "
+                   "watched through the name filters, where the two agree "
+                   "exactly -- is generated as its own flavor (stepNotifyNs) "
+                   "and IS driven to completion here.",
+        candidate_fix="samba: raise LAST_WRITE|SIZE from the write path and "
+                      "at the cleanup of a modified handle, and suppress the "
+                      "metadata-settle notification that follows a create it "
+                      "has already reported as ADDED",
+        ops=("RNotify", "RNotifyAsync"),
+        reconcilable=False,
+    ),
+
+    Deviation(
+        id="SD-12",
+        verdict=SAMBA,
+        spec="MS-FSCC 2.7.1 (FILE_NOTIFY_INFORMATION), FILE_ACTION_RENAMED_*",
+        summary="a rename within a directory also reports the old name as "
+                "FILE_ACTION_REMOVED, on top of the RENAMED_OLD_NAME / "
+                "RENAMED_NEW_NAME pair",
+        root_cause="measured: a run of renames delivers, for each one, an "
+                   "extra FILE_ACTION_REMOVED naming the name the object was "
+                   "renamed AWAY from, in addition to the pair.  The pair "
+                   "already says the name went away and where it went; the "
+                   "extra record says it was deleted, which is a different "
+                   "and untrue statement -- a client that acts on REMOVED "
+                   "drops the file it should have followed.",
+        candidate_fix="samba: emit only the RENAMED_OLD_NAME/_NEW_NAME pair "
+                      "for an intra-directory rename",
+        ops=("RNotify", "RNotifyAsync"),
+        field="recs",
+        # Precise, not a blanket record excuse: the model's records must be a
+        # SUBSEQUENCE of the wire's, and every extra wire record must be a
+        # FILE_ACTION_REMOVED.  A missing record, a reordered one, or an extra
+        # record of any other action still fails.
+        context=_extra_removes_match,
+        reconcilable=_extra_removes_in_step,
+    ),
+
+    Deviation(
+        id="SD-11",
+        verdict=SAMBA,
+        spec="MS-SMB2 2.2.35 (SMB2 CHANGE_NOTIFY Request), CompletionFilter",
+        summary="the CompletionFilter of the FIRST CHANGE_NOTIFY on a handle "
+                "is binding: a later request on that handle cannot widen or "
+                "change it",
+        root_cause="measured four ways on one handle.  arm(dirName), cancel, "
+                   "arm(fileName), create a file -> nothing is ever "
+                   "delivered; the same handle armed with fileName FROM THE "
+                   "START gets the record, and arm(fileName)/cancel/"
+                   "arm(fileName) also gets it -- so it is the CHANGE of "
+                   "filter that is ignored, not the re-arm.  Queueing a "
+                   "second request with a different filter behind the first "
+                   "does not help either: neither waiter sees the create.  "
+                   "CompletionFilter is a per-REQUEST field (2.2.35) and "
+                   "MS-FSA 2.1.5.9 records it per pending request; nothing "
+                   "makes the first one binding for the life of the handle.  "
+                   "A client that narrows its watch and later widens it again "
+                   "is therefore watching nothing, with no error to say so.",
+        candidate_fix="samba: re-register the fsp's notify filter from the "
+                      "current request rather than keeping the one the first "
+                      "request installed",
+        ops=("RNotify", "RNotifyAsync"),
+        reconcilable=False,
+    ),
 
     Deviation(
         id="SD-2",
@@ -311,6 +452,8 @@ KNOWN_DEVIATIONS = [
 #                 none of it afterwards (denyCheck vs deny).
 #   SD-6 (model)  the lease-key-to-file binding was enforced on a profile whose
 #                 server advertises no leasing.  Fixed: gated on caps.leases.
+#   SD-10 (samba) CHANGE_NOTIFY event vocabulary; see the entry itself.
+#   SD-11 (samba) a handle's CompletionFilter is fixed at its first request.
 #   SD-7 (model)  a truncating CREATE refused with a sharing violation still
 #                 truncated the file.  Fixed: the disposition's filesystem
 #                 effect is committed on the success path only.  The oracle
