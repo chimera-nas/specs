@@ -34,6 +34,7 @@
 module smb2state {
 
     import nfs4fs.* from "../nfs/nfs4_fs"
+    import smb2notify.* from "./smb2_notify"
 
     type SessionId = int
     type TreeId = int
@@ -224,6 +225,14 @@ module smb2state {
         breaking: bool,
         breakTo: Caching,
         deleteOnClose: bool,
+        // Has this handle written?  MS-FSA 2.1.5.4 (Close) reports a
+        // LAST_WRITE/SIZE change for a handle that modified the file, on TOP
+        // of what the write itself reported: a file's directory-visible
+        // metadata is not settled until the last writer lets go, so the close
+        // is a change to the DIRECTORY even though the write was a change to
+        // the FILE.  Cleared nowhere -- a handle that has written stays
+        // modified until it closes.
+        modified: bool,
         // The durable-handle grant this open holds, if any (MS-SMB2
         // 3.3.5.9.6 / 3.3.5.9.10).  `on` is the grant; `v2` distinguishes the
         // DH2Q form (identified by a CreateGuid) from the DHnQ form (no guid,
@@ -334,7 +343,28 @@ module smb2state {
         // durable opens that survived their connection, keyed by the FileId
         // they keep across the reclaim (MS-SMB2 3.3.7.1).  Disjoint from
         // `opens` by construction: a handle is live or parked, never both.
-        parked: FileId -> Parked
+        parked: FileId -> Parked,
+        // CHANGE_NOTIFY watches, one per OPEN HANDLE that has ever armed one
+        // (smb2_notify.Watch).  Keyed by FileId rather than by directory
+        // because that is where the lifetime is: two handles on one directory
+        // are two independent watches with their own filters, rings and parked
+        // requests, and each dies with its own handle.
+        //
+        // A watch outlives the request that created it, so this map is NOT the
+        // set of outstanding requests -- w.pending is.  Disjoint from `parked`
+        // by construction: a durable handle that survives its connection has
+        // its notify dropped without a reply (the client is not there to read
+        // one), so no watch follows a handle into the parked map.
+        watches: FileId -> Watch,
+        // Objects removed during this trace, so a CHANGE_NOTIFY armed on a
+        // handle to one AFTER the removal still learns it is gone.  chimera
+        // keeps a bounded, time-limited ring of tombstoned filehandles per
+        // hash bucket (CHIMERA_VFS_NOTIFY_TOMBSTONE_*) for exactly this race:
+        // the deleting client need not wait for the watcher's interim reply,
+        // so the delete can land before the watch exists.  Model inode numbers
+        // are never reused and a trace is far shorter than the tombstone
+        // lifetime, so an unbounded set is exact here.
+        tombstones: Set[Ino]
     }
 
     pure def stInit(rootMode: int): StateDB = {
@@ -347,7 +377,9 @@ module smb2state {
         nextFile: 0,
         rangeLocks: List(),
         deletePending: Set(),
-        parked: Map()
+        parked: Map(),
+        watches: Map(),
+        tombstones: Set()
     }
 
     pure def smapDrop(m, k) = m.keys().exclude(Set(k)).mapBy(x => m.get(x))
@@ -467,7 +499,8 @@ module smb2state {
                   session: sess, tree: tree, file: f, dir: dir, name: name,
                   granted: granted, denied: deny, caching: CNone,
                   breaking: false, breakTo: CNone,
-                  deleteOnClose: delOnClose, durable: DUR_NONE,
+                  deleteOnClose: delOnClose, modified: false,
+                  durable: DUR_NONE,
                   // The CREATE's own ChannelSequence seeds the handle
                   // (probe R11).  Replay eligibility is set by the CREATE
                   // handler afterwards, only when a DH2Q context was present.
@@ -594,8 +627,143 @@ module smb2state {
     }
 
     // ------------------------------------------------------------------
+    // CHANGE_NOTIFY watches (MS-SMB2 3.3.5.19; smb2_notify.qnt)
+    // ------------------------------------------------------------------
+
+    // A completion the server owes a client whose CHANGE_NOTIFY was PARKED:
+    // an unsolicited message on the watcher's connection, arriving whenever
+    // the event that satisfies it happens -- which is usually while some other
+    // client's command is being served.  It is therefore recorded on the
+    // MESSAGE that caused it rather than in any command's reply (evalMsg's
+    // `notes`), which is also how it looks on the wire.
+    // `seq` is the request's position in the handle's outstanding queue when
+    // it completed: 0 is the oldest.  It is needed because a handle may owe
+    // SEVERAL completions at once -- a teardown finishes every request queued
+    // on it -- and without an index two of them would be indistinguishable.
+    type NotifyNote = { fid: FileId, seq: int, st: int,
+                        recs: List[NotifyRec] }
+
+    // Raise a change on directory `d`.  Buffers into every watch that covers
+    // `d` and whose ENQUEUE mask admits the event; a watch that does not want
+    // this class never sees it, now or later.
+    //
+    // Note what is NOT here: waking the parked request.  chimera rings a
+    // doorbell and completes the request on the watcher's own thread, so the
+    // reply is ordered after the mutation, not inside it.  The model matches
+    // that by buffering here and firing in stFireNotifies at the end of the
+    // message.
+    pure def stEmitEv(sdb: StateDB, d: Ino, cls: Set[str], name: Name,
+                      oldName: Name): StateDB = {
+        val e: NotifyEv = { cls: cls, name: name, oldName: oldName }
+        sdb.with("watches", sdb.watches.keys().mapBy(f => {
+            val w = sdb.watches.get(f)
+            if (watchCovers(w, sdb.fs, d)) watchPush(w, e) else w
+        }))
+    }
+
+    // The watched object itself was removed.  Distinct from an event on its
+    // parent: it terminates every watch on the object with DELETE_PENDING
+    // rather than adding a record, and it is remembered as a tombstone so a
+    // CHANGE_NOTIFY armed after the fact learns the same thing instead of
+    // parking on a directory that can never change again.
+    pure def stEmitDelete(sdb: StateDB, ino: Ino): StateDB =
+        sdb.with("watches", sdb.watches.keys().mapBy(f => {
+            val w = sdb.watches.get(f)
+            if (w.dir == ino) w.with("deleted", true) else w
+        })).with("tombstones", sdb.tombstones.union(Set(ino)))
+
+    // Drop a handle's watch.  Called for every way a handle can go away.
+    pure def stDropWatch(sdb: StateDB, fid: FileId): StateDB =
+        if (sdb.watches.keys().contains(fid))
+            sdb.with("watches", smapDrop(sdb.watches, fid))
+        else sdb
+
+    // Complete EVERY request queued on `fid`'s watch because the HANDLE is
+    // going away (CLOSE, TREE_DISCONNECT, LOGOFF).  MS-SMB2 3.3.4.4: this is
+    // STATUS_NOTIFY_CLEANUP and not STATUS_CANCELLED, which belongs to an
+    // explicit CANCEL alone -- a client can tell "your handle is gone" from
+    // "your request was cancelled", and must be able to.
+    //
+    // All of them, not just the oldest: the handle is going away, so there
+    // will never be another event, and a request left outstanding would never
+    // be answered at all.
+    pure def stCleanupWatch(sdb: StateDB, fid: FileId):
+            { sdb2: StateDB, notes: Set[NotifyNote] } =
+        if (not(sdb.watches.keys().contains(fid)))
+            { sdb2: sdb, notes: Set() }
+        else {
+            val w = sdb.watches.get(fid)
+            val idx = w.queue.indices()
+            { sdb2: stDropWatch(sdb, fid),
+              notes: idx.map(i => {
+                  val d = watchDrain(w, w.queue[i].cf, w.queue[i].obl, true)
+                  { fid: fid, seq: i, st: d.st, recs: d.recs }
+              }) }
+        }
+
+    // CANCEL (MS-SMB2 3.3.5.17) ends ONE request -- the oldest outstanding,
+    // which is the one the generator names.  It does NOT drain the ring: a
+    // cancelled watcher keeps whatever was buffered, which is exactly the
+    // point of cancelling rather than closing the handle.
+    pure def stCancelNotify(sdb: StateDB, fid: FileId):
+            { sdb2: StateDB, notes: Set[NotifyNote] } =
+        if (not(sdb.watches.keys().contains(fid)) or
+            sdb.watches.get(fid).queue.length() == 0)
+            { sdb2: sdb, notes: Set() }
+        else {
+            val w = sdb.watches.get(fid)
+            { sdb2: sdb.with("watches", sdb.watches.put(fid,
+                  w.with("queue", w.queue.slice(1, w.queue.length())))),
+              notes: Set({ fid: fid, seq: 0, st: ST_CANCELLED_N,
+                           recs: [] }) }
+        }
+
+    // Fire every parked request whose watch now has something to say.  Run
+    // once at the end of a message, after all its commands have raised their
+    // events, because that is the granularity the wire offers: the harness
+    // quiesces the server and then reads whatever async completions arrived.
+    //
+    // A watch whose drain comes up empty stays parked -- the wakeup was
+    // spurious (every buffered event was filtered out) and the client is told
+    // nothing at all, which is a real and separately observable outcome from
+    // being told SUCCESS with no records.
+    // Wake the OLDEST outstanding request on every watch that now has
+    // something to say.  One delivery cycle per message: the head drains the
+    // ring and completes, and the requests behind it stay parked for whatever
+    // happens next.
+    //
+    // The notes are a SET, keyed by (handle, queue position).  Two watchers
+    // woken by one mutation are woken on their own connections -- the wire
+    // imposes no order between them, and asserting one would make the suite
+    // fail on a scheduling detail rather than on a protocol fact.
+    pure def stFireNotifies(sdb: StateDB):
+            { sdb2: StateDB, notes: Set[NotifyNote] } = {
+        val fids = sdb.watches.keys().filter(f =>
+            sdb.watches.get(f).queue.length() > 0)
+        val r = fids.fold({ ws: sdb.watches, notes: Set() }, (a, f) => {
+            val w = a.ws.get(f)
+            val first = w.queue[0]
+            val d = watchDrain(w, first.cf, first.obl, false)
+            if (not(d.fired)) a.with("ws", a.ws.put(f, d.w))
+            else { ws: a.ws.put(f,
+                       d.w.with("queue", w.queue.slice(1, w.queue.length()))),
+                   notes: a.notes.union(
+                       Set({ fid: f, seq: 0, st: d.st, recs: d.recs })) }
+        })
+        { sdb2: sdb.with("watches", r.ws), notes: r.notes }
+    }
+
+    // STATUS_CANCELLED, spelled here so this module does not have to import
+    // the status table from smb2_ops (which imports this one).
+    pure val ST_CANCELLED_N = 0xC0000120
+
+    // ------------------------------------------------------------------
     // Oplock / lease caching grants and the break lifecycle
     // ------------------------------------------------------------------
+
+    // Record that a handle has written, so its CLOSE reports the change.
+    pure def doMarkModified(sdb: StateDB, fid: FileId): StateDB =
+        sdb.with("opens", sdb.opens.setBy(fid, o => o.with("modified", true)))
 
     // Set (or replace) the caching grant on a handle.
     pure def doSetCaching(sdb: StateDB, fid: FileId, c: Caching): StateDB =

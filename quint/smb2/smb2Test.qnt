@@ -11,6 +11,7 @@
 
 module smb2Test {
     import nfs4fs.* from "../nfs/nfs4_fs"
+    import smb2notify.* from "./smb2_notify"
     import smb2state.* from "./smb2_state"
     import smb2ops.* from "./smb2_ops"
     import smb2(
@@ -78,6 +79,45 @@ module smb2Test {
     def oneCsRp(sess: SessionId, tree: TreeId, c: Cmd, cs: int): Msg =
         { sess: sess, tree: tree, related: false, cs: cs, replay: true,
           cmds: [ c ] }
+
+    val noNotify: { st: int, parked: bool, recs: List[NotifyRec] } =
+        { st: -1, parked: false, recs: [] }
+    def asNotify(r) =
+        match r { | RNotify(x) => x | _ => noNotify }
+
+    // The CHANGE_NOTIFY completions the last message caused, on whatever
+    // handles had a request parked.  They sit on the message rather than in a
+    // command's reply because they belong to no command slot.
+    def lastNotes: Set[NotifyNote] =
+        match lastOp {
+            | LMsg(l) => l.notes
+            | LInit(_) => Set()
+        }
+
+    def noteOf(f: FileId): { st: int, recs: List[NotifyRec] } = {
+        val m = lastNotes.filter(n => n.fid == f and n.seq == 0)
+        if (m.size() == 0) { st: -1, recs: [] }
+        else m.fold({ st: -1, recs: [] },
+                    (a, n) => { st: n.st, recs: n.recs })
+    }
+
+    /// The completion at queue position `q` on handle `f`.
+    def noteAt(f: FileId, q: int): { st: int, recs: List[NotifyRec] } = {
+        val m = lastNotes.filter(n => n.fid == f and n.seq == q)
+        if (m.size() == 0) { st: -1, recs: [] }
+        else m.fold({ st: -1, recs: [] },
+                    (a, n) => { st: n.st, recs: n.recs })
+    }
+
+    // A directory handle on the share root -- an empty relative path names the
+    // directory itself, which is how an SMB client gets one at all.
+    def openRoot(acc: DesiredAccess): Cmd =
+        CCreate({ dir: ROOT, name: "", disp: DispOpen, access: acc,
+                  share: SHARE_RWD, isDir: true, delOnClose: false,
+                  oplock: OrNone, durable: DurNone })
+
+    def notify(f: FileId, cf: Set[str], wt: bool, obl: int): Cmd =
+        CNotify({ fid: FidRef(f), cf: cf, watchTree: wt, obl: obl })
 
     // ------------------------------------------------------------------
     // Bootstrap: one session (client 1) + one tree.
@@ -2374,6 +2414,345 @@ module smb2Test {
             // response context (R4 against durable probe D3)
             .expect(asCreate(resAt(0)).durable)
             .expect(sdb.parked.keys() == Set())
+
+    // ==================================================================
+    // CHANGE_NOTIFY (MS-SMB2 3.3.5.19; the watch layer is smb2_notify.qnt)
+    //
+    // These pin the arms the generated corpus deliberately cannot reach --
+    // the compound-position rule (the chimera replayer sends compound slots as
+    // separate messages), and everything that needs a directory to be DELETED
+    // while a watch is on it (the Q-1 removal-timing question) -- plus the
+    // boundary cases where a fixed sequence says more than a random walk: the
+    // exact buffer arithmetic, and the two filters being genuinely different.
+    // ==================================================================
+
+    // The three ways a request that finds the directory quiet can end, and the
+    // one way it can be answered at once.
+    run notifyParkAndDeliverTest =
+        bootRun
+            .then(runM(one(0, 0, openRoot(ACCESS_R))))
+            .expect(stAt(0) == ST_SUCCESS)
+            // Nothing has happened, so the request PARKS: an interim
+            // STATUS_PENDING and no answer until something changes.
+            .then(runM(one(0, 0, notify(0, CF_ALL, false, 4096))))
+            .expect(stAt(0) == ST_PENDING)
+            .expect(asNotify(resAt(0)).parked)
+            .expect(asNotify(resAt(0)).recs == [])
+            // A create in the watched directory completes it -- on the parked
+            // request, not in the create's own reply.
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .expect(noteOf(0).st == ST_SUCCESS)
+            .expect(noteOf(0).recs == [ { act: FA_ADDED, name: "a" } ])
+            // With the request gone, the NEXT change has nobody to wake: it
+            // buffers on the watch instead, and the next CHANGE_NOTIFY is
+            // answered immediately from the buffer with no interim at all.
+            .then(runM(one(0, 0, CWrite({ fid: FidRef(1), off: 0, len: 1,
+                                          pat: 1 }))))
+            .expect(lastNotes == Set())
+            .then(runM(one(0, 0, notify(0, CF_ALL, false, 4096))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .expect(not(asNotify(resAt(0)).parked))
+            .expect(asNotify(resAt(0)).recs == [ { act: FA_MODIFIED, name: "a" } ])
+
+    // The two filters are different filters.  The watch's decides what is
+    // BUFFERED and the request's decides what is DELIVERED, so a wide watch
+    // followed by a narrow request drops events that were captured -- they are
+    // gone, not merely deferred, which the second arm proves by asking again
+    // with the wide filter and getting nothing.
+    run notifyTwoFiltersTest =
+        bootRun
+            .then(runM(one(0, 0, openRoot(ACCESS_R))))
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RWD,
+                                        SHARE_RWD, false, OrNone))))
+            // A watch exists only once a CHANGE_NOTIFY has armed it, so this
+            // is where the buffering starts -- the create above raised
+            // nothing anyone was listening for.
+            .then(runM(one(0, 0, notify(0, CF_ALL, false, 4096))))
+            .expect(stAt(0) == ST_PENDING)
+            // A rename reaches it, and arrives as the OLD/NEW record pair.
+            .then(runM(one(0, 0, CSetRename({ fid: FidRef(1), newdir: ROOT,
+                                              newname: "b" }))))
+            .expect(noteOf(0).st == ST_SUCCESS)
+            .expect(noteOf(0).recs == [ { act: FA_RENAMED_OLD, name: "a" },
+                                        { act: FA_RENAMED_NEW, name: "b" } ])
+            // With nothing parked, a WRITE buffers under the watch's still-wide
+            // mask ...
+            .then(runM(one(0, 0, CWrite({ fid: FidRef(1), off: 0, len: 1,
+                                          pat: 1 }))))
+            .expect(lastNotes == Set())
+            // ... and a request that asks only about NAMES drains it and
+            // throws it away: the write is gone, not deferred, so the request
+            // parks with nothing to report.
+            .then(runM(one(0, 0, notify(0, Set(CF_FILE_NAME), false, 4096))))
+            .expect(stAt(0) == ST_PENDING)
+            .expect(asNotify(resAt(0)).parked)
+
+    // A rename needs TWO records, so it needs 32 bytes; an OutputBufferLength
+    // of 16 cannot hold it however small the rest is.  The event is atomic --
+    // half a rename is never delivered -- so the answer is ENUM_DIR with no
+    // records at all, and the overflow is STICKY: the events are gone, and the
+    // next request must not report a clean SUCCESS as though nothing had been
+    // lost.
+    run notifyOverflowStickyTest =
+        bootRun
+            .then(runM(one(0, 0, openRoot(ACCESS_R))))
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RWD,
+                                        SHARE_RWD, false, OrNone))))
+            // Arm the watch, then take the request away again: what is left
+            // is an armed watch with nobody waiting, which is what lets the
+            // rename below BUFFER instead of being delivered at once.
+            .then(runM(one(0, 0, notify(0, CF_ALL, false, 4096))))
+            .expect(stAt(0) == ST_PENDING)
+            .then(runM(one(0, 0, CCancel(FidRef(0)))))
+            .expect(noteOf(0).st == ST_CANCELLED)
+            .then(runM(one(0, 0, CSetRename({ fid: FidRef(1), newdir: ROOT,
+                                              newname: "b" }))))
+            .expect(lastNotes == Set())
+            .then(runM(one(0, 0, notify(0, CF_ALL, false, 16))))
+            .expect(stAt(0) == ST_NOTIFY_ENUM_DIR)
+            .expect(asNotify(resAt(0)).recs == [])
+            // Sticky: nothing has happened since, and the answer is still
+            // ENUM_DIR rather than a park.
+            .then(runM(one(0, 0, notify(0, CF_ALL, false, 4096))))
+            .expect(stAt(0) == ST_NOTIFY_ENUM_DIR)
+            // Drained now: the watch is clean again and the next request parks.
+            .then(runM(one(0, 0, notify(0, CF_ALL, false, 4096))))
+            .expect(stAt(0) == ST_PENDING)
+
+    // A zero-length OutputBufferLength is a POLL: "did anything happen?"
+    // without asking what.  It reports ENUM_DIR like any buffer too small to
+    // serve -- but it must NOT set the sticky overflow, because the client
+    // lost nothing it had asked to receive.
+    run notifyZeroBufferPollTest =
+        bootRun
+            .then(runM(one(0, 0, openRoot(ACCESS_R))))
+            .then(runM(one(0, 0, notify(0, CF_ALL, false, 0))))
+            .expect(stAt(0) == ST_PENDING)
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(noteOf(0).st == ST_NOTIFY_ENUM_DIR)
+            .expect(noteOf(0).recs == [])
+            // Not sticky: the next request finds a clean watch and parks.
+            .then(runM(one(0, 0, notify(0, CF_ALL, false, 4096))))
+            .expect(stAt(0) == ST_PENDING)
+
+    // Every way a CHANGE_NOTIFY is refused, in the order the server decides
+    // them.  The type check precedes the access check, which precedes the
+    // buffer-size check, which precedes the one-outstanding-request rule.
+    run notifyRefusalsTest =
+        bootRun
+            // A FILE handle cannot be watched at all.
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .then(runM(one(0, 0, notify(0, CF_ALL, false, 4096))))
+            .expect(stAt(0) == ST_INVALID_PARAMETER)
+            // A directory handle without FILE_LIST_DIRECTORY cannot either.
+            .then(runM(one(0, 0, openRoot(ACCESS_H))))
+            .then(runM(one(0, 0, notify(1, CF_ALL, false, 4096))))
+            .expect(stAt(0) == ST_ACCESS_DENIED)
+            // A buffer past Connection.MaxTransactSize is refused rather than
+            // clamped: the server will not arm a watch it cannot answer.
+            .then(runM(one(0, 0, openRoot(ACCESS_R))))
+            .then(runM(one(0, 0, notify(2, CF_ALL, false, MAX_TRANSACT + 1))))
+            .expect(stAt(0) == ST_INVALID_PARAMETER)
+            // A well-formed request on a readable directory handle parks.
+            .then(runM(one(0, 0, notify(2, CF_ALL, false, 4096))))
+            .expect(stAt(0) == ST_PENDING)
+            .then(runM(one(0, 0, create(ROOT, "b", DispCreate, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(noteOf(2).st == ST_SUCCESS)
+
+    // A handle may carry SEVERAL outstanding requests, and they are answered
+    // oldest first -- one delivery cycle each.  That is what lets an
+    // overlapped client keep a directory continuously watched: it always has
+    // another request posted before the last one completes.
+    //
+    // The second request also re-aims the watch, so what is CAPTURED from here
+    // on is its filter even though the request behind it is not the one being
+    // answered next.  Both halves are asserted: a write is no longer buffered
+    // once the watch has been narrowed to names, and the name change that
+    // follows is answered on the OLDEST request's own wide terms.
+    run notifyQueueTest =
+        bootRun
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .then(runM(one(0, 0, openRoot(ACCESS_R))))
+            .then(runM(one(0, 0, notify(1, CF_ALL, false, 4096))))
+            .expect(stAt(0) == ST_PENDING)
+            .then(runM(one(0, 0, notify(1, Set(CF_FILE_NAME), false, 4096))))
+            .expect(stAt(0) == ST_PENDING)
+            .expect(asNotify(resAt(0)).parked)
+            // Narrowed: a write is not captured at all now.
+            .then(runM(one(0, 0, CWrite({ fid: FidRef(0), off: 0, len: 1,
+                                          pat: 1 }))))
+            .expect(lastNotes == Set())
+            // A name change wakes the OLDEST request, on its own wide filter.
+            .then(runM(one(0, 0, create(ROOT, "b", DispCreate, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(noteOf(1).st == ST_SUCCESS)
+            .expect(noteOf(1).recs == [ { act: FA_ADDED, name: "b" } ])
+            // The second is still outstanding, and the next change is its.
+            .then(runM(one(0, 0, create(ROOT, "c", DispCreate, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(noteOf(1).st == ST_SUCCESS)
+            .expect(noteOf(1).recs == [ { act: FA_ADDED, name: "c" } ])
+
+    // Flipping WATCH_TREE keeps the buffered events.  Nothing in MS-SMB2 says
+    // a re-armed watch discards what it already holds, and a client that
+    // narrows its recursion has not asked to lose the changes it was waiting
+    // for.  (The model used to purge here, on the reasoning that a subtree
+    // event names its object by a relative path and an exact event by a bare
+    // filename -- which is an argument about one implementation's event
+    // representation, not about the standard.  Samba delivers across the
+    // flip.)
+    run notifyWatchTreeFlipTest =
+        bootRun
+            .then(runM(one(0, 0, openRoot(ACCESS_R))))
+            .then(runM(one(0, 0, notify(0, CF_ALL, false, 4096))))
+            .expect(stAt(0) == ST_PENDING)
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(noteOf(0).st == ST_SUCCESS)
+            // Buffer a change with nothing outstanding, then re-arm with the
+            // recursion flag flipped: the change is still there.
+            .then(runM(one(0, 0, CWrite({ fid: FidRef(1), off: 0, len: 1,
+                                          pat: 1 }))))
+            .expect(lastNotes == Set())
+            .then(runM(one(0, 0, notify(0, CF_ALL, true, 4096))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .expect(asNotify(resAt(0)).recs ==
+                    [ { act: FA_MODIFIED, name: "a" } ])
+
+    // A CANCEL ends the request, not the watch: STATUS_CANCELLED with no
+    // records, and the buffered events survive for the next request to
+    // collect.  That is the whole difference between cancelling and closing.
+    run notifyCancelKeepsBufferTest =
+        bootRun
+            .then(runM(one(0, 0, openRoot(ACCESS_R))))
+            .then(runM(one(0, 0, notify(0, CF_ALL, false, 4096))))
+            .expect(stAt(0) == ST_PENDING)
+            .then(runM(one(0, 0, CCancel(FidRef(0)))))
+            .expect(noteOf(0).st == ST_CANCELLED)
+            .expect(noteOf(0).recs == [])
+            // Cancelling twice hits nothing the second time.
+            .then(runM(one(0, 0, CCancel(FidRef(0)))))
+            .expect(lastNotes == Set())
+            // The watch is still armed, so a change is still buffered ...
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(lastNotes == Set())
+            // ... and the next request collects it at once.
+            .then(runM(one(0, 0, notify(0, CF_ALL, false, 4096))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .expect(asNotify(resAt(0)).recs == [ { act: FA_ADDED, name: "a" } ])
+
+    // The handle going away completes the request with STATUS_NOTIFY_CLEANUP,
+    // and NOT with STATUS_CANCELLED, which belongs to an explicit CANCEL
+    // alone -- the client can tell "your handle is gone" from "your request
+    // was cancelled" and must be able to.  Both the CLOSE and the
+    // TREE_DISCONNECT form.
+    run notifyCleanupTest =
+        bootRun
+            .then(runM(one(0, 0, openRoot(ACCESS_R))))
+            .then(runM(one(0, 0, notify(0, CF_ALL, false, 4096))))
+            .expect(stAt(0) == ST_PENDING)
+            // A SECOND request outstanding on the same handle: the close must
+            // finish that one too, or it would never be answered at all.
+            .then(runM(one(0, 0, notify(0, CF_ALL, false, 4096))))
+            .expect(stAt(0) == ST_PENDING)
+            .then(runM(one(0, 0, CClose(FidRef(0)))))
+            .expect(noteAt(0, 0).st == ST_NOTIFY_CLEANUP)
+            .expect(noteAt(0, 1).st == ST_NOTIFY_CLEANUP)
+            // A tree teardown does the same to every watch under it.
+            .then(runM(one(0, 0, openRoot(ACCESS_R))))
+            .then(runM(one(0, 0, notify(1, CF_ALL, false, 4096))))
+            .expect(stAt(0) == ST_PENDING)
+            .then(runM(one(0, 0, CTreeDisconnect)))
+            .expect(noteOf(1).st == ST_NOTIFY_CLEANUP)
+
+    // A transport drop is the exception: the watches die and NOTHING is sent.
+    // There is no connection left to carry a completion.
+    run notifyDisconnectSilentTest =
+        bootRun
+            .then(runM(one(0, 0, openRoot(ACCESS_R))))
+            .then(runM(one(0, 0, notify(0, CF_ALL, false, 4096))))
+            .expect(stAt(0) == ST_PENDING)
+            .then(runM({ sess: 0, tree: -1, related: false, cs: 0,
+                         replay: false, cmds: [ CDisconnect ] }))
+            .expect(lastNotes == Set())
+            .expect(sdb.watches.keys() == Set())
+
+    // A CHANGE_NOTIFY that would go ASYNCHRONOUS anywhere but the last slot of
+    // a compound is failed outright (MS-SMB2 <159>/<162>): the server cannot
+    // split a mid-compound request off into its own async message and still
+    // deliver the slots after it.  One that completes SYNCHRONOUSLY is fine in
+    // any position, which is why the rule is checked after the drain and not
+    // before -- both halves are here.
+    //
+    // Pinned here rather than generated: the chimera replayer expands a modeled
+    // compound into one message per command, so a mid-compound notify reaches
+    // that server as a standalone request and correctly parks.
+    run notifyMidCompoundTest =
+        bootRun
+            .then(runM(one(0, 0, openRoot(ACCESS_R))))
+            // Quiet directory: the notify would park, so it fails instead --
+            // and the QUERY after it still runs.
+            .then(runM({ sess: 0, tree: 0, related: false, cs: 0,
+                         replay: false,
+                         cmds: [ notify(0, CF_ALL, false, 4096),
+                                 CQueryBasic(FidRef(0)) ] }))
+            .expect(stAt(0) == ST_INTERNAL_ERROR)
+            .expect(stAt(1) == ST_SUCCESS)
+            // With something buffered it completes synchronously, and its
+            // position no longer matters.
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .then(runM({ sess: 0, tree: 0, related: false, cs: 0,
+                         replay: false,
+                         cmds: [ notify(0, CF_ALL, false, 4096),
+                                 CQueryBasic(FidRef(0)) ] }))
+            .expect(stAt(0) == ST_SUCCESS)
+            .expect(asNotify(resAt(0)).recs == [ { act: FA_ADDED, name: "a" } ])
+            .expect(stAt(1) == ST_SUCCESS)
+
+    // What an OPEN reports, by what it actually DID rather than by the
+    // disposition it asked for.  A create ADDS; an overwrite of a name that was
+    // already there MODIFIES; an open that created nothing reports nothing.
+    //
+    // The middle case is the one that carries the fidelity: reporting ADDED for
+    // an overwrite is wrong in both directions once a filter is involved -- a
+    // client watching SIZE or ATTRIBUTES is told nothing about a change that
+    // touched both, and a client watching FILE_NAME is woken for a name that
+    // did not appear.
+    run notifyCreateActionTest =
+        bootRun
+            .then(runM(one(0, 0, openRoot(ACCESS_R))))
+            .then(runM(one(0, 0, notify(0, CF_ALL, false, 4096))))
+            .expect(stAt(0) == ST_PENDING)
+            .then(runM(one(0, 0, create(ROOT, "a", DispOpenIf, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(noteOf(0).recs == [ { act: FA_ADDED, name: "a" } ])
+            // OPEN_IF on a name that now exists creates nothing, so it reports
+            // nothing and the re-armed request stays parked.
+            .then(runM(one(0, 0, notify(0, CF_ALL, false, 4096))))
+            .expect(stAt(0) == ST_PENDING)
+            .then(runM(one(0, 0, create(ROOT, "a", DispOpenIf, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(lastNotes == Set())
+            // OVERWRITE_IF on the same name replaces its data: MODIFIED.
+            .then(runM(one(0, 0, create(ROOT, "a", DispOverwriteIf, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(noteOf(0).recs == [ { act: FA_MODIFIED, name: "a" } ])
+            // ... and it is reachable through a SIZE watcher, which an ADDED
+            // would not be.
+            .then(runM(one(0, 0, notify(0, Set(CF_SIZE), false, 4096))))
+            .expect(stAt(0) == ST_PENDING)
+            .then(runM(one(0, 0, create(ROOT, "a", DispSupersede, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(noteOf(0).recs == [ { act: FA_MODIFIED, name: "a" } ])
+
 
 }
 

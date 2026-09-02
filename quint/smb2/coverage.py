@@ -107,12 +107,41 @@ INFO_FLAVORS = ("stepInfo",)
 # TREE_DISCONNECT.
 NS_FLAVORS = ("stepNs",)
 
+# The CHANGE_NOTIFY lifecycle: arm a directory watch, buffer changes against
+# its two filters, deliver or overflow them, and end the parked request every
+# way it can end.
+#
+# This flavor deliberately SHARES EVERYTHING and issues no READ, and both are
+# load-bearing rather than oversights, so several generic buckets are dropped
+# for it in required_buckets() -- see the justification there.
+NOTIFY_FLAVORS = ("stepNotify", "stepNotifyNs")
+
+# The namespace half of it, which is the subset an independent server agrees
+# on record-for-record.  Narrower by construction -- one name filter per
+# handle, buffers that always fit, one waiter at a time -- so the buckets that
+# belong to the axes it drops are not required of it.
+NOTIFY_NS_FLAVORS = ("stepNotifyNs",)
+
+ST_NOTIFY_CLEANUP = 0x0000010B
+ST_NOTIFY_ENUM_DIR = 0x0000010C
+ST_CANCELLED = 0xC0000120
+ST_ACCESS_DENIED = 0xC0000022
+
+# FILE_ACTION_* (MS-FSCC 2.7.1).  All five must be delivered to a watcher: the
+# rename pair is what proves a two-record event survives serialization, and
+# ADDED / REMOVED / MODIFIED are what prove the three mutation classes are
+# distinguished rather than collapsed.
+FILE_ACTIONS = [1, 2, 3, 4, 5]
+
 ST_LOCK_NOT_GRANTED = 0xC0000055
 ST_RANGE_NOT_LOCKED = 0xC000007E
 ST_FILE_LOCK_CONFLICT = 0xC0000054
 
 ST_INVALID_PARAMETER = 0xC000000D
 ST_DUPLICATE_OBJECTID = 0xC000022A
+
+# Connection.MaxTransactSize, as the model pins it (smb2ops.MAX_TRANSACT).
+MAX_TRANSACT = 1048576
 
 # Acknowledgment outcomes (MS-SMB2 3.3.5.22.1/.2): success, the two
 # not-Breaking rejections, and the keep-too-much rejection.
@@ -298,6 +327,38 @@ def scan(path, buckets):
                 buckets["rename:0x%08x" % status] = True
             elif ctag == "CLogoff":
                 buckets["logoff:0x%08x" % status] = True
+            elif ctag == "CNotify":
+                buckets["notify:0x%08x" % status] = True
+                buckets["notify:wt:%d" % (1 if cv["watchTree"] else 0)] = True
+                # The two filters are only distinguishable if the corpus draws
+                # more than one, so every CompletionFilter bit the model can
+                # ask for is a bucket of its own.
+                for bit in as_set(cv["cf"]):
+                    buckets["notify:cf:" + bit] = True
+                # OutputBufferLength, by what it MEANS rather than by value: a
+                # zero-length poll, a buffer that can hold records, and one
+                # past Connection.MaxTransactSize (refused, not clamped).
+                obl = as_int(cv["obl"])
+                if obl == 0:
+                    buckets["notify:obl:poll"] = True
+                elif obl > MAX_TRANSACT:
+                    buckets["notify:obl:overmax"] = True
+                else:
+                    buckets["notify:obl:fit"] = True
+                # Did it park (an async interim went out) or answer inline?
+                # Both are required: a corpus where every request parked would
+                # never exercise the synchronous drain, and one where none did
+                # would never exercise the async completion path at all.
+                buckets["notify:park:%d"
+                        % (1 if rv.get("parked") else 0)] = True
+                for rec in rv.get("recs", []):
+                    buckets["notifyrec:act:%d" % as_int(rec["act"])] = True
+                if status == ST_SUCCESS:
+                    buckets["notify:recs:%s"
+                            % ("0" if not rv.get("recs") else "nz")] = True
+            elif ctag == "CCancel":
+                buckets["cancel:found:%d"
+                        % (1 if rv.get("found") else 0)] = True
             elif ctag == "CTreeDisconnect":
                 buckets["treedisc:0x%08x" % status] = True
             elif ctag == "CDisconnect":
@@ -316,6 +377,16 @@ def scan(path, buckets):
                 buckets["break:new:0x%02x" % as_int(b["newState"])] = True
                 if as_int(b["epoch"]) > 1:
                     buckets["break:epoch_bump"] = True
+        # CHANGE_NOTIFY completions this message caused, on whatever handles
+        # had a request parked.  They hang off the MESSAGE rather than any
+        # command's reply, because the watcher is usually not the client whose
+        # command woke it -- which is the whole shape this flavor exists to
+        # exercise.
+        for n in as_set(v.get("notes")):
+            buckets["note:0x%08x" % (as_int(n["st"]) & 0xFFFFFFFF)] = True
+            buckets["note:recs:%s" % ("0" if not n["recs"] else "nz")] = True
+            for rec in n["recs"]:
+                buckets["notifyrec:act:%d" % as_int(rec["act"])] = True
 
 
 def required_buckets(flavor, observed=None):
@@ -424,6 +495,79 @@ def required_buckets(flavor, observed=None):
         # The FileDispositionInformation class, unmark arm (see smb2.qnt's
         # smbSetDispositionOff for why only that arm is generated).
         req += ["setdisp:0:0x%08x" % ST_SUCCESS]
+    if flavor in NOTIFY_NS_FLAVORS:
+        # This flavor is not about the CREATE matrix at all -- it is the
+        # notify machinery watched through the name filters, and it draws a
+        # deliberately narrow set of opens (read-capable directory handles and
+        # RWD file handles) so that no request is ever refused for access and
+        # no delivery is ever cut short.  Requiring the generic
+        # disposition/access/share matrix of it would be requiring it to stop
+        # being itself; stepCore and stepShare own that matrix.
+        keep = ("action:", "close:", "session:", "tree:", "compound:full")
+        req = [b for b in req
+               if b.startswith(keep) or b == "cr_status:0x00000000"]
+    if flavor in NOTIFY_FLAVORS:
+        # Drop the generic buckets this flavor cannot reach BY CONSTRUCTION,
+        # each for a stated reason rather than because it happened to starve:
+        #
+        #  * every open shares R/W/D, so share arbitration never refuses one.
+        #    That is deliberate: a refused TRUNCATING create is CD-3, a
+        #    non-reconcilable deviation that abandons the trace and takes the
+        #    remaining hundreds of steps of notify coverage with it.  Share
+        #    arbitration is stepCore's and stepShare's subject.
+        #  * no action issues a READ.  Reading a file raises no change and
+        #    tells a watcher nothing; the flavor spends its budget on mutations
+        #    instead.
+        #  * the one compound it builds (open-for-delete + close) always
+        #    succeeds, so no chain is ever cut short by a first error.
+        req = [b for b in req
+               if not b.startswith("read:") and
+               not (b.startswith("shr:") and b != "shr:rwd")]
+        req = [b for b in req
+               if b not in ("compound:abort",
+                            "cr_status:0x%08x" % ST_SHARING_VIOLATION,
+                            "truncnw:0x%08x" % ST_SHARING_VIOLATION)]
+        # Every outcome an arriving CHANGE_NOTIFY can have that this flavor
+        # can produce: answered from the buffer, parked, and the handle going
+        # away.  The refusals and the overflow arms belong to the full flavor.
+        req += ["notify:0x%08x" % s for s in (ST_SUCCESS, 0x00000103)]
+        req += ["notify:park:0", "notify:park:1", "notify:obl:fit"]
+        # A CHANGE_NOTIFY answered from the buffer with records in it -- the
+        # synchronous drain.  Without this the corpus could park every request
+        # and never serialize a record on the reply path at all.
+        req += ["notify:recs:nz"]
+        # Every way a PARKED request can end that this flavor reaches.
+        req += ["note:0x%08x" % s for s in
+                (ST_SUCCESS, ST_NOTIFY_CLEANUP, ST_CANCELLED)]
+        req += ["note:recs:nz", "cancel:found:1"]
+        # The four namespace FILE_ACTIONs actually delivered to a client.
+        # MODIFIED (3) belongs to the data half, which this flavor omits.
+        req += ["notifyrec:act:%d" % a for a in (1, 2, 4, 5)]
+        # Both name filters actually used, and the discrimination between
+        # them: this is the axis the flavor exists for, and a corpus that
+        # asked for both at once on every handle would not test it.
+        req += ["notify:cf:fileName", "notify:cf:dirName"]
+    if flavor in NOTIFY_FLAVORS and flavor not in NOTIFY_NS_FLAVORS:
+        # Every outcome an arriving CHANGE_NOTIFY can have: answered from the
+        # buffer, parked, told to rescan, and the three refusals (wrong handle
+        # type / no FILE_LIST_DIRECTORY / a buffer past MaxTransactSize).
+        req += ["notify:0x%08x" % s for s in
+                (ST_SUCCESS, 0x00000103, ST_NOTIFY_ENUM_DIR,
+                 ST_INVALID_PARAMETER, ST_ACCESS_DENIED)]
+        # Both halves of the park/answer split, both recursion settings, and
+        # all three OutputBufferLength meanings.
+        req += ["notify:park:0", "notify:park:1",
+                "notify:wt:0", "notify:wt:1",
+                "notify:obl:poll", "notify:obl:fit", "notify:obl:overmax"]
+        req += ["notify:recs:nz"]
+        # Every way a PARKED request can end: an event, an overflow, an
+        # explicit CANCEL, and the handle going away.
+        req += ["note:0x%08x" % s for s in
+                (ST_SUCCESS, ST_NOTIFY_ENUM_DIR, ST_NOTIFY_CLEANUP,
+                 ST_CANCELLED)]
+        req += ["note:recs:nz", "cancel:found:1"]
+        # All five FILE_ACTIONs actually delivered to a client.
+        req += ["notifyrec:act:%d" % a for a in FILE_ACTIONS]
     if flavor in DIR_FLAVORS:
         # Both diagonals of the type matrix (a file open of a directory and a
         # directory open of a file), and a READ through a directory handle --
