@@ -33,18 +33,6 @@ module posix {
 
     // Server/implementation discretion (POSIX acceptance sets and
     // documented divergences); trueness per capChoices:
-    const P_GID_FROM_PARENT: FeatureMode   // new-object gid = parent's
-    const P_SGID_INHERIT: FeatureMode      // subdirs inherit S_ISGID
-    const P_WRITE_CLEARS_SETIDS: FeatureMode // write/trunc clears setids
-    const P_PWRITE_APPENDS: FeatureMode    // Linux-style pwrite+O_APPEND
-    const P_RENAME_CTIME: FeatureMode      // rename marks moved ctime
-    const P_STRICT_ATIME: FeatureMode      // harness enforces atime marks
-    const P_STICKY_WRITE_ARM: FeatureMode  // sticky exempts write-perm
-    const P_CHOWN_SUPP_GROUP: FeatureMode  // chgrp to a supplementary group
-    const P_ERR_NOTEMPTY: FeatureMode      // ENOTEMPTY (else EEXIST)
-    const P_ERR_STICKY_ACCES: FeatureMode  // EACCES (else EPERM)
-    const P_ERR_UNLINKDIR_ISDIR: FeatureMode // EISDIR (else EPERM)
-    const P_ERR_LOCK_AGAIN: FeatureMode    // EAGAIN (else EACCES)
 
     // ------------------------------------------------------------------
     // Universes
@@ -114,7 +102,7 @@ module posix {
 
     type Label =
         | LInit({ caps: Caps })
-        | LCall({ pid: Pid, req: OpReq, res: OpRes })
+        | LCall({ pid: Pid, req: OpReq, res: OpRes, alt: Set[int] })
 
     var fs: Fs
     var ps: Pstate
@@ -189,26 +177,9 @@ module posix {
         nondet cloneR = oneOf(capChoices(F_CLONE_RANGE))
         nondet seekH = oneOf(capChoices(F_SEEK_HOLE))
         nondet rootP = oneOf(capChoices(F_ROOT))
-        nondet gidPar = oneOf(capChoices(P_GID_FROM_PARENT))
-        nondet sgidInh = oneOf(capChoices(P_SGID_INHERIT))
-        nondet wClear = oneOf(capChoices(P_WRITE_CLEARS_SETIDS))
-        nondet pwApp = oneOf(capChoices(P_PWRITE_APPENDS))
-        nondet rnCt = oneOf(capChoices(P_RENAME_CTIME))
-        nondet sAtime = oneOf(capChoices(P_STRICT_ATIME))
-        nondet stArm = oneOf(capChoices(P_STICKY_WRITE_ARM))
-        nondet chSup = oneOf(capChoices(P_CHOWN_SUPP_GROUP))
-        nondet eNe = oneOf(capChoices(P_ERR_NOTEMPTY))
-        nondet eSt = oneOf(capChoices(P_ERR_STICKY_ACCES))
-        nondet eUd = oneOf(capChoices(P_ERR_UNLINKDIR_ISDIR))
-        nondet eLk = oneOf(capChoices(P_ERR_LOCK_AGAIN))
         val c: Caps = {
             copyRange: copyR, cloneRange: cloneR, seekHole: seekH,
-            withRoot: rootP, gidFromParent: gidPar, sgidInherit: sgidInh,
-            writeClearsSets: wClear, pwriteAppends: pwApp,
-            renameCtime: rnCt, strictAtime: sAtime, stickyWriteArm: stArm,
-            chownSuppGroup: chSup,
-            errNotempty: eNe, errStickyAcces: eSt,
-            errUnlinkDirIsdir: eUd, errLockAgain: eLk
+            withRoot: rootP
         }
         all {
             fs' = fsInit(511, 0, 0),
@@ -224,7 +195,8 @@ module posix {
             fs' = o.fs2,
             ps' = o.ps2,
             caps' = caps,
-            lastOp' = LCall({ pid: p, req: req, res: o.res })
+            lastOp' = LCall({ pid: p, req: req, res: o.res,
+                              alt: o.alt })
         }
     }
 
@@ -552,7 +524,23 @@ module posix {
         {
             nondet k = oneOf(pfds(ps))
             nondet off = oneOf(OFFS.union(Set(-1)))
-            nondet wh = oneOf(Set(WSet, WCur, WEnd, WData, WHole))
+            nondet wh = oneOf(Set(WSet, WCur, WEnd))
+            runOp(k._1, RLseek({ fd: k._2, off: off, wh: wh }))
+        }
+    }
+
+    // SEEK_DATA / SEEK_HOLE.  Kept out of the general mix on purpose: they
+    // are an optional interface (F_SEEK_HOLE), and an op that a filesystem
+    // answers EOPNOTSUPP changes what the rest of the trace means, so a
+    // trace carrying one is only replayable where the interface exists.
+    // Concentrating them here is what lets every other flavor be generated
+    // once, for everybody.
+    action genSeekSparse = all {
+        pfds(ps).size() > 0,
+        {
+            nondet k = oneOf(pfds(ps))
+            nondet off = oneOf(OFFS.union(Set(-1)))
+            nondet wh = oneOf(Set(WData, WHole))
             runOp(k._1, RLseek({ fd: k._2, off: off, wh: wh }))
         }
     }
@@ -891,6 +879,11 @@ module posix {
     // copy / clone
     // ------------------------------------------------------------------
 
+    // copy_file_range and reflink are separate optional interfaces -- ext4
+    // has the first and not the second -- so they get separate generators
+    // and separate flavors.  Drawing both from one action would put a clone
+    // in half the copy traces and make a filesystem without reflink skip
+    // batches it could otherwise run.
     action genCopyRange = all {
         pfdsReg(fs, ps).size() > 0,
         {
@@ -899,15 +892,23 @@ module posix {
             nondet oIn = oneOf(OFFS_BLK)
             nondet oOut = oneOf(OFFS_BLK)
             nondet len = oneOf(LENS_BLK)
-            nondet clone = oneOf(Set(true, false))
-            if (clone)
-                runOp(kIn._1, RCloneRange({ fdDst: kOut._2, offDst: oOut,
-                                            fdSrc: kIn._2, offSrc: oIn,
-                                            len: len }))
-            else
-                runOp(kIn._1, RCopyRange({ fdIn: kIn._2, offIn: oIn,
-                                           fdOut: kOut._2, offOut: oOut,
-                                           len: len }))
+            runOp(kIn._1, RCopyRange({ fdIn: kIn._2, offIn: oIn,
+                                       fdOut: kOut._2, offOut: oOut,
+                                       len: len }))
+        }
+    }
+
+    action genCloneRange = all {
+        pfdsReg(fs, ps).size() > 0,
+        {
+            nondet kIn = oneOf(pfdsReg(fs, ps))
+            nondet kOut = oneOf(pfdsReg(fs, ps).filter(k => k._1 == kIn._1))
+            nondet oIn = oneOf(OFFS_BLK)
+            nondet oOut = oneOf(OFFS_BLK)
+            nondet len = oneOf(LENS_BLK)
+            runOp(kIn._1, RCloneRange({ fdDst: kOut._2, offDst: oOut,
+                                        fdSrc: kIn._2, offSrc: oIn,
+                                        len: len }))
         }
     }
 
@@ -971,8 +972,29 @@ module posix {
 
     action stepData = any {
         genRead, genWrite, genPio, genVread, genVwrite, genVpio, genLseek,
-        genTruncate, genCopyRange, genFallocate, genStatfs, genFstatfs,
+        genTruncate, genFallocate, genStatfs, genFstatfs,
         genOpenFile, genOpenCreat, genClose
+    }
+
+    // The two capability-gated flavors.  Everything else in this model is
+    // generated once and replayed everywhere; these two exercise interfaces
+    // a filesystem is allowed not to have (copy_file_range, reflink,
+    // SEEK_DATA/SEEK_HOLE), so a harness that meets an EOPNOTSUPP reports
+    // the batch as a SKIP -- which keeps the gap visible and attributable,
+    // rather than hiding it in a corpus generated per implementation.
+    action stepOffload = any {
+        genOpenCreat, genOpenFile, genClose, genWrite, genRead,
+        genCopyRange, genTruncate, genFstat
+    }
+
+    action stepClone = any {
+        genOpenCreat, genOpenFile, genClose, genWrite, genRead,
+        genCloneRange, genTruncate, genFstat
+    }
+
+    action stepSparse = any {
+        genOpenCreat, genOpenFile, genClose, genWrite, genTruncate,
+        genFallocate, genSeekSparse, genRead, genFstat
     }
 
     // Focused flavors for behaviors the broad mixes starve:
@@ -1079,19 +1101,7 @@ module posix {
         capChoices(F_COPY_RANGE).contains(caps.copyRange),
         capChoices(F_CLONE_RANGE).contains(caps.cloneRange),
         capChoices(F_SEEK_HOLE).contains(caps.seekHole),
-        capChoices(F_ROOT).contains(caps.withRoot),
-        capChoices(P_GID_FROM_PARENT).contains(caps.gidFromParent),
-        capChoices(P_SGID_INHERIT).contains(caps.sgidInherit),
-        capChoices(P_WRITE_CLEARS_SETIDS).contains(caps.writeClearsSets),
-        capChoices(P_PWRITE_APPENDS).contains(caps.pwriteAppends),
-        capChoices(P_RENAME_CTIME).contains(caps.renameCtime),
-        capChoices(P_STRICT_ATIME).contains(caps.strictAtime),
-        capChoices(P_STICKY_WRITE_ARM).contains(caps.stickyWriteArm),
-        capChoices(P_CHOWN_SUPP_GROUP).contains(caps.chownSuppGroup),
-        capChoices(P_ERR_NOTEMPTY).contains(caps.errNotempty),
-        capChoices(P_ERR_STICKY_ACCES).contains(caps.errStickyAcces),
-        capChoices(P_ERR_UNLINKDIR_ISDIR).contains(caps.errUnlinkDirIsdir),
-        capChoices(P_ERR_LOCK_AGAIN).contains(caps.errLockAgain)
+        capChoices(F_ROOT).contains(caps.withRoot)
     }
 
     val inv = all {

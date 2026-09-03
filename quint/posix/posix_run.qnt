@@ -4,278 +4,51 @@
 
 // Runnable instances of the POSIX model.
 //
-//   posixDefault      every feature and policy explored both ways; the
-//                     harness reconciles each trace's drawn profile
-//                     against the live implementation and skips
-//                     non-applicable traces
-//   posixStrict       POSIX-canonical behavior forced: optional features
-//                     mandatory, divergence knobs pinned to the standard
-//                     reading (pwrite ignores O_APPEND, unlink(dir) is
-//                     EPERM, ...); an implementation that quietly drops a
-//                     feature fails instead of passing vacuously
-//   posixLinuxish     the common Linux deviations forced on, for testing
-//                     against Linux-behaving backends
-//   posixExt4         Linux + ext4 exactly as measured, for the ext4
-//                     conformance suite (harness/posix)
+// There used to be one instance per backend -- posixMemfs, posixDisk,
+// posixNfs3, posixNfs4, posixFuse, posixExt4 -- each pinning a profile of
+// sixteen capability and policy knobs, and each generating its own corpus.
+// That was the model picking one of several conforming answers and then
+// recording every implementation that picked another as deviating; the
+// corpus grew with the number of consumers, and a divergence in the shared
+// behaviour had to be found six times.
 //
-// Simulate:  quint run posix_run.qnt --main=posixDefault --invariant=inv
+// The knobs are gone (see posix_ops.qnt's Caps).  Where POSIX names more
+// than one errno for a condition the model states the acceptance set and
+// the harness honours it; where POSIX is silent the model encodes what the
+// mature implementations agree on; where POSIX is prescriptive the model
+// asserts it and a departure is recorded against whoever departs.  What is
+// left is the optional interfaces, which are not a matter of opinion: a
+// filesystem either has copy_file_range and reflink and SEEK_HOLE or it
+// does not, and a call it answers EOPNOTSUPP changes what the rest of a
+// trace means.  Those live in two flavors of their own (stepOffload,
+// stepSparse) so that every other flavor is generated ONCE, for everybody.
+//
+//   posixFull     the generation instance: every optional interface
+//                 present, so the capability flavors are exercised.  The
+//                 general flavors never touch them, so their corpus is the
+//                 same corpus for every implementation.
+//   posixDefault  every knob explored, for hand simulation
+//
+// Simulate:  quint run posix_run.qnt --main=posixFull --invariant=inv
 
+module posixFull {
+    import posix(
+        F_COPY_RANGE = FeatMandatory,
+        F_CLONE_RANGE = FeatMandatory,
+        F_SEEK_HOLE = FeatMandatory,
+        F_ROOT = FeatIfAdvertised
+    ).* from "./posix"
+    import posixops.* from "./posix_ops"
+}
+
+// F_ROOT stays explorable everywhere: the harness chooses the credentials
+// it runs the trace with, so both draws are real against any target.
 module posixDefault {
     import posix(
         F_COPY_RANGE = FeatIfAdvertised,
         F_CLONE_RANGE = FeatIfAdvertised,
         F_SEEK_HOLE = FeatIfAdvertised,
-        F_ROOT = FeatIfAdvertised,
-        P_GID_FROM_PARENT = FeatIfAdvertised,
-        P_SGID_INHERIT = FeatIfAdvertised,
-        P_WRITE_CLEARS_SETIDS = FeatIfAdvertised,
-        P_PWRITE_APPENDS = FeatIfAdvertised,
-        P_RENAME_CTIME = FeatIfAdvertised,
-        P_STRICT_ATIME = FeatIfAdvertised,
-        P_STICKY_WRITE_ARM = FeatIfAdvertised,
-        P_CHOWN_SUPP_GROUP = FeatIfAdvertised,
-        P_ERR_NOTEMPTY = FeatIfAdvertised,
-        P_ERR_STICKY_ACCES = FeatIfAdvertised,
-        P_ERR_UNLINKDIR_ISDIR = FeatIfAdvertised,
-        P_ERR_LOCK_AGAIN = FeatIfAdvertised
-    ).* from "./posix"
-    import posixops.* from "./posix_ops"
-}
-
-// The in-memory-backend profile, pinned to the behavior measured by
-// `posix_replay.py --probe` on 2026-08-10 (see PROFILE there; the probe
-// re-measures and `--check-profile` fails on drift).  Trace generation from
-// this instance produces only profiles the live backend can satisfy, so the
-// harness never skips a trace for profile mismatch.  F_ROOT stays
-// explorable: the harness chooses the credentials, so both draws are real.
-// P_ERR_LOCK_AGAIN is unobservable while memfs lacks record locks (PD1 in
-// posix_deviations.py); pinned to the Linux-style EAGAIN reading.
-module posixMemfs {
-    import posix(
-        F_COPY_RANGE = FeatMandatory,
-        F_CLONE_RANGE = FeatMandatory,
-        F_SEEK_HOLE = FeatMandatory,
-        F_ROOT = FeatIfAdvertised,
-        P_GID_FROM_PARENT = FeatOff,
-        P_SGID_INHERIT = FeatOff,
-        P_WRITE_CLEARS_SETIDS = FeatMandatory,
-        P_PWRITE_APPENDS = FeatOff,
-        P_RENAME_CTIME = FeatMandatory,
-        P_STRICT_ATIME = FeatOff,
-        P_STICKY_WRITE_ARM = FeatOff,
-        P_CHOWN_SUPP_GROUP = FeatMandatory,
-        P_ERR_NOTEMPTY = FeatMandatory,
-        P_ERR_STICKY_ACCES = FeatMandatory,
-        P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
-        P_ERR_LOCK_AGAIN = FeatMandatory
-    ).* from "./posix"
-    import posixops.* from "./posix_ops"
-}
-
-// The disk-backend (diskfs/cairn) profile, pinned to `--probe --backend diskfs`
-// and `--backend cairn` measurements on 2026-08-11: both probe identically
-// to memfs except clone_range is unsupported (F_CLONE_RANGE off).  One
-// instance therefore serves trace generation for both backends.
-module posixDisk {
-    import posix(
-        F_COPY_RANGE = FeatMandatory,
-        F_CLONE_RANGE = FeatOff,
-        F_SEEK_HOLE = FeatMandatory,
-        F_ROOT = FeatIfAdvertised,
-        P_GID_FROM_PARENT = FeatOff,
-        P_SGID_INHERIT = FeatOff,
-        P_WRITE_CLEARS_SETIDS = FeatMandatory,
-        P_PWRITE_APPENDS = FeatOff,
-        P_RENAME_CTIME = FeatMandatory,
-        P_STRICT_ATIME = FeatOff,
-        P_STICKY_WRITE_ARM = FeatOff,
-        P_CHOWN_SUPP_GROUP = FeatMandatory,
-        P_ERR_NOTEMPTY = FeatMandatory,
-        P_ERR_STICKY_ACCES = FeatMandatory,
-        P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
-        P_ERR_LOCK_AGAIN = FeatMandatory
-    ).* from "./posix"
-    import posixops.* from "./posix_ops"
-}
-
-// The NFS3-loopback profile (client -> in-process server ->
-// backend), pinned to `--probe --backend nfs3_{memfs,diskfs,cairn}` on
-// 2026-08-12: all three backends probe identically behind the server, so one
-// instance serves the three.  No copy/clone offload (the VFS copy fallback
-// refuses proxy handles) and no SEEK_DATA/SEEK_HOLE in the NFS3 protocol;
-// atime propagates strictly (reads refresh it through the wire attributes).
-module posixNfs3 {
-    import posix(
-        F_COPY_RANGE = FeatOff,
-        F_CLONE_RANGE = FeatOff,
-        F_SEEK_HOLE = FeatOff,
-        F_ROOT = FeatIfAdvertised,
-        P_GID_FROM_PARENT = FeatOff,
-        P_SGID_INHERIT = FeatOff,
-        P_WRITE_CLEARS_SETIDS = FeatMandatory,
-        P_PWRITE_APPENDS = FeatOff,
-        P_RENAME_CTIME = FeatMandatory,
-        P_STRICT_ATIME = FeatMandatory,
-        P_STICKY_WRITE_ARM = FeatOff,
-        P_CHOWN_SUPP_GROUP = FeatMandatory,
-        P_ERR_NOTEMPTY = FeatMandatory,
-        P_ERR_STICKY_ACCES = FeatMandatory,
-        P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
-        P_ERR_LOCK_AGAIN = FeatMandatory
-    ).* from "./posix"
-    import posixops.* from "./posix_ops"
-}
-
-// The NFS4-loopback profile, pinned the same day: again identical
-// across the three backends.  NFS4.2 SEEK backs SEEK_DATA/SEEK_HOLE; atime
-// is not strictly observed.  unlink(dir) now yields EISDIR
-// (P_ERR_UNLINKDIR_ISDIR mandatory, matching nfs3 and the engine backends):
-// the generic remove path enforces the rmdir/unlink type assertion for every
-// backend (vfs_proc_remove.c), so the nfs4 client's type-agnostic bare REMOVE
-// no longer removes a directory.
-module posixNfs4 {
-    import posix(
-        F_COPY_RANGE = FeatOff,
-        F_CLONE_RANGE = FeatOff,
-        F_SEEK_HOLE = FeatMandatory,
-        F_ROOT = FeatIfAdvertised,
-        P_GID_FROM_PARENT = FeatOff,
-        P_SGID_INHERIT = FeatOff,
-        P_WRITE_CLEARS_SETIDS = FeatMandatory,
-        P_PWRITE_APPENDS = FeatOff,
-        P_RENAME_CTIME = FeatMandatory,
-        P_STRICT_ATIME = FeatOff,
-        P_STICKY_WRITE_ARM = FeatOff,
-        P_CHOWN_SUPP_GROUP = FeatMandatory,
-        P_ERR_NOTEMPTY = FeatMandatory,
-        P_ERR_STICKY_ACCES = FeatMandatory,
-        P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
-        P_ERR_LOCK_AGAIN = FeatMandatory
-    ).* from "./posix"
-    import posixops.* from "./posix_ops"
-}
-
-// The chimera FUSE profile, pinned to `posix_replay.py --probe` against
-// fuse_quint_driver (the in-process FUSE harness) on 2026-08-26.  It differs
-// from the memfs profile it is served by in three ways, all of them properties
-// of the FUSE transport rather than of the backend:
-//
-//   * no reflink.  FICLONERANGE is an ioctl; there is no FUSE request for it
-//     and fuse_file_operations has no ->remap_file_range, so the kernel answers
-//     EOPNOTSUPP without the server ever seeing the call.
-//   * strict atime.  Every read reaches the server (no page cache to satisfy
-//     it), so memfs's relatime update is observed rather than hidden behind a
-//     stale cached attribute the way the direct POSIX client hides it.
-//   * no chgrp to a supplementary group.  fuse_in_header carries a single gid,
-//     so the server cannot tell that the caller belongs to the target group and
-//     refuses with EPERM.  Measured on a live mount: as uid 200 gid 20 with
-//     groups 20,30, `chgrp 30` fails EPERM where `chgrp 20` succeeds.
-module posixFuse {
-    import posix(
-        F_COPY_RANGE = FeatMandatory,
-        F_CLONE_RANGE = FeatOff,
-        F_SEEK_HOLE = FeatMandatory,
-        F_ROOT = FeatIfAdvertised,
-        P_GID_FROM_PARENT = FeatOff,
-        P_SGID_INHERIT = FeatOff,
-        P_WRITE_CLEARS_SETIDS = FeatMandatory,
-        P_PWRITE_APPENDS = FeatOff,
-        P_RENAME_CTIME = FeatMandatory,
-        P_STRICT_ATIME = FeatMandatory,
-        P_STICKY_WRITE_ARM = FeatOff,
-        P_CHOWN_SUPP_GROUP = FeatOff,
-        P_ERR_NOTEMPTY = FeatMandatory,
-        P_ERR_STICKY_ACCES = FeatMandatory,
-        P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
-        P_ERR_LOCK_AGAIN = FeatMandatory
-    ).* from "./posix"
-    import posixops.* from "./posix_ops"
-}
-
-// Linux + ext4, pinned to `harness/posix/posix_replay.py --probe` measured
-// on a 6.x kernel over a strictatime-mounted ext4 (2026-09-02).  This is the
-// profile the ext4 conformance suite replays, and the reason it is worth
-// replaying: three knobs differ from every backend the model was developed
-// against, so the corpus generated here exercises branches no other instance
-// reaches.
-//
-//   * P_PWRITE_APPENDS on.  Linux's pwrite() through an O_APPEND descriptor
-//     appends instead of writing at the given offset -- a documented
-//     divergence from POSIX XSH pwrite, which the model carries as a policy
-//     knob rather than a fault.
-//   * P_SGID_INHERIT on.  A new subdirectory of a set-group-ID directory
-//     inherits S_ISGID (XSH mkdir leaves this to the implementation).
-//   * P_ERR_STICKY_ACCES off.  A sticky-directory refusal is EPERM, where
-//     the in-memory backends answer EACCES; XSH unlink names both.
-//
-// F_CLONE_RANGE is off because ext4 has no reflink (FICLONERANGE answers
-// EOPNOTSUPP).  P_STRICT_ATIME holds only under the strictatime mount option
-// the runner passes; relatime would make an atime mark depend on how the
-// previous mtime compares, which is a mount policy rather than a filesystem
-// one.  F_ROOT stays explorable: the harness chooses the credentials, so
-// both draws are real.
-module posixExt4 {
-    import posix(
-        F_COPY_RANGE = FeatMandatory,
-        F_CLONE_RANGE = FeatOff,
-        F_SEEK_HOLE = FeatMandatory,
-        F_ROOT = FeatIfAdvertised,
-        P_GID_FROM_PARENT = FeatOff,
-        P_SGID_INHERIT = FeatMandatory,
-        P_WRITE_CLEARS_SETIDS = FeatMandatory,
-        P_PWRITE_APPENDS = FeatMandatory,
-        P_RENAME_CTIME = FeatMandatory,
-        P_STRICT_ATIME = FeatMandatory,
-        P_STICKY_WRITE_ARM = FeatOff,
-        P_CHOWN_SUPP_GROUP = FeatMandatory,
-        P_ERR_NOTEMPTY = FeatMandatory,
-        P_ERR_STICKY_ACCES = FeatOff,
-        P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
-        P_ERR_LOCK_AGAIN = FeatMandatory
-    ).* from "./posix"
-    import posixops.* from "./posix_ops"
-}
-
-module posixStrict {
-    import posix(
-        F_COPY_RANGE = FeatMandatory,
-        F_CLONE_RANGE = FeatMandatory,
-        F_SEEK_HOLE = FeatMandatory,
-        F_ROOT = FeatMandatory,
-        P_GID_FROM_PARENT = FeatOff,
-        P_SGID_INHERIT = FeatOff,
-        P_WRITE_CLEARS_SETIDS = FeatMandatory,
-        P_PWRITE_APPENDS = FeatOff,
-        P_RENAME_CTIME = FeatOff,
-        P_STRICT_ATIME = FeatMandatory,
-        P_STICKY_WRITE_ARM = FeatOff,
-        P_CHOWN_SUPP_GROUP = FeatMandatory,
-        P_ERR_NOTEMPTY = FeatMandatory,
-        P_ERR_STICKY_ACCES = FeatMandatory,
-        P_ERR_UNLINKDIR_ISDIR = FeatOff,
-        P_ERR_LOCK_AGAIN = FeatMandatory
-    ).* from "./posix"
-    import posixops.* from "./posix_ops"
-}
-
-module posixLinuxish {
-    import posix(
-        F_COPY_RANGE = FeatMandatory,
-        F_CLONE_RANGE = FeatIfAdvertised,
-        F_SEEK_HOLE = FeatMandatory,
-        F_ROOT = FeatIfAdvertised,
-        P_GID_FROM_PARENT = FeatIfAdvertised,
-        P_SGID_INHERIT = FeatIfAdvertised,
-        P_WRITE_CLEARS_SETIDS = FeatMandatory,
-        P_PWRITE_APPENDS = FeatMandatory,
-        P_RENAME_CTIME = FeatMandatory,
-        P_STRICT_ATIME = FeatOff,
-        P_STICKY_WRITE_ARM = FeatOff,
-        P_CHOWN_SUPP_GROUP = FeatMandatory,
-        P_ERR_NOTEMPTY = FeatMandatory,
-        P_ERR_STICKY_ACCES = FeatOff,
-        P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
-        P_ERR_LOCK_AGAIN = FeatMandatory
+        F_ROOT = FeatIfAdvertised
     ).* from "./posix"
     import posixops.* from "./posix_ops"
 }

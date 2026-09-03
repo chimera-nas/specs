@@ -63,6 +63,34 @@ def _only_suid_dropped(f, ctx):
 
 
 DEVIATIONS = [
+    # ------------------------------------------------------------ pwrite
+    Deviation(
+        id="EXT4-14",
+        verdict=SERVER,
+        spec="POSIX.1-2024 XSH pwrite; Linux pwrite(2) BUGS",
+        summary="pwrite through an O_APPEND descriptor appends instead of "
+                "writing at the offset it was given.",
+        root_cause="Linux's write path honours O_APPEND for pwrite as well "
+                   "as write, so the offset argument is ignored whenever the "
+                   "descriptor carries O_APPEND.  pwrite(2) documents it "
+                   "under BUGS: 'POSIX requires that opening a file with the "
+                   "O_APPEND flag should have no effect on the location at "
+                   "which pwrite() writes data.  However, on Linux, ... "
+                   "pwrite() appends data to the end of the file, regardless "
+                   "of the value of offset.'",
+        candidate_fix="XSH pwrite is prescriptive -- it writes at the given "
+                      "offset 'regardless of whether O_APPEND is set' -- so "
+                      "the model asserts that and this is Linux's departure, "
+                      "not a choice the standard offers.  It was a model knob "
+                      "(P_PWRITE_APPENDS) until the widening, which meant the "
+                      "corpus assumed the divergence and could never report "
+                      "it.  Retired only by Linux changing, which it will not.",
+        ops=("RPwrite", "RPwritev"),
+        field="size",
+        # Same post-state shape, different landing offset: the harness's
+        # shadow follows the model, so everything downstream disagrees.
+        reconcilable=False,
+    ),
     # ----------------------------------------------------------------- mkdir
     Deviation(
         id="EXT4-1",
@@ -185,62 +213,6 @@ DEVIATIONS = [
     ),
 
     # ------------------------------------------------- order of checks
-    Deviation(
-        id="EXT4-6",
-        verdict=MODEL,
-        spec="POSIX.1-2024 XSH unlink, rmdir",
-        summary="The write permission on the parent directory is checked "
-                "before the type of the object being removed.",
-        root_cause="Linux resolves the parent, calls "
-                   "may_delete()->inode_permission(MAY_WRITE|MAY_EXEC) on "
-                   "it, and only then looks at what the victim is -- so a "
-                   "caller who may not write the parent gets EACCES (or "
-                   "EPERM from the sticky check) where the model, which "
-                   "judges the type first, answers EISDIR or ENOTDIR.",
-        candidate_fix="POSIX lists both conditions and orders neither, so "
-                      "both answers conform.  Retire by moving the parent "
-                      "permission check ahead of the type check in "
-                      "opUnlink/opRmdir, which costs nothing and matches "
-                      "the only implementations anyone runs.",
-        ops=("RUnlink", "RRmdir"),
-        expected_status=(EISDIR, ENOTDIR, ENOTEMPTY),
-        actual_status=(EACCES, EPERM),
-    ),
-    Deviation(
-        id="EXT4-7",
-        verdict=MODEL,
-        spec="POSIX.1-2024 XSH rename",
-        summary="'The new pathname names a descendant of the old directory' "
-                "is checked before the permission checks.",
-        root_cause="Linux's do_renameat2() runs its EINVAL cases -- a new "
-                   "path inside the old directory, a rename of '.' or '..' "
-                   "-- in the lookup, before may_delete()/may_create() get "
-                   "to judge permissions, so it answers EINVAL where the "
-                   "model answers EACCES.",
-        candidate_fix="XSH rename lists EINVAL and EACCES with no ordering. "
-                      "Retire by hoisting the descendant check in opRename.",
-        ops=("RRename",),
-        expected_status=EACCES,
-        actual_status=EINVAL,
-    ),
-    Deviation(
-        id="EXT4-8",
-        verdict=MODEL,
-        spec="POSIX.1-2024 XSH link",
-        summary="The destination is judged before the source's type, so a "
-                "hard link to a directory reports the destination's error.",
-        root_cause="Linux's do_linkat() resolves and checks path2 first "
-                   "(EEXIST for an existing name, EACCES when its parent is "
-                   "not writable) and only reaches vfs_link()'s "
-                   "'S_ISDIR(inode) -> -EPERM' afterwards.  The model tests "
-                   "the source type first.",
-        candidate_fix="XSH link lists EEXIST, EACCES and EPERM without an "
-                      "order.  Retire by checking the destination first in "
-                      "opLink.",
-        ops=("RLink",),
-        expected_status=EPERM,
-        actual_status=(EEXIST, EACCES),
-    ),
 
     # ------------------------------------------------------------- utimensat
     Deviation(

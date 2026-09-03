@@ -48,43 +48,45 @@ import ext4_deviations                                          # noqa: E402
 
 REGISTRIES = {"ext4": ext4_deviations.REGISTRY}
 
-# The capability/policy profile of Linux + ext4, measured by `--probe` on a
-# 6.x kernel over a strictatime-mounted ext4 (2026-09-02) and pinned here as
-# a regression check; posix_run.qnt's posixExt4 instance pins trace
-# generation to the same profile, so a trace whose LInit profile disagrees is
-# a measurement drift rather than a divergence, and is skipped rather than
-# replayed against a policy the live filesystem does not implement.
-# None = harness-chosen (withRoot: the harness picks the credentials, so both
-# draws are real).
-#
-# Three entries are what makes ext4 worth replaying at all -- the knobs where
-# Linux differs from every backend the model was developed against: pwrite
-# honors O_APPEND (a documented Linux divergence from POSIX XSH pwrite), a
-# new subdirectory inherits S_ISGID, and a sticky-bit refusal is EPERM rather
-# than EACCES.  cloneRange is off because ext4 has no reflink (FICLONERANGE
-# answers EOPNOTSUPP); strictAtime holds only under the strictatime mount
-# option the runner passes, because relatime makes an atime mark depend on
-# how the previous mtime compares.
-EXT4_PROFILE = {
-    "copyRange": True,
-    "cloneRange": False,
-    "seekHole": True,
-    "withRoot": None,
-    "gidFromParent": False,
-    "sgidInherit": True,
-    "writeClearsSets": True,
-    "pwriteAppends": True,
-    "renameCtime": True,
-    "strictAtime": True,
-    "stickyWriteArm": False,
-    "chownSuppGroup": True,
-    "errNotempty": True,
-    "errStickyAcces": False,
-    "errUnlinkDirIsdir": True,
-    "errLockAgain": True,
+# The model no longer carries a per-target policy profile -- see the header
+# of quint/posix/posix_run.qnt.  What a trace can still depend on is whether
+# an optional interface exists, and a trace that meets one the target does
+# not have is reported as NOT APPLICABLE rather than replayed against a
+# capability nobody claimed.  These are the ops that can raise that.
+CAPABILITY_OPS = {
+    "RCopyRange": "copy_file_range",
+    "RCloneRange": "clone_file_range (reflink)",
+    "RLseek": "SEEK_DATA/SEEK_HOLE",
 }
 
-PROFILES = {"ext4": EXT4_PROFILE}
+# What a filesystem answers for an interface it does not implement.  Only
+# EOPNOTSUPP: a target that answers EINVAL for an absent SEEK_DATA/SEEK_HOLE
+# shows up as a divergence to triage rather than a silent skip, which is the
+# safer way round -- EINVAL is a legitimate answer for these ops too, and
+# treating it as "absent" would mask real disagreements.
+NOT_IMPLEMENTED = (95,)         # EOPNOTSUPP / ENOTSUP
+
+# What the model now asserts unconditionally, where it used to carry a knob.
+# `--check-profile` measures the target and reports every one it does not
+# satisfy: each of those has to be a recorded deviation, so this is really a
+# check that the registry is complete rather than a profile comparison.
+# None means "the harness chooses" or "not measurable".
+MODEL_ASSUMES = {
+    "gidFromParent": False,     # egid, unless a S_ISGID parent forces it
+    "sgidInherit": True,        # a new subdir of a setgid dir inherits it
+    "writeClearsSets": True,    # write by an unprivileged owner clears setid
+    "pwriteAppends": False,     # XSH pwrite: at the offset, O_APPEND or not
+    "renameCtime": True,        # rename marks the moved object's ctime
+    "stickyWriteArm": False,    # sticky is not exempted by write permission
+    "chownSuppGroup": True,     # chgrp to any group the caller belongs to
+}
+
+# Departures already written down, per target: measuring one of these is the
+# expected outcome, not a finding.  Anything else this probe turns up is a
+# deviation that has not been recorded yet.
+RECORDED_DEPARTURES = {
+    "ext4": {"pwriteAppends"},  # EXT4-14; pwrite(2) lists it under BUGS
+}
 
 BADFD = 999999
 
@@ -113,6 +115,23 @@ _PLONG = "@plong"
 
 class TraceFormatError(Exception):
     pass
+
+
+class NotApplicable(Exception):
+    """The target lacks an optional interface this trace exercises.
+
+    Not a divergence and not a pass: the trace asked for copy_file_range or
+    reflink or SEEK_HOLE, the filesystem does not implement it, and every
+    step after the refusal would be comparing against a state the model did
+    not predict.  Reported as a SKIP so the gap stays visible and
+    attributable to the interface rather than hidden in a corpus generated
+    per implementation."""
+
+    def __init__(self, step, op, what):
+        self.step = step
+        self.op = op
+        self.what = what
+        super().__init__(f"step {step}: {op} needs {what}")
 
 
 class Divergence(Exception):
@@ -259,10 +278,15 @@ class Replayer:
     AUDIT_PID = 3          # an out-of-band root worker for the final sweep
 
     def __init__(self, driver, caps, registry, keep_going=False,
-                 verbose=False):
+                 verbose=False, strict_atime=True):
         self.drv = driver
         self.bs = driver.block_size
         self.caps = caps
+        # Whether to hold the target to the atime marks the model predicts.
+        # A mount option, not a filesystem property: under relatime whether
+        # an access is recorded depends on how the previous mtime compares,
+        # so the runner mounts strictatime and this stays on.
+        self.strict_atime = strict_atime
         self.registry = registry
         self.keep_going = keep_going
         self.verbose = verbose
@@ -273,6 +297,11 @@ class Replayer:
         self.timemap = {}     # (model ino, field) -> (abstract, (sec, ns))
         self.history = []
         self.deviations_hit = collections.Counter()
+        # (op, canonical, chosen) -> count, for the permitted alternates this
+        # implementation took.  Reported, because "which of the allowed
+        # answers does it give" is worth knowing even though it is not a
+        # divergence.
+        self.alts_taken = collections.Counter()
         self.findings = []
         self.abandoned = None    # (step, deviation id) once state diverges
         self._ctx = {}
@@ -403,16 +432,37 @@ class Replayer:
         return True
 
     def check_status(self, expected, actual, detail=""):
-        """True if the errno matches (proceed with success-path checks)."""
+        """True if the errno matches (proceed with success-path checks).
+
+        The model may name more than one acceptable errno: where POSIX gives
+        a condition two spellings -- rmdir on a non-empty directory is
+        {ENOTEMPTY, EEXIST}, a sticky refusal is {EPERM, EACCES} -- the trace
+        carries the alternates alongside the canonical answer and any of them
+        conforms.  An implementation that picks a permitted alternate is not
+        deviating from anything, so this is not a deviation-registry matter
+        and no entry is written for it."""
         if actual == expected:
             return True
+        if actual in self._ctx.get("alt", ()):
+            self.alts_taken[(self._ctx.get("tag"), expected, actual)] += 1
+            return False
+        # An absent interface refuses every call, whatever the model
+        # expected of the arguments -- ext4 answers FICLONERANGE with
+        # EOPNOTSUPP before it looks at the ranges at all -- so this does not
+        # test `expected`.
+        tag = self._ctx.get("tag")
+        if (actual in NOT_IMPLEMENTED and expected not in NOT_IMPLEMENTED
+                and tag in CAPABILITY_OPS
+                and self._ctx.get("capability_op")):
+            raise NotApplicable(self._ctx.get("step"), tag,
+                                CAPABILITY_OPS[tag])
         self.note("status", expected, actual, detail)
         return False
 
     # -- attribute checks -------------------------------------------------
 
     def check_time(self, mino, field, abstract, wire):
-        if field == "atime" and not self.caps["strictAtime"]:
+        if field == "atime" and not self.strict_atime:
             return
         wire = tuple(wire)
         if abstract < 0:
@@ -594,6 +644,7 @@ class Replayer:
         ino = self.model_ino_of_fd(pid, rv["fd"])
         node = fs["inodes"].get(ino) if ino is not None else None
         self._ctx["whence"] = rv["wh"]["tag"]
+        self._ctx["capability_op"] = rv["wh"]["tag"] in ("WData", "WHole")
         self._ctx["on_dir"] = node is not None and \
             node["ftype"]["tag"] == "FDir"
         # Whether any byte at or after the queried offset was ever WRITTEN,
@@ -704,7 +755,33 @@ class Replayer:
     def op_pwrite(self, pid, rv, res, fs):
         r = self._write_and_shadow("pwrite", pid, rv, res, off=rv["off"])
         self._check_write(r, res)
+        self._check_pwrite_landed(pid, rv, res, fs)
         return r
+
+    def _check_pwrite_landed(self, pid, rv, res, fs):
+        """Did the write land where POSIX says it should?
+
+        XSH pwrite writes at the given offset "regardless of whether
+        O_APPEND is set"; Linux appends instead (pwrite(2), BUGS).  Nothing
+        in the reply says where the bytes went, so the size afterwards is
+        what tells them apart -- and it has to be caught here, because by
+        the time the difference shows up as a surprising file offset several
+        steps later there is nothing left to attribute it to."""
+        if res["e"] != 0 or res.get("ino", -1) < 0:
+            return
+        ofd = (self._ctx.get("ps") or {}).get("fds", {}).get((pid, rv["fd"]))
+        ps = self._ctx.get("ps") or {}
+        if ofd is None or not ps.get("ofds", {}).get(ofd, {}).get("appendF"):
+            return
+        node = fs["inodes"].get(res["ino"])
+        if node is None:
+            return
+        st = self.drv.request(op="fstat", pid=pid, fd=self.rfd(pid, rv["fd"]))
+        if st.get("err") or st.get("size") == node["size"]:
+            return
+        self.note("size", node["size"], st.get("size"),
+                  "pwrite through an O_APPEND descriptor did not land at "
+                  "the offset it was given")
 
     def op_writev(self, pid, rv, res, fs):
         r = self._write_and_shadow("writev", pid, rv, res)
@@ -756,6 +833,7 @@ class Replayer:
         return r
 
     def op_copy_range(self, pid, rv, res, fs):
+        self._ctx["capability_op"] = True
         r = self.drv.request(op="copy_range", pid=pid,
                              fd_in=self.rfd(pid, rv["fdIn"]),
                              off_in=rv["offIn"],
@@ -774,6 +852,7 @@ class Replayer:
         return r
 
     def op_clone_range(self, pid, rv, res, fs):
+        self._ctx["capability_op"] = True
         r = self.drv.request(op="clone_range", pid=pid,
                              dst_fd=self.rfd(pid, rv["fdDst"]),
                              dst_off=rv["offDst"],
@@ -1111,7 +1190,8 @@ class Replayer:
             self.findings = []
             self._ctx = {"tag": tag, "req": req["value"], "res": res["value"],
                          "pid": pid, "fs": state["fs"], "ps": state.get("ps"),
-                         "caps": self.caps, "step": idx}
+                         "caps": self.caps, "step": idx,
+                         "alt": set(label["value"].get("alt", []))}
             signal.alarm(120)
             r = handler(self, pid, req["value"], res["value"], state["fs"])
             signal.alarm(0)
@@ -1459,7 +1539,7 @@ def probe(driver_path, root):
 # Per-trace driving
 # --------------------------------------------------------------------------
 
-def replay_one(driver, trace_path, args, registry, profile):
+def replay_one(driver, trace_path, args, registry):
     """Replay one trace against an already-running driver.
 
     Returns "ok", "skip" or "fail".  The caller resets the filesystem
@@ -1471,14 +1551,9 @@ def replay_one(driver, trace_path, args, registry, profile):
         raise TraceFormatError(f"{trace_path}: first label is not LInit")
     caps = init["value"]["caps"]
 
-    for key, want in profile.items():
-        if want is not None and caps.get(key) != want:
-            print(f"{trace_path}: SKIP: trace profile {key}={caps.get(key)} "
-                  f"does not match the live profile ({want})")
-            return "skip"
-
     rp = Replayer(driver, caps, registry, keep_going=args.keep_going,
-                  verbose=args.verbose)
+                  verbose=args.verbose,
+                  strict_atime=not args.no_strict_atime)
     audited = 0
     steps = 0
     stopped = None       # a deviation that ended the replay before the end
@@ -1487,6 +1562,11 @@ def replay_one(driver, trace_path, args, registry, profile):
         stopped = rp.abandoned
         if stopped is None:
             audited = rp.final_audit(states[-1], len(states) - 1)
+    except NotApplicable as na:
+        print(f"{trace_path}: SKIP: needs {na.what}, which this filesystem "
+              f"does not implement (step {na.step}, {na.op})")
+        rp.cleanup()
+        return "skip"
     except Divergence as div:
         report_divergence(trace_path, div, rp)
         rp.cleanup()
@@ -1500,10 +1580,16 @@ def replay_one(driver, trace_path, args, registry, profile):
               f"finding(s) (survey mode)", file=sys.stderr)
         return "fail"
 
+    alts = ""
+    if rp.alts_taken:
+        alts = "; permitted alternates: " + ", ".join(
+            f"{op} {a} for {e}" for (op, e, a), _ in
+            sorted(rp.alts_taken.items()))
     devs = ""
     if rp.deviations_hit:
         devs = "; known deviations: " + ", ".join(
             f"{k}x{v}" for k, v in sorted(rp.deviations_hit.items()))
+    devs += alts
     if stopped is not None:
         step, dev_id, what = stopped
         print(f"{trace_path}: {steps} of {len(states) - 1} steps replayed, "
@@ -1525,7 +1611,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--root", required=True,
                     help="mount point of the filesystem under test")
-    ap.add_argument("--target", default="ext4", choices=sorted(PROFILES),
+    ap.add_argument("--target", default="ext4", choices=sorted(REGISTRIES),
                     help="which deviation registry and pinned profile to "
                          "use (default: ext4)")
     ap.add_argument("--driver",
@@ -1545,6 +1631,11 @@ def main():
     ap.add_argument("--check-profile", action="store_true",
                     help="measure the live profile and diff it against the "
                          "pinned one")
+    ap.add_argument("--no-strict-atime", action="store_true",
+                    help="do not hold the target to the atime marks the "
+                         "model predicts (for a relatime mount, where "
+                         "whether an access is recorded depends on the "
+                         "previous mtime)")
     ap.add_argument("--keep-going", action="store_true",
                     help="report every divergence in a trace instead of "
                          "stopping at the first unreconciled one")
@@ -1567,10 +1658,24 @@ def main():
         measured = probe(args.driver, root)
         print(json.dumps(measured, indent=2, sort_keys=True))
         if args.check_profile:
-            bad = [k for k, v in PROFILES[args.target].items()
-                   if v is not None and measured.get(k) != v]
-            if bad:
-                print(f"PROFILE drift on: {bad}", file=sys.stderr)
+            recorded = RECORDED_DEPARTURES.get(args.target, set())
+            unrecorded, expected = [], []
+            for key, assumed in MODEL_ASSUMES.items():
+                if assumed is None or measured.get(key) == assumed:
+                    continue
+                (expected if key in recorded else unrecorded).append(
+                    f"{key}: model assumes {assumed}, measured "
+                    f"{measured.get(key)}")
+            for line in expected:
+                print(f"recorded departure -- {line}")
+            if unrecorded:
+                print("\nUNRECORDED departures from what the model assumes:",
+                      file=sys.stderr)
+                for line in unrecorded:
+                    print(f"  {line}", file=sys.stderr)
+                print("Each needs an entry in this target's deviation "
+                      "registry, or the model's assumption is wrong.",
+                      file=sys.stderr)
                 return 1
         return 0
 
@@ -1590,7 +1695,6 @@ def main():
         return 77
 
     registry = REGISTRIES[args.target]
-    profile = PROFILES[args.target]
     driver = Driver(args.driver, root)
     replayed = skipped = failures = ran = 0
     try:
@@ -1601,7 +1705,7 @@ def main():
                     print(f"FATAL: newfs failed before {trace}: {reset}\n"
                           f"{driver.stderr_tail()}", file=sys.stderr)
                     return 1
-            status = replay_one(driver, trace, args, registry, profile)
+            status = replay_one(driver, trace, args, registry)
             if status == "ok":
                 replayed += 1
                 ran += 1
@@ -1610,6 +1714,13 @@ def main():
                 ran += 1
             else:
                 skipped += 1
+                # A capability skip happens PART WAY THROUGH a trace -- the
+                # filesystem has been written to by everything before the
+                # call that turned out to need an absent interface -- so the
+                # next trace still needs a fresh one.  (A skip used to mean
+                # "never touched the filesystem", which is why the reset was
+                # keyed on having run.)
+                ran += 1
     finally:
         driver.close()
 

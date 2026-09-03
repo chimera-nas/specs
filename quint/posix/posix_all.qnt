@@ -16,6 +16,6 @@
 // This module is never simulated or tested itself; --main always selects a
 // module from one of the imported files.  Nothing may be added here.
 module posixAll {
-    import posixMemfs.* from "./posix_run"
+    import posixFull.* from "./posix_run"
     import posixTestStd.* from "./posixTest"
 }

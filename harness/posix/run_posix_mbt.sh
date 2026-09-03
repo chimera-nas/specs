@@ -9,7 +9,7 @@
 # Usage: run_posix_mbt.sh <trace-dir> [trace-glob]
 #
 #   <trace-dir>   directory holding the generated *.itf.json corpus
-#   [trace-glob]  shell glob selecting the batch (default: ext4_*.itf.json).
+#   [trace-glob]  shell glob selecting the batch (default: *.itf.json).
 #                 One ctest per batch, so a divergence names the flavor that
 #                 found it and the batches run in parallel.
 #
@@ -59,7 +59,7 @@ set -u
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 TRACE_DIR=${1:?usage: run_posix_mbt.sh <trace-dir> [trace-glob]}
-TRACE_GLOB=${2:-ext4_*.itf.json}
+TRACE_GLOB=${2:-*.itf.json}
 CHECK_PROFILE=${SPECS_POSIX_CHECK_PROFILE:-0}
 
 TIMEOUT=${SPECS_POSIX_TIMEOUT:-1500}
