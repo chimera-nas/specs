@@ -75,41 +75,45 @@ module posixops {
         }
 
     // The capability/policy profile pinned at init.
+    // What is left after the widening: the optional interfaces, whose absence
+    // makes a call fail rather than answer differently, and the shape of the
+    // process universe.  Everything else that used to live here -- the errno
+    // acceptance sets, the creation-time discretion, the setid and timestamp
+    // policies -- was a place the model picked one of several conforming
+    // answers, which cost a corpus per implementation and recorded every
+    // other implementation as deviating.  Those are now either stated as an
+    // acceptance set the harness honours (see ALT_* above) or resolved to the
+    // POSIX reading, with departures recorded against the implementation that
+    // departs.
     type Caps = {
         // Optional features (absent => the op fails EOPNOTSUPP/EINVAL):
         copyRange: bool,     // copy_file_range supported
         cloneRange: bool,    // clone_file_range supported
         seekHole: bool,      // lseek SEEK_HOLE/SEEK_DATA supported
         // Universe shape:
-        withRoot: bool,      // process 0 runs with euid 0
-        // Creation-time discretion (POSIX acceptance sets):
-        gidFromParent: bool, // new object gid = parent dir's gid (else egid)
-        sgidInherit: bool,   // new subdir inherits parent's S_ISGID
-        // Setid clearing / divergence policies:
-        writeClearsSets: bool,  // write/truncate by unprivileged clears setids
-        pwriteAppends: bool,    // pwrite honors O_APPEND (Linux divergence;
-                                // POSIX: writes at the given offset)
-        renameCtime: bool,      // rename marks the moved object's ctime
-        strictAtime: bool,      // harness enforces atime marking exactly
-        stickyWriteArm: bool,   // sticky check exempts write-permitted callers
-        chownSuppGroup: bool,   // chgrp to a *supplementary* group is accepted
-                                // (false: only the caller's egid is, because
-                                // the transport carries no group list)
-        // Errno choices POSIX leaves open (true = first-named value):
-        errNotempty: bool,      // ENOTEMPTY (else EEXIST) for non-empty dirs
-        errStickyAcces: bool,   // EACCES (else EPERM) for sticky violations
-        errUnlinkDirIsdir: bool, // EISDIR (else EPERM) for unlink(directory)
-        errLockAgain: bool      // EAGAIN (else EACCES) for lock conflicts
+        withRoot: bool       // process 0 runs with euid 0
     }
 
-    pure def errNonempty(caps: Caps): int =
-        if (caps.errNotempty) ENOTEMPTY else EEXIST
-    pure def errSticky(caps: Caps): int =
-        if (caps.errStickyAcces) EACCES else EPERM
-    pure def errUnlinkDir(caps: Caps): int =
-        if (caps.errUnlinkDirIsdir) EISDIR else EPERM
-    pure def errLockBusy(caps: Caps): int =
-        if (caps.errLockAgain) EAGAIN else EACCES
+    // Conditions for which POSIX names more than one errno.  Each is a
+    // canonical value -- the one the mature implementations answer -- plus
+    // the alternates the text also allows; a handler emits both through
+    // outErrAlt and the harness accepts any member.  These were four
+    // policy knobs (P_ERR_*), which meant a corpus per choice and an
+    // implementation recorded as deviating for picking the other permitted
+    // answer.
+    //
+    //   rmdir/rename onto a non-empty directory  XSH rmdir: [ENOTEMPTY]
+    //   sticky-directory refusal                 XSH unlink: [EPERM]/[EACCES]
+    //   unlink of a directory                    XSH unlink: [EPERM]/[EISDIR]
+    //   a lock the holder will not yield         XSH fcntl: [EACCES]/[EAGAIN]
+    pure val ERR_NOTEMPTY = ENOTEMPTY
+    pure val ALT_NOTEMPTY = Set(EEXIST)
+    pure val ERR_STICKY = EPERM
+    pure val ALT_STICKY = Set(EACCES)
+    pure val ERR_UNLINKDIR = EISDIR
+    pure val ALT_UNLINKDIR = Set(EPERM)
+    pure val ERR_LOCKBUSY = EAGAIN
+    pure val ALT_LOCKBUSY = Set(EACCES)
 
     // ------------------------------------------------------------------
     // The file access permission algorithm (XBD 4.5)
@@ -147,14 +151,17 @@ module posixops {
 
     // Sticky-bit deletion rule (XBD 4.5): removing/renaming an entry in a
     // S_ISVTX directory needs euid == entry owner, euid == dir owner, or
-    // privilege; Issue 8 leaves an additional write-permission-on-the-file
-    // arm implementation-defined (caps.stickyWriteArm).
+    // privilege.  Issue 8 leaves an additional write-permission-on-the-file
+    // arm implementation-defined; no mature implementation takes it (Linux
+    // does not, and neither does any backend measured here), so the model
+    // encodes the three criteria and an implementation that also honours
+    // write permission is the one that deviates.
     pure def stickyOk(caps: Caps, cr: Cred, dnode: Inode, vnode: Inode): bool =
         not(bitOn(dnode.mode, MB_SVTX)) or
         isPriv(cr) or
         cr.euid == vnode.uid or
         cr.euid == dnode.uid or
-        (caps.stickyWriteArm and mayWrite(cr, vnode))
+        false
 
     // Apply umask to a requested creation mode (bitwise m & ~mask over the
     // nine permission bits; the setid/sticky bits pass through untouched).
@@ -166,18 +173,22 @@ module posixops {
                     acc + b
                 else acc)
 
-    // Group of a newly created object (acceptance set pinned in caps; a
-    // S_ISGID parent directory forces the parent's gid).
-    pure def newGid(caps: Caps, cr: Cred, dnode: Inode): int =
-        if (bitOn(dnode.mode, MB_SGID) or caps.gidFromParent) dnode.gid
+    // Group of a newly created object.  XSH allows either the parent's group
+    // or the creator's effective group -- pjdfstest asserts only membership
+    // in that pair, because it runs across four operating systems -- but a
+    // model that goes on reasoning about the object needs one answer, so it
+    // takes the rule Linux and the BSDs share: the creator's egid, unless a
+    // S_ISGID parent forces the parent's group.  An implementation that
+    // always takes the parent's group deviates.
+    pure def newGid(cr: Cred, dnode: Inode): int =
+        if (bitOn(dnode.mode, MB_SGID)) dnode.gid
         else cr.egid
 
     // Mode of a newly created directory: umask-filtered, plus inherited
     // S_ISGID when the policy says so.
-    pure def newDirMode(caps: Caps, m: int, mask: int, dnode: Inode): int = {
+    pure def newDirMode(m: int, mask: int, dnode: Inode): int = {
         val base = applyUmask(m, mask)
-        if (caps.sgidInherit and bitOn(dnode.mode, MB_SGID) and
-                not(bitOn(base, MB_SGID)))
+        if (bitOn(dnode.mode, MB_SGID) and not(bitOn(base, MB_SGID)))
             base + MB_SGID
         else base
     }
@@ -467,13 +478,35 @@ module posixops {
         }
 
     // Handler outcome.
-    type Out = { fs2: Fs, ps2: Pstate, res: OpRes }
+    //
+    // `alt` is the set of errnos POSIX *also* permits for the condition this
+    // handler just hit, beyond the one in `res`.  Where the standard names
+    // two values for one condition -- rmdir on a non-empty directory is
+    // {ENOTEMPTY, EEXIST}, a sticky-directory refusal is {EACCES, EPERM} --
+    // an implementation that answers either is conforming, and a model that
+    // picks one and calls the other a divergence is recording its own guess.
+    // So the model states the acceptance set and the harness honors it:
+    // actual in {res.e} union alt passes.
+    //
+    // Only the handler knows which condition fired -- an EACCES from the
+    // sticky check and an EACCES from a permission check are the same number
+    // and not the same rule -- so the set is filled in here rather than
+    // reconstructed downstream.  It is deliberately NOT a general "these
+    // errnos are interchangeable" table: an empty alt means the standard
+    // says one thing, and a disagreement there is a finding.
+    type Out = { fs2: Fs, ps2: Pstate, res: OpRes, alt: Set[int] }
 
     pure def out(fs: Fs, ps: Pstate, r: OpRes): Out =
-        { fs2: fs, ps2: ps, res: r }
+        { fs2: fs, ps2: ps, res: r, alt: Set() }
+
+    pure def outAlt(fs: Fs, ps: Pstate, r: OpRes, a: Set[int]): Out =
+        { fs2: fs, ps2: ps, res: r, alt: a }
 
     pure def outErr(fs: Fs, ps: Pstate, e: int): Out =
         out(fs, ps, SOk({ e: e }))
+
+    pure def outErrAlt(fs: Fs, ps: Pstate, e: int, a: Set[int]): Out =
+        outAlt(fs, ps, SOk({ e: e }), a)
 
     // Read/write result constructors.  Errors carry no shadow target
     // (ino -1); successes carry the target inode + landing byte offset.
@@ -567,7 +600,7 @@ module posixops {
                     // that did not exist (mode-000 creation works).
                     val m = applyUmask(fl.mode, ps.umask.get(p))
                     val node = mkFile(m, cr.euid,
-                                      newGid(caps, cr, fs.inodes.get(r.par)))
+                                      newGid(cr, fs.inodes.get(r.par)))
                     val mk = fsMknode(fs, r.par, r.leaf, node)
                     val fd = fdLowest(ps, p, 0, MAX_FDS)
                     if (fd == -1) out(fs, ps, SFd({ e: EMFILE, fd: -1 }))
@@ -604,7 +637,6 @@ module posixops {
                     else {
                         val fsT = if (fl.trunc and nd.ftype == FReg)
                                       fsResize(fs, r.ino, 0,
-                                          caps.writeClearsSets and
                                           not(isPriv(cr)))
                                   else fs
                         out(fsT, psOpen(ps, p, fd, r.ino, fl.acc, fl.appendF),
@@ -729,7 +761,7 @@ module posixops {
                 val at = if (o.appendF) fs.inodes.get(o.ino).size
                          else o.offset
                 val wr = fsWrite(fs, o.ino, at, len, pat,
-                    caps.writeClearsSets and not(isPriv(cr)))
+                    not(isPriv(cr)))
                 out(wr.fs2, psSetOffset(ps, p, fd, at + len),
                     rwOk(len, o.ino, at))
             }
@@ -770,13 +802,15 @@ module posixops {
             else if (off < 0)
                 out(fs, ps, rwErr(EINVAL))
             else {
-                // POSIX: pwrite writes at the given offset regardless of
-                // O_APPEND; Linux appends anyway (caps.pwriteAppends).
-                val at = if (o.appendF and caps.pwriteAppends)
-                             fs.inodes.get(o.ino).size
-                         else off
+                // XSH pwrite writes at the given offset "regardless of
+                // whether O_APPEND is set".  Linux appends anyway, which its
+                // own pwrite(2) lists under BUGS -- so this is a case where
+                // the standard speaks and an implementation departs, and the
+                // departure belongs in that implementation's registry rather
+                // than in a knob here.
+                val at = off
                 val wr = fsWrite(fs, o.ino, at, len, pat,
-                    caps.writeClearsSets and not(isPriv(cr)))
+                    not(isPriv(cr)))
                 out(wr.fs2, ps, rwOk(len, o.ino, at))
             }
         }
@@ -793,7 +827,7 @@ module posixops {
             else if (len < 0) outErr(fs, ps, EINVAL)
             else if (not(mayWrite(cr, nd))) outErr(fs, ps, EACCES)
             else out(fsResize(fs, r.ino, len,
-                         caps.writeClearsSets and not(isPriv(cr))),
+                         not(isPriv(cr))),
                      ps, SOk({ e: OK }))
         }
     }
@@ -809,7 +843,7 @@ module posixops {
             else if (fs.inodes.get(o.ino).ftype != FReg)
                 outErr(fs, ps, EINVAL)
             else out(fsResize(fs, o.ino, len,
-                         caps.writeClearsSets and not(isPriv(cr))),
+                         not(isPriv(cr))),
                      ps, SOk({ e: OK }))
         }
 
@@ -913,11 +947,13 @@ module posixops {
     // clear on regular files carrying an execute bit (Issue 8 makes the
     // no-execute case and the privileged case implementation-defined; the
     // model clears exactly when an execute bit is present).
-    // `caps.chownSuppGroup` false narrows the "member of the target group"
-    // arm to the caller's egid alone.  POSIX permits chgrp to any group the
-    // caller belongs to, but a server reached over a transport that carries
-    // no supplementary group list (FUSE: fuse_in_header has a single gid)
-    // cannot see the rest of the list and refuses them with EPERM.
+    // The "member of the target group" arm covers the caller's whole group
+    // list: XSH chown permits chgrp to any group the caller belongs to, so
+    // the model asserts that.  A server reached over a transport that
+    // carries no supplementary group list (FUSE: fuse_in_header has a single
+    // gid) cannot see the rest of the list and refuses with EPERM -- that is
+    // a property of the transport, and it belongs in that implementation's
+    // deviation registry rather than in a knob here.
     pure def chownCommon(fs: Fs, ps: Pstate, caps: Caps, p: Pid, i: Ino,
                          u: int, g: int): Out = {
         val cr = psCred(ps, p)
@@ -935,9 +971,13 @@ module posixops {
                 isPriv(cr) or
                 (cr.euid == nd.uid and
                  (u == -1 or u == nd.uid) and
-                 (g == -1 or
-                  (if (caps.chownSuppGroup) inGroup(cr, g)
-                   else cr.egid == g)))
+                 /* Restating the current group is not a change, so it needs
+                  * no membership -- the same exemption the uid arm above
+                  * already has.  Linux guards its whole membership test with
+                  * !vfsgid_eq(attr->ia_vfsgid, i_gid).  Found the other way
+                  * round for once: chimera allowed a no-op chgrp the model
+                  * refused. */
+                 (g == -1 or g == nd.gid or inGroup(cr, g)))
             if (not(allowed)) outErr(fs, ps, EPERM)
             else out(fsChown(fs, i, u, g, nd.ftype == FReg and anyExec(nd.mode)),
                      ps, SOk({ e: OK }))
@@ -1057,7 +1097,18 @@ module posixops {
         val at = atStart(fs, ps, p, dfd, pth)
         if (at.e != OK) { e: at.e, par: -1, leaf: "" }
         else {
-            val r = resolve(fs, caps, cr, at.start, pth, false)
+            // Resolve with the trailing slash suppressed.  A trailing slash
+            // normally forces the final component to be followed and to be
+            // a directory (ENOTDIR otherwise, XBD 4.16), but on the create
+            // path the final component is judged, not traversed: XSH mkdir
+            // and symlink both list EEXIST as "the named file exists" with
+            // no qualification, and Linux answers EEXIST for `mkdir("f/")`,
+            // `mkdir("dangling/")` and `symlink(t, "f/")` alike.  Only when
+            // nothing is there does the slash matter, and slashOk below is
+            // what says whether this caller tolerates it.  Found by
+            // replaying this corpus at ext4.
+            val r = resolve(fs, caps, cr, at.start, pth.with("slash", false),
+                            false)
             if (r.err != OK) { e: r.err, par: -1, leaf: "" }
             else if (r.ino != -1) { e: EEXIST, par: -1, leaf: "" }
             else if (pth.slash and not(slashOk))
@@ -1075,8 +1126,8 @@ module posixops {
         if (g.e != OK) outErr(fs, ps, g.e)
         else {
             val dnode = fs.inodes.get(g.par)
-            val node = mkDir(newDirMode(caps, m, ps.umask.get(p), dnode),
-                             cr.euid, newGid(caps, cr, dnode))
+            val node = mkDir(newDirMode(m, ps.umask.get(p), dnode),
+                             cr.euid, newGid(cr, dnode))
             val mk = fsMknode(fs, g.par, g.leaf, node)
             outErr(mk.fs2, ps, OK)
         }
@@ -1094,9 +1145,9 @@ module posixops {
             val dnode = fs.inodes.get(g.par)
             val mode = applyUmask(m, ps.umask.get(p))
             val node = if (ft == FReg) mkFile(mode, cr.euid,
-                                              newGid(caps, cr, dnode))
+                                              newGid(cr, dnode))
                        else mkSpecial(ft, mode, cr.euid,
-                                      newGid(caps, cr, dnode))
+                                      newGid(cr, dnode))
             outErr(fsMknode(fs, g.par, g.leaf, node).fs2, ps, OK)
         }
     }
@@ -1112,7 +1163,7 @@ module posixops {
         if (g.e != OK) outErr(fs, ps, g.e)
         else {
             val dnode = fs.inodes.get(g.par)
-            val node = mkSymlink(tgt, 511, cr.euid, newGid(caps, cr, dnode))
+            val node = mkSymlink(tgt, 511, cr.euid, newGid(cr, dnode))
             outErr(fsMknode(fs, g.par, g.leaf, node).fs2, ps, OK)
         }
     }
@@ -1126,11 +1177,18 @@ module posixops {
         else {
             val ro = resolveEx(fs, caps, cr, atO.start, pthOld, followOld)
             if (ro.err != OK) outErr(fs, ps, ro.err)
-            else if (fs.inodes.get(ro.ino).ftype == FDir)
-                outErr(fs, ps, EPERM)
             else {
+                // The destination is judged first.  XSH link lists EEXIST,
+                // EACCES and EPERM without ordering them, and every
+                // implementation measured resolves and checks path2 -- an
+                // existing name, an unwritable parent -- before it reaches
+                // "the source is a directory".  Ordering the model the other
+                // way made a conforming implementation look like it was
+                // deviating, on a point the standard does not speak to.
                 val g = createGate(fs, ps, caps, p, dfdNew, pthNew, false)
                 if (g.e != OK) outErr(fs, ps, g.e)
+                else if (fs.inodes.get(ro.ino).ftype == FDir)
+                    outErr(fs, ps, EPERM)
                 else {
                     val lk = fsLink(fs, ro.ino, g.par, g.leaf)
                     outErr(lk.fs2, ps,
@@ -1156,10 +1214,17 @@ module posixops {
             else {
                 val dnode = fs.inodes.get(r.par)
                 val vnode = fs.inodes.get(r.ino)
-                if (vnode.ftype == FDir) outErr(fs, ps, errUnlinkDir(caps))
-                else if (not(mayWrite(cr, dnode))) outErr(fs, ps, EACCES)
+                // Write permission on the parent is checked before what
+                // the victim is: Linux's may_delete() runs
+                // inode_permission(MAY_WRITE) on the directory and only then
+                // looks at the entry.  XSH orders neither, so a model that
+                // judged the type first reported EISDIR where every
+                // implementation says EACCES.
+                if (not(mayWrite(cr, dnode))) outErr(fs, ps, EACCES)
+                else if (vnode.ftype == FDir)
+                    outErrAlt(fs, ps, ERR_UNLINKDIR, ALT_UNLINKDIR)
                 else if (not(stickyOk(caps, cr, dnode, vnode)))
-                    outErr(fs, ps, errSticky(caps))
+                    outErrAlt(fs, ps, ERR_STICKY, ALT_STICKY)
                 else {
                     val rm = fsRemove(fs, r.par, r.leaf, psPinned(ps))
                     outErr(rm.fs2, ps, if (rm.st == FsOk) OK else ENOENT)
@@ -1183,12 +1248,13 @@ module posixops {
             else {
                 val dnode = fs.inodes.get(r.par)
                 val vnode = fs.inodes.get(r.ino)
-                if (vnode.ftype != FDir) outErr(fs, ps, ENOTDIR)
+                // As in opUnlink: the parent's write permission first.
+                if (not(mayWrite(cr, dnode))) outErr(fs, ps, EACCES)
+                else if (vnode.ftype != FDir) outErr(fs, ps, ENOTDIR)
                 else if (vnode.ents.keys().size() > 0)
-                    outErr(fs, ps, errNonempty(caps))
-                else if (not(mayWrite(cr, dnode))) outErr(fs, ps, EACCES)
+                    outErrAlt(fs, ps, ERR_NOTEMPTY, ALT_NOTEMPTY)
                 else if (not(stickyOk(caps, cr, dnode, vnode)))
-                    outErr(fs, ps, errSticky(caps))
+                    outErrAlt(fs, ps, ERR_STICKY, ALT_STICKY)
                 else {
                     val rm = fsRemove(fs, r.par, r.leaf, psPinned(ps))
                     outErr(rm.fs2, ps, if (rm.st == FsOk) OK else ENOENT)
@@ -1221,15 +1287,26 @@ module posixops {
                     val srcNode = fs.inodes.get(rs.ino)
                     val noop = (rs.par == rt.par and rs.leaf == rt.leaf) or
                                (rt.ino != -1 and rt.ino == rs.ino)
-                    if (not(mayWrite(cr, sdnode)) or
+                    // "The new directory pathname names a descendant of
+                    // the old directory" is judged before the permission
+                    // checks.  XSH rename lists EINVAL and EACCES without
+                    // ordering them, and Linux settles the descendant case
+                    // during lookup, well before may_delete/may_create get
+                    // to judge permissions -- so a model that checked
+                    // permissions first reported a conforming implementation
+                    // as deviating on a point the standard leaves open.
+                    if (srcNode.ftype == FDir and
+                            fsDescOf(fs, rs.ino).contains(rt.par))
+                        outErr(fs, ps, EINVAL)
+                    else if (not(mayWrite(cr, sdnode)) or
                             not(mayWrite(cr, tdnode)))
                         outErr(fs, ps, EACCES)
                     else if (not(stickyOk(caps, cr, sdnode, srcNode)))
-                        outErr(fs, ps, errSticky(caps))
+                        outErrAlt(fs, ps, ERR_STICKY, ALT_STICKY)
                     else if (rt.ino != -1 and not(noop) and
                              not(stickyOk(caps, cr, tdnode,
                                           fs.inodes.get(rt.ino))))
-                        outErr(fs, ps, errSticky(caps))
+                        outErrAlt(fs, ps, ERR_STICKY, ALT_STICKY)
                     else {
                         val rn = fsRename(fs, rs.par, rs.leaf, rt.par,
                                           rt.leaf, psPinned(ps))
@@ -1238,13 +1315,14 @@ module posixops {
                                 else if (rn.st == FsInval) EINVAL
                                 else if (rn.st == FsNotdir) ENOTDIR
                                 else if (rn.st == FsIsdir) EISDIR
-                                else errNonempty(caps)
-                        val fsC = if (e == OK and not(noop) and
-                                          caps.renameCtime)
+                                else ERR_NOTEMPTY
+                        val fsC = if (e == OK and not(noop))
                                       fsMark(rn.fs2, rs.ino, false, false,
                                              true)
                                   else rn.fs2
-                        outErr(fsC, ps, e)
+                        outErrAlt(fsC, ps, e,
+                                  if (e == ERR_NOTEMPTY) ALT_NOTEMPTY
+                                  else Set())
                     }
                 }
             }
@@ -1456,7 +1534,7 @@ module posixops {
                     if (lk == LkUn)
                         out(fs, lockUnset(ps, p, i, lo, hi), SOk({ e: OK }))
                     else if (lockConflict(ps, p, i, lo, hi, lkType(lk)))
-                        outErr(fs, ps, errLockBusy(caps))
+                        outErrAlt(fs, ps, ERR_LOCKBUSY, ALT_LOCKBUSY)
                     else
                         out(fs, lockSet(ps, p, i, lo, hi, lkType(lk)),
                             SOk({ e: OK }))
@@ -1467,7 +1545,7 @@ module posixops {
                     if (lk == LkUn)
                         out(fs, lockUnset(ps, p, i, lo, hi), SOk({ e: OK }))
                     else if (lockConflict(ps, p, i, lo, hi, lkType(lk)))
-                        outErr(fs, ps, errLockBusy(caps))
+                        outErrAlt(fs, ps, ERR_LOCKBUSY, ALT_LOCKBUSY)
                     else
                         out(fs, lockSet(ps, p, i, lo, hi, lkType(lk)),
                             SOk({ e: OK }))
@@ -1475,15 +1553,26 @@ module posixops {
         }
 
     // lockf: exclusive locks only, section starts at the current offset
-    // (len 0 = to end, modeled as the whole span), requires a descriptor
-    // open for writing.
+    // (len 0 = to end, modeled as the whole span).
+    //
+    // Write access is required only by the two commands that TAKE a lock.
+    // XSH lockf's EBADF condition is "fildes is not a valid open file
+    // descriptor; or function is F_LOCK or F_TLOCK and fildes is not a
+    // valid file descriptor open for writing" -- F_ULOCK and F_TEST are
+    // deliberately absent from that list, and Linux (where lockf is a
+    // glibc wrapper over fcntl F_SETLK / F_GETLK) accepts both on a
+    // read-only descriptor.  Found by replaying this corpus at ext4.
+    pure def lockfTakes(cmd: LockfCmd): bool =
+        cmd == LfLock or cmd == LfTlock
+
     pure def opLockf(fs: Fs, ps: Pstate, caps: Caps, p: Pid, fd: Fd,
                      cmd: LockfCmd, len: int): Out =
         if (not(fdLive(ps, p, fd))) outErr(fs, ps, EBADF)
         else {
             val o = fdOfd(ps, p, fd)
             val i = o.ino
-            if (not(accWrites(o.acc))) outErr(fs, ps, EBADF)
+            if (lockfTakes(cmd) and not(accWrites(o.acc)))
+                outErr(fs, ps, EBADF)
             else if (fs.inodes.get(i).ftype != FReg) outErr(fs, ps, EINVAL)
             else if (len < 0) outErr(fs, ps, EINVAL)
             else {
@@ -1495,18 +1584,18 @@ module posixops {
                         out(fs, lockUnset(ps, p, i, lo, hi), SOk({ e: OK }))
                     | LfTst =>
                         if (lockConflict(ps, p, i, lo, hi, LWrite))
-                            outErr(fs, ps, errLockBusy(caps))
+                            outErrAlt(fs, ps, ERR_LOCKBUSY, ALT_LOCKBUSY)
                         else outErr(fs, ps, OK)
                     | LfLock =>
                         // Blocking variant; generators keep it
                         // conflict-free (see CSetlkw).
                         if (lockConflict(ps, p, i, lo, hi, LWrite))
-                            outErr(fs, ps, errLockBusy(caps))
+                            outErrAlt(fs, ps, ERR_LOCKBUSY, ALT_LOCKBUSY)
                         else out(fs, lockSet(ps, p, i, lo, hi, LWrite),
                                  SOk({ e: OK }))
                     | LfTlock =>
                         if (lockConflict(ps, p, i, lo, hi, LWrite))
-                            outErr(fs, ps, errLockBusy(caps))
+                            outErrAlt(fs, ps, ERR_LOCKBUSY, ALT_LOCKBUSY)
                         else out(fs, lockSet(ps, p, i, lo, hi, LWrite),
                                  SOk({ e: OK }))
                 }

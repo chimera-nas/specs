@@ -22,6 +22,7 @@ divergence in that server — and both are worth having written down.
 |---------|-------------------|-------|
 | [`samba/`](samba/) | Samba `smbd` | `quint/smb2` |
 | [`nfs/`](nfs/) | NFS-Ganesha `ganesha.nfsd`; the Linux kernel NFS server (knfsd) in a KVM guest | `quint/nfs` (nfs3, nfs4) |
+| [`posix/`](posix/) | a real ext4 filesystem in a KVM guest | `quint/posix` |
 
 Only the third-party servers' records live here. A consuming project's own
 divergences belong in that project, next to the code that has to change --
@@ -40,3 +41,10 @@ checks, and the divergences found so far.
 private NFS-Ganesha instance per trace; `ctest -L knfsd` replays the same corpus
 against the Linux kernel NFS server booted in a KVM guest. See
 [`nfs/README.md`](nfs/README.md).
+
+## posix
+
+`ctest -L ext4` replays the generated POSIX corpus against a real ext4
+filesystem in a KVM guest -- syscalls rather than a protocol, so the harness
+runs inside the guest, forks one process per model credential, and chroots
+into the filesystem it is measuring. See [`posix/README.md`](posix/README.md).

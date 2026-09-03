@@ -66,8 +66,11 @@ hiding it in what was never generated.
 
 ## Testing the models against a real server
 
-`ctest -L samba` replays the generated SMB2 corpus against a real Samba `smbd`
-and fails on any divergence that is not already recorded and analyzed.
+`ctest -L samba` replays the generated SMB2 corpus against a real Samba `smbd`,
+`ctest -L ganesha` / `-L knfsd` the NFS corpora against NFS-Ganesha and the
+Linux kernel NFS server, and `ctest -L ext4` the POSIX corpus against a real
+ext4 filesystem in a KVM guest. Each fails on any divergence that is not
+already recorded and analyzed.
 
 This exists because a model developed alongside one implementation drifts
 toward it: the traces keep passing, and the passing keeps meaning less, because

@@ -20,19 +20,7 @@ module posixTestStd {
         F_COPY_RANGE = FeatMandatory,
         F_CLONE_RANGE = FeatMandatory,
         F_SEEK_HOLE = FeatMandatory,
-        F_ROOT = FeatOff,
-        P_GID_FROM_PARENT = FeatOff,
-        P_SGID_INHERIT = FeatOff,
-        P_WRITE_CLEARS_SETIDS = FeatMandatory,
-        P_PWRITE_APPENDS = FeatOff,
-        P_RENAME_CTIME = FeatOff,
-        P_STRICT_ATIME = FeatMandatory,
-        P_STICKY_WRITE_ARM = FeatOff,
-        P_CHOWN_SUPP_GROUP = FeatMandatory,
-        P_ERR_NOTEMPTY = FeatMandatory,
-        P_ERR_STICKY_ACCES = FeatMandatory,
-        P_ERR_UNLINKDIR_ISDIR = FeatOff,
-        P_ERR_LOCK_AGAIN = FeatMandatory
+        F_ROOT = FeatOff
     ).* from "./posix"
 
     // ---------------- helpers ----------------
@@ -40,6 +28,14 @@ module posixTestStd {
     def lastE = match lastOp {
         | LCall(c) => errOf(c.res)
         | LInit(x) => -999
+    }
+
+    // The errnos the model says POSIX *also* permits for the condition the
+    // last call hit.  Asserted alongside lastE wherever the standard names
+    // more than one, so the acceptance set is itself under test.
+    def lastAlt = match lastOp {
+        | LCall(c) => c.alt
+        | LInit(x) => Set()
     }
 
     def lastFd = match lastOp {
@@ -454,12 +450,12 @@ module posixTestStd {
                                 mode: 511 })))
         .expect(lastE == OK)
         .then(runOp(0, RRmdir({ dfd: -1, pth: ap(["d"]) })))
-        .expect(lastE == ENOTEMPTY)
+        .expect(lastE == ERR_NOTEMPTY and lastAlt == ALT_NOTEMPTY)
         .then(runOp(0, RUnlink({ dfd: -1, pth: ap(["d", "x"]) })))
         .expect(lastE == OK)
         // unlink of a directory: EPERM in this instance's profile
         .then(runOp(0, RUnlink({ dfd: -1, pth: ap(["d"]) })))
-        .expect(lastE == EPERM)
+        .expect(lastE == ERR_UNLINKDIR and lastAlt == ALT_UNLINKDIR)
         .then(runOp(0, RRmdir({ dfd: -1,
                                 pth: { abs: true, comps: ["d", "."],
                                        slash: false } })))
@@ -493,7 +489,7 @@ module posixTestStd {
                                 mode: 511 })))
         .expect(lastE == OK)
         .then(runOp(1, RUnlink({ dfd: -1, pth: ap(["t", "f0"]) })))
-        .expect(lastE == EACCES)
+        .expect(lastE == ERR_STICKY and lastAlt == ALT_STICKY)
         .then(runOp(1, RUnlink({ dfd: -1, pth: ap(["t", "f1"]) })))
         .expect(lastE == OK)
         .then(runOp(1, RMknod({ pth: ap(["t", "f1"]), ft: FReg,
@@ -503,7 +499,7 @@ module posixTestStd {
         .expect(lastE == OK)
         .then(runOp(1, RRename({ dfdOld: -1, pthOld: ap(["t", "f0"]),
                                  dfdNew: -1, pthNew: ap(["t", "z"]) })))
-        .expect(lastE == EACCES)
+        .expect(lastE == ERR_STICKY and lastAlt == ALT_STICKY)
         .then(runOp(0, RChmod({ dfd: -1, pth: ap(["t"]), mode: 511 })))
         .expect(lastE == OK)
         .then(runOp(1, RUnlink({ dfd: -1, pth: ap(["t", "f0"]) })))
@@ -817,12 +813,16 @@ module posixTestStd {
         .then(runOp(0, RMknod({ pth: ap(["d", "f"]), ft: FReg,
                                 mode: 511 })))
         .expect(lastE == OK and fsGet(fs, 2).gid == 30)
-        // subdirectory: group inherited, S_ISGID bit not (knob off)
+        // subdirectory of a set-group-ID directory: both the group and the
+        // bit are inherited.  XSH mkdir leaves the bit to the
+        // implementation, and Linux and the BSDs alike propagate it, so the
+        // model encodes that rather than parameterizing it -- an
+        // implementation that drops the bit is the one that deviates.
         .then(runOp(0, RMkdir({ dfd: -1, pth: ap(["d", "sub"]),
                                 mode: 493 })))
         .expect(lastE == OK and fsGet(fs, 3).gid == 30 and
-                not(bitOn(fsGet(fs, 3).mode, MB_SGID)))
-        // plain directory: group = egid (P_GID_FROM_PARENT off)
+                bitOn(fsGet(fs, 3).mode, MB_SGID))
+        // plain (non-setgid) parent: the group is the creator's egid
         .then(runOp(0, RMkdir({ dfd: -1, pth: ap(["p"]), mode: 493 })))
         .expect(lastE == OK and fsGet(fs, 4).gid == 10)
 
@@ -908,19 +908,7 @@ module posixTestRoot {
         F_COPY_RANGE = FeatMandatory,
         F_CLONE_RANGE = FeatMandatory,
         F_SEEK_HOLE = FeatMandatory,
-        F_ROOT = FeatMandatory,
-        P_GID_FROM_PARENT = FeatOff,
-        P_SGID_INHERIT = FeatOff,
-        P_WRITE_CLEARS_SETIDS = FeatMandatory,
-        P_PWRITE_APPENDS = FeatOff,
-        P_RENAME_CTIME = FeatOff,
-        P_STRICT_ATIME = FeatMandatory,
-        P_STICKY_WRITE_ARM = FeatOff,
-        P_CHOWN_SUPP_GROUP = FeatMandatory,
-        P_ERR_NOTEMPTY = FeatMandatory,
-        P_ERR_STICKY_ACCES = FeatMandatory,
-        P_ERR_UNLINKDIR_ISDIR = FeatOff,
-        P_ERR_LOCK_AGAIN = FeatMandatory
+        F_ROOT = FeatMandatory
     ).* from "./posix"
 
     def lastE = match lastOp {
