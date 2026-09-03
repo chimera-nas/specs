@@ -62,6 +62,11 @@ jobs:
           load: true
           tags: specs-dev:${{ github.sha }}
           cache-from: type=registry,ref=ghcr.io/chimera-nas/specs-dev:amd64
+          # The sole writer.  The three conformance jobs below build the same
+          # image from the same Dockerfile and import this cache, but must not
+          # export it: four concurrent mode=max writes to one tag on every push
+          # to main is four uploads of identical content racing for last-writer,
+          # and those jobs hold packages: read precisely because they never push.
           cache-to: ${{ github.ref == 'refs/heads/main' && 'type=registry,ref=ghcr.io/chimera-nas/specs-dev:amd64,mode=max' || '' }}
 
       # On the host, not in the image: it is only needed to push the finished
@@ -121,11 +126,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Layers are cached in GHCR, next to chimera's.  cache-to only on main --
-      # as chimera does -- so a PR can read the shared cache but never write to
-      # it.  load: true because the image is used by `docker run` in the steps
-      # below rather than pushed anywhere: a fork's pull_request token cannot
-      # write a package, and this workflow has to work for a fork.
+      # Import only; the build job above owns this tag.  load: true because the
+      # image is used by `docker run` in the steps below rather than pushed
+      # anywhere -- a fork's pull_request token cannot write a package, and
+      # this workflow has to work for a fork.
       - name: Build the devcontainer image
         uses: docker/build-push-action@v7
         with:
@@ -135,7 +139,6 @@ jobs:
           load: true
           tags: specs-dev:${{ github.sha }}
           cache-from: type=registry,ref=ghcr.io/chimera-nas/specs-dev:amd64
-          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=registry,ref=ghcr.io/chimera-nas/specs-dev:amd64,mode=max' || '' }}
 
       - name: Generate the corpus
         run: |
@@ -202,7 +205,6 @@ jobs:
           load: true
           tags: specs-dev:${{ github.sha }}
           cache-from: type=registry,ref=ghcr.io/chimera-nas/specs-dev:amd64
-          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=registry,ref=ghcr.io/chimera-nas/specs-dev:amd64,mode=max' || '' }}
 
       # What this runner can host, recorded once per run so a SKIP has a
       # visible cause: the kernel NFS server needs /dev/kvm (a guest) or a host
@@ -275,7 +277,6 @@ jobs:
           load: true
           tags: specs-dev:${{ github.sha }}
           cache-from: type=registry,ref=ghcr.io/chimera-nas/specs-dev:amd64
-          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=registry,ref=ghcr.io/chimera-nas/specs-dev:amd64,mode=max' || '' }}
 
       - name: Install oras
         uses: oras-project/setup-oras@v1
