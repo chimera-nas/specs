@@ -86,7 +86,33 @@ See [`harness/README.md`](harness/README.md).
 
 A consuming project embeds this repo as a submodule and drives the generated
 traces against its server with its own replay harness. When the submodule is
-clean it can fetch the prebuilt trace bundle for that exact commit from
-`ghcr.io/chimera-nas/specs:<sha>` instead of building it; otherwise (spec
-development) it builds the corpus locally from these sources. CI publishes the
-`<sha>`-tagged bundle on every push to `main`.
+clean it can fetch the prebuilt trace bundle instead of building it; otherwise
+(spec development) it builds the corpus locally from these sources.
+
+Bundles are published under two coordinates, and they answer different
+questions:
+
+- `ghcr.io/chimera-nas/specs:<sha>` — published on every push to `main`. This
+  is the mechanical coordinate: a consumer keys on its submodule's committed
+  HEAD, so any `main` commit it pins can be fetched, and a pin with no bundle
+  degrades to local generation rather than to a wrong corpus.
+- `ghcr.io/chimera-nas/specs:<version>` — published when a `v*` tag is pushed.
+  This is the coordinate a human names, and the one that makes retention a
+  policy: releases are kept, and unreferenced per-commit bundles can be pruned
+  without breaking a consumer.
+
+Every bundle carries a `manifest.json` recording the `source_sha` it was
+generated from. A consumer that resolves a bundle by *version* must check that
+against its own pinned HEAD before trusting the traces, because a version names
+the last tagged commit and a consumer may be pinned past it — replaying a corpus
+against models it was not generated from is the one failure mode this whole
+arrangement exists to prevent.
+
+### Releasing
+
+`VERSION` carries a `-dev` suffix between releases, and no bundle is ever
+published for a `-dev` version. To cut a release: set `VERSION` to the release
+number, commit, tag `v<number>`, push the tag — CI publishes both coordinates —
+then set `VERSION` to the next `-dev` and commit. Bumping straight back to
+`-dev` is what keeps a mid-release commit from resolving to the previous
+release's corpus.
