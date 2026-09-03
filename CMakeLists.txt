@@ -27,6 +27,8 @@ project(specs NONE)
 enable_testing()
 
 find_program(QUINT_BIN quint REQUIRED)
+# tools/gen.js drives quint's staged API directly; see the specs_gen comment.
+find_program(NODE_BIN NAMES node nodejs REQUIRED)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/.quint-version PINNED_QUINT)
@@ -42,7 +44,18 @@ endif()
 message(STATUS "specs: quint ${HAVE_QUINT} (pinned ${PINNED_QUINT})")
 
 set(Q ${CMAKE_CURRENT_SOURCE_DIR}/quint)
-set(T ${CMAKE_CURRENT_BINARY_DIR}/traces)
+# Where the trace corpus lives.  Normally it is generated into the build tree;
+# SPECS_TRACES_DIR points at a corpus produced elsewhere instead, which is how
+# the conformance jobs replay the exact bytes the build job generated, gated and
+# published rather than three independent regenerations of their own.
+set(SPECS_TRACES_DIR "" CACHE PATH
+    "Replay a prebuilt trace corpus at this path instead of generating one")
+if(SPECS_TRACES_DIR)
+    set(T ${SPECS_TRACES_DIR})
+    message(STATUS "specs: replaying the prebuilt corpus at ${T} (generation disabled)")
+else()
+    set(T ${CMAKE_CURRENT_BINARY_DIR}/traces)
+endif()
 
 file(GLOB POSIX_QNT ${Q}/posix/*.qnt)
 file(GLOB NFS_QNT   ${Q}/nfs/*.qnt)
@@ -61,51 +74,105 @@ set(SELFTEST_STAMPS)     # every self-test stamp, gating generation
 # Model self-check (quint test): a bounded random walk with invariant checks.
 # Produces a stamp so it reruns only when the model changes, and generation
 # depends on it, so a model regression stops the corpus at the source.
+# Map any model file in a family to that family's umbrella entry point:
+# <dir>/<stem>_all.qnt, where the stem drops a _run or Test suffix.  So
+# posix_run.qnt and posixTest.qnt both resolve to posix/posix_all.qnt, and
+# nfs3.qnt / nfs4_run.qnt resolve to different umbrellas despite sharing a
+# directory.  The umbrella names one module from each file, which is enough for
+# quint's resolver to pull both -- and their shared base -- into one module
+# tree, so a family is elaborated once for its tests AND its generation.
+function(specs_umbrella model out)
+    get_filename_component(dir ${model} DIRECTORY)
+    get_filename_component(nm ${model} NAME_WE)
+    string(REGEX REPLACE "(_run|Test)$" "" stem "${nm}")
+    set(${out} "${dir}/${stem}_all.qnt" PARENT_SCOPE)
+endfunction()
+
 function(specs_selftest name model mainarg samples deps_var)
-    set(stamp ${CMAKE_CURRENT_BINARY_DIR}/${name}.stamp)
-    if(mainarg STREQUAL "-")
-        set(_main)
-    else()
-        set(_main --main=${mainarg})
-    endif()
-    add_custom_command(OUTPUT ${stamp}
-        COMMAND ${QUINT_BIN} test --max-samples=${samples} ${_main} ${model} > /dev/null
-        COMMAND ${CMAKE_COMMAND} -E touch ${stamp}
-        DEPENDS ${${deps_var}}
-        COMMENT "model self-test: ${name}"
-        VERBATIM)
-    set(SELFTEST_STAMPS ${SELFTEST_STAMPS} ${stamp} PARENT_SCOPE)
-    set(SELFTEST_${name} ${stamp} PARENT_SCOPE)
+    specs_umbrella("${model}" umbrella)
+    string(MAKE_C_IDENTIFIER "${umbrella}" key)
+    set_property(GLOBAL APPEND PROPERTY SPECS_GEN_KEYS "${key}")
+    set_property(GLOBAL PROPERTY SPECS_GEN_${key}_UMBRELLA "${umbrella}")
+    set_property(GLOBAL APPEND PROPERTY SPECS_GEN_${key}_DEPS ${${deps_var}} ${model})
+    set_property(GLOBAL APPEND_STRING PROPERTY SPECS_GEN_${key}_TESTS
+        "{\"name\":\"${name}\",\"main\":\"${mainarg}\",\"maxSamples\":${samples}},")
+
+    # The gate is now internal: tools/gen.js runs a family's self-tests before
+    # its generation batches and stops on the first failure, so a model
+    # regression still stops the corpus at the source -- in one process instead
+    # of behind a stamp file.  These stay defined and empty because the
+    # specs_gen() call sites name them as their gate argument.
+    set(SELFTEST_${name} "" PARENT_SCOPE)
 endfunction()
 
 # Generate `ntraces` traces from one (model, main, flavor, steps, seed) with a
 # single quint invocation (--n-traces amortizes quint's node-startup cost over
 # the batch).  `naming` is the output basename with a literal {seq} placeholder
 # and no .itf.json suffix.  --invariant=inv gates every emitted trace.
+# Batches are ACCUMULATED here and emitted, grouped by model, in
+# specs_gen_finalize() below -- one build edge per model rather than per batch.
+#
+# The reason is cost.  A batch is a (model, --main, --step) triple, and
+# `quint run` handles exactly one per process, so each batch re-elaborates the
+# model from scratch.  Measured on nfs4_run.qnt: elaboration is 13-21s and
+# `quint typecheck` alone costs as much as a full `quint run`, while simulating
+# a batch costs ~0.45s.  nfs4 has 18 batches over one model -- ~270s of work for
+# ~8s of traces.  tools/gen.js elaborates once and simulates every batch against
+# the same typechecked model, which brings that to ~21s.
+#
+# The traces are unchanged; see tools/gen.js for how that was verified.
 function(specs_gen subdir model mainarg flavor steps ntraces seed naming gate_var deps_var)
     set(outdir ${T}/${subdir})
-    if(mainarg STREQUAL "-")
-        set(_main)
-    else()
-        set(_main --main=${mainarg})
-    endif()
     set(traces)
     math(EXPR last "${ntraces} - 1")
     foreach(seq RANGE 0 ${last})
         string(REPLACE "{seq}" "${seq}" nm "${naming}")
         list(APPEND traces ${outdir}/${nm}.itf.json)
     endforeach()
-    add_custom_command(OUTPUT ${traces}
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${outdir}
-        COMMAND ${QUINT_BIN} run ${model} ${_main}
-                --step=${flavor} --max-steps=${steps}
-                --max-samples=${ntraces} --n-traces=${ntraces} --seed=${seed}
-                --invariant=inv
-                --out-itf=${outdir}/${naming}.itf.json > /dev/null
-        DEPENDS ${${deps_var}} ${${gate_var}}
-        COMMENT "generate ${ntraces} ${subdir} traces ${mainarg}/${flavor} steps=${steps}"
-        VERBATIM)
+
+    # One bucket per model file.  Every call site for a given model passes the
+    # same gate and deps (checked: posix/nfs3/nfs4/smb2/nfsaux/s3/nfsdrc each
+    # have exactly one pair), so the bucket can carry them.
+    specs_umbrella("${model}" umbrella)
+    string(MAKE_C_IDENTIFIER "${umbrella}" key)
+    set_property(GLOBAL APPEND PROPERTY SPECS_GEN_KEYS "${key}")
+    set_property(GLOBAL PROPERTY SPECS_GEN_${key}_UMBRELLA "${umbrella}")
+    set_property(GLOBAL APPEND PROPERTY SPECS_GEN_${key}_DEPS ${${deps_var}} ${model})
+    set_property(GLOBAL APPEND PROPERTY SPECS_GEN_${key}_TRACES ${traces})
+    set_property(GLOBAL APPEND_STRING PROPERTY SPECS_GEN_${key}_JSON
+        "{\"outdir\":\"${outdir}\",\"main\":\"${mainarg}\",\"step\":\"${flavor}\",\"maxSteps\":${steps},\"nTraces\":${ntraces},\"seed\":\"${seed}\",\"naming\":\"${naming}\"},")
+
     set(ALL_TRACES ${ALL_TRACES} ${traces} PARENT_SCOPE)
+endfunction()
+
+# Emit the accumulated batches: one spec file and one build edge per model.
+# Must be called after every specs_gen() and before the targets that consume
+# ALL_TRACES.
+function(specs_gen_finalize)
+    get_property(keys GLOBAL PROPERTY SPECS_GEN_KEYS)
+    list(REMOVE_DUPLICATES keys)
+    foreach(key ${keys})
+        get_property(umbrella GLOBAL PROPERTY SPECS_GEN_${key}_UMBRELLA)
+        get_property(deps     GLOBAL PROPERTY SPECS_GEN_${key}_DEPS)
+        get_property(traces   GLOBAL PROPERTY SPECS_GEN_${key}_TRACES)
+        get_property(json     GLOBAL PROPERTY SPECS_GEN_${key}_JSON)
+        get_property(tests    GLOBAL PROPERTY SPECS_GEN_${key}_TESTS)
+        list(REMOVE_DUPLICATES deps)
+        string(REGEX REPLACE ",$" "" json "${json}")
+        string(REGEX REPLACE ",$" "" tests "${tests}")
+        list(LENGTH traces ntraces)
+
+        set(spec ${CMAKE_CURRENT_BINARY_DIR}/gen_${key}.json)
+        file(GENERATE OUTPUT ${spec} CONTENT
+             "{\"quintCli\":\"${QUINT_BIN}\",\"model\":\"${umbrella}\",\"tests\":[${tests}],\"batches\":[${json}]}\n")
+
+        get_filename_component(fam ${umbrella} NAME_WE)
+        add_custom_command(OUTPUT ${traces}
+            COMMAND ${NODE_BIN} ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen.js ${spec}
+            DEPENDS ${deps} ${umbrella} ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen.js ${spec}
+            COMMENT "${fam}: self-test + generate ${ntraces} traces (one elaboration)"
+            VERBATIM)
+    endforeach()
 endfunction()
 
 # ---------------------------------------------------------------------------
@@ -396,7 +463,16 @@ endforeach()
 # ---------------------------------------------------------------------------
 # Aggregate + bundle
 # ---------------------------------------------------------------------------
-add_custom_target(specs_traces ALL DEPENDS ${ALL_TRACES})
+if(SPECS_TRACES_DIR)
+    # Nothing to build: the traces are inputs, not outputs.  Emitting the
+    # generation edges here would make ninja treat every trace file as something
+    # it must produce, and the corpus would be regenerated on top of the one
+    # supplied -- which is the whole thing this mode exists to avoid.
+    add_custom_target(specs_traces)
+else()
+    specs_gen_finalize()
+    add_custom_target(specs_traces ALL DEPENDS ${ALL_TRACES})
+endif()
 
 add_custom_target(bundle
     COMMAND ${CMAKE_COMMAND} -E env QUINT_VERSION=${PINNED_QUINT}
