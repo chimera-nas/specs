@@ -1,8 +1,10 @@
 version = 1
 
-# Files that carry no inline SPDX header: the pinned quint version marker and
-# the git ignore list.  Everything else tags its license in-file.
+# Files that carry no inline SPDX header: the pinned quint version marker, the
+# declared release version, and the git ignore list.  Everything else tags its
+# license in-file.  VERSION is read verbatim by bundle.sh and by consumers, so
+# it holds a bare version string and nothing else.
 [[annotations]]
-path = [".quint-version", ".gitignore"]
+path = [".quint-version", "VERSION", ".gitignore"]
 SPDX-FileCopyrightText = "2026 The Quint Specs Authors"
 SPDX-License-Identifier = "MIT"

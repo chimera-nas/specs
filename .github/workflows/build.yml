@@ -4,39 +4,45 @@ name: build-specs
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
-# Pull through the internal mirrors, as chimera's workflows do.  Not a
-# connectivity requirement -- the ARC runners reach the public registries
-# fine -- but this image installs a Ubuntu base plus samba, node and a
-# toolchain on every run, and there is no reason to fetch all of that from the
-# internet each time.  The Dockerfile already takes both as ARGs and rewrites
-# its apt sources / base image from them; these are what feed it.  npm is not
-# mirrored (chimera has no npm proxy either), so quint still comes from the
-# public registry.
+# Everything comes from the public registries now: these jobs run on
+# GitHub-hosted runners, which have no route to the internal mirrors the
+# self-hosted ones used.  The Dockerfile still takes APT_MIRROR and
+# DOCKER_MIRROR as ARGs and defaults both to empty, so nothing there has to
+# change -- this workflow simply stops overriding them.  What keeps the image
+# build cheap is the buildx layer cache below, not a package mirror.
+#
+# That cache lives in the GitHub Actions cache (type=gha), not in a registry.
+# Nothing here pushes an image -- every job builds the devcontainer and loads it
+# into its own docker daemon -- so a registry would exist solely to hold cache
+# blobs.  The Actions cache also scopes by branch, which does for free what a
+# registry needs an explicit ref guard for: a pull request reads the default
+# branch's cache and writes only its own scope, so it can never poison main.
+# And its read works from a fork's read-only token without depending on how
+# package permissions resolve there.  GHCR is left doing the one job it is
+# actually for here: holding the published trace bundles.
 env:
-  APT_MIRROR: http://repository.mdh.quantum.com/repository/pkgs/ubuntu
-  DOCKER_MIRROR: repository.mdh.quantum.com/
   # The kvm-test-base guest the knfsd conformance job boots (it carries
   # nfs-kernel-server as of v1.10.0).  amd64 only -- KVM needs a matching host.
   KNFSD_IMAGE: ghcr.io/chimera-nas/kvm-test-base:ubuntu2404-v1.10.0-amd64
 
 jobs:
   # Heavy: simulates every model to generate the corpus, then runs the coverage
-  # gates over it -- so it gets a full-size ARC runner.
+  # gates over it.
   #
-  # Everything runs INSIDE the devcontainer image rather than on the runner.
-  # The ARC runners are minimal hosts: they carry git and the runner itself and
-  # not much else -- no cmake, no node -- where the GitHub-hosted images this
-  # job used to run on came with a whole SDK preinstalled.  Rather than
-  # reassembling that toolchain on the host one setup-action at a time, use the
-  # image that already defines it: .devcontainer is exactly "the dependency set
-  # of cmake -B build && cmake --build build && ctest", pinned quint included.
-  # That also makes CI and a developer's container the same environment, so a
-  # green run here means the same thing locally.
+  # Everything runs INSIDE the devcontainer image rather than on the runner,
+  # even though a GitHub-hosted image comes with a whole SDK preinstalled:
+  # reassembling that toolchain on the host one setup-action at a time is both
+  # more work and less faithful than using the image that already defines it.
+  # .devcontainer is exactly "the dependency set of cmake -B build && cmake
+  # --build build && ctest", pinned quint included, which also makes CI and a
+  # developer's container the same environment -- so a green run here means the
+  # same thing locally.
   build:
-    runs-on: arc-amd64
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write        # publish the trace bundle to GHCR
@@ -47,9 +53,6 @@ jobs:
         uses: docker/setup-buildx-action@v4
         with:
           driver: docker-container
-          buildkitd-config-inline: |
-            [registry."docker.io"]
-              mirrors = ["repository.mdh.quantum.com:5001"]
 
       - name: Build the devcontainer image
         uses: docker/build-push-action@v7
@@ -59,11 +62,17 @@ jobs:
           platforms: linux/amd64
           load: true
           tags: specs-dev:${{ github.sha }}
-          cache-from: type=registry,ref=repository.mdh.quantum.com:5004/cache/specs-dev:amd64
-          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=registry,ref=repository.mdh.quantum.com:5004/cache/specs-dev:amd64,mode=max' || '' }}
-          build-args: |
-            APT_MIRROR=${{ env.APT_MIRROR }}
-            DOCKER_MIRROR=${{ env.DOCKER_MIRROR }}
+          cache-from: type=gha,scope=specs-dev
+          # The sole writer, and only from main.  The three conformance jobs
+          # below build the identical image from the identical Dockerfile and
+          # import this same scope, but exporting from all four would be four
+          # uploads of identical content racing for last-writer.
+          #
+          # mode=min, not max: this Dockerfile's weight is one apt/npm install
+          # layer rather than a chain of intermediate stages, so min caches
+          # substantially the same thing for a fraction of the size -- which
+          # matters against a cache quota measured in gigabytes per repository.
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,scope=specs-dev,mode=min' || '' }}
 
       # On the host, not in the image: it is only needed to push the finished
       # bundle, which the bind mount below leaves in the workspace.
@@ -73,8 +82,13 @@ jobs:
       # -LE samba|ganesha: the conformance suites are the `samba` and `ganesha`
       # jobs' business and need live servers; this job gates the corpus itself.
       - name: Generate the corpus, gate it, and bundle it
+        env:
+          # bundle.sh stamps this into the bundle's manifest.  Passed in rather
+          # than resolved by git inside the container, where the bind-mounted
+          # checkout is not owned by root and git refuses it as dubious.
+          SPECS_SOURCE_SHA: ${{ github.sha }}
         run: |
-          docker run --rm -v "$PWD:/specs" -w /specs specs-dev:${{ github.sha }} \
+          docker run --rm -e SPECS_SOURCE_SHA -v "$PWD:/specs" -w /specs specs-dev:${{ github.sha }} \
             bash -c '
               set -e
               cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -83,15 +97,51 @@ jobs:
               cmake --build build --target bundle
             '
 
-      - name: Publish bundle to GHCR (main only, keyed by commit SHA)
-        if: github.ref == 'refs/heads/main'
+      # Two coordinates for the same bytes, and each does a different job.
+      #
+      # The commit SHA is what a consumer resolves mechanically: chimera keys on
+      # its submodule's committed HEAD, so any main commit it pins can be
+      # fetched, and a pin with no bundle degrades to generating the corpus
+      # locally rather than to a wrong one.  Keeping this means the fast path
+      # stays available for every commit, not only for tagged ones.
+      #
+      # The release tag is the coordinate a human names, and the one that makes
+      # retention a policy instead of an accident: releases are kept, and
+      # unreferenced per-commit bundles can be pruned without breaking anyone.
+      #
+      # A tag push publishes both, since the tagged commit deserves its SHA
+      # coordinate too even if it was tagged before landing on main.
+      # The corpus is generated exactly once per run.  The conformance jobs
+      # below replay THESE bytes rather than regenerating their own, which is
+      # cheaper and, more usefully, means what samba/ganesha/knfsd replay is
+      # provably the same corpus that was gated here and published below --
+      # not three independent regenerations that merely ought to agree.
+      - name: Upload the corpus for the conformance jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: specs-traces
+          path: build/specs-traces.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Publish the bundle to GHCR
+        if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
         working-directory: build
         run: |
+          set -euo pipefail
           echo "${{ secrets.GITHUB_TOKEN }}" | \
             oras login ghcr.io -u "${{ github.actor }}" --password-stdin
-          oras push "ghcr.io/chimera-nas/specs:${{ github.sha }}" \
-              --annotation "org.opencontainers.image.source=https://github.com/chimera-nas/specs" \
-              specs-traces.tar.gz:application/gzip
+          push() {
+            echo "publishing ghcr.io/chimera-nas/specs:$1"
+            oras push "ghcr.io/chimera-nas/specs:$1" \
+                --annotation "org.opencontainers.image.source=https://github.com/chimera-nas/specs" \
+                --annotation "org.opencontainers.image.revision=${{ github.sha }}" \
+                specs-traces.tar.gz:application/gzip
+          }
+          push "${{ github.sha }}"
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            push "${GITHUB_REF_NAME}"
+          fi
 
   # Replay the generated SMB2 corpus against a real Samba server.  This is what
   # keeps the models honest: a model developed alongside one implementation
@@ -100,7 +150,8 @@ jobs:
   # replay client), privileged because each test isolates its smbd in a network
   # namespace so the batches can run concurrently on :445.
   samba:
-    runs-on: arc-amd64
+    needs: [build]
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -110,16 +161,10 @@ jobs:
         uses: docker/setup-buildx-action@v4
         with:
           driver: docker-container
-          buildkitd-config-inline: |
-            [registry."docker.io"]
-              mirrors = ["repository.mdh.quantum.com:5001"]
 
-      # Layers are cached in the internal registry, next to chimera's, rather
-      # than in GitHub's artifact/actions cache: the cache then lives beside the
-      # runners that use it instead of crossing the internet twice per run.
-      # cache-to only on main -- as chimera does -- so a PR can read the shared
-      # cache but never write to it.  load: true because the image is used by
-      # `docker run` in the steps below rather than pushed anywhere.
+      # Import only; the build job above owns this scope.  load: true because
+      # the image is used by `docker run` in the steps below rather than pushed
+      # anywhere.
       - name: Build the devcontainer image
         uses: docker/build-push-action@v7
         with:
@@ -128,18 +173,28 @@ jobs:
           platforms: linux/amd64
           load: true
           tags: specs-dev:${{ github.sha }}
-          cache-from: type=registry,ref=repository.mdh.quantum.com:5004/cache/specs-dev:amd64
-          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=registry,ref=repository.mdh.quantum.com:5004/cache/specs-dev:amd64,mode=max' || '' }}
-          build-args: |
-            APT_MIRROR=${{ env.APT_MIRROR }}
-            DOCKER_MIRROR=${{ env.DOCKER_MIRROR }}
+          cache-from: type=gha,scope=specs-dev
 
-      - name: Generate the corpus
+      # The corpus comes from the build job rather than being regenerated here.
+      # SPECS_TRACES_DIR makes cmake treat the traces as inputs, so this
+      # configure registers the replay tests against them and emits no
+      # generation edges at all.
+      - name: Fetch the corpus generated by the build job
+        uses: actions/download-artifact@v4
+        with:
+          name: specs-traces
+          path: .
+
+      - name: Unpack the corpus and configure against it
         run: |
+          mkdir -p prebuilt-traces
+          tar -xzf specs-traces.tar.gz -C prebuilt-traces
+          echo "corpus: $(find prebuilt-traces -name '*.itf.json' | wc -l) traces"
           docker run --rm --privileged -v "$PWD:/specs" -w /specs specs-dev:${{ github.sha }} \
             bash -c '
               set -e
-              cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+              cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                    -DSPECS_TRACES_DIR=/specs/prebuilt-traces
               cmake --build build -j"$(nproc)"
             '
 
@@ -168,7 +223,8 @@ jobs:
   # Privileged: each batch runs its servers in a network namespace and
   # loop-mounts an ext4 image for the export.
   ganesha:
-    runs-on: arc-amd64
+    needs: [build]
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -178,9 +234,6 @@ jobs:
         uses: docker/setup-buildx-action@v4
         with:
           driver: docker-container
-          buildkitd-config-inline: |
-            [registry."docker.io"]
-              mirrors = ["repository.mdh.quantum.com:5001"]
 
       - name: Build the devcontainer image
         uses: docker/build-push-action@v7
@@ -190,11 +243,7 @@ jobs:
           platforms: linux/amd64
           load: true
           tags: specs-dev:${{ github.sha }}
-          cache-from: type=registry,ref=repository.mdh.quantum.com:5004/cache/specs-dev:amd64
-          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=registry,ref=repository.mdh.quantum.com:5004/cache/specs-dev:amd64,mode=max' || '' }}
-          build-args: |
-            APT_MIRROR=${{ env.APT_MIRROR }}
-            DOCKER_MIRROR=${{ env.DOCKER_MIRROR }}
+          cache-from: type=gha,scope=specs-dev
 
       # What this runner can host, recorded once per run so a SKIP has a
       # visible cause: the kernel NFS server needs /dev/kvm (a guest) or a host
@@ -208,12 +257,26 @@ jobs:
           docker run --rm --privileged specs-dev:${{ github.sha }} \
             bash -c 'ls -l /dev/kvm /dev/loop-control 2>&1; ganesha.nfsd -v | head -1'
 
-      - name: Generate the corpus
+      # The corpus comes from the build job rather than being regenerated here.
+      # SPECS_TRACES_DIR makes cmake treat the traces as inputs, so this
+      # configure registers the replay tests against them and emits no
+      # generation edges at all.
+      - name: Fetch the corpus generated by the build job
+        uses: actions/download-artifact@v4
+        with:
+          name: specs-traces
+          path: .
+
+      - name: Unpack the corpus and configure against it
         run: |
+          mkdir -p prebuilt-traces
+          tar -xzf specs-traces.tar.gz -C prebuilt-traces
+          echo "corpus: $(find prebuilt-traces -name '*.itf.json' | wc -l) traces"
           docker run --rm --privileged -v "$PWD:/specs" -w /specs specs-dev:${{ github.sha }} \
             bash -c '
               set -e
-              cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+              cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                    -DSPECS_TRACES_DIR=/specs/prebuilt-traces
               cmake --build build -j"$(nproc)"
             '
 
@@ -221,7 +284,7 @@ jobs:
         run: |
           docker run --rm --privileged -v "$PWD:/specs" -w /specs specs-dev:${{ github.sha }} \
             bash -c '
-              ctest --test-dir build -L ganesha -V --no-tests=error -j 4
+              ctest --test-dir build -L ganesha -V --no-tests=error -j 2
               rc=$?
               if [ "$rc" != 0 ]; then
                 echo "=== ctest exited $rc; LastTest.log ==="
@@ -236,7 +299,8 @@ jobs:
   # amd64 only.  The guest image is fetched with oras on the host and bind
   # mounted; each batch boots one guest and drives it over a TAP link.
   knfsd:
-    runs-on: arc-amd64
+    needs: [build]
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -246,9 +310,6 @@ jobs:
         uses: docker/setup-buildx-action@v4
         with:
           driver: docker-container
-          buildkitd-config-inline: |
-            [registry."docker.io"]
-              mirrors = ["repository.mdh.quantum.com:5001"]
 
       - name: Build the devcontainer image
         uses: docker/build-push-action@v7
@@ -258,11 +319,7 @@ jobs:
           platforms: linux/amd64
           load: true
           tags: specs-dev:${{ github.sha }}
-          cache-from: type=registry,ref=repository.mdh.quantum.com:5004/cache/specs-dev:amd64
-          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=registry,ref=repository.mdh.quantum.com:5004/cache/specs-dev:amd64,mode=max' || '' }}
-          build-args: |
-            APT_MIRROR=${{ env.APT_MIRROR }}
-            DOCKER_MIRROR=${{ env.DOCKER_MIRROR }}
+          cache-from: type=gha,scope=specs-dev
 
       - name: Install oras
         uses: oras-project/setup-oras@v1
@@ -280,12 +337,26 @@ jobs:
           echo "kernel: $(uname -r)"
           ls -l /dev/kvm 2>&1 || echo "no /dev/kvm on the host"
 
-      - name: Generate the corpus
+      # The corpus comes from the build job rather than being regenerated here.
+      # SPECS_TRACES_DIR makes cmake treat the traces as inputs, so this
+      # configure registers the replay tests against them and emits no
+      # generation edges at all.
+      - name: Fetch the corpus generated by the build job
+        uses: actions/download-artifact@v4
+        with:
+          name: specs-traces
+          path: .
+
+      - name: Unpack the corpus and configure against it
         run: |
+          mkdir -p prebuilt-traces
+          tar -xzf specs-traces.tar.gz -C prebuilt-traces
+          echo "corpus: $(find prebuilt-traces -name '*.itf.json' | wc -l) traces"
           docker run --rm --privileged -v "$PWD:/specs" -w /specs specs-dev:${{ github.sha }} \
             bash -c '
               set -e
-              cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+              cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                    -DSPECS_TRACES_DIR=/specs/prebuilt-traces
               cmake --build build -j"$(nproc)"
             '
 
@@ -296,6 +367,7 @@ jobs:
             -w /specs specs-dev:${{ github.sha }} \
             bash -c '
               cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                    -DSPECS_TRACES_DIR=/specs/prebuilt-traces \
                     -DSPECS_KNFSD_TESTS=ON -DKVM_IMAGE_DIR=/kvm-image
               ctest --test-dir build -L knfsd -V --no-tests=error -j 2
               rc=$?
