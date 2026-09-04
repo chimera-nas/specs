@@ -73,6 +73,8 @@ jobs:
           # substantially the same thing for a fraction of the size -- which
           # matters against a cache quota measured in gigabytes per repository.
           cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,scope=specs-dev,mode=min' || '' }}
+          build-args: |
+            UBUNTU_MIRROR=azure
 
       # On the host, not in the image: it is only needed to push the finished
       # bundle, which the bind mount below leaves in the workspace.
@@ -174,6 +176,8 @@ jobs:
           load: true
           tags: specs-dev:${{ github.sha }}
           cache-from: type=gha,scope=specs-dev
+          build-args: |
+            UBUNTU_MIRROR=azure
 
       # The corpus comes from the build job rather than being regenerated here.
       # SPECS_TRACES_DIR makes cmake treat the traces as inputs, so this
@@ -244,6 +248,8 @@ jobs:
           load: true
           tags: specs-dev:${{ github.sha }}
           cache-from: type=gha,scope=specs-dev
+          build-args: |
+            UBUNTU_MIRROR=azure
 
       # What this runner can host, recorded once per run so a SKIP has a
       # visible cause: the kernel NFS server needs /dev/kvm (a guest) or a host
@@ -320,6 +326,8 @@ jobs:
           load: true
           tags: specs-dev:${{ github.sha }}
           cache-from: type=gha,scope=specs-dev
+          build-args: |
+            UBUNTU_MIRROR=azure
 
       - name: Install oras
         uses: oras-project/setup-oras@v1
