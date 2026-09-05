@@ -190,6 +190,44 @@ module posixFuse {
     import posixops.* from "./posix_ops"
 }
 
+// The SMB-loopback profile (posix client -> in-process SMB2 server ->
+// backend), analogous to posixNfs3/posixNfs4 but for the SMB wire.  It is the
+// memfs profile modified by three SMB transport properties:
+//
+//   * server-side copy IS available (copyRange mandatory).  SMB2 has
+//     FSCTL_SRV_COPYCHUNK; the proxy issues it, so copy_file_range succeeds --
+//     unlike NFS3/NFS4, which have no COPY and force the VFS fallback that the
+//     proxy handle refuses.
+//   * no reflink (cloneRange off).  SMB block-cloning is ReFS-only
+//     (FSCTL_DUPLICATE_EXTENTS_TO_FILE); the server does not implement it and a
+//     Samba-on-ext4 mount could not either, so FICLONERANGE answers EOPNOTSUPP.
+//   * no sparse seek (seekHole off).  SEEK_DATA/SEEK_HOLE has no SMB2 wire
+//     equivalent the proxy translates, so it answers EINVAL.
+//
+// Owner/mode/nlink are conveyed for real via modefromsid (the server's
+// smb_mode_from_sid path), so the identity/attribute policies match memfs.
+module posixSmb {
+    import posix(
+        F_COPY_RANGE = FeatMandatory,
+        F_CLONE_RANGE = FeatOff,
+        F_SEEK_HOLE = FeatOff,
+        F_ROOT = FeatIfAdvertised,
+        P_GID_FROM_PARENT = FeatOff,
+        P_SGID_INHERIT = FeatOff,
+        P_WRITE_CLEARS_SETIDS = FeatMandatory,
+        P_PWRITE_APPENDS = FeatOff,
+        P_RENAME_CTIME = FeatMandatory,
+        P_STRICT_ATIME = FeatOff,
+        P_STICKY_WRITE_ARM = FeatOff,
+        P_CHOWN_SUPP_GROUP = FeatMandatory,
+        P_ERR_NOTEMPTY = FeatMandatory,
+        P_ERR_STICKY_ACCES = FeatMandatory,
+        P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
+        P_ERR_LOCK_AGAIN = FeatMandatory
+    ).* from "./posix"
+    import posixops.* from "./posix_ops"
+}
+
 module posixStrict {
     import posix(
         F_COPY_RANGE = FeatMandatory,

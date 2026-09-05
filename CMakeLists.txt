@@ -221,6 +221,15 @@ set(POSIX_BATCHES
   "posixFuse|fuse_|stepLinks|128|5|0x1"   "posixFuse|fuse_|stepFds|128|5|0x1"
   "posixFuse|fuse_|stepTooLong|128|4|0x1" "posixFuse|fuse_|stepPrefix|128|5|0x1"
   "posixFuse|fuse_|stepFallocate|128|4|0x1"
+  # SMB loopback (posix client -> in-process SMB2 server -> backend).  Mirrors
+  # the nfs3/nfs4 loopback batch set; no stepLocks (SMB record-lock support is
+  # not wired through the loopback yet).
+  "posixSmb|smb_|step|128|10|0x1"         "posixSmb|smb_|step|128|6|0x2"
+  "posixSmb|smb_|step|256|3|0x100"        "posixSmb|smb_|stepNamespace|128|4|0x1"
+  "posixSmb|smb_|stepDescriptors|128|4|0x1" "posixSmb|smb_|stepMetadata|128|4|0x1"
+  "posixSmb|smb_|stepDirs|128|3|0x1"      "posixSmb|smb_|stepData|128|4|0x1"
+  "posixSmb|smb_|stepPerms|128|5|0x1"     "posixSmb|smb_|stepLinks|128|5|0x1"
+  "posixSmb|smb_|stepFds|128|5|0x1"
 )
 foreach(b ${POSIX_BATCHES})
     string(REPLACE "|" ";" parts "${b}")
