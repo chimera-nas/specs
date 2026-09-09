@@ -82,13 +82,8 @@ jobs:
       # -LE samba|ganesha: the conformance suites are the `samba` and `ganesha`
       # jobs' business and need live servers; this job gates the corpus itself.
       - name: Generate the corpus, gate it, and bundle it
-        env:
-          # bundle.sh stamps this into the bundle's manifest.  Passed in rather
-          # than resolved by git inside the container, where the bind-mounted
-          # checkout is not owned by root and git refuses it as dubious.
-          SPECS_SOURCE_SHA: ${{ github.sha }}
         run: |
-          docker run --rm -e SPECS_SOURCE_SHA -v "$PWD:/specs" -w /specs specs-dev:${{ github.sha }} \
+          docker run --rm -v "$PWD:/specs" -w /specs specs-dev:${{ github.sha }} \
             bash -c '
               set -e
               cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -101,12 +96,16 @@ jobs:
               # silently, which is how the old bundle-era gates went quiet.
               ctest --test-dir build --output-on-failure -L devliveness \
                     --no-tests=error -j "$(nproc)"
+              # Archived INSIDE the container, and it has to be: build/ is
+              # created here by root through the bind mount, so the runner user
+              # cannot write into it from the host.  (The bundle target this
+              # replaced ran in here for the same reason.)
+              #
+              # Tarred from inside the corpus root so it unpacks AS the corpus
+              # root, and the conformance jobs can point SPECS_CORPUS_ROOT
+              # straight at their unpack directory.
+              tar -czf build/specs-corpus.tar.gz -C build/specs-corpus .
             '
-          # The corpus is a directory of per-cell trace sets under
-          # build/specs-corpus.  Archived from INSIDE it, so it unpacks as the
-          # corpus root itself and the conformance jobs can point
-          # SPECS_CORPUS_ROOT straight at the unpack directory.
-          tar -czf build/specs-corpus.tar.gz -C build/specs-corpus .
 
       # The corpus is generated exactly once per run.  The conformance jobs
       # below replay THESE bytes rather than regenerating their own, which is
