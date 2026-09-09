@@ -31,10 +31,15 @@
     "S4-change-is-coarse-ctime"
   ],
 
-  // ext4 has a real allocation map, and RFC 7862 15.11 lets a server answer
-  // SEEK more precisely than the model's block-granular view.
+  // holeTracking: ext4 has a real allocation map, and RFC 7862 15.11 lets a
+  // server answer SEEK more precisely than the model's block-granular view.
+  // linkRefusal: RFC 7530 16.9.4 pins neither the code for a LINK whose
+  // source is a directory nor its precedence against a malformed target name.
+  // It is stated here as well as in the 4.1 cell, and has to be -- this cell
+  // is a ROOT, not a child of that one.
   "tolerances": {
-    "holeTracking": true
+    "holeTracking": true,
+    "linkRefusal": true
   },
 
   "policies": {

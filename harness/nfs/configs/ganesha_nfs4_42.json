@@ -26,6 +26,7 @@
   // enabling it would be a claim the corpus cannot prove.  It is on in the 4.0
   // cell instead.
   "deviations": [
+    "G4-op-outside-session-no-result",
     "S4-no-wrong-type",
     "S4-change-is-coarse-ctime",
     "G4-verify-wide-trivial-match",
@@ -42,9 +43,16 @@
   // GD-35): ext4 has a real allocation map, and RFC 7862 15.11 lets a server
   // answer more precisely than the model can.  rflagsConfirm drops the
   // assertion on an OPEN reply flag RFC 8881 18.16 leaves inert above 4.0.
+  // linkRefusal and wideAttrRefusal are stated here as well as in the 4.1
+  // cell, and have to be: this cell is a ROOT, not a child of that one -- the
+  // two are siblings so that a 4.2 knob is never inherited into a profile
+  // that cannot reach it.  Both are the same server, so both say the same
+  // thing; see ganesha_nfs4_41.json for what they replace.
   "tolerances": {
     "holeTracking": true,
-    "rflagsConfirm": true
+    "rflagsConfirm": true,
+    "linkRefusal": true,
+    "wideAttrRefusal": true
   },
 
   "policies": {
