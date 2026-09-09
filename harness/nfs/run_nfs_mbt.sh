@@ -692,11 +692,14 @@ for t in "${TRACES[@]}"; do
         fi
     fi
     if [ -n "$SERVER_PID" ] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        # The server DIED.  That is the loudest finding this harness can
+        # produce, and it is exactly the case where nobody will have thought
+        # to set SPECS_NFS_SERVER_LOG in advance -- so the log tail comes out
+        # unconditionally here, unlike the ordinary failure path above.
         echo "=== ganesha exited during $(basename "$t") ==="
-        if [ "${SPECS_NFS_SERVER_LOG:-0}" = "1" ]; then
-            cat "$GANESHA_OUT"
-            tail -60 "$GANESHA_LOG" 2>/dev/null || true
-        fi
+        cat "$GANESHA_OUT" 2>/dev/null || true
+        echo "=== ganesha log (last 60 lines) ==="
+        tail -60 "$GANESHA_LOG" 2>/dev/null || true
         SERVER_PID=""
         [ "$rc" = "0" ] && { n_ok=$((n_ok - 1)); n_fail=$((n_fail + 1)); }
     fi
