@@ -1,0 +1,25 @@
+{
+  "extends": "./_smbd.json",
+  "family": "smb2",
+  "description": "CHANGE_NOTIFY in full: both filters, the buffer and overflow arithmetic, and every way a parked request can end. Samba's own CHANGE_NOTIFY divergences (SD-10, SD-11, SD-12) are NOT expressible in the model and remain in harness/samba/samba_deviations.py, so a trace here is still driven only as far as the first of them.",
+  "traceStem": "smb2Base",
+
+  // Which of the smbd profile's deviations this flavour can actually REACH.
+  // tools/devliveness.py fails a cell that enables one its own corpus never
+  // records having taken, so each flavour switches off what it cannot reach:
+  // byte-range locks are drawn only by stepInfo, SET_INFO renames only by
+  // stepNs, and a FILE_CREATE onto an existing directory only by the flavours
+  // that make directories.  Switching a deviation off in a cell that never
+  // takes its branch does not change one byte of that cell's corpus -- it is a
+  // statement about coverage, not about the server.
+  "deviationsOff": [
+    "SD-2",
+    "SD-4",
+    "SD-8",
+    "SD-9"
+  ],
+
+  "batches": [
+    { "flavor": "stepNotify", "steps": 400, "traces": 8, "seed": "0x61" }
+  ]
+}

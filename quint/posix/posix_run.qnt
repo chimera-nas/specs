@@ -35,19 +35,20 @@ module posixDefault {
         P_ERR_NOTEMPTY = FeatIfAdvertised,
         P_ERR_STICKY_ACCES = FeatIfAdvertised,
         P_ERR_UNLINKDIR_ISDIR = FeatIfAdvertised,
-        P_ERR_LOCK_AGAIN = FeatIfAdvertised
+        P_ERR_LOCK_AGAIN = FeatIfAdvertised,
+        DEVS = Set(),
+        T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
     import posixops.* from "./posix_ops"
 }
 
 // The in-memory-backend profile, pinned to the behavior measured by
-// `posix_replay.py --probe` on 2026-08-10 (see PROFILE there; the probe
-// re-measures and `--check-profile` fails on drift).  Trace generation from
+// a live memfs mount on 2026-08-10.  Trace generation from
 // this instance produces only profiles the live backend can satisfy, so the
 // harness never skips a trace for profile mismatch.  F_ROOT stays
 // explorable: the harness chooses the credentials, so both draws are real.
-// P_ERR_LOCK_AGAIN is unobservable while memfs lacks record locks (PD1 in
-// posix_deviations.py); pinned to the Linux-style EAGAIN reading.
+// P_ERR_LOCK_AGAIN is unobservable while memfs lacks record locks (deviation
+// PD1); pinned to the Linux-style EAGAIN reading.
 module posixMemfs {
     import posix(
         F_COPY_RANGE = FeatMandatory,
@@ -65,7 +66,9 @@ module posixMemfs {
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
-        P_ERR_LOCK_AGAIN = FeatMandatory
+        P_ERR_LOCK_AGAIN = FeatMandatory,
+        DEVS = Set(),
+        T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
     import posixops.* from "./posix_ops"
 }
@@ -91,7 +94,9 @@ module posixDisk {
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
-        P_ERR_LOCK_AGAIN = FeatMandatory
+        P_ERR_LOCK_AGAIN = FeatMandatory,
+        DEVS = Set(),
+        T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
     import posixops.* from "./posix_ops"
 }
@@ -119,7 +124,9 @@ module posixNfs3 {
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
-        P_ERR_LOCK_AGAIN = FeatMandatory
+        P_ERR_LOCK_AGAIN = FeatMandatory,
+        DEVS = Set(),
+        T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
     import posixops.* from "./posix_ops"
 }
@@ -148,12 +155,14 @@ module posixNfs4 {
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
-        P_ERR_LOCK_AGAIN = FeatMandatory
+        P_ERR_LOCK_AGAIN = FeatMandatory,
+        DEVS = Set(),
+        T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
     import posixops.* from "./posix_ops"
 }
 
-// The chimera FUSE profile, pinned to `posix_replay.py --probe` against
+// The chimera FUSE profile, measured against
 // fuse_quint_driver (the in-process FUSE harness) on 2026-08-26.  It differs
 // from the memfs profile it is served by in three ways, all of them properties
 // of the FUSE transport rather than of the backend:
@@ -185,7 +194,9 @@ module posixFuse {
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
-        P_ERR_LOCK_AGAIN = FeatMandatory
+        P_ERR_LOCK_AGAIN = FeatMandatory,
+        DEVS = Set(),
+        T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
     import posixops.* from "./posix_ops"
 }
@@ -223,7 +234,9 @@ module posixSmb {
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
-        P_ERR_LOCK_AGAIN = FeatMandatory
+        P_ERR_LOCK_AGAIN = FeatMandatory,
+        DEVS = Set(),
+        T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
     import posixops.* from "./posix_ops"
 }
@@ -245,7 +258,9 @@ module posixStrict {
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatOff,
-        P_ERR_LOCK_AGAIN = FeatMandatory
+        P_ERR_LOCK_AGAIN = FeatMandatory,
+        DEVS = Set(),
+        T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
     import posixops.* from "./posix_ops"
 }
@@ -267,7 +282,9 @@ module posixLinuxish {
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatOff,
         P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
-        P_ERR_LOCK_AGAIN = FeatMandatory
+        P_ERR_LOCK_AGAIN = FeatMandatory,
+        DEVS = Set(),
+        T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
     import posixops.* from "./posix_ops"
 }

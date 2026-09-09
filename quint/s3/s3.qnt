@@ -174,6 +174,7 @@ module s3 {
     pure val HTTP_NOT_FOUND = 404
     pure val HTTP_CONFLICT = 409
     pure val HTTP_RANGE_ERR = 416
+    pure val HTTP_INTERNAL = 500
 
     // ------------------------------------------------------------------
     // The trace-visible request/response label
@@ -231,8 +232,33 @@ module s3 {
     // State
     // ------------------------------------------------------------------
 
+    // ------------------------------------------------------------------
+    // Known implementation deviations.
+    //
+    // The model states S3 as AWS documents it.  Where the implementation under
+    // test knowingly diverges, the divergence is DESCRIBED HERE, gated on the
+    // consumer's config, rather than forgiven by the replay harness after the
+    // fact.  A harness that forgives cannot say what it forgave; a model that
+    // describes produces a trace whose expectation already IS the implementation's
+    // behaviour, so replay is an exact match and the harness needs no registry.
+    //
+    // One Set constant, not a constant per deviation: adding a deviation then
+    // costs no schema signature change, and a config names only what it enables.
+    // Every id here must be declared, with a citation, in the family's
+    // corpus.schema.json before a config may switch it on.
+    const DEVS: Set[str]
+
+    pure def dev(id: str): bool = DEVS.contains(id)
+
     // The store: bucket name -> bucket.  Bucket existence is membership.
     var bkts: str -> Bkt
+
+    // Which deviations shaped the step just taken.  This is what makes a
+    // deviation falsifiable: tools/devliveness.py fails the build when a config
+    // enables one that no trace in its corpus ever records here, so a deviation
+    // that has been fixed cannot sit on quietly forgiving the same divergence
+    // elsewhere.
+    var devHits: Set[str]
     // Next multipart upload id (abstract; the harness maps to wire ids).
     var nextUpl: int
     var lastOp: Op
@@ -468,6 +494,7 @@ module s3 {
     action init = all {
         bkts' = Map(),
         nextUpl' = 1,
+        devHits' = Set(),
         lastOp' = OInit,
     }
 
@@ -481,6 +508,7 @@ module s3 {
     action applyCreateBucket(b: str): bool = all {
         bkts' = if (liveBuckets.contains(b)) bkts else bkts.put(b, EMPTY_BKT),
         nextUpl' = nextUpl,
+        devHits' = Set(),
         lastOp' = OCreateBucket({ bucket: b, status: HTTP_OK }),
     }
 
@@ -496,6 +524,7 @@ module s3 {
     action applyHeadBucket(b: str): bool = all {
         bkts' = bkts,
         nextUpl' = nextUpl,
+        devHits' = Set(),
         lastOp' = OHeadBucket({
             bucket: b,
             status: if (liveBuckets.contains(b)) HTTP_OK else HTTP_NOT_FOUND }),
@@ -513,6 +542,14 @@ module s3 {
     // A bucket must hold no objects AND no in-progress multipart uploads
     // to be deletable.  (The in-flight-upload 409 is never generated; see
     // the module comment.)
+
+    // Is this DELETE the non-empty-bucket refusal?  Named so the deviating
+    // status and the deviation record can ask the same question of the same
+    // state, instead of the harness reconstructing it from the trace.
+    pure def delBktNonEmptyIn(bs: str -> Bkt, b: str): bool =
+        bs.keys().contains(b) and
+        (bs.get(b).objs.keys().size() > 0 or bs.get(b).mpu.keys().size() > 0)
+
     action applyDeleteBucket(b: str): bool = all {
         bkts' =
             if (liveBuckets.contains(b) and bkts.get(b).objs.keys().size() == 0
@@ -520,12 +557,24 @@ module s3 {
                 mapDrop(bkts, b)
             else bkts,
         nextUpl' = nextUpl,
+        // AWS answers 409 BucketNotEmpty here (S3 API Reference, DeleteBucket).
+        // chimera has no mapping for its internal BUCKET_NOT_EMPTY, so the
+        // refusal falls through the gateway's default arm and comes back as
+        // 500 InternalError -- the right decision, reported as a server fault.
+        devHits' =
+            if (delBktNonEmptyIn(bkts, b) and dev("delete-bucket-nonempty-500"))
+                Set("delete-bucket-nonempty-500")
+            else Set(),
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 ODeleteBucket({ bucket: b, status: HTTP_NOT_FOUND, err: "NoSuchBucket" })
-            else if (bkts.get(b).objs.keys().size() > 0
-                     or bkts.get(b).mpu.keys().size() > 0)
-                ODeleteBucket({ bucket: b, status: HTTP_CONFLICT, err: "BucketNotEmpty" })
+            else if (delBktNonEmptyIn(bkts, b))
+                if (dev("delete-bucket-nonempty-500"))
+                    ODeleteBucket({ bucket: b, status: HTTP_INTERNAL,
+                                    err: "InternalError" })
+                else
+                    ODeleteBucket({ bucket: b, status: HTTP_CONFLICT,
+                                    err: "BucketNotEmpty" })
             else
                 ODeleteBucket({ bucket: b, status: HTTP_NO_CONTENT, err: "" }),
     }
@@ -544,6 +593,7 @@ module s3 {
     action listBuckets = all {
         bkts' = bkts,
         nextUpl' = nextUpl,
+        devHits' = Set(),
         lastOp' = OListBuckets({ buckets: liveBuckets, status: HTTP_OK }),
     }
 
@@ -560,6 +610,7 @@ module s3 {
                 bkts.setBy(b, bk => bk.with("objs", bk.objs.put(k, mkObj(d, mt))))
             else bkts,
         nextUpl' = nextUpl,
+        devHits' = Set(),
         lastOp' =
             if (liveBuckets.contains(b))
                 OPutObject({ bucket: b, key: k, data: d, mtag: mt,
@@ -596,9 +647,29 @@ module s3 {
     // GetObject (GET /{bucket}/{key}), optionally ranged
     // ------------------------------------------------------------------
 
+    // A satisfiable Range whose result happens to span the whole object.
+    // RFC 7233 4.1: a 206 is the answer to a satisfiable Range request, and
+    // nothing there makes an exception for one that covers everything.
+    pure def rangeIsFull(d: Blocks, r: Range): bool =
+        val ro = rangeApply(d, r)
+        ro.status == HTTP_PARTIAL and ro.first == 0 and ro.out.length() == d.length()
+
+    pure def getIsFullRange(bs: str -> Bkt, b: str, k: Key, r: Range): bool =
+        if (bs.keys().contains(b) and bs.get(b).objs.keys().contains(k))
+            rangeIsFull(bs.get(b).objs.get(k).data, r)
+        else false
+
     action applyGetObject(b: str, k: Key, r: Range): bool = all {
         bkts' = bkts,
         nextUpl' = nextUpl,
+        // chimera collapses a whole-object range to a plain 200 (and then
+        // sends no Content-Range, which is consistent with the 200 it chose).
+        // RNone is untouched: an unranged GET is 200 on AWS too, so only a
+        // request that carried a Range header can take this branch.
+        devHits' =
+            if (getIsFullRange(bkts, b, k, r) and dev("range-full-200"))
+                Set("range-full-200")
+            else Set(),
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 OGetObject({ bucket: b, key: k, range: r, status: HTTP_NOT_FOUND,
@@ -609,7 +680,10 @@ module s3 {
             else
                 val d = bkts.get(b).objs.get(k).data
                 val ro = rangeApply(d, r)
-                OGetObject({ bucket: b, key: k, range: r, status: ro.status,
+                OGetObject({ bucket: b, key: k, range: r,
+                             status: if (rangeIsFull(d, r) and dev("range-full-200"))
+                                         HTTP_OK
+                                     else ro.status,
                              err: ro.err, data: ro.out, first: ro.first,
                              total: d.length() }),
     }
@@ -657,6 +731,7 @@ module s3 {
     action applyHeadObject(b: str, k: Key): bool = all {
         bkts' = bkts,
         nextUpl' = nextUpl,
+        devHits' = Set(),
         lastOp' =
             if (liveBuckets.contains(b) and bkts.get(b).objs.keys().contains(k))
                 OHeadObject({ bucket: b, key: k, status: HTTP_OK,
@@ -681,16 +756,37 @@ module s3 {
 
     // AWS DeleteObject is idempotent: 204 whether or not the key exists
     // (only a missing *bucket* is an error).
+    // Does this key exist right now?  The harness used to answer questions like
+    // this from the trace's op record; the model can just look.
+    pure def delObjHasKeyIn(bs: str -> Bkt, b: str, k: Key): bool =
+        bs.keys().contains(b) and bs.get(b).objs.keys().contains(k)
+
     action applyDeleteObject(b: str, k: Key): bool = all {
         bkts' =
             if (liveBuckets.contains(b))
                 bkts.setBy(b, bk => bk.with("objs", mapDrop(bk.objs, k)))
             else bkts,
         nextUpl' = nextUpl,
+        // AWS is idempotent here: 204 whether or not the key existed, and only
+        // a missing BUCKET is an error.  chimera answers 200 for a key it
+        // deleted and 404 NoSuchKey for one that was not there, so both halves
+        // are separate claims that can be retired separately.
+        devHits' =
+            if (not(liveBuckets.contains(b))) Set()
+            else if (delObjHasKeyIn(bkts, b, k) and dev("delete-object-200"))
+                Set("delete-object-200")
+            else if (not(delObjHasKeyIn(bkts, b, k)) and dev("delete-object-missing-404"))
+                Set("delete-object-missing-404")
+            else Set(),
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 ODeleteObject({ bucket: b, key: k, status: HTTP_NOT_FOUND,
                                 err: "NoSuchBucket" })
+            else if (delObjHasKeyIn(bkts, b, k) and dev("delete-object-200"))
+                ODeleteObject({ bucket: b, key: k, status: HTTP_OK, err: "" })
+            else if (not(delObjHasKeyIn(bkts, b, k)) and dev("delete-object-missing-404"))
+                ODeleteObject({ bucket: b, key: k, status: HTTP_NOT_FOUND,
+                                err: "NoSuchKey" })
             else
                 ODeleteObject({ bucket: b, key: k, status: HTTP_NO_CONTENT, err: "" }),
     }
@@ -735,6 +831,7 @@ module s3 {
                     bk.with("objs", ks.foldl(bk.objs, (m, k) => mapDrop(m, k))))
             else bkts,
         nextUpl' = nextUpl,
+        devHits' = Set(),
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 ODeleteObjects({ bucket: b, keys: ks, quiet: quiet,
@@ -779,6 +876,25 @@ module s3 {
                     bk.with("objs", bk.objs.put(dk, bkts.get(sb).objs.get(sk))))
             else bkts,
         nextUpl' = nextUpl,
+        // AWS rejects a copy of an object onto itself when nothing about it
+        // would change -- no x-amz-metadata-directive REPLACE -- with 400
+        // InvalidRequest (S3 API Reference, CopyObject, "This copy request is
+        // illegal because it is trying to copy an object to itself").  chimera
+        // does not special-case the self-copy and just performs it, answering
+        // 200.  The predicate is exactly `sb == db and sk == dk`, which the
+        // model can ask directly; the harness used to rebuild it from the
+        // trace's four name fields.
+        //
+        // Note bkts' above: the self-copy is excluded from the write, and that
+        // stays right under the deviation too -- rewriting an object with its
+        // own content and metadata yields the identical map, so chimera's
+        // performing the copy is invisible in the modeled state.
+        devHits' =
+            if (liveBuckets.contains(db) and liveBuckets.contains(sb)
+                    and bkts.get(sb).objs.keys().contains(sk)
+                    and sb == db and sk == dk and dev("copy-self-200"))
+                Set("copy-self-200")
+            else Set(),
         lastOp' =
             if (not(liveBuckets.contains(db)))
                 OCopyObject({ srcBucket: sb, srcKey: sk, dstBucket: db, dstKey: dk,
@@ -789,7 +905,7 @@ module s3 {
             else if (not(bkts.get(sb).objs.keys().contains(sk)))
                 OCopyObject({ srcBucket: sb, srcKey: sk, dstBucket: db, dstKey: dk,
                               status: HTTP_NOT_FOUND, err: "NoSuchKey" })
-            else if (sb == db and sk == dk)
+            else if (sb == db and sk == dk and not(dev("copy-self-200")))
                 OCopyObject({ srcBucket: sb, srcKey: sk, dstBucket: db, dstKey: dk,
                               status: HTTP_BAD_REQUEST, err: "InvalidRequest" })
             else
@@ -832,6 +948,7 @@ module s3 {
     action applyGetAttrs(b: str, k: Key): bool = all {
         bkts' = bkts,
         nextUpl' = nextUpl,
+        devHits' = Set(),
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 OGetAttrs({ bucket: b, key: k, status: HTTP_NOT_FOUND,
@@ -860,6 +977,7 @@ module s3 {
     action applyListObjects(b: str, p: Prefix, delim: bool, sa: Key, mk: int, mode: int): bool = all {
         bkts' = bkts,
         nextUpl' = nextUpl,
+        devHits' = Set(),
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 OListObjects({ bucket: b, prefix: p, delim: delim, startAfter: sa,
@@ -898,6 +1016,7 @@ module s3 {
                     bk.with("objs", bk.objs.setBy(k, o => o.with("tags", ts))))
             else bkts,
         nextUpl' = nextUpl,
+        devHits' = Set(),
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 OPutObjTagging({ bucket: b, key: k, tags: ts,
@@ -925,6 +1044,7 @@ module s3 {
     action applyGetObjTagging(b: str, k: Key): bool = all {
         bkts' = bkts,
         nextUpl' = nextUpl,
+        devHits' = Set(),
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 OGetObjTagging({ bucket: b, key: k, status: HTTP_NOT_FOUND,
@@ -953,6 +1073,7 @@ module s3 {
                     bk.with("objs", bk.objs.setBy(k, o => o.with("tags", Set()))))
             else bkts,
         nextUpl' = nextUpl,
+        devHits' = Set(),
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 ODelObjTagging({ bucket: b, key: k, status: HTTP_NOT_FOUND,
@@ -984,6 +1105,7 @@ module s3 {
                 bkts.setBy(b, bk => bk.with("btags", ts))
             else bkts,
         nextUpl' = nextUpl,
+        devHits' = Set(),
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 OPutBktTagging({ bucket: b, tags: ts, status: HTTP_NOT_FOUND,
@@ -1003,6 +1125,7 @@ module s3 {
     action applyGetBktTagging(b: str): bool = all {
         bkts' = bkts,
         nextUpl' = nextUpl,
+        devHits' = Set(),
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 OGetBktTagging({ bucket: b, status: HTTP_NOT_FOUND,
@@ -1026,6 +1149,7 @@ module s3 {
                 bkts.setBy(b, bk => bk.with("btags", Set()))
             else bkts,
         nextUpl' = nextUpl,
+        devHits' = Set(),
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 ODelBktTagging({ bucket: b, status: HTTP_NOT_FOUND,
@@ -1051,6 +1175,7 @@ module s3 {
                     bk.with("mpu", bk.mpu.put(nextUpl, { key: k, parts: Map() })))
             else bkts,
         nextUpl' = if (liveBuckets.contains(b)) nextUpl + 1 else nextUpl,
+        devHits' = Set(),
         lastOp' =
             if (liveBuckets.contains(b))
                 OCreateMpu({ bucket: b, key: k, uplid: nextUpl,
@@ -1083,6 +1208,7 @@ module s3 {
                         m.with("parts", m.parts.put(n, d)))))
             else bkts,
         nextUpl' = nextUpl,
+        devHits' = Set(),
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 OUploadPart({ bucket: b, key: k, uplid: u, partNum: n, data: d,
@@ -1152,6 +1278,7 @@ module s3 {
                             m.with("parts", m.parts.put(n, pdata)))))
                 else bkts,
             nextUpl' = nextUpl,
+            devHits' = Set(),
             lastOp' =
                 if (not(liveBuckets.contains(b)))
                     OUploadPartCopy({ bucket: b, key: k, uplid: u, partNum: n,
@@ -1238,6 +1365,7 @@ module s3 {
                           .with("mpu", mapDrop(bk.mpu, u)))
                 else bkts,
             nextUpl' = nextUpl,
+            devHits' = Set(),
             lastOp' =
                 if (not(liveBuckets.contains(b)))
                     OCompleteMpu({ bucket: b, key: k, uplid: u, manifest: manifest,
@@ -1280,6 +1408,7 @@ module s3 {
                 bkts.setBy(b, bk => bk.with("mpu", mapDrop(bk.mpu, u)))
             else bkts,
         nextUpl' = nextUpl,
+        devHits' = Set(),
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 OAbortMpu({ bucket: b, key: k, uplid: u,
@@ -1312,6 +1441,7 @@ module s3 {
     action applyListParts(b: str, k: Key, u: int): bool = all {
         bkts' = bkts,
         nextUpl' = nextUpl,
+        devHits' = Set(),
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 OListParts({ bucket: b, key: k, uplid: u, status: HTTP_NOT_FOUND,
@@ -1346,6 +1476,7 @@ module s3 {
     action applyListMpu(b: str): bool = all {
         bkts' = bkts,
         nextUpl' = nextUpl,
+        devHits' = Set(),
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 OListMpu({ bucket: b, status: HTTP_NOT_FOUND, err: "NoSuchBucket",

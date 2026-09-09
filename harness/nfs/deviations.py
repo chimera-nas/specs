@@ -15,8 +15,20 @@ one of three things:
      suite keeps running and the divergence stays enumerable.
   3. an unanalyzed difference -- neither of the above yet.  It must fail.
 
-A per-server registry module (ganesha_deviations.py, knfsd_deviations.py)
-is what separates (2) from (3): a Finding that matches one of its entries
+Nearly all of (2) has moved OUT of this mechanism.  A server deviation the
+model can state is now a branch in the model, gated on the cell's config and
+declared with its citation in quint/nfs3/corpus.schema.json or
+quint/nfs4/corpus.schema.json -- so the trace's expectation already IS what
+that server does, replay is an exact match, and tools/devliveness.py fails the
+build when a cell enables a deviation its own corpus never reaches (which is
+what stops an entry outliving its fix; this file had two such entries when the
+migration was done).  What is left here is the residue: divergences no model
+branch can describe, either because what the server does was never measured
+precisely enough to predict, or because the two conformant answers differ in
+whether STATE changed, so no per-call acceptance can keep replay in sync.
+
+For that residue, a per-server registry module (ganesha_deviations.py,
+knfsd_deviations.py) is what separates (2) from (3): a Finding that matches one of its entries
 is reported as a DEVIATION and does not fail the run; anything else is a
 MISMATCH and does.  This is the same contract the Samba harness uses
 (harness/samba/samba_deviations.py) and the consuming project's own

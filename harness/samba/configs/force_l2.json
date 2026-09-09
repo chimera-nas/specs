@@ -1,0 +1,28 @@
+{
+  "family": "smb2",
+  "description": "the same caching profile on a share carrying SMB2_SHAREFLAG_FORCE_LEVELII_OPLOCK, where every grant caps to a read cache. Generated but NOT driven -- run_samba_mbt.sh configures smbd with oplocks off, and smb2_replay.py skips any trace whose profile turns a caching capability on, so this cell reports a ctest SKIP. Registered anyway so the gap stays visible and attributable to the harness rather than hidden by not generating the traces.",
+  "traceStem": "smb2ForceL2",
+
+  "features": {
+    "oplocks": "supported",
+    "leases": "supported",
+    "dirLeases": "unsupported",
+    "durable": "unsupported"
+  },
+
+  "policies": {
+    // 0x0300
+    "dialect": 768,
+    "leaseOpenBreak": true,
+    "forceLevel2": true
+  },
+
+  // No deviations: nothing in this corpus is ever replayed against Samba, so
+  // enabling one here would be a claim nothing checks -- and the liveness gate
+  // would rightly have to be pointed at a corpus no server ever saw.
+  "deviations": [],
+
+  "batches": [
+    { "flavor": "stepLease", "steps": 300, "traces": 8, "seed": "0x31" }
+  ]
+}

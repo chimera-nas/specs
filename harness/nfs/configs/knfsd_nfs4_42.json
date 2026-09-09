@@ -1,0 +1,57 @@
+{
+  "family": "nfs4",
+  "description": "The Linux kernel NFS server at NFSv4.2, exporting ext4 inside the kvm-test-base guest the harness boots. The feature and policy knobs mirror chimera's nfs4_memfs42 cell exactly, so a difference between the two corpora is a difference in what the two servers do and nothing else.",
+  "traceStem": "knfsd42",
+
+  "features": {
+    "pnfs": "unsupported",
+    "readDelegation": "unsupported",
+    "writeDelegation": "unsupported",
+    "xattr": "supported",
+    "sparse": "supported",
+    "copy": "supported",
+    "readPlus": "supported",
+    "ioAdvise": "supported",
+    "writeSame": "supported",
+    "clone": "supported"
+  },
+
+  // Every id is declared, with its citation and the registry entry it
+  // replaces, in ext/specs/quint/nfs4/corpus.schema.json.  Four of the five
+  // are S4-*: divergences this server SHARES with NFS-Ganesha, which is the
+  // evidence that the clause is ambiguous rather than that one server has a
+  // bug.
+  // K4-rename-symlink-notdir is NOT enabled here even though knfsd has it:
+  // measured with tools/devliveness.py, no trace this profile generates ever
+  // RENAMEs through a symbolic-link directory handle -- only the 4.0 walk does
+  // -- so enabling it would be a claim the corpus cannot prove.  It is on in
+  // the 4.0 cell instead.
+  "deviations": [
+    "S4-no-wrong-type",
+    "S4-compound-tag-unvalidated",
+    "S4-link-dir-notdir",
+    "S4-change-is-coarse-ctime"
+  ],
+
+  // ext4 has a real allocation map, and RFC 7862 15.11 lets a server answer
+  // SEEK more precisely than the model's block-granular view.
+  "tolerances": {
+    "holeTracking": true
+  },
+
+  "policies": {
+    "minor": 2,
+    "conflictDelays": true,
+    "closeFreesLocks": true,
+    "layoutWholeFile": true
+  },
+
+  "batches": [
+    { "flavor": "step",          "steps": 80, "traces": 8, "seed": "0x7" },
+    { "flavor": "stepState",     "steps": 80, "traces": 8, "seed": "0x7" },
+    { "flavor": "stepNamespace", "steps": 80, "traces": 8, "seed": "0x7" },
+    { "flavor": "stepData",      "steps": 80, "traces": 8, "seed": "0x7" },
+    { "flavor": "stepTypes",     "steps": 80, "traces": 6, "seed": "0x7" },
+    { "flavor": "stepData42",    "steps": 80, "traces": 8, "seed": "0x7" }
+  ]
+}

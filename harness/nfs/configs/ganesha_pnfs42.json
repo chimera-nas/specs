@@ -1,0 +1,27 @@
+{
+  "extends": "./ganesha_nfs4_42.json",
+  "description": "The 4.2 ganesha standing as a pNFS METADATA server: LAYOUTGET, LAYOUTCOMMIT, LAYOUTRETURN and GETDEVICEINFO are required rather than explored, so failing to advertise EXCHGID4_FLAG_USE_PNFS_MDS is a failure and not a skip. A single-node ganesha over a local filesystem is not a metadata server, so in practice this cell reports a ctest SKIP -- which is the point: the gap stays visible and attributable.",
+  "traceStem": "ganeshaPnfs42",
+
+  "features": {
+    "pnfs": "supported"
+  },
+
+  // The stepPnfs and stepData flavors never send a tagged compound, never
+  // GETATTR the wide bitmap and never VERIFY it, so most of the parent's
+  // divergences are unreachable here.
+  "deviationsOff": [
+    "S4-compound-tag-unvalidated",
+    "S4-link-dir-notdir",
+    "G4-compound-tag-length-limit",
+    "G4-getattr-wide-inval",
+    "G4-verify-wide-trivial-match",
+    "G4-open-type-before-exist",
+    "G4-bindconn-direction-accepted"
+  ],
+
+  "batches": [
+    { "flavor": "stepPnfs", "steps": 80, "traces": 6, "seed": "0x7" },
+    { "flavor": "stepData", "steps": 80, "traces": 6, "seed": "0x7" }
+  ]
+}

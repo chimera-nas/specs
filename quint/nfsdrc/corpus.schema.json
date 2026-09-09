@@ -1,0 +1,84 @@
+{
+  "family": "nfsdrc",
+  "modelFile": "./nfsdrc",
+  "modelModule": "nfsdrc",
+
+  "prelude": [
+    "import drcCache.* from \"./drc_cache\"",
+    "import drcOps.* from \"./drc_ops\"",
+    "import nfsdrcProfiles.* from \"./nfsdrc_run\""
+  ],
+
+  "selfTests": [
+    { "name": "nfsdrcTestRef",       "module": "nfsdrcTestRef",       "file": "./nfsdrcTest", "maxSamples": 200 },
+    { "name": "nfsdrcTestNoV3",      "module": "nfsdrcTestNoV3",      "file": "./nfsdrcTest", "maxSamples": 200 },
+    { "name": "nfsdrcTestTwoAddr",   "module": "nfsdrcTestTwoAddr",   "file": "./nfsdrcTest", "maxSamples": 200 },
+    { "name": "nfsdrcTestCredBlind", "module": "nfsdrcTestCredBlind", "file": "./nfsdrcTest", "maxSamples": 200 }
+  ],
+
+  "consts": {
+    "V3_DRC": {
+      "kind": "feature",
+      "key": "features.v3Cache",
+      "type": "bool",
+      "default": true,
+      "doc": "the NFSv3 duplicate-request cache is switched on. The NFSv4.0 cache is always present, so there is no knob for it."
+    },
+    "KEY_CRED": {
+      "kind": "policy",
+      "key": "policies.keyOnCredential",
+      "type": "bool",
+      "default": true,
+      "doc": "the cache key includes the caller's credential, so two users issuing the identical request are told apart. False describes an unfixed server and is kept under quint test rather than generated."
+    },
+    "V40_SLOTS": {
+      "kind": "policy",
+      "key": "policies.v40Slots",
+      "type": "int",
+      "default": 16,
+      "doc": "entries the NFSv4.0 cache holds per connection."
+    },
+    "ADDR_OF": {
+      "kind": "policy",
+      "key": "policies.addrOf",
+      "type": "raw",
+      "default": "ONE_ADDR",
+      "doc": "connection -> peer address. ONE_ADDR is what an in-process or loopback transport reports (and what a NAT or container host produces); TWO_ADDRS needs a transport no harness here can stand up."
+    },
+    "DIR": {
+      "kind": "policy",
+      "key": "policies.dir",
+      "type": "str",
+      "default": "d",
+      "doc": "the directory the traces work in."
+    },
+    "NAMES": {
+      "kind": "policy",
+      "key": "policies.names",
+      "type": "raw",
+      "default": "THREE_NAMES",
+      "doc": "the names traces operate on. Small on purpose: a random walk revisits them often, which is what puts two requests on one name and one transaction id."
+    },
+    "CONNS": {
+      "kind": "policy",
+      "key": "policies.conns",
+      "type": "raw",
+      "default": "TWO_CONNS",
+      "doc": "the connections in play, so connection scoping has something to separate."
+    },
+    "CREDS": {
+      "kind": "policy",
+      "key": "policies.creds",
+      "type": "raw",
+      "default": "TWO_CREDS",
+      "doc": "the credentials in play. Unprivileged, so neither is a spelling of root."
+    },
+    "XIDS": {
+      "kind": "policy",
+      "key": "policies.xids",
+      "type": "raw",
+      "default": "THREE_XIDS",
+      "doc": "the transaction ids. Few and reused, because every question this suite asks is about two requests sharing an XID."
+    }
+  }
+}

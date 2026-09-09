@@ -1,0 +1,68 @@
+{
+  "family": "nfs4",
+  "description": "NFS-Ganesha at NFSv4.2 over FSAL_VFS on a loop-mounted ext4 image. The feature and policy knobs mirror chimera's nfs4_memfs42 cell exactly -- same minor version, same optional surface asserted, same discretionary policies -- so that a difference between the two corpora is a difference in what the two SERVERS do and nothing else. Everything below the batch list is what ganesha does differently.",
+  "traceStem": "ganesha42",
+
+  "features": {
+    "pnfs": "unsupported",
+    "readDelegation": "unsupported",
+    "writeDelegation": "unsupported",
+    "xattr": "supported",
+    "sparse": "supported",
+    "copy": "supported",
+    "readPlus": "supported",
+    "ioAdvise": "supported",
+    "writeSame": "supported",
+    "clone": "supported"
+  },
+
+  // Every id is declared, with its citation and the registry entry it
+  // replaces, in ext/specs/quint/nfs4/corpus.schema.json.  The strict twin
+  // regenerates this cell with all of them off; its failures are ganesha's
+  // conformance debt against the RFCs, re-measured on every run.
+  // G4-compound-tag-length-limit is NOT enabled here even though ganesha has
+  // it: measured with tools/devliveness.py, no trace this profile generates
+  // ever sends the 256-byte NLONG compound tag -- only the 4.0 walk does -- so
+  // enabling it would be a claim the corpus cannot prove.  It is on in the 4.0
+  // cell instead.
+  "deviations": [
+    "S4-no-wrong-type",
+    "S4-compound-tag-unvalidated",
+    "S4-link-dir-notdir",
+    "S4-change-is-coarse-ctime",
+    "G4-getattr-wide-inval",
+    "G4-verify-wide-trivial-match",
+    "G4-setattr-share-denied",
+    "G4-exchange-id-no-confirmed-r",
+    "G4-open-type-before-exist",
+    "G4-bindconn-direction-accepted",
+    "G4-seek-at-eof-not-nxio"
+  ],
+
+  // Not deviations.  holeTracking is the same tolerance chimera's
+  // passthrough-backed cells enable and it is what covers ganesha's SEEK
+  // boundary differing from the model's block-granular sparse map (the old
+  // GD-35): ext4 has a real allocation map, and RFC 7862 15.11 lets a server
+  // answer more precisely than the model can.  rflagsConfirm drops the
+  // assertion on an OPEN reply flag RFC 8881 18.16 leaves inert above 4.0.
+  "tolerances": {
+    "holeTracking": true,
+    "rflagsConfirm": true
+  },
+
+  "policies": {
+    "minor": 2,
+    "conflictDelays": true,
+    "closeFreesLocks": true,
+    "layoutWholeFile": true
+  },
+
+  "batches": [
+    { "flavor": "step",          "steps": 80, "traces": 8, "seed": "0x7" },
+    { "flavor": "stepState",     "steps": 80, "traces": 8, "seed": "0x7" },
+    { "flavor": "stepNamespace", "steps": 80, "traces": 8, "seed": "0x7" },
+    { "flavor": "stepData",      "steps": 80, "traces": 8, "seed": "0x7" },
+    { "flavor": "stepTypes",     "steps": 80, "traces": 6, "seed": "0x7" },
+    { "flavor": "stepData42",    "steps": 80, "traces": 8, "seed": "0x7" }
+  ]
+}

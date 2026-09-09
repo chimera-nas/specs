@@ -59,6 +59,67 @@ module nfs4 {
     const P_CLOSE_FREES_LOCKS: bool
     const P_LAYOUT_WHOLE_FILE: bool
 
+    // Known divergences the implementation under test still carries, named by
+    // the consumer's config rather than forgiven by the replay harness after
+    // the fact.  A harness that forgives cannot say what it forgave, and an
+    // entry that outlives its fix keeps forgiving the same divergence
+    // everywhere else it appears; a model that DESCRIBES produces a trace
+    // whose expectation already IS the implementation's behaviour, so replay
+    // is an exact match and the harness needs no registry.
+    //
+    // One Set constant rather than a constant per deviation: adding one then
+    // costs no schema signature change, and a config names only what it
+    // enables.  Every id must be declared, with its citation, in
+    // quint/nfs4/corpus.schema.json before a config may switch it on.
+    const DEVS: Set[str]
+
+    pure def dev(id: str): bool = DEVS.contains(id)
+
+    // A TOLERANCE is not a deviation: it is a place where the standard itself
+    // permits several answers per call, so no boolean pins which one is right.
+    // T_HOLE_TRACKING is the one nfs4 has.  The model, like memfs, reads every
+    // byte below EOF as data and puts the sole hole at EOF; a backend that
+    // tracks holes for real legitimately refines that -- SEEK_HOLE may find a
+    // genuine hole earlier, SEEK_DATA may skip a never-written range to a
+    // later offset or answer NFS4ERR_NXIO when nothing but holes remain below
+    // EOF.  All of those satisfy RFC 7862 15.11.  With this on, SEEK's results
+    // carry `stAccept` / `offsetAccept` / `eofAccept` sets and the harness
+    // membership-tests instead of comparing for equality.
+    const T_HOLE_TRACKING: bool
+
+    // RFC 7530 16.24.4 Table 7 lists BOTH NFS4ERR_SYMLINK and NFS4ERR_NOTDIR
+    // for READDIR on a symbolic link, so either is conformant -- and which one
+    // chimera gives depends on which VFS backend resolved the handle.  One
+    // corpus serves every backend a cell is replayed against, so with this on
+    // READDIR's reply carries both in `stAccept`.
+    const T_DIR_SYMLINK_STATUS: bool
+
+    // RFC 8276 leaves it to the server whether writing an extended attribute
+    // advances the object's change attribute, and chimera's backends answer
+    // differently (memfs and diskfs advance it, cairn does not).  With this on
+    // the model stops predicting an inode's change attribute once an extended
+    // attribute has been written to it, which is the only honest thing one
+    // corpus replayed against every backend can say.
+    const T_XATTR_CHANGE: bool
+
+    // RFC 7530 16.30.4 lists BOTH NFS4ERR_EXPIRED and NFS4ERR_STALE_CLIENTID
+    // for RENEW, and 9.6.3 leaves it to the server how long a client id whose
+    // lease has lapsed survives -- so a late RENEW may equally be refused as a
+    // stale id, refused as an expired lease, or simply succeed.  The model
+    // retires a client id the moment a superseding SETCLIENTID replaces its
+    // incarnation and answers NFS4ERR_STALE_CLIENTID; with this on RENEW's
+    // reply carries all three conformant answers in `stAccept`.
+    const T_RENEW_LAPSED: bool
+
+    // RFC 8881 18.16 makes OPEN4_RESULT_CONFIRM meaningful only for the 4.0
+    // OPEN_CONFIRM handshake; on 4.1+ the flag is inert and a server may set
+    // it or not without any observable consequence.  The model predicts
+    // needConfirm = false there.  With this on, OPEN's reply carries both
+    // values in `needConfirmAccept` for a minor version that has no
+    // OPEN_CONFIRM.  Off below 4.1, where the flag drives the handshake and
+    // has to be exact.
+    const T_RFLAGS_CONFIRM: bool
+
     // ------------------------------------------------------------------
     // Bounded universes
     // ------------------------------------------------------------------
@@ -145,6 +206,12 @@ module nfs4 {
     /// it as new.
     var prev: { valid: bool, tag: int, ops: List[OpReq] }
     var lastOp: Label
+    // Which deviations shaped the step just taken.  This is what makes a
+    // deviation falsifiable: tools/devliveness.py fails the build when a
+    // config enables one that no trace in its corpus ever records here, so a
+    // deviation that has been fixed cannot sit on quietly forgiving the same
+    // divergence somewhere else.
+    var devHits: Set[str]
 
     action init = {
         nondet cPnfs = oneOf(capChoices(F_PNFS))
@@ -178,7 +245,17 @@ module nfs4 {
             clone: cCl and MINOR >= 2,
             conflictDelays: P_CONFLICT_DELAYS,
             closeFreesLocks: P_CLOSE_FREES_LOCKS,
-            layoutWholeFile: P_LAYOUT_WHOLE_FILE
+            layoutWholeFile: P_LAYOUT_WHOLE_FILE,
+            // Threaded through Caps rather than passed beside it: every
+            // evaluation step already carries Caps, so a deviating branch can
+            // ask `hasDev(a, "...")` wherever the divergence actually is
+            // without a new parameter on forty functions.
+            devs: DEVS,
+            tolHoleTracking: T_HOLE_TRACKING,
+            tolDirSymlinkStatus: T_DIR_SYMLINK_STATUS,
+            tolXattrChange: T_XATTR_CHANGE,
+            tolRenewLapsed: T_RENEW_LAPSED,
+            tolRflagsConfirm: T_RFLAGS_CONFIRM and MINOR >= 1
         }
         all {
             // ref: in-memory share roots are 0777; the root mode is not
@@ -193,6 +270,7 @@ module nfs4 {
             // before replaying step 1 (skip on mismatch unless the
             // feature is FeatMandatory -- then mismatch is a failure).
             lastOp' = LInit({ minor: MINOR, caps: c }),
+            devHits' = Set(),
         }
     }
 
@@ -212,6 +290,7 @@ module nfs4 {
             lastOp' = LCompound({ tag: tag, tagName: "", ops: ops,
                                   status: out.status,
                                   results: out.results }),
+            devHits' = out.devHits,
         }
     }
 
@@ -228,12 +307,36 @@ module nfs4 {
     // A well-formed tag -- including multi-byte -- is accepted and the
     // compound runs normally, which is what reaches the validator's accept
     // paths.
+    pure def tagUtf8Bad(t: str): bool =
+        t == "NUTF8" or t == "NUTF8B" or t == "NUTF8C" or t == "NUSUR" or
+        t == "NUNCH" or t == "NU4OV" or t == "NU4HI" or t == "NUF5" or
+        t == "NUTRUNC" or t == "NUBADC" or t == "NUMIXB" or
+        t == "NUMIXT" or t == "NUMIXS"
+
+    // S4-compound-tag-unvalidated: RFC 8881 2.2 leaves the COMPOUND tag an
+    // opaque utf8str_cs the server need not police, and neither NFS-Ganesha
+    // nor the Linux server rejects a malformed one -- the compound runs and
+    // its result array is the ordinary one.  With the deviation on the model
+    // stops rejecting the tag, so the whole compound (and every later step
+    // that depends on what it did) stays in step with the server instead of
+    // parting at the first tagged compound.
+    //
+    // G4-compound-tag-length-limit: the opposite direction, and independent of
+    // the above -- RFC 8881 2.2 sets NO maximum tag length, but ganesha caps
+    // the tag below 256 bytes and answers NFS4ERR_INVAL for the whole
+    // compound.  (The Linux server rejects the same message at the RPC layer
+    // with GARBAGE_ARGS, which never reaches a COMPOUND status at all and so
+    // is not something the model can state.)
     pure def tagStatus(t: str): int =
-        if (t == "NUTF8" or t == "NUTF8B" or t == "NUTF8C" or t == "NUSUR" or
-            t == "NUNCH" or t == "NU4OV" or t == "NU4HI" or t == "NUF5" or
-            t == "NUTRUNC" or t == "NUBADC" or t == "NUMIXB" or
-            t == "NUMIXT" or t == "NUMIXS") E_INVAL
+        if (t == "NLONG" and dev("G4-compound-tag-length-limit")) E_INVAL
+        else if (tagUtf8Bad(t) and not(dev("S4-compound-tag-unvalidated"))) E_INVAL
         else OK
+
+    pure def tagDevs(t: str): Set[str] =
+        (if (tagUtf8Bad(t) and dev("S4-compound-tag-unvalidated"))
+             Set("S4-compound-tag-unvalidated") else Set())
+        .union(if (t == "NLONG" and dev("G4-compound-tag-length-limit"))
+                   Set("G4-compound-tag-length-limit") else Set())
 
     // Tagged compounds are not recorded for retransmission: replayPrev
     // rebuilds the request with an empty tag name, so only untagged compounds
@@ -250,6 +353,7 @@ module nfs4 {
                 prev' = { valid: false, tag: 0, ops: [] },
                 lastOp' = LCompound({ tag: tag, tagName: t, ops: ops,
                                       status: E_INVAL, results: [] }),
+                devHits' = tagDevs(t),
             }
         else {
             val out = evalCompound(fs, sdb, MINOR, caps, tag, ops)
@@ -262,6 +366,7 @@ module nfs4 {
                 lastOp' = LCompound({ tag: tag, tagName: t, ops: ops,
                                       status: out.status,
                                       results: out.results }),
+                devHits' = out.devHits.union(tagDevs(t)),
             }
         }
 
@@ -297,6 +402,7 @@ module nfs4 {
                                       ops: prev.ops,
                                       status: out.status,
                                       results: out.results }),
+                devHits' = out.devHits,
             }
         },
     }

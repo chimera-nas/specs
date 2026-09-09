@@ -29,7 +29,16 @@ module nfs4Test42 {
         F_CLONE = FeatMandatory,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
-        P_LAYOUT_WHOLE_FILE = true
+        P_LAYOUT_WHOLE_FILE = true,
+        // The self-tests assert the STANDARD, always: no deviation is
+        // enabled and no tolerance relaxed, so a model branch that only a
+        // deviating implementation takes can never shape what they check.
+        DEVS = Set(),
+        T_HOLE_TRACKING = false,
+        T_DIR_SYMLINK_STATUS = false,
+        T_XATTR_CHANGE = false,
+        T_RENEW_LAPSED = false,
+        T_RFLAGS_CONFIRM = false
     ).* from "./nfs4"
 
     def lastStatus: int =
@@ -47,7 +56,8 @@ module nfs4Test42 {
     def resAt(i: int): OpRes = lastResults[i]
 
     val noOpen = { st: -999, sid: -1, seq: 0, needConfirm: false,
-                   cinfo: { before: 0, after: 0 }, deleg: DNone,
+                   needConfirmAccept: Set(false),
+                   cinfo: { before: 0, after: 0, opaque: false }, deleg: DNone,
                    recalls: Set() }
     def asOpen(r) =
         match r {
@@ -70,7 +80,8 @@ module nfs4Test42 {
     def asSeek(r) =
         match r {
             | SSeek(x) => x
-            | _ => { st: -999, eof: false, offset: -1 }
+            | _ => { st: -999, eof: false, offset: -1,
+                     stAccept: Set(), offsetAccept: Set(), eofAccept: Set() }
         }
 
     def asLayoutget(r) =
@@ -858,7 +869,16 @@ module nfs4Test40 {
         F_CLONE = FeatOff,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
-        P_LAYOUT_WHOLE_FILE = true
+        P_LAYOUT_WHOLE_FILE = true,
+        // The self-tests assert the STANDARD, always: no deviation is
+        // enabled and no tolerance relaxed, so a model branch that only a
+        // deviating implementation takes can never shape what they check.
+        DEVS = Set(),
+        T_HOLE_TRACKING = false,
+        T_DIR_SYMLINK_STATUS = false,
+        T_XATTR_CHANGE = false,
+        T_RENEW_LAPSED = false,
+        T_RFLAGS_CONFIRM = false
     ).* from "./nfs4"
 
     def lastStatus: int =
@@ -879,7 +899,8 @@ module nfs4Test40 {
         match r {
             | SOpen(x) => x
             | _ => { st: -999, sid: -1, seq: 0, needConfirm: false,
-                     cinfo: { before: 0, after: 0 }, deleg: DNone,
+                     needConfirmAccept: Set(false),
+                     cinfo: { before: 0, after: 0, opaque: false }, deleg: DNone,
                      recalls: Set() }
         }
 

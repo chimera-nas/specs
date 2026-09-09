@@ -41,7 +41,7 @@
 // the test file, so quint's resolver pulls both into a single module tree.
 //
 // Usage: gen.js <spec.json>   where spec.json is written by CMake:
-//   { "quintCli": "...", "model": "<family>_all.qnt",
+//   { "quintCli": "...", "model": "<family>_all.qnt", "backend": "typescript",
 //     "tests":   [ { "name": "...", "main": "-"|"name", "maxSamples": N } ],
 //     "batches": [ { "outdir": "...", "main": "-"|"name", "step": "...",
 //                    "maxSteps": N, "nTraces": N, "seed": "0x7",
@@ -94,12 +94,25 @@ function argsFor(batch) {
     maxSteps: batch.maxSteps ?? 20,
     nTraces: batch.nTraces ?? 1,
     nThreads: os.cpus().length,
+    // The simulator backend.  DEFAULT IS TYPESCRIPT, and that is a portability
+    // decision rather than a performance one.  quint publishes its Rust
+    // evaluator only as *-unknown-linux-gnu built against glibc 2.39, newer
+    // than ubuntu 22.04 and rocky 9 carry, with no musl build to mirror -- so
+    // on those two CI images the rust backend loads and then dies
+    // ("version `GLIBC_2.39' not found") the first time a generator runs.
+    // While a prebuilt trace bundle existed that did not matter, because those
+    // images replayed a corpus somebody else generated.  The corpus is now
+    // generated on every build, so a backend that cannot run there costs those
+    // cells their model-based tests entirely.  TypeScript is slower on the
+    // large families and produces a DIFFERENT (equally valid) corpus for the
+    // same seed; both were accepted deliberately in exchange for generating
+    // everywhere.
+    backend: spec.backend ?? 'typescript',
     // Generation batches are seeded and so reproducible; self-tests are not,
     // exactly as `quint test` was invoked before -- it passed no --seed, so each
     // run walks a different sample.  Seeding them here would quietly turn a
     // randomised check into a fixed one.
     seed: batch.seed !== undefined ? BigInt(batch.seed) : undefined,
-    backend: 'rust',
     mbt: false,
     verbosity: 0,
     quiet: true,

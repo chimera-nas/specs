@@ -2,10 +2,35 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""Registry of known Linux kernel NFS server (knfsd) divergences from the
-NFS models.  See deviations.py for the contract and ganesha_deviations.py
-for the shape of an entry.  Recorded against the kernel of the
-kvm-test-base guest the harness boots (harness/nfs/run_nfs_mbt.sh).
+"""What is LEFT of the Linux kernel NFS server (knfsd) divergence registry.
+
+Most of what this file used to hold now lives in the MODEL, switched on per
+cell by harness/nfs/configs/knfsd_*.json and declared with its citation in
+quint/nfs3/corpus.schema.json and quint/nfs4/corpus.schema.json.  Moved, with
+the id that replaced them -- note how many are S4-*, meaning the SAME id
+NFS-Ganesha enables, which is what makes them evidence of an ambiguous clause
+rather than of one server's bug:
+
+  KN-3          -> S4-link-dir-notdir            (shared with ganesha)
+  KN-4, KN-12   -> T_RENEW_LAPSED tolerance      (shared with ganesha)
+  KN-5          -> K4-rename-symlink-notdir      (narrower twin of chimera's
+                   own D4-19-dirop-symlink-notdir)
+  KN-6          -> S4-no-wrong-type              (shared with ganesha)
+  KN-9          -> S4-owner-seqid-gap-unpoliced  (shared with ganesha)
+  KN-15         -> S4-change-is-coarse-ctime     (shared with ganesha)
+  KN-20, KN-21  -> S4-compound-tag-unvalidated   (shared with ganesha)
+  KN3-2         -> K3-exclusive-mode-zero
+  KN3-3         -> the existing T_ERROR_PRECEDENCE tolerance (shared with
+                   ganesha AND with chimera, which already had it)
+
+Retired without a replacement because the model was already corrected and
+knfsd no longer diverges: KN-16 (a directory's nlink -- nfs4_fs.qnt's fsInv
+has counted subdirectories for some time, so the entry was forgiving a
+divergence that no longer existed).
+
+See deviations.py for the contract and ganesha_deviations.py for the shape of
+an entry.  Recorded against the kernel of the kvm-test-base guest the harness
+boots (harness/nfs/run_nfs_mbt.sh).
 """
 
 from deviations import (Deviation, Registry, SERVER, MODEL, BOTH,  # noqa: F401
@@ -46,81 +71,8 @@ KN_1_NAME_HANDLING = Deviation(
 
 
 
-# KN-3: LINK of a directory source -> NFS4ERR_NOTDIR, the knfsd side of GD-9
-# (both real servers agree on NOTDIR where the model and RFC 7530 16.9.4 pick
-# NFS4ERR_ISDIR).  Nothing is linked, so replay continues.
-KN_3_LINK_DIR_NOTDIR = Deviation(
-    id="KN-3-link-dir-notdir",
-    verdict=SERVER,
-    spec="RFC 7530 16.9.4 (LINK; the directory-source status is effectively "
-         "unspecified and servers differ)",
-    summary="LINK of a directory source returns NFS4ERR_NOTDIR instead of "
-            "the model's NFS4ERR_ISDIR",
-    root_cause="knfsd refuses a directory hard link with NOTDIR",
-    candidate_fix="switch the model (and nfs4Test) to NOTDIR -- both servers "
-                  "agree on it -- or keep ISDIR and this record",
-    ops=("SLink",),
-    expected_status=(NFS4ERR_ISDIR, NFS4ERR_INVAL, NFS4ERR_BADNAME,
-                     NFS4ERR_BADCHAR),
-    actual_status=(NFS4ERR_NOTDIR, NFS4ERR_ISDIR, NFS4ERR_INVAL,
-                   NFS4ERR_BADNAME, NFS4ERR_BADCHAR),
-)
 
-# KN-4: RENEW of a lapsed lease -> NFS4ERR_EXPIRED, the knfsd side of GD-10.
-# RFC 7530 16.30.4 / 9.6.3 leave EXPIRED vs STALE_CLIENTID to the server; the
-# client re-establishes state either way, so replay continues.
-KN_4_RENEW_EXPIRED = Deviation(
-    id="KN-4-renew-expired",
-    verdict=SERVER,
-    spec="RFC 7530 16.30.4 / 9.6.3 (RENEW; EXPIRED vs STALE_CLIENTID for a "
-         "lapsed lease is the server's to time)",
-    summary="RENEW of a lapsed lease returns NFS4ERR_EXPIRED where the model "
-            "predicts NFS4ERR_STALE_CLIENTID",
-    root_cause="knfsd retains the client id past the lease and reports "
-               "EXPIRED; the model retires it and reports STALE_CLIENTID",
-    candidate_fix="none required (defensible); the model could retain a "
-                  "lapsed client id briefly to match",
-    ops=("SRenew",),
-    expected_status=NFS4ERR_STALE_CLIENTID,
-    actual_status=NFS4ERR_EXPIRED,
-)
 
-# KN-5: RENAME across a symlink directory -> NFS4ERR_NOTDIR.  When the source
-# or target directory handle names a symlink, the model reports NFS4ERR_SYMLINK
-# (matching ganesha), but knfsd reports NFS4ERR_NOTDIR -- a symlink is not a
-# directory (RFC 7530 16.27.4 lists NOTDIR; the symlink-vs-notdir framing is
-# the server's).  Nothing is renamed, so replay continues.
-KN_5_RENAME_SYMLINK_NOTDIR = Deviation(
-    id="KN-5-rename-symlink-notdir",
-    verdict=SERVER,
-    spec="RFC 7530 16.27.4 (RENAME; NOTDIR is listed, and symlink-vs-notdir "
-         "for a symlink directory handle is the server's framing)",
-    summary="RENAME with a symlink source/target directory returns "
-            "NFS4ERR_NOTDIR instead of the model's NFS4ERR_SYMLINK",
-    root_cause="knfsd frames a symlink used as a directory as NOTDIR",
-    candidate_fix="none required (defensible)",
-    ops=("SRename",),
-    expected_status=NFS4ERR_SYMLINK,
-    actual_status=NFS4ERR_NOTDIR,
-)
-
-# KN-6: the knfsd side of GD-11 -- a wrong-type operation on 4.1+ comes back
-# as the POSIX-aligned ISDIR/INVAL/SYMLINK, never the model's 4.1+
-# NFS4ERR_WRONG_TYPE (RFC 8881's SHOULD).  Status-only, so replay continues.
-KN_6_WRONG_TYPE = Deviation(
-    id="KN-6-wrong-type-posix-status",
-    verdict=SERVER,
-    spec="RFC 8881 (NFS4ERR_WRONG_TYPE is a SHOULD; the POSIX-aligned "
-         "ISDIR/INVAL/SYMLINK are equally conformant)",
-    summary="a wrong-type op returns ISDIR/INVAL/SYMLINK where the model, "
-            "following the 4.1+ SHOULD, predicts NFS4ERR_WRONG_TYPE",
-    root_cause="knfsd reports the object's natural POSIX-aligned status, "
-               "never NFS4ERR_WRONG_TYPE",
-    candidate_fix="none required (both conformant)",
-    ops=("SSetattr", "SWrite", "SRead", "SOpen", "SLayoutget"),
-    expected_status=NFS4ERR_WRONG_TYPE,
-    actual_status=(NFS4ERR_ISDIR, NFS4ERR_INVAL, NFS4ERR_SYMLINK),
-)
 
 
 # KN-7: an OPEN whose stateid still awaits OPEN_CONFIRM does not survive an
@@ -154,30 +106,6 @@ KN_7_UNCONFIRMED_OPEN_LOST = Deviation(
 
 
 
-# KN-9: open-owner seqid enforcement, both directions.  The model drives a
-# deliberate +2 gap expecting NFS4ERR_BAD_SEQID (nfs4_ops.qnt oseq: seqid + 2);
-# knfsd processes the OPEN instead (NOENT / the object status).  Conversely,
-# where the model expects a name/other status knfsd sometimes answers BAD_SEQID
-# from its own owner bookkeeping.  RFC 7530 9.1.7 makes exactly-+1 sequencing a
-# server enforcement point the two sides police differently.  reconcilable=False:
-# the owner seqid parts, so the trace stops here.
-KN_9_OWNER_SEQID = Deviation(
-    id="KN-9-owner-seqid-enforcement",
-    verdict=SERVER,
-    spec="RFC 7530 9.1.7 (open-owner seqid must be exactly one greater; "
-         "enforcement is the server's)",
-    summary="open-owner seqid: knfsd processes a gap the model calls BAD_SEQID, "
-            "or answers BAD_SEQID where the model expects another status",
-    root_cause="knfsd's open-owner seqid bookkeeping diverges from the model's "
-               "strict +1 gate",
-    candidate_fix="none from the model; drop the BAD_SEQID probe or record",
-    ops=("SOpen", "SClose", "SOpenDowngrade"),
-    expected_status=(NFS4ERR_BAD_SEQID, NFS4ERR_INVAL, NFS4_OK,
-                     NFS4ERR_EXIST),
-    actual_status=(NFS4ERR_NOENT, NFS4_OK, NFS4ERR_BAD_SEQID, NFS4ERR_INVAL,
-                   NFS4ERR_NOTDIR, NFS4ERR_BAD_STATEID, NFS4ERR_EXPIRED),
-    reconcilable=False,
-)
 
 # KN-10: share reservation / open-attempt enforcement.  A second OPEN that the
 # model predicts SHARE_DENIED against a deny reservation, or predicts OK, knfsd
@@ -219,23 +147,6 @@ KN_11_OPENMODE = Deviation(
                    NFS4ERR_OLD_STATEID),
 )
 
-# KN-12: RENEW of a lapsed lease succeeds (NFS4_OK) where the model, having
-# retired the client id, predicts STALE_CLIENTID -- the OK-valued companion of
-# KN-4.  RFC 7530 16.30.4 / 9.6.3: how long a lapsed client id survives, and
-# whether a late RENEW still refreshes it, is the server's to time.
-KN_12_RENEW_OK = Deviation(
-    id="KN-12-renew-ok",
-    verdict=SERVER,
-    spec="RFC 7530 16.30.4 / 9.6.3 (a lapsed client id's survival is the "
-         "server's to time)",
-    summary="RENEW of a lapsed lease succeeds where the model predicts "
-            "STALE_CLIENTID",
-    root_cause="knfsd still holds the client id and refreshes it",
-    candidate_fix="none required (defensible)",
-    ops=("SRenew",),
-    expected_status=NFS4ERR_STALE_CLIENTID,
-    actual_status=NFS4_OK,
-)
 
 # KN-13: LOOKUP of a malformed-UTF-8 component answers NFS4ERR_ACCESS -- the
 # knfsd side of KN-1's name-handling latitude, landing on ACCESS rather than a
@@ -273,44 +184,6 @@ KN_14_LOCKT_GRACE = Deviation(
     actual_status=NFS4ERR_GRACE,
 )
 
-# KN-15: change-attribute consistency -- the knfsd side of GD-1/GD-14.  knfsd's
-# change attribute is the object's coarse ctime, so two mutations within a tick
-# report the same value, or the value advances between two reads the model
-# treats as unchanged.  RFC 7530 5.8.1.4 requires it differ on every change.
-KN_15_CHANGE = Deviation(
-    id="KN-15-change-coarse-ctime",
-    verdict=SERVER,
-    spec="RFC 7530 5.8.1.4 / RFC 8881 5.8.1.4 (change must differ after any "
-         "modification)",
-    summary="knfsd's change attribute (coarse ctime) is non-injective against "
-            "the model's abstract change",
-    root_cause="knfsd change = ctime; a tick boundary makes it collide or "
-               "advance untracked",
-    candidate_fix="a per-object modification counter (as GD-1)",
-    ops=("SCreate", "SLink", "SRemove", "SRename", "SGetattr", "SOpen"),
-    field=("cinfo.before", "cinfo.after", "cinfoS.before", "cinfoT.before",
-           "change"),
-    context=lambda f, ctx: ("unchanged on the wire" in f.detail or
-                            "reported two wire values" in f.detail),
-)
-
-# KN-16: GETATTR mode/nlink on a directory whose link count or mode knfsd tracks
-# differently from the model (a subdirectory bumps a POSIX directory's nlink to
-# 3; the model keeps 2).  RFC 7530 5.8 leaves nlink's exact accounting to the
-# filesystem.  Field-only, reconcilable.
-KN_16_ATTR = Deviation(
-    id="KN-16-dir-attr-accounting",
-    verdict=SERVER,
-    spec="RFC 7530 5.8.1 (numlinks/mode follow the backing filesystem's "
-         "accounting)",
-    summary="GETATTR nlink/mode on a directory differs from the model's "
-            "abstract accounting",
-    root_cause="knfsd's ext4 export counts a directory's subdirectories in "
-               "nlink where the model keeps a flat 2",
-    candidate_fix="model: count subdirectories in a directory's nlink",
-    ops=("SGetattr",),
-    field=("nlink", "mode"),
-)
 
 
 # KN-17: client-id and object lifecycle cascades.  A SETCLIENTID_CONFIRM whose
@@ -372,37 +245,6 @@ KN_19_CREATE_SETATTR = Deviation(
 )
 
 
-# KN-20/21: compound-level structural divergences -- the knfsd side of
-# GD-23/24.  knfsd does not reject a malformed compound tag, so a compound the
-# model predicts NFS4ERR_INVAL with no results is processed (OK, one result).
-# RFC 8881 2.2 leaves tag validation to the server.  Compound-level only.
-KN_20_COMPOUND_STATUS = Deviation(
-    id="KN-20-compound-tag-status",
-    verdict=SERVER,
-    spec="RFC 8881 2.2 (compound-tag validation is the server's)",
-    summary="a malformed-tag compound the model calls NFS4ERR_INVAL is OK to "
-            "knfsd",
-    root_cause="knfsd does not reject a malformed compound tag",
-    candidate_fix="model: relax compound-tag validation",
-    ops=("compound",),
-    expected_status=NFS4ERR_INVAL,
-    actual_status=NFS4_OK,
-)
-
-KN_21_COMPOUND_RESULTS = Deviation(
-    id="KN-21-compound-tag-results",
-    verdict=SERVER,
-    spec="RFC 8881 2.2 (the result count follows server processing of a tag "
-         "the model would have rejected)",
-    summary="a compound's result count differs (knfsd processed a tag the "
-            "model rejected)",
-    root_cause="knfsd returns a result for a compound the model dropped whole",
-    candidate_fix="model: relax compound-tag validation",
-    ops=("compound",),
-    field="results",
-    expected_value=(0, 1),
-    actual_value=(0, 1),
-)
 
 
 # KN-22: the ACCESS granted-mask differs from the model's type-masking, as
@@ -421,24 +263,14 @@ KN_22_ACCESS = Deviation(
 
 NFS4 = Registry("knfsd/nfs4", [
     KN_1_NAME_HANDLING,
-    KN_3_LINK_DIR_NOTDIR,
-    KN_4_RENEW_EXPIRED,
-    KN_5_RENAME_SYMLINK_NOTDIR,
-    KN_6_WRONG_TYPE,
     KN_7_UNCONFIRMED_OPEN_LOST,
-    KN_9_OWNER_SEQID,
     KN_10_SHARE,
     KN_11_OPENMODE,
-    KN_12_RENEW_OK,
     KN_13_NAME_ACCESS,
     KN_14_LOCKT_GRACE,
-    KN_15_CHANGE,
-    KN_16_ATTR,
     KN_17_LIFECYCLE,
     KN_18_READDIR_NAMES,
     KN_19_CREATE_SETATTR,
-    KN_20_COMPOUND_STATUS,
-    KN_21_COMPOUND_RESULTS,
     KN_22_ACCESS,
 ])
 
@@ -460,43 +292,8 @@ KN3_1_CREATE = Deviation(
     reconcilable=False,
 )
 
-# KN3-2: an EXCLUSIVE-created file materialises mode 0 on knfsd (the client is
-# expected to SETATTR its permissions), where the model -- like ganesha and
-# chimera -- uses 0600.  RFC 1813 3.3.8 leaves the mode undefined until that
-# SETATTR.  Field-only (the WCC mode), no state divergence.
-KN3_2_EXCL_MODE = Deviation(
-    id="KN3-2-exclusive-mode-zero",
-    verdict=SERVER,
-    spec="RFC 1813 3.3.8 (the mode of an EXCLUSIVE-created file is undefined "
-         "until the client's SETATTR)",
-    summary="an EXCLUSIVE-created file is mode 0 on knfsd where the model "
-            "predicts 0600",
-    root_cause="knfsd creates the exclusive file with no permission bits until "
-               "the follow-up SETATTR",
-    candidate_fix="none required (RFC-undefined); a knfsd-specific choice",
-    ops=("OWrite", "OSetattr", "OCreate", "OGetattr", "ORead",
-         "OReaddir"),
-    field=("wcc.after.mode", "attrs.mode", "mode",
-           "file_attributes.mode", "readdirplus[a].mode"),
-)
 
-# KN3-3: RENAME onto a directory reports NFS3ERR_NOTEMPTY (the knfsd side of
-# GN-4).  RFC 1813 3.3.14 leaves ISDIR vs NOTEMPTY unordered.
-KN3_3_RENAME = Deviation(
-    id="KN3-3-rename-notempty",
-    verdict=SERVER,
-    spec="RFC 1813 3.3.14 (RENAME; ISDIR vs NOTEMPTY is unordered)",
-    summary="RENAME onto a directory reports NFS3ERR_NOTEMPTY where the model "
-            "predicts NFS3ERR_ISDIR",
-    root_cause="knfsd reports the non-empty target before its type",
-    candidate_fix="none required (defensible)",
-    ops=("ORename",),
-    expected_status=NFS3ERR_ISDIR,
-    actual_status=NFS3ERR_NOTEMPTY,
-)
 
 NFS3 = Registry("knfsd/nfs3", [
     KN3_1_CREATE,
-    KN3_2_EXCL_MODE,
-    KN3_3_RENAME,
 ])

@@ -1,0 +1,25 @@
+{
+  "extends": "./_smbd.json",
+  "family": "smb2",
+  "description": "the namespace half -- SET_INFO rename, delete-on-close, session and tree teardown -- against Samba; the only flavour that draws renames, which is why it is the one that reaches SD-4.",
+  "traceStem": "smb2Base",
+
+  // Which of the smbd profile's deviations this flavour can actually REACH.
+  // tools/devliveness.py fails a cell that enables one its own corpus never
+  // records having taken, so each flavour switches off what it cannot reach:
+  // byte-range locks are drawn only by stepInfo, SET_INFO renames only by
+  // stepNs, and a FILE_CREATE onto an existing directory only by the flavours
+  // that make directories.  Switching a deviation off in a cell that never
+  // takes its branch does not change one byte of that cell's corpus -- it is a
+  // statement about coverage, not about the server.
+  "deviationsOff": [
+    "SD-2",
+    "SD-5",
+    "SD-8",
+    "SD-9"
+  ],
+
+  "batches": [
+    { "flavor": "stepNs", "steps": 500, "traces": 8, "seed": "0xd" }
+  ]
+}

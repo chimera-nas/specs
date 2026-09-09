@@ -1,0 +1,26 @@
+{
+  "extends": "./_smbd.json",
+  "family": "smb2",
+  "description": "the NAMESPACE half of CHANGE_NOTIFY -- entries appearing, being renamed and disappearing, watched through the two name filters and nothing else. The subset the model and Samba agree on, so it is driven record-for-record to the end of a 400-message trace where the full stepNotify flavour above stops at SD-10 / SD-11 within a few dozen steps. No deviation of this smbd is reachable from this flavour, so the cell states the standard exactly and is its own strict twin -- and it GATES, rather than reporting.",
+  "traceStem": "smb2Base",
+
+  // Which of the smbd profile's deviations this flavour can actually REACH.
+  // tools/devliveness.py fails a cell that enables one its own corpus never
+  // records having taken, so each flavour switches off what it cannot reach:
+  // byte-range locks are drawn only by stepInfo, SET_INFO renames only by
+  // stepNs, and a FILE_CREATE onto an existing directory only by the flavours
+  // that make directories.  Switching a deviation off in a cell that never
+  // takes its branch does not change one byte of that cell's corpus -- it is a
+  // statement about coverage, not about the server.
+  "deviationsOff": [
+    "SD-2",
+    "SD-4",
+    "SD-5",
+    "SD-8",
+    "SD-9"
+  ],
+
+  "batches": [
+    { "flavor": "stepNotifyNs", "steps": 400, "traces": 6, "seed": "0x71" }
+  ]
+}

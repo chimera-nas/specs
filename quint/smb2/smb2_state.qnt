@@ -259,7 +259,17 @@ module smb2state {
         // (probe R3c -- the evidence the create was not re-evaluated).
         replayOk: bool,
         replayGuid: int,
-        replayAct: int
+        replayAct: int,
+        // The CreateAction this handle's own CREATE reported -- the standard
+        // never consults it again, so nothing in the MS-SMB2 / MS-FSA rules
+        // reads this field.  It is here because one recorded deviation turns
+        // on it: Samba's LOCK path checks the backing descriptor's open mode
+        // rather than the SMB GrantedAccess, and the descriptor was opened for
+        // write exactly when the server had to CREATE or TRUNCATE the object
+        // -- i.e. whenever the CreateAction is anything but OPENED (SD-8).
+        // Distinct from `replayAct`, which is set only for a DH2Q-eligible
+        // create and is about the reply cache.
+        createAct: int
     }
 
     // A durable grant as it sits on an open handle.
@@ -491,7 +501,8 @@ module smb2state {
     pure def doInsertOpen(sdb: StateDB, sess: SessionId, tree: TreeId,
                           f: Ino, dir: Ino, name: Name,
                           granted: { r: bool, w: bool, h: bool, d: bool },
-                          deny: Access, delOnClose: bool, cs: int):
+                          deny: Access, delOnClose: bool, cs: int,
+                          act: int):
             { sdb2: StateDB, fid: FileId } = {
         val fid = sdb.nextFile
         { sdb2: sdb
@@ -504,7 +515,8 @@ module smb2state {
                   // The CREATE's own ChannelSequence seeds the handle
                   // (probe R11).  Replay eligibility is set by the CREATE
                   // handler afterwards, only when a DH2Q context was present.
-                  cs: cs, replayOk: false, replayGuid: -1, replayAct: -1 }))
+                  cs: cs, replayOk: false, replayGuid: -1, replayAct: -1,
+                  createAct: act }))
               .with("nextFile", fid + 1),
           fid: fid }
     }

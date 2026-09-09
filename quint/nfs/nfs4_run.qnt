@@ -30,7 +30,17 @@ module nfs4Default {
         F_CLONE = FeatIfAdvertised,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
-        P_LAYOUT_WHOLE_FILE = true
+        P_LAYOUT_WHOLE_FILE = true,
+        // The run instances are the RFC-first ones: no deviation enabled and
+        // no tolerance relaxed.  The corpus is generated from the cell
+        // modules tools/mkconfig.js renders out of chimera's configs, which
+        // is where a deviation is switched on.
+        DEVS = Set(),
+        T_HOLE_TRACKING = false,
+        T_DIR_SYMLINK_STATUS = false,
+        T_XATTR_CHANGE = false,
+        T_RENEW_LAPSED = false,
+        T_RFLAGS_CONFIRM = false
     ).* from "./nfs4"
 }
 
@@ -51,7 +61,17 @@ module nfs4V40 {
         F_CLONE = FeatOff,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
-        P_LAYOUT_WHOLE_FILE = true
+        P_LAYOUT_WHOLE_FILE = true,
+        // The run instances are the RFC-first ones: no deviation enabled and
+        // no tolerance relaxed.  The corpus is generated from the cell
+        // modules tools/mkconfig.js renders out of chimera's configs, which
+        // is where a deviation is switched on.
+        DEVS = Set(),
+        T_HOLE_TRACKING = false,
+        T_DIR_SYMLINK_STATUS = false,
+        T_XATTR_CHANGE = false,
+        T_RENEW_LAPSED = false,
+        T_RFLAGS_CONFIRM = false
     ).* from "./nfs4"
 }
 
@@ -72,7 +92,17 @@ module nfs4V41 {
         F_CLONE = FeatOff,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
-        P_LAYOUT_WHOLE_FILE = true
+        P_LAYOUT_WHOLE_FILE = true,
+        // The run instances are the RFC-first ones: no deviation enabled and
+        // no tolerance relaxed.  The corpus is generated from the cell
+        // modules tools/mkconfig.js renders out of chimera's configs, which
+        // is where a deviation is switched on.
+        DEVS = Set(),
+        T_HOLE_TRACKING = false,
+        T_DIR_SYMLINK_STATUS = false,
+        T_XATTR_CHANGE = false,
+        T_RENEW_LAPSED = false,
+        T_RFLAGS_CONFIRM = false
     ).* from "./nfs4"
 }
 
@@ -115,7 +145,17 @@ module nfs4Memfs42 {
         F_CLONE = FeatMandatory,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
-        P_LAYOUT_WHOLE_FILE = true
+        P_LAYOUT_WHOLE_FILE = true,
+        // The run instances are the RFC-first ones: no deviation enabled and
+        // no tolerance relaxed.  The corpus is generated from the cell
+        // modules tools/mkconfig.js renders out of chimera's configs, which
+        // is where a deviation is switched on.
+        DEVS = Set(),
+        T_HOLE_TRACKING = false,
+        T_DIR_SYMLINK_STATUS = false,
+        T_XATTR_CHANGE = false,
+        T_RENEW_LAPSED = false,
+        T_RFLAGS_CONFIRM = false
     ).* from "./nfs4"
 }
 
@@ -140,7 +180,17 @@ module nfs4Memfs42Deleg {
         F_CLONE = FeatMandatory,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
-        P_LAYOUT_WHOLE_FILE = true
+        P_LAYOUT_WHOLE_FILE = true,
+        // The run instances are the RFC-first ones: no deviation enabled and
+        // no tolerance relaxed.  The corpus is generated from the cell
+        // modules tools/mkconfig.js renders out of chimera's configs, which
+        // is where a deviation is switched on.
+        DEVS = Set(),
+        T_HOLE_TRACKING = false,
+        T_DIR_SYMLINK_STATUS = false,
+        T_XATTR_CHANGE = false,
+        T_RENEW_LAPSED = false,
+        T_RFLAGS_CONFIRM = false
     ).* from "./nfs4"
 }
 
@@ -160,7 +210,17 @@ module nfs4Memfs41Deleg {
         F_CLONE = FeatOff,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
-        P_LAYOUT_WHOLE_FILE = true
+        P_LAYOUT_WHOLE_FILE = true,
+        // The run instances are the RFC-first ones: no deviation enabled and
+        // no tolerance relaxed.  The corpus is generated from the cell
+        // modules tools/mkconfig.js renders out of chimera's configs, which
+        // is where a deviation is switched on.
+        DEVS = Set(),
+        T_HOLE_TRACKING = false,
+        T_DIR_SYMLINK_STATUS = false,
+        T_XATTR_CHANGE = false,
+        T_RENEW_LAPSED = false,
+        T_RFLAGS_CONFIRM = false
     ).* from "./nfs4"
 }
 
@@ -180,7 +240,17 @@ module nfs4Memfs41 {
         F_CLONE = FeatOff,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
-        P_LAYOUT_WHOLE_FILE = true
+        P_LAYOUT_WHOLE_FILE = true,
+        // The run instances are the RFC-first ones: no deviation enabled and
+        // no tolerance relaxed.  The corpus is generated from the cell
+        // modules tools/mkconfig.js renders out of chimera's configs, which
+        // is where a deviation is switched on.
+        DEVS = Set(),
+        T_HOLE_TRACKING = false,
+        T_DIR_SYMLINK_STATUS = false,
+        T_XATTR_CHANGE = false,
+        T_RENEW_LAPSED = false,
+        T_RFLAGS_CONFIRM = false
     ).* from "./nfs4"
 }
 
@@ -200,7 +270,17 @@ module nfs4Memfs40 {
         F_CLONE = FeatOff,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
-        P_LAYOUT_WHOLE_FILE = true
+        P_LAYOUT_WHOLE_FILE = true,
+        // The run instances are the RFC-first ones: no deviation enabled and
+        // no tolerance relaxed.  The corpus is generated from the cell
+        // modules tools/mkconfig.js renders out of chimera's configs, which
+        // is where a deviation is switched on.
+        DEVS = Set(),
+        T_HOLE_TRACKING = false,
+        T_DIR_SYMLINK_STATUS = false,
+        T_XATTR_CHANGE = false,
+        T_RENEW_LAPSED = false,
+        T_RFLAGS_CONFIRM = false
     ).* from "./nfs4"
 }
 
@@ -225,7 +305,17 @@ module nfs4Pnfs42 {
         F_CLONE = FeatMandatory,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
-        P_LAYOUT_WHOLE_FILE = true
+        P_LAYOUT_WHOLE_FILE = true,
+        // The run instances are the RFC-first ones: no deviation enabled and
+        // no tolerance relaxed.  The corpus is generated from the cell
+        // modules tools/mkconfig.js renders out of chimera's configs, which
+        // is where a deviation is switched on.
+        DEVS = Set(),
+        T_HOLE_TRACKING = false,
+        T_DIR_SYMLINK_STATUS = false,
+        T_XATTR_CHANGE = false,
+        T_RENEW_LAPSED = false,
+        T_RFLAGS_CONFIRM = false
     ).* from "./nfs4"
 }
 
@@ -245,7 +335,17 @@ module nfs4Pnfs41 {
         F_CLONE = FeatOff,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
-        P_LAYOUT_WHOLE_FILE = true
+        P_LAYOUT_WHOLE_FILE = true,
+        // The run instances are the RFC-first ones: no deviation enabled and
+        // no tolerance relaxed.  The corpus is generated from the cell
+        // modules tools/mkconfig.js renders out of chimera's configs, which
+        // is where a deviation is switched on.
+        DEVS = Set(),
+        T_HOLE_TRACKING = false,
+        T_DIR_SYMLINK_STATUS = false,
+        T_XATTR_CHANGE = false,
+        T_RENEW_LAPSED = false,
+        T_RFLAGS_CONFIRM = false
     ).* from "./nfs4"
 }
 
@@ -267,7 +367,17 @@ module nfs4PnfsMandatory {
         F_CLONE = FeatIfAdvertised,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
-        P_LAYOUT_WHOLE_FILE = true
+        P_LAYOUT_WHOLE_FILE = true,
+        // The run instances are the RFC-first ones: no deviation enabled and
+        // no tolerance relaxed.  The corpus is generated from the cell
+        // modules tools/mkconfig.js renders out of chimera's configs, which
+        // is where a deviation is switched on.
+        DEVS = Set(),
+        T_HOLE_TRACKING = false,
+        T_DIR_SYMLINK_STATUS = false,
+        T_XATTR_CHANGE = false,
+        T_RENEW_LAPSED = false,
+        T_RFLAGS_CONFIRM = false
     ).* from "./nfs4"
 }
 
@@ -290,6 +400,16 @@ module nfs4AllMandatory {
         F_CLONE = FeatMandatory,
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
-        P_LAYOUT_WHOLE_FILE = true
+        P_LAYOUT_WHOLE_FILE = true,
+        // The run instances are the RFC-first ones: no deviation enabled and
+        // no tolerance relaxed.  The corpus is generated from the cell
+        // modules tools/mkconfig.js renders out of chimera's configs, which
+        // is where a deviation is switched on.
+        DEVS = Set(),
+        T_HOLE_TRACKING = false,
+        T_DIR_SYMLINK_STATUS = false,
+        T_XATTR_CHANGE = false,
+        T_RENEW_LAPSED = false,
+        T_RFLAGS_CONFIRM = false
     ).* from "./nfs4"
 }

@@ -1,0 +1,134 @@
+{
+  "family": "nfsaux",
+  "modelFile": "./nfsaux",
+  "modelModule": "nfsaux",
+
+  "prelude": [
+    "import portmapProto.* from \"./aux_portmap\"",
+    "import mountProto.* from \"./aux_mount\"",
+    "import nlmProto.* from \"./aux_nlm\"",
+    "import nsmProto.* from \"./aux_nsm\"",
+    "import nfsauxProfiles.* from \"./nfsaux_run\""
+  ],
+
+  "selfTests": [
+    { "name": "nfsauxTestRef",   "module": "nfsauxTestRef",   "file": "./nfsauxTest", "maxSamples": 200 },
+    { "name": "nfsauxTestFull",  "module": "nfsauxTestFull",  "file": "./nfsauxTest", "maxSamples": 200 },
+    { "name": "nfsauxTestGrace", "module": "nfsauxTestGrace", "file": "./nfsauxTest", "maxSamples": 200 }
+  ],
+
+  "consts": {
+    "IMPLEMENTED": {
+      "kind": "feature",
+      "key": "features.implemented",
+      "type": "raw",
+      "default": "PORTMAP_MINIMAL.union(MOUNT_PROCS).union(NLM_PROCS).union(NSM_PROCS)",
+      "doc": "the procedures the server registers. Anything outside the set is still called by the traces and must answer PROC_UNAVAIL, so the refusal is itself under test. PORTMAP_MINIMAL is an embedded portmapper that lets a client find the services but not change the table; PORTMAP_PROCS is the full rpcbind surface, which no server here implements."
+    },
+    "SERVICES": {
+      "kind": "policy",
+      "key": "policies.services",
+      "type": "raw",
+      "default": "NFS_SERVICES",
+      "doc": "the portmap service table published at startup. DUMP returns it verbatim, so the ORDER is part of the contract."
+    },
+    "UADDR_HOST": {
+      "kind": "policy",
+      "key": "policies.uaddrHost",
+      "type": "str",
+      "default": "127.0.0.1",
+      "doc": "the host half of the universal addresses rpcbind reports."
+    },
+    "PM_SET_MUTATES": {
+      "kind": "policy",
+      "key": "policies.pmSetMutates",
+      "type": "bool",
+      "default": false,
+      "doc": "PMAPPROC_SET/UNSET mutate the registry. Only meaningful when they are in IMPLEMENTED; a server publishing a fixed table does not register them at all."
+    },
+    "EXPORTS": {
+      "kind": "policy",
+      "key": "policies.exports",
+      "type": "raw",
+      "default": "TWO_EXPORTS",
+      "doc": "the export list, in the order the server reports it. Two exports over one directory, so MNT has something to disambiguate and EXPORT has more than one row to order."
+    },
+    "PATHS": {
+      "kind": "policy",
+      "key": "policies.paths",
+      "type": "raw",
+      "default": "NFS_PATHS",
+      "doc": "every path the traces may present to MOUNTPROC3_MNT, mapped to how it resolves. Closed universe: quint cannot do string surgery, so the resolution rules are enumerated."
+    },
+    "MOUNT_HOST": {
+      "kind": "policy",
+      "key": "policies.mountHost",
+      "type": "str",
+      "default": "inproc",
+      "doc": "the hostname the server records in the mount table for the replay client. A property of the harness's transport rather than of the protocol -- every connection over one in-process transport reports one name."
+    },
+    "NSM_MON_FROM_LOCKS": {
+      "kind": "policy",
+      "key": "policies.nsmMonFromLocks",
+      "type": "bool",
+      "default": true,
+      "doc": "the NSM monitor list is fed by NLM lock grants (a server monitoring its own lock holders) rather than by SM_MON (the classic statd)."
+    },
+    "NSM_ADDRS_DISTINCT": {
+      "kind": "policy",
+      "key": "policies.nsmAddrsDistinct",
+      "type": "bool",
+      "default": false,
+      "doc": "monitored peers are distinguishable by source address. With one transport there is one peer address, so SM_NOTIFY's fallback match cannot tell monitored hosts apart."
+    },
+    "NSM_INITIAL_STATE": {
+      "kind": "policy",
+      "key": "policies.nsmInitialState",
+      "type": "int",
+      "default": 1,
+      "doc": "the state number a freshly started server reports."
+    },
+    "NLM_UPGRADE_IS_NOOP": {
+      "kind": "policy",
+      "key": "policies.nlmUpgradeIsNoop",
+      "type": "bool",
+      "default": true,
+      "doc": "a LOCK naming a range its own owner already holds is answered as an idempotent retry without re-evaluating the mode, so a shared-to-exclusive upgrade is a silent no-op."
+    },
+    "NLM_SHARE_ENFORCED": {
+      "kind": "policy",
+      "key": "policies.nlmShareEnforced",
+      "type": "bool",
+      "default": false,
+      "doc": "NLM DOS share reservations are enforced rather than merely accepted."
+    },
+    "NLM_IN_GRACE": {
+      "kind": "policy",
+      "key": "policies.nlmInGrace",
+      "type": "bool",
+      "default": false,
+      "doc": "the server sits in its post-restart grace window for the whole trace. A server whose lock state cannot survive a restart has nothing to reclaim and opens for business immediately."
+    },
+    "NLM_BLOCKING": {
+      "kind": "feature",
+      "key": "features.nlmBlocking",
+      "type": "bool",
+      "default": true,
+      "doc": "blocking LOCK requests are served, so traces may issue them."
+    },
+    "NLM_GRANT_CALLBACK_OBSERVABLE": {
+      "kind": "policy",
+      "key": "policies.nlmGrantCallbackObservable",
+      "type": "bool",
+      "default": false,
+      "doc": "the out-of-band NLMPROC4_GRANTED callback that delivers a deferred blocking lock is observable by the replay client. It is addressed to the client's own lock manager, which a harness that is not a real lockd cannot receive; the lock is granted server-side either way."
+    },
+    "NLM_CANCEL_MSG_CANCELS": {
+      "kind": "policy",
+      "key": "policies.nlmCancelMsgCancels",
+      "type": "bool",
+      "default": true,
+      "doc": "NLMPROC4_CANCEL_MSG withdraws a queued blocking request the way NLMPROC4_CANCEL does. RFC 1813 gives the two the same meaning; a server may nonetheless acknowledge the asynchronous form without acting on it."
+    }
+  }
+}

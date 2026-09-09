@@ -46,6 +46,32 @@ module posix {
     const P_ERR_UNLINKDIR_ISDIR: FeatureMode // EISDIR (else EPERM)
     const P_ERR_LOCK_AGAIN: FeatureMode    // EAGAIN (else EACCES)
 
+    // Known divergences from POSIX.1-2024 that the implementation under test
+    // still carries.  A deviation is DESCRIBED by the model, gated on the
+    // consumer's config, rather than forgiven by the replay harness after the
+    // fact: a harness that forgives cannot say what it forgave, while a model
+    // that describes produces a trace whose expectation already IS the
+    // implementation's behaviour, so replay is an exact match and the harness
+    // needs no registry.
+    //
+    // One Set constant, not a constant per deviation: adding a deviation then
+    // costs no schema signature change, and a config names only what it
+    // enables.  Every id must be declared, with a citation, in the family's
+    // corpus.schema.json before a config may switch it on.
+    const DEVS: Set[str]
+
+    // A TOLERANCE, not a deviation: POSIX permits several answers PER CALL
+    // and no boolean pins one, because the cell's corpus is replayed by more
+    // than one backend and they legitimately differ.  Removal denied by the
+    // sticky rule is such a place -- unlink() names EACCES *or* EPERM -- and
+    // the disk cell is replayed both by cairn (which answers the errno the
+    // errStickyAcces policy names) and by the host passthroughs (whose kernel
+    // answers EPERM).  A tolerant handler emits its own answer plus an
+    // `eAccept` set of the others; the harness membership-tests that set
+    // instead of comparing, so a cell without the tolerance still demands the
+    // exact answer.
+    const T_STICKY_REMOVAL_EPERM: bool
+
     // ------------------------------------------------------------------
     // Universes
     // ------------------------------------------------------------------
@@ -120,6 +146,11 @@ module posix {
     var ps: Pstate
     var caps: Caps
     var lastOp: Label
+
+    // Which deviations shaped the step just taken.  Empty for a conformant
+    // step; tools/devliveness.py reads it across a cell's corpus and fails
+    // when a deviation the config enables is never recorded here.
+    var devHits: Set[str]
 
     // ------------------------------------------------------------------
     // Path construction from the model tree
@@ -208,12 +239,14 @@ module posix {
             renameCtime: rnCt, strictAtime: sAtime, stickyWriteArm: stArm,
             chownSuppGroup: chSup,
             errNotempty: eNe, errStickyAcces: eSt,
-            errUnlinkDirIsdir: eUd, errLockAgain: eLk
+            errUnlinkDirIsdir: eUd, errLockAgain: eLk,
+            devs: DEVS, stickyRemovalEperm: T_STICKY_REMOVAL_EPERM
         }
         all {
             fs' = fsInit(511, 0, 0),
             ps' = psInit(credsFor(rootP)),
             caps' = c,
+            devHits' = Set(),
             lastOp' = LInit({ caps: c })
         }
     }
@@ -224,6 +257,7 @@ module posix {
             fs' = o.fs2,
             ps' = o.ps2,
             caps' = caps,
+            devHits' = o.hits,
             lastOp' = LCall({ pid: p, req: req, res: o.res })
         }
     }

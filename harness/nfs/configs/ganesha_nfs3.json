@@ -1,0 +1,31 @@
+{
+  "family": "nfs3",
+  "description": "NFS-Ganesha 4.x (the build in this repo's devcontainer) exporting a loop-mounted ext4 image through FSAL_VFS, spoken to at NFSv3. The batch list is chimera's nfs3_ref list unchanged -- the corpus is protocol-level and backend-agnostic, so what distinguishes this cell from chimera's is only which divergences the model is told to predict.",
+  "traceStem": "ganesha3",
+
+  // ganesha resolves every name through the host kernel, so the search-
+  // permission bug that chimera's in-engine backends carry
+  // (create-search-perm-1771) is NOT enabled here.
+  "deviations": [
+    "G3-link-dir-badtype"
+  ],
+
+  // RFC 1813 mandates no error precedence when more than one condition
+  // applies, and ganesha -- resolving through the host kernel -- legitimately
+  // takes the other order for LINK-onto-an-existing-name and
+  // RENAME-onto-a-non-empty-directory.  The exclusive verifier lives in
+  // atime/mtime on a real filesystem, so an intervening READ can retire it.
+  "tolerances": {
+    "errorPrecedence": true,
+    "exclusiveRetryVerifier": true
+  },
+
+  "batches": [
+    { "flavor": "step",      "steps": 128, "traces": 10, "seed": "0x1"   },
+    { "flavor": "step",      "steps": 256, "traces": 3,  "seed": "0x100" },
+    { "flavor": "stepChurn", "steps": 128, "traces": 6,  "seed": "0x1"   },
+    { "flavor": "stepChurn", "steps": 256, "traces": 2,  "seed": "0x200" },
+    { "flavor": "stepDir",   "steps": 128, "traces": 4,  "seed": "0x1"   },
+    { "flavor": "stepExcl",  "steps": 128, "traces": 3,  "seed": "0x1"   }
+  ]
+}

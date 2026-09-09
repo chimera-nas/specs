@@ -85,6 +85,54 @@ module nfs3 {
     // check strict NFS in isolation.
     pure val P_OWNER_OVERRIDE: bool = true
 
+    // ------------------------------------------------------------------
+    // Known deviations, and tolerances
+    // ------------------------------------------------------------------
+
+    // The KNOWN DEVIATIONS the implementation under test still carries.  This
+    // model states RFC 1813; where the server under test disagrees on purpose
+    // -- a bug that is understood, cited and not yet fixed -- the cell says so
+    // in its config, and the model then predicts what that server actually
+    // does.  The trace's expectation is therefore already the truth, replay is
+    // an exact match, and the harness needs no registry of forgivable
+    // differences.
+    //
+    // One Set constant rather than a constant per deviation: adding one costs
+    // no schema signature change, and a config names only what it enables.
+    // Every id must be declared, with a citation, in nfs3/corpus.schema.json
+    // before a config may switch it on.
+    const DEVS: Set[str]
+
+    pure def dev(id: str): bool = DEVS.contains(id)
+
+    // TOLERANCES are a different thing from a deviation.  A deviation is a
+    // server getting one answer wrong; a tolerance is the STANDARD permitting
+    // several answers for one call, so no boolean pins the reply and nothing
+    // is being forgiven.  Where one is in play the model emits a `statusAccept`
+    // set beside the `status` it predicts, and the harness membership-tests
+    // instead of comparing: an empty set means exact match, which is what
+    // every other reply carries.
+    //
+    // RFC 1813 does not mandate ERROR PRECEDENCE when more than one condition
+    // applies to a request.  The model commits to one order (the one the mkfs
+    // backends mirror); a server that resolves the name through a host kernel
+    // follows the kernel's order, which is equally valid.  Two cases are
+    // reachable from the generated corpus:
+    //   LINK of a directory onto an existing name -- ISDIR (the source is a
+    //     directory) against EXIST (target existence checked first);
+    //   RENAME of a non-directory onto a non-empty directory -- ISDIR (the
+    //     target type conflicts) against NOTEMPTY (emptiness checked first).
+    const T_ERROR_PRECEDENCE: bool
+
+    // RFC 1813 3.3.8 says an EXCLUSIVE create retry presenting the SAME
+    // verifier "should" succeed idempotently.  The guarantee is for a true
+    // retransmit, and the verifier has to be stored somewhere: the RFC's own
+    // suggestion is the file's atime/mtime, which is what chimera uses.  A
+    // server whose backend updates atime on an intervening READ therefore
+    // loses the verifier and answers EXIST on the retry -- permitted, since
+    // this is not a retransmit.  With this on, both answers are accepted.
+    const T_EXCL_RETRY_VERIFIER: bool
+
     // Permission bit values within one rwx triad.
     pure def bitR(triad: int): bool = (triad / 4) % 2 == 1
     pure def bitW(triad: int): bool = (triad / 2) % 2 == 1
@@ -130,7 +178,7 @@ module nfs3 {
         | OSetattr({ obj: Fid, mode: int, sizeBlocks: int, guard: int, status: int })
         | OAccess({ obj: Fid, mask: int, status: int, access: int })
         | OCreate({ dir: Fid, name: Name, cmode: CreateMode, mode: int, verf: int,
-                    status: int, obj: Fid, cred: Cred })
+                    status: int, obj: Fid, cred: Cred, statusAccept: Set[int] })
         | OMkdir({ dir: Fid, name: Name, mode: int, status: int, obj: Fid })
         | OSymlink({ dir: Fid, name: Name, target: str, status: int, obj: Fid })
         | OReadlink({ obj: Fid, status: int, target: str })
@@ -141,8 +189,10 @@ module nfs3 {
                   status: int, retCount: int, eof: bool, blocks: List[int], cred: Cred })
         | ORemove({ dir: Fid, name: Name, status: int })
         | ORmdir({ dir: Fid, name: Name, status: int })
-        | ORename({ fromDir: Fid, fromName: Name, toDir: Fid, toName: Name, status: int })
-        | OLink({ obj: Fid, dir: Fid, name: Name, status: int })
+        | ORename({ fromDir: Fid, fromName: Name, toDir: Fid, toName: Name, status: int,
+                    statusAccept: Set[int] })
+        | OLink({ obj: Fid, dir: Fid, name: Name, status: int,
+                  statusAccept: Set[int] })
         | OReaddir({ dir: Fid, plus: bool, status: int, names: Set[Name] })
         | OCommit({ file: Fid, status: int })
         | OFsstat({ status: int })
@@ -154,6 +204,12 @@ module nfs3 {
     var removed: Set[Fid]
     var nextFid: Fid
     var lastOp: Op
+    // Which deviations shaped the step just taken.  This is what makes a
+    // deviation falsifiable: tools/devliveness.py fails the build when a config
+    // enables one that no trace in its corpus ever records here, so a deviation
+    // that has been fixed cannot sit on quietly forgiving the same divergence
+    // elsewhere.
+    var devHits: Set[str]
 
     // nfsstat3 values (RFC 1813 section 2.6), numerically identical to the
     // wire encoding so the harness compares raw status with no decode step.
@@ -167,6 +223,8 @@ module nfs3 {
     pure val ERR_NOTEMPTY = 66
     pure val ERR_STALE = 70
     pure val ERR_NOT_SYNC = 10002
+    // NFS3ERR_BADTYPE (RFC 1813 2.6): reached only by G3-link-dir-badtype.
+    pure val ERR_BADTYPE = 10007
 
     pure val ROOT: Fid = 0
 
@@ -197,8 +255,13 @@ module nfs3 {
     pure def emptyFile(m: int, o: Cred): Node =
         { ftype: TReg, mode: m, nlink: 1, data: [], ents: Map(), target: "",
           uid: o.uid, gid: o.gid, xverf: 0 }
+    // K3-exclusive-mode-zero: RFC 1813 3.3.8 leaves the mode of an
+    // EXCLUSIVE-created file undefined until the client's follow-up SETATTR.
+    // The model -- like NFS-Ganesha and chimera -- materializes it 0600; the
+    // Linux server creates it with NO permission bits at all.
     pure def exclFile(m: int, v: int, o: Cred): Node =
-        { ftype: TReg, mode: m, nlink: 1, data: [], ents: Map(), target: "",
+        { ftype: TReg, mode: if (dev("K3-exclusive-mode-zero")) 0 else m,
+          nlink: 1, data: [], ents: Map(), target: "",
           uid: o.uid, gid: o.gid, xverf: v }
     pure def symlinkNode(tgt: str, o: Cred): Node =
         // ref: symlink mode is fixed 0755; the sattr3 mode in the
@@ -246,6 +309,7 @@ module nfs3 {
         fs' = Map(ROOT -> emptyDir(511, ROOT_CRED)),
         removed' = Set(),
         nextFid' = 1,
+        devHits' = Set(),
         lastOp' = OInit,
     }
 
@@ -254,14 +318,11 @@ module nfs3 {
     // ------------------------------------------------------------------
 
     // RFC 1813 3.3.3: LOOKUP on any non-directory handle is NFS3ERR_NOTDIR.
-    // The reference implementation deviates for a symlink handle (returns
-    // SERVERFAULT); that is
-    // recorded as deviation `lookup-symlink-serverfault` in the replay harness's deviation registry
-    // and reconciled by the harness, NOT encoded here.
     action applyLookup(d: Fid, n: Name): bool = all {
         fs' = fs,
         removed' = removed,
         nextFid' = nextFid,
+        devHits' = Set(),
         lastOp' =
             if (fs.get(d).ftype != TDir)
                 OLookup({ dir: d, name: n, status: ERR_NOTDIR, child: -1 })
@@ -288,6 +349,7 @@ module nfs3 {
         fs' = fs,
         removed' = removed,
         nextFid' = nextFid,
+        devHits' = Set(),
         lastOp' = OGetattr({ obj: o, status: OK }),
     }
 
@@ -318,6 +380,7 @@ module nfs3 {
         fs' = fs,
         removed' = removed,
         nextFid' = nextFid,
+        devHits' = Set(),
         lastOp' = OStaleGetattr({ obj: o, status: ERR_STALE }),
     }
 
@@ -340,6 +403,7 @@ module nfs3 {
             }),
         removed' = removed,
         nextFid' = nextFid,
+        devHits' = Set(),
         lastOp' = OSetattr({ obj: o, mode: m, sizeBlocks: sz, guard: guard,
                              status: if (guard == 2) ERR_NOT_SYNC else OK }),
     }
@@ -411,6 +475,7 @@ module nfs3 {
         fs' = fs,
         removed' = removed,
         nextFid' = nextFid,
+        devHits' = Set(),
         lastOp' = OAccess({ obj: o, mask: mask, status: OK,
                             access: accessReply3(fs.get(o), mask) }),
     }
@@ -425,69 +490,98 @@ module nfs3 {
     // CREATE (RFC 1813 3.3.8)
     // ------------------------------------------------------------------
 
+    // RFC 1813 3.3.8 create-on-existing, by mode and existing type.  The model
+    // is a spec oracle: this encodes the standard, not any one
+    // implementation's behavior.  `acc` is the tolerance/deviation accept set
+    // the caller wants carried on the reply (Set() everywhere the standard
+    // pins one answer).
+    def createOnExisting(d: Fid, n: Name, cm: CreateMode, m: int, c: Cred,
+                         acc: Set[int]): Op =
+        if (cm == Guarded)
+            // GUARDED: the name exists -> NFS3ERR_EXIST, before any per-object
+            // access check.
+            OCreate({ dir: d, name: n, cmode: cm, mode: m, verf: -1,
+                      status: ERR_EXIST, obj: -1, cred: c, statusAccept: acc })
+        else if (fs.get(fs.get(d).ents.get(n)).ftype == TReg)
+            // UNCHECKED over an existing regular file: succeed and return the
+            // existing object, attributes untouched (a stateless CREATE does
+            // not require write on it).
+            OCreate({ dir: d, name: n, cmode: cm, mode: m, verf: -1,
+                      status: OK, obj: fs.get(d).ents.get(n), cred: c,
+                      statusAccept: acc })
+        else if (fs.get(fs.get(d).ents.get(n)).ftype == TDir)
+            // UNCHECKED over a directory: a regular-file create cannot
+            // overwrite a directory -- POSIX open(O_CREAT) gives EISDIR.
+            OCreate({ dir: d, name: n, cmode: cm, mode: m, verf: -1,
+                      status: ERR_ISDIR, obj: -1, cred: c, statusAccept: acc })
+        else
+            // UNCHECKED over a symlink/socket/fifo: the name is held by a
+            // non-regular object and CREATE (which does not follow symlinks or
+            // unlink) cannot materialize a regular file there -> NFS3ERR_EXIST.
+            OCreate({ dir: d, name: n, cmode: cm, mode: m, verf: -1,
+                      status: ERR_EXIST, obj: -1, cred: c, statusAccept: acc })
+
     action applyCreate(d: Fid, n: Name, cm: CreateMode, m: int, c: Cred): bool =
         if (not(canSearch(fs.get(d), c))) all {
             // Resolving the name at all requires search (execute) permission on
             // the parent directory (POSIX path resolution).  Without it the
             // server cannot observe whether the name exists, so an entry's
             // existence or type must not leak -- NFS3ERR_ACCES, taking
-            // precedence over any EXIST/ISDIR outcome.  ref: a server that
-            // resolves the name through the host kernel returns ACCES here; one
-            // that omits the search check on the existing-entry path instead
-            // leaks the type-based reply (a deviation the replay harness may
-            // reconcile).
+            // precedence over any EXIST/ISDIR outcome.
+            //
+            // DEVIATION create-search-perm-1771.  chimera's mkfs backends
+            // (memfs/diskfs/cairn) omit the search check on the EXISTING-entry
+            // path and leak the type-based reply instead: EISDIR over a
+            // directory, EXIST over another non-regular object, or OK (with
+            // the existing regular file's handle) for an UNCHECKED create.
+            // The fresh-entry path still refuses, which is why this branch is
+            // conditioned on hasEnt.
+            //
+            // The accept set carries the RFC-correct ACCES because ONE corpus
+            // is replayed against every backend, and the passthrough backends
+            // (linux/io_uring) resolve the name through the host kernel, which
+            // enforces the search bit and answers ACCES.  It is not a
+            // tolerance -- the standard pins one answer here -- it is the
+            // price of a single cell serving backends that differ on this bug,
+            // and it retires with #1771 exactly as the branch does.
             fs' = fs,
             removed' = removed,
             nextFid' = nextFid,
-            lastOp' = OCreate({ dir: d, name: n, cmode: cm, mode: m, verf: -1,
-                                status: ERR_ACCES, obj: -1, cred: c }),
+            devHits' =
+                if (dev("create-search-perm-1771") and hasEnt(d, n))
+                    Set("create-search-perm-1771")
+                else Set(),
+            lastOp' =
+                if (dev("create-search-perm-1771") and hasEnt(d, n))
+                    createOnExisting(d, n, cm, m, c, Set(ERR_ACCES))
+                else
+                    OCreate({ dir: d, name: n, cmode: cm, mode: m, verf: -1,
+                              status: ERR_ACCES, obj: -1, cred: c,
+                              statusAccept: Set() }),
         } else if (not(hasEnt(d, n)) and not(canWrite(fs.get(d), c))) all {
             // Creating a fresh entry additionally needs write on the parent
             // (XBD 4.6).  A new file is owned by its creator's credential.
             fs' = fs,
             removed' = removed,
             nextFid' = nextFid,
+            devHits' = Set(),
             lastOp' = OCreate({ dir: d, name: n, cmode: cm, mode: m, verf: -1,
-                                status: ERR_ACCES, obj: -1, cred: c }),
+                                status: ERR_ACCES, obj: -1, cred: c, statusAccept: Set() }),
         } else if (hasEnt(d, n)) all {
             fs' = fs,
             removed' = removed,
             nextFid' = nextFid,
-            lastOp' =
-                // RFC 1813 3.3.8 create-on-existing, by mode and existing type.
-                // The model is a spec oracle: it encodes the standard, not any
-                // one implementation's behavior.
-                if (cm == Guarded)
-                    // GUARDED: the name exists -> NFS3ERR_EXIST, before any
-                    // per-object access check.
-                    OCreate({ dir: d, name: n, cmode: cm, mode: m, verf: -1,
-                              status: ERR_EXIST, obj: -1, cred: c })
-                else if (fs.get(fs.get(d).ents.get(n)).ftype == TReg)
-                    // UNCHECKED over an existing regular file: succeed and
-                    // return the existing object, attributes untouched (a
-                    // stateless CREATE does not require write on it).
-                    OCreate({ dir: d, name: n, cmode: cm, mode: m, verf: -1,
-                              status: OK, obj: fs.get(d).ents.get(n), cred: c })
-                else if (fs.get(fs.get(d).ents.get(n)).ftype == TDir)
-                    // UNCHECKED over a directory: a regular-file create cannot
-                    // overwrite a directory -- POSIX open(O_CREAT) gives EISDIR.
-                    OCreate({ dir: d, name: n, cmode: cm, mode: m, verf: -1,
-                              status: ERR_ISDIR, obj: -1, cred: c })
-                else
-                    // UNCHECKED over a symlink/socket/fifo: the name is held by
-                    // a non-regular object and CREATE (which does not follow
-                    // symlinks or unlink) cannot materialize a regular file
-                    // there -> NFS3ERR_EXIST.
-                    OCreate({ dir: d, name: n, cmode: cm, mode: m, verf: -1,
-                              status: ERR_EXIST, obj: -1, cred: c }),
+            devHits' = Set(),
+            lastOp' = createOnExisting(d, n, cm, m, c, Set()),
         } else all {
             fs' = fs
                 .put(nextFid, emptyFile(m, c))
                 .setBy(d, dn => dn.with("ents", dn.ents.put(n, nextFid))),
             removed' = removed,
             nextFid' = nextFid + 1,
+            devHits' = Set(),
             lastOp' = OCreate({ dir: d, name: n, cmode: cm, mode: m, verf: -1,
-                                status: OK, obj: nextFid, cred: c }),
+                                status: OK, obj: nextFid, cred: c, statusAccept: Set() }),
         }
 
     action createCore = {
@@ -513,12 +607,17 @@ module nfs3 {
     // 0644 instead, which now shows as a chimera divergence.
     // RFC 1813: a retry that presents the *same* verifier as the
     // create in progress "should" succeed idempotently and return the same
-    // object; a different verifier gives NFS3ERR_EXIST.  The reference
-    // implementation returns
-    // EXIST even for the same verifier -- recorded as deviation
-    // `exclusive-create-retry-exist` (a status-only divergence: the file
-    // exists and is unchanged under either outcome, so model state stays in
-    // sync).
+    // object; a different verifier gives NFS3ERR_EXIST.
+    //
+    // TOLERANCE T_EXCL_RETRY_VERIFIER.  The RFC's guarantee is for a true
+    // RETRANSMIT, and the verifier has to live somewhere: chimera stores it in
+    // the file's atime/mtime, the mechanism the RFC itself suggests.  On a
+    // backend that resolves through the host kernel, an intervening READ bumps
+    // atime, the stored verifier no longer matches, and the retry answers
+    // EXIST -- which the standard permits, because this is not a retransmit.
+    // So the accept set names both, and it is the CELL that decides whether
+    // its server may take the second answer.  The file exists and is unchanged
+    // under either outcome, so the model's state is right either way.
     action applyCreateExcl(d: Fid, n: Name, v: int): bool =
         if (hasEnt(d, n)) {
             val existing = fs.get(d).ents.get(n)
@@ -528,14 +627,20 @@ module nfs3 {
                 fs' = fs,
                 removed' = removed,
                 nextFid' = nextFid,
+                devHits' = Set(),
                 lastOp' = OCreate({ dir: d, name: n, cmode: Exclusive, mode: -1,
-                                    verf: v, status: OK, obj: existing, cred: ROOT_CRED }),
+                                    verf: v, status: OK, obj: existing,
+                                    cred: ROOT_CRED,
+                                    statusAccept:
+                                        if (T_EXCL_RETRY_VERIFIER) Set(ERR_EXIST)
+                                        else Set() }),
             } else all {
                 fs' = fs,
                 removed' = removed,
                 nextFid' = nextFid,
+                devHits' = Set(),
                 lastOp' = OCreate({ dir: d, name: n, cmode: Exclusive, mode: -1,
-                                    verf: v, status: ERR_EXIST, obj: -1, cred: ROOT_CRED }),
+                                    verf: v, status: ERR_EXIST, obj: -1, cred: ROOT_CRED, statusAccept: Set() }),
             }
         } else all {
             fs' = fs
@@ -543,8 +648,10 @@ module nfs3 {
                 .setBy(d, dn => dn.with("ents", dn.ents.put(n, nextFid))),
             removed' = removed,
             nextFid' = nextFid + 1,
+            devHits' = if (dev("K3-exclusive-mode-zero"))
+                           Set("K3-exclusive-mode-zero") else Set(),
             lastOp' = OCreate({ dir: d, name: n, cmode: Exclusive, mode: -1,
-                                verf: v, status: OK, obj: nextFid, cred: ROOT_CRED }),
+                                verf: v, status: OK, obj: nextFid, cred: ROOT_CRED, statusAccept: Set() }),
         }
 
     action createExclCore = {
@@ -568,6 +675,7 @@ module nfs3 {
             fs' = fs,
             removed' = removed,
             nextFid' = nextFid,
+            devHits' = Set(),
             lastOp' = OMkdir({ dir: d, name: n, mode: m, status: ERR_EXIST, obj: -1 }),
         } else all {
             fs' = fs
@@ -575,6 +683,7 @@ module nfs3 {
                 .setBy(d, dn => dn.with("ents", dn.ents.put(n, nextFid))),
             removed' = removed,
             nextFid' = nextFid + 1,
+            devHits' = Set(),
             lastOp' = OMkdir({ dir: d, name: n, mode: m, status: OK, obj: nextFid }),
         }
 
@@ -599,6 +708,7 @@ module nfs3 {
             fs' = fs,
             removed' = removed,
             nextFid' = nextFid,
+            devHits' = Set(),
             lastOp' = OSymlink({ dir: d, name: n, target: tgt,
                                  status: ERR_EXIST, obj: -1 }),
         } else all {
@@ -607,6 +717,7 @@ module nfs3 {
                 .setBy(d, dn => dn.with("ents", dn.ents.put(n, nextFid))),
             removed' = removed,
             nextFid' = nextFid + 1,
+            devHits' = Set(),
             lastOp' = OSymlink({ dir: d, name: n, target: tgt,
                                  status: OK, obj: nextFid }),
         }
@@ -627,6 +738,7 @@ module nfs3 {
         fs' = fs,
         removed' = removed,
         nextFid' = nextFid,
+        devHits' = Set(),
         lastOp' = OReadlink({ obj: l, status: OK, target: fs.get(l).target }),
     }
 
@@ -648,6 +760,7 @@ module nfs3 {
             fs' = fs,
             removed' = removed,
             nextFid' = nextFid,
+            devHits' = Set(),
             lastOp' = OMknod({ dir: d, name: n, ftype: ft, mode: m,
                                status: ERR_EXIST, obj: -1 }),
         } else all {
@@ -656,6 +769,7 @@ module nfs3 {
                 .setBy(d, dn => dn.with("ents", dn.ents.put(n, nextFid))),
             removed' = removed,
             nextFid' = nextFid + 1,
+            devHits' = Set(),
             lastOp' = OMknod({ dir: d, name: n, ftype: ft, mode: m,
                                status: OK, obj: nextFid }),
         }
@@ -684,6 +798,7 @@ module nfs3 {
             fs' = fs,
             removed' = removed,
             nextFid' = nextFid,
+            devHits' = Set(),
             lastOp' = OWrite({ file: f, offset: off, count: len, pat: pat,
                                stable: stable, status: ERR_ACCES,
                                newSizeBlocks: fs.get(f).data.length(), cred: c }),
@@ -695,6 +810,7 @@ module nfs3 {
                 fn.with("data", writeBlocks(fn.data, off, len, pat)).with("xverf", 0)),
             removed' = removed,
             nextFid' = nextFid,
+            devHits' = Set(),
             lastOp' = OWrite({
                 file: f, offset: off, count: len, pat: pat, stable: stable,
                 status: OK,
@@ -728,6 +844,7 @@ module nfs3 {
             fs' = fs,
             removed' = removed,
             nextFid' = nextFid,
+            devHits' = Set(),
             lastOp' = ORead({ file: f, offset: off, count: len,
                               status: ERR_ACCES, retCount: 0, eof: false,
                               blocks: [], cred: c }),
@@ -735,6 +852,7 @@ module nfs3 {
             fs' = fs,
             removed' = removed,
             nextFid' = nextFid,
+            devHits' = Set(),
             lastOp' = {
                 val sz = fs.get(f).data.length()
                 val ret = if (off >= sz) 0 else imin(len, sz - off)
@@ -771,6 +889,7 @@ module nfs3 {
         fs' = fs,
         removed' = removed,
         nextFid' = nextFid,
+        devHits' = Set(),
         lastOp' = OCommit({ file: f, status: OK }),
     }
 
@@ -815,6 +934,7 @@ module nfs3 {
             fs' = o.fs2,
             removed' = removed.union(o.rm2),
             nextFid' = nextFid,
+            devHits' = Set(),
             lastOp' = ORemove({ dir: d, name: n, status: o.st }),
         }
     }
@@ -856,6 +976,7 @@ module nfs3 {
             fs' = o.fs2,
             removed' = removed.union(o.rm2),
             nextFid' = nextFid,
+            devHits' = Set(),
             lastOp' = ORmdir({ dir: d, name: n, status: o.st }),
         }
     }
@@ -892,6 +1013,13 @@ module nfs3 {
                 if (fs.get(src).ftype == TDir and fs.get(tgt).ftype != TDir)
                     { fs2: fs, rm2: Set(), st: ERR_NOTDIR }
                 else if (fs.get(src).ftype != TDir and fs.get(tgt).ftype == TDir)
+                    // TOLERANCE T_ERROR_PRECEDENCE: two conditions hold when
+                    // the target directory is also non-empty -- the type
+                    // conflict the model reports, and the emptiness Linux
+                    // checks first (NOTEMPTY).  RFC 1813 mandates no order
+                    // between them, so both are legal answers to the same
+                    // call; an EMPTY target directory leaves only the type
+                    // conflict and only one answer.
                     { fs2: fs, rm2: Set(), st: ERR_ISDIR }
                 else if (fs.get(tgt).ftype == TDir and
                          fs.get(tgt).ents.keys().size() > 0)
@@ -911,14 +1039,31 @@ module nfs3 {
             }
         }
 
+    // The alternative status a legal implementation may answer this RENAME
+    // with; empty everywhere the standard pins one.  See renameOutcome.
+    def renameAccept(sd: Fid, sn: Name, td: Fid, tn: Name): Set[int] =
+        if (not(T_ERROR_PRECEDENCE) or not(hasEnt(sd, sn)) or not(hasEnt(td, tn)))
+            Set()
+        else {
+            val src = fs.get(sd).ents.get(sn)
+            val tgt = fs.get(td).ents.get(tn)
+            if (src == tgt or (sd == td and sn == tn)) Set()
+            else if (fs.get(src).ftype != TDir and fs.get(tgt).ftype == TDir and
+                     fs.get(tgt).ents.keys().size() > 0)
+                Set(ERR_NOTEMPTY)
+            else Set()
+        }
+
     action applyRename(sd: Fid, sn: Name, td: Fid, tn: Name): bool = {
         val o = renameOutcome(sd, sn, td, tn)
         all {
             fs' = o.fs2,
             removed' = removed.union(o.rm2),
             nextFid' = nextFid,
+            devHits' = Set(),
             lastOp' = ORename({ fromDir: sd, fromName: sn, toDir: td, toName: tn,
-                                status: o.st }),
+                                status: o.st,
+                                statusAccept: renameAccept(sd, sn, td, tn) }),
         }
     }
 
@@ -940,23 +1085,45 @@ module nfs3 {
         // ref: the directory-target check precedes the name-collision
         // check (S_ISDIR before EEXIST), so linking a
         // directory is ISDIR even when the target name is already taken.
+        //
+        // TOLERANCE T_ERROR_PRECEDENCE: RFC 1813 mandates no precedence when
+        // both conditions hold at once, and Linux checks target existence
+        // first and reports EXIST.  Both are legal, so when the name is
+        // already taken the accept set names the other one.  Where the name is
+        // free there is only one condition and only one answer.
+        // G3-link-dir-badtype: RFC 1813 3.3.15 lists neither NFS3ERR_ISDIR
+        // nor a POSIX EPERM among LINK's errors, so the status for a directory
+        // source is unspecified and servers differ -- the model and chimera
+        // answer ISDIR, NFS-Ganesha answers NFS3ERR_BADTYPE.  (The NFSv4 LINK
+        // path is a separate divergence, S4-link-dir-notdir, and ganesha does
+        // NOT take it: its v4 LINK of a directory answers NFS4ERR_ISDIR.)
         if (fs.get(o).ftype == TDir) all {
             fs' = fs,
             removed' = removed,
             nextFid' = nextFid,
-            lastOp' = OLink({ obj: o, dir: d, name: n, status: ERR_ISDIR }),
+            devHits' = if (dev("G3-link-dir-badtype"))
+                           Set("G3-link-dir-badtype") else Set(),
+            lastOp' = OLink({ obj: o, dir: d, name: n,
+                              status: if (dev("G3-link-dir-badtype"))
+                                          ERR_BADTYPE else ERR_ISDIR,
+                              statusAccept:
+                                  if (T_ERROR_PRECEDENCE and hasEnt(d, n))
+                                      Set(ERR_EXIST)
+                                  else Set() }),
         } else if (hasEnt(d, n)) all {
             fs' = fs,
             removed' = removed,
             nextFid' = nextFid,
-            lastOp' = OLink({ obj: o, dir: d, name: n, status: ERR_EXIST }),
+            devHits' = Set(),
+            lastOp' = OLink({ obj: o, dir: d, name: n, status: ERR_EXIST, statusAccept: Set() }),
         } else all {
             fs' = fs
                 .setBy(o, x => x.with("nlink", x.nlink + 1))
                 .setBy(d, dn => dn.with("ents", dn.ents.put(n, o))),
             removed' = removed,
             nextFid' = nextFid,
-            lastOp' = OLink({ obj: o, dir: d, name: n, status: OK }),
+            devHits' = Set(),
+            lastOp' = OLink({ obj: o, dir: d, name: n, status: OK, statusAccept: Set() }),
         }
 
     action link = {
@@ -984,6 +1151,7 @@ module nfs3 {
         fs' = fs,
         removed' = removed,
         nextFid' = nextFid,
+        devHits' = Set(),
         lastOp' =
             if (fs.get(o).ftype != TDir)
                 OReaddir({ dir: o, plus: plus, status: ERR_NOTDIR, names: Set() })
@@ -1009,6 +1177,7 @@ module nfs3 {
         fs' = fs,
         removed' = removed,
         nextFid' = nextFid,
+        devHits' = Set(),
         lastOp' = OFsstat({ status: OK }),
     }
 
@@ -1016,6 +1185,7 @@ module nfs3 {
         fs' = fs,
         removed' = removed,
         nextFid' = nextFid,
+        devHits' = Set(),
         lastOp' = OFsinfo({ status: OK }),
     }
 
@@ -1025,6 +1195,7 @@ module nfs3 {
             fs' = fs,
             removed' = removed,
             nextFid' = nextFid,
+            devHits' = Set(),
             lastOp' = OPathconf({ obj: o, status: OK }),
         }
     }
