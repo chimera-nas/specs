@@ -41,7 +41,8 @@ module nfs4Test42 {
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
         T_WIDE_ATTR_REFUSAL = false,
-        T_RENAME_SYMLINK_STATUS = false
+        T_RENAME_SYMLINK_STATUS = false,
+        T_DATA_SYMLINK_STATUS = false
     ).* from "./nfs4"
 
     def lastStatus: int =
@@ -78,7 +79,8 @@ module nfs4Test42 {
     def asRead(r) =
         match r {
             | SRead(x) => x
-            | _ => { st: -999, count: -1, eof: false, blocks: [] }
+            | _ => { st: -999, count: -1, eof: false, blocks: [],
+                     stAccept: Set() }
         }
 
     def asSeek(r) =
@@ -885,7 +887,8 @@ module nfs4Test40 {
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
         T_WIDE_ATTR_REFUSAL = false,
-        T_RENAME_SYMLINK_STATUS = false
+        T_RENAME_SYMLINK_STATUS = false,
+        T_DATA_SYMLINK_STATUS = false
     ).* from "./nfs4"
 
     def lastStatus: int =

@@ -166,9 +166,17 @@ GD_20_LIFECYCLE = Deviation(
     root_cause="an upstream recorded deviation left the model and ganesha with "
                "different live stateids/objects",
     candidate_fix="none (downstream of the recorded upstream deviation)",
-    ops=("SSetattr", "SPutfh", "SSeek", "SLink"),
+    # Widened after the config migration let traces run past the point the
+    # registry used to abandon them: CREATE and LINK answer NFS4ERR_EXIST for
+    # a name ganesha still holds and the model has removed, VERIFY answers
+    # NFS4ERR_INVAL against attributes of an object the two no longer agree
+    # about.  A directory's nlink counting a child only one side has is the
+    # same cause on a FIELD, which the contract keeps in its own entry
+    # (GD-20b) because one Deviation matches either statuses or a field.
+    ops=("SSetattr", "SPutfh", "SSeek", "SLink", "SCreate", "SVerify"),
     expected_status=(NFS4ERR_BAD_STATEID, NFS4_OK, NFS4ERR_LOCKED),
-    actual_status=(NFS4_OK, NFS4ERR_STALE, NFS4ERR_NOENT),
+    actual_status=(NFS4_OK, NFS4ERR_STALE, NFS4ERR_NOENT, NFS4ERR_EXIST,
+                   NFS4ERR_INVAL),
     reconcilable=False,
 )
 
@@ -335,19 +343,155 @@ GD_19_OWNER_SEQID_GAP = Deviation(
             "sometimes; the other times it is answered on its merits",
     root_cause="ganesha's open-owner sequence check does not fire uniformly",
     candidate_fix="ganesha: police the gap on every OPEN, or on none",
-    ops=("SOpen",),
-    expected_status=(NFS4ERR_BAD_SEQID, NFS4_OK, NFS4ERR_NOENT,
-                     NFS4ERR_EXIST, NFS4ERR_SHARE_DENIED, NFS4ERR_NOTDIR),
-    actual_status=(NFS4ERR_BAD_SEQID, NFS4_OK, NFS4ERR_NOENT, NFS4ERR_EXIST,
-                   NFS4ERR_SHARE_DENIED, NFS4ERR_NOTDIR),
-    context=lambda f, ctx: ctx.get("minor") == 0 and
+    # CLOSE, OPEN_CONFIRM and OPEN_DOWNGRADE ride the same owner sequence, so
+    # once it has parted they answer BAD_SEQID too; the guard below keeps the
+    # entry to exactly that -- a finding with BAD_SEQID on one side or the
+    # other, at 4.0, where the sequence exists at all.
+    ops=("SOpen", "SClose", "SOpenConfirm", "SOpenDowngrade"),
+    context=lambda f, ctx: ctx.get("minor") == 0 and f.kind == "status" and
                            (f.expected == NFS4ERR_BAD_SEQID or
                             f.actual == NFS4ERR_BAD_SEQID),
     reconcilable=False,
 )
 
 
+# GD-36: the client id's lifecycle.  DESTROY_CLIENTID answers STALE_CLIENTID
+# for an id ganesha has already forgotten, or NFS4ERR_CLIENTID_BUSY for one it
+# still counts state against, where the model -- which has no lease clock and
+# retires an id the moment a superseding EXCHANGE_ID replaces it -- expects the
+# destroy to succeed; and once the model has destroyed an id ganesha kept, the
+# mirror image (the model predicting CLIENTID_BUSY where ganesha destroys it)
+# follows.  RFC 8881 18.50.3 makes both statuses the server's to decide from
+# state the model does not track.  reconcilable=False: one side has a client
+# the other does not.
+GD_36_CLIENTID_LIFECYCLE = Deviation(
+    id="GD-36-destroy-clientid-lifecycle",
+    verdict=SERVER,
+    spec="RFC 8881 18.50.3 (DESTROY_CLIENTID: STALE_CLIENTID and "
+         "CLIENTID_BUSY follow from server-side lease and state accounting)",
+    summary="DESTROY_CLIENTID answers STALE_CLIENTID or CLIENTID_BUSY where "
+            "the model expects success, and the mirror image after that",
+    root_cause="ganesha's lease clock and busy accounting differ from the "
+               "model's, which has neither",
+    candidate_fix="none within a trace (the model has no lease clock)",
+    ops=("SDestroyClientid",),
+    expected_status=(NFS4_OK, NFS4ERR_CLIENTID_BUSY),
+    actual_status=(NFS4ERR_STALE_CLIENTID, NFS4ERR_CLIENTID_BUSY, NFS4_OK),
+    reconcilable=False,
+)
+
+
+# GD-37: OPEN_DOWNGRADE answers NFS4ERR_SERVERFAULT.  RFC 8881 18.18.3 lists
+# NFS4ERR_INVAL for a downgrade whose share bits are not a subset of those
+# held; SERVERFAULT is the status a server sends when it has no better answer
+# (RFC 8881 15.1.14.2), so this is a ganesha defect rather than a latitude --
+# recorded here rather than modelled because the model would have to PREDICT a
+# server fault, which is not something a specification can state.  Measured on
+# access=3 deny=1 downgrades at 4.1 and 4.2.  Nothing is downgraded, so replay
+# continues.
+GD_37_DOWNGRADE_SERVERFAULT = Deviation(
+    id="GD-37-open-downgrade-serverfault",
+    verdict=SERVER,
+    spec="RFC 8881 18.18.3 (OPEN_DOWNGRADE; a non-subset share request is "
+         "NFS4ERR_INVAL) / 15.1.14.2 (SERVERFAULT is the no-better-answer "
+         "status)",
+    summary="OPEN_DOWNGRADE answers NFS4ERR_SERVERFAULT",
+    root_cause="ganesha faults on a downgrade the model expects to succeed",
+    candidate_fix="ganesha: answer NFS4ERR_INVAL, or perform the downgrade",
+    ops=("SOpenDowngrade",),
+    actual_status=NFS4ERR_SERVERFAULT,
+)
+
+
+# GD-38: stateid and open-owner bookkeeping the model does not track.
+# FREE_STATEID answers BAD_STATEID for a stateid the model still holds with
+# locks (expecting LOCKS_HELD); an OPEN's stateid seqid runs one ahead of the
+# model's; a LOCK is refused NFS4ERR_RESOURCE; and a LOOKUP finds a name the
+# model has removed.  RFC 8881 8.2.2 makes the stateid generation and 15.1.4
+# makes RESOURCE the server's own accounting.  Field/status-only where the
+# state has not parted; the LOOKUP arm has, so the entry is not reconcilable.
+GD_38_STATEID_BOOKKEEPING = Deviation(
+    id="GD-38-stateid-bookkeeping",
+    verdict=SERVER,
+    spec="RFC 8881 8.2.2 (stateid generation) / 15.1.4 (NFS4ERR_RESOURCE) / "
+         "18.38.3 (FREE_STATEID)",
+    summary="FREE_STATEID BAD_STATEID, an OPEN stateid seqid one ahead, a "
+            "LOCK refused RESOURCE, and a LOOKUP finding a removed name",
+    root_cause="ganesha's stateid and resource accounting differ from the "
+               "model's",
+    candidate_fix="triage individually if any of them recurs at volume",
+    ops=("SFreeStateid", "SLock", "SLookup"),
+    context=lambda f, ctx: (
+        (f.op == "SFreeStateid" and f.actual == NFS4ERR_BAD_STATEID) or
+        (f.op == "SLock" and f.actual == NFS4ERR_RESOURCE) or
+        (f.op == "SLookup" and f.actual == NFS4_OK)),
+    reconcilable=False,
+)
+
+
+# GD-38b: the field twin of GD-38.  An OPEN's stateid seqid runs one ahead of
+# the model's (RFC 8881 8.2.2 makes the generation the server's), which the
+# contract cannot fold into the entry above: one Deviation matches either
+# statuses or a field, never both.
+GD_38B_OPEN_SEQID = Deviation(
+    id="GD-38b-open-stateid-seqid",
+    verdict=SERVER,
+    spec="RFC 8881 8.2.2 (the stateid's seqid is the server's generation "
+         "counter)",
+    summary="an OPEN's stateid seqid is one ahead of the model's",
+    root_cause="ganesha advances the open stateid's generation where the "
+               "model does not",
+    candidate_fix="triage if it recurs at volume",
+    ops=("SOpen",),
+    field="seqid",
+)
+
+
+# GD-20b: the field twin of GD-20 -- a directory's link count carrying a child
+# only one side holds, after the object lifecycle parted.  Field-only.
+GD_20B_NLINK = Deviation(
+    id="GD-20b-nlink-after-lifecycle",
+    verdict=SERVER,
+    spec="RFC 8881 5.8.1.5 (numlinks follows the backing filesystem)",
+    summary="a directory's nlink counts a child only ganesha holds",
+    root_cause="ganesha kept a name the model removed (GD-20's cause)",
+    candidate_fix="none (downstream of GD-20)",
+    ops=("SGetattr",),
+    field=("nlink",),
+)
+
+
+# GD-17b: the 4.0 half of the OPEN confirm flag.  Above 4.0 the flag is inert
+# and the T_RFLAGS_CONFIRM tolerance covers it; at 4.0 it drives the
+# OPEN_CONFIRM handshake, so a server that sets it where the model does not
+# expects a confirmation the trace never sends and the open stateid stays
+# unconfirmed.  RFC 7530 9.1.11 makes the decision the server's.
+# reconcilable=False: the handshake has parted.
+GD_17B_RFLAGS_CONFIRM_40 = Deviation(
+    id="GD-17b-rflags-confirm-40",
+    verdict=SERVER,
+    spec="RFC 7530 9.1.11 / 16.16 (OPEN4_RESULT_CONFIRM and the OPEN_CONFIRM "
+         "handshake are the server's to require)",
+    summary="OPEN sets OPEN4_RESULT_CONFIRM at 4.0 where the model's "
+            "needConfirm is false",
+    root_cause="ganesha requires a confirmation for an owner the model "
+               "considers already confirmed",
+    candidate_fix="none required (the RFC leaves it open); the model would "
+                  "need ganesha's own confirmed-owner accounting",
+    ops=("SOpen",),
+    field="rflags_confirm",
+    context=lambda f, ctx: ctx.get("minor") == 0,
+    reconcilable=False,
+)
+
+
 NFS4 = Registry("ganesha/nfs4", [
+    GD_17B_RFLAGS_CONFIRM_40,
+    GD_36_CLIENTID_LIFECYCLE,
+    GD_37_DOWNGRADE_SERVERFAULT,
+    GD_38_STATEID_BOOKKEEPING,
+    GD_38B_OPEN_SEQID,
+    GD_20B_NLINK,
     GD_19_OWNER_SEQID_GAP,
     GD_6_NAME_HANDLING,
     GD_15_OPENMODE,

@@ -32,7 +32,6 @@
     "G4-verify-wide-trivial-match",
     "G4-setattr-share-denied",
     "G4-exchange-id-no-confirmed-r",
-    "G4-open-type-before-exist",
     "G4-bindconn-direction-accepted",
     "G4-seek-at-eof-not-nxio"
   ],
@@ -52,7 +51,9 @@
     "holeTracking": true,
     "rflagsConfirm": true,
     "linkRefusal": true,
-    "wideAttrRefusal": true
+    "wideAttrRefusal": true,
+    "dataSymlinkStatus": true,
+    "renameSymlinkStatus": true
   },
 
   "policies": {

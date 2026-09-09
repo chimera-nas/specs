@@ -259,7 +259,11 @@ module nfs4ops {
         // TOLERANCE (not a deviation): RFC 7530 16.27.4 lists NFS4ERR_NOTDIR
         // and Table 7 NFS4ERR_SYMLINK for a RENAME through a symbolic-link
         // directory handle.  See renameSymAccept.
-        tolRenameSymlinkStatus: bool
+        tolRenameSymlinkStatus: bool,
+        // TOLERANCE (not a deviation): RFC 7530 Table 7 lists NFS4ERR_SYMLINK
+        // and NFS4ERR_INVAL for READ/WRITE/COMMIT/LOCKT on a symbolic-link
+        // current filehandle.  See dataSymlinkAccept.
+        tolDataSymlinkStatus: bool
     }
 
     // Did the cell's config enable this deviation?
@@ -441,9 +445,11 @@ module nfs4ops {
         | SOpenConfirm({ st: int, seq: int })
         | SOpenDowngrade({ st: int, seq: int })
         | SClose({ st: int })
-        | SRead({ st: int, count: int, eof: bool, blocks: List[int] })
-        | SWrite({ st: int, count: int, newSizeBlocks: int })
-        | SCommit({ st: int })
+        | SRead({ st: int, count: int, eof: bool, blocks: List[int],
+                  stAccept: Set[int] })
+        | SWrite({ st: int, count: int, newSizeBlocks: int,
+                   stAccept: Set[int] })
+        | SCommit({ st: int, stAccept: Set[int] })
         // denied: the owner symbol of one conflicting lock (-1 if OK).
         // acceptance: which conflicting lock a server reports when several
         // exist is discretionary; the harness checks the reported conflict
@@ -728,13 +734,6 @@ module nfs4ops {
     // third server, but its coarse pair is NOT the same mapping -- it also
     // collapses SYMLINK to INVAL on the size-setting operations -- so the two
     // are separate ids rather than one shared knob.)
-    // G4-open-type-before-exist, and which types it covers.  Measured against
-    // V6.5: a fail-if-exists OPEN onto an existing DIRECTORY or special file
-    // answers that object's type error ahead of NFS4ERR_EXIST, but onto a
-    // SYMBOLIC LINK it answers EXIST, which is what the model says anyway --
-    // so the branch is not taken for a symlink.  (The registry entry this
-    // came from, GD-13, listed SYMLINK among the statuses it forgave, which
-    // is how the wider claim survived into the model.)
     // T_RENEW_LAPSED reaches further than RENEW.  RFC 7530 9.6.3 leaves it to
     // the server how long a client id whose lease has lapsed survives, and
     // 8.1.3 lets a fresh incarnation of a client purge the old one's state at
@@ -749,10 +748,6 @@ module nfs4ops {
     pure def lapseAccept(a: Acc): Set[int] =
         if (a.caps.tolRenewLapsed) Set(E_EXPIRED, E_STALE_STATEID)
         else Set()
-
-    pure def openTypeFirst(a: Acc, childT: Ftype): bool =
-        childT != FReg and childT != FLnk and
-        hasDev(a.caps, "G4-open-type-before-exist")
 
     pure def noWT(a: Acc, st: int, v40: int): int =
         if (st == E_WRONG_TYPE and hasDev(a.caps, "S4-no-wrong-type")) v40
@@ -2077,21 +2072,16 @@ module nfs4ops {
                                     .with("cinfo", o.cinfo)
                             }
                         | HGuarded(gm) =>
-                            // G4-open-type-before-exist: RFC 7530 16.16.4 /
-                            // RFC 8881 18.16.4 list NFS4ERR_EXIST and the
-                            // target's own type error for a fail-if-exists
-                            // OPEN without ordering them.  The model keeps the
-                            // RFC-literal, POSIX O_EXCL reading -- an existing
-                            // name is EXIST whatever its type -- and
-                            // NFS-Ganesha reports the type first, EXCEPT for a
-                            // symbolic link, where it reports EXIST as the
-                            // model does (openTypeFirst).  The OPEN fails
-                            // either way.
-                            if (present and openTypeFirst(a, childT))
-                                base.with("st", typeErr)
-                                    .with("devs",
-                                          Set("G4-open-type-before-exist"))
-                            else if (present) base.with("st", E_EXIST)
+                            // RFC 7530 16.16.4 / RFC 8881 18.16.4 list
+                            // NFS4ERR_EXIST and the target's own type error
+                            // for a fail-if-exists OPEN without ordering
+                            // them; the model keeps the RFC-literal, POSIX
+                            // O_EXCL reading -- an existing name is EXIST
+                            // whatever its type -- and NFS-Ganesha V6.5 was
+                            // measured to agree for every type this corpus
+                            // reaches (see the retired
+                            // G4-open-type-before-exist in the schema).
+                            if (present) base.with("st", E_EXIST)
                             else {
                                 val o = fsMknode(a.fs, a.cfh, n,
                                                  mkFile(gm.mode, 0))
@@ -2114,10 +2104,6 @@ module nfs4ops {
                                 base.with("file", child)
                                     .with("cinfo", { before: dnd.change,
                                                      after: dnd.change, opaque: false })
-                            else if (present and openTypeFirst(a, childT))
-                                base.with("st", typeErr)
-                                    .with("devs",
-                                          Set("G4-open-type-before-exist"))
                             else if (present) base.with("st", E_EXIST)
                             else {
                                 // K4-exclusive-create-mode-zero: the Linux
@@ -2217,10 +2203,9 @@ module nfs4ops {
         else {
             val res = openResolve(a, ar.claim, ar.how)
             // openResolve may have taken a deviating branch on EITHER path --
-            // G4-open-type-before-exist and S4-no-wrong-type on the error
-            // side, K4-exclusive-create-mode-zero on the success side -- so
-            // the ids it reports are folded onto whatever Acc the arms below
-            // produce, once, at the end.
+            // S4-no-wrong-type on the error side, K4-exclusive-create-mode-
+            // zero on the success side -- so the ids it reports are folded
+            // onto whatever Acc the arms below produce, once, at the end.
             val outAcc = if (res.st != OK) {
                 // D4-19 above may have coarsened a symlink parent; record it.
                 val aSym = if (res.st == E_NOTDIR and cfhLive(a) and
@@ -2452,6 +2437,19 @@ module nfs4ops {
 
     // The same gate as chimera answers it (D4-15), and the accumulator that
     // records the divergence when there was one.
+    // T_DATA_SYMLINK_STATUS: RFC 7530 Table 7 lists NFS4ERR_SYMLINK *and*
+    // NFS4ERR_INVAL for READ / WRITE / COMMIT / LOCKT on a symbolic-link
+    // current filehandle (rfc-notes R-CORE-91/96/97), so either is
+    // conformant.  The model answers the specific SYMLINK; NFS-Ganesha
+    // answers the generic INVAL.  Deliberately not chimera's
+    // D4-15-coarse-type-error, which is a DIFFERENT mapping: that one also
+    // collapses SYMLINK on the size-setting operations, where V6.5 has not
+    // been measured.
+    pure def dataSymlinkAccept(a: Acc, st: int): Set[int] =
+        if (a.caps.tolDataSymlinkStatus and st == E_SYMLINK)
+            Set(E_SYMLINK, E_INVAL)
+        else Set(st)
+
     pure def dataTypeGateDev(a: Acc, coarsenSymlink: bool): int =
         devCoarseType(a, dataTypeGate(a), coarsenSymlink)
 
@@ -2468,12 +2466,16 @@ module nfs4ops {
         }
 
     pure def opRead(a: Acc, ar: { sel: SidSel, off: int, len: int }): Acc = {
-        val nores = { st: OK, count: 0, eof: false, blocks: [] }
+        val nores = { st: OK, count: 0, eof: false, blocks: [],
+                      stAccept: Set(OK) }
         val g = fhGate(a)
         if (g != OK) emit(a, SRead(nores.with("st", g)))
         else {
             val tg = dataTypeGateDev(a, false)
-            if (tg != OK) emit(dataTypeAcc(a, false), SRead(nores.with("st", tg)))
+            if (tg != OK)
+                emit(dataTypeAcc(a, false),
+                     SRead(nores.with("st", tg)
+                                .with("stAccept", dataSymlinkAccept(a, tg))))
             else {
                 val io = resolveSel(a, ar.sel)
                 match io {
@@ -2486,7 +2488,8 @@ module nfs4ops {
                         else {
                             val r = fsReadData(cfhNode(a), ar.off, ar.len)
                             emit(a, SRead({ st: OK, count: r.count,
-                                            eof: r.eof, blocks: r.syms }))
+                                            eof: r.eof, blocks: r.syms,
+                                            stAccept: Set(OK) }))
                         }
                     | IoBypass =>
                         // READ-bypass: the server MAY bypass share checks
@@ -2500,7 +2503,8 @@ module nfs4ops {
                         else {
                             val r = fsReadData(cfhNode(a), ar.off, ar.len)
                             emit(a, SRead({ st: OK, count: r.count,
-                                            eof: r.eof, blocks: r.syms }))
+                                            eof: r.eof, blocks: r.syms,
+                                            stAccept: Set(OK) }))
                         }
                     | IoState(s) =>
                         // discretion: READ via a write-only open is a MAY
@@ -2511,7 +2515,8 @@ module nfs4ops {
                         else {
                             val r = fsReadData(cfhNode(a), ar.off, ar.len)
                             emit(a, SRead({ st: OK, count: r.count,
-                                            eof: r.eof, blocks: r.syms }))
+                                            eof: r.eof, blocks: r.syms,
+                                            stAccept: Set(OK) }))
                         }
                 }
             }
@@ -2520,12 +2525,16 @@ module nfs4ops {
 
     pure def opWrite(a: Acc, ar: { sel: SidSel, off: int, len: int,
                                    pat: int, stable: int }): Acc = {
-        val nores = { st: OK, count: 0, newSizeBlocks: 0 }
+        val nores = { st: OK, count: 0, newSizeBlocks: 0,
+                      stAccept: Set(OK) }
         val g = fhGate(a)
         if (g != OK) emit(a, SWrite(nores.with("st", g)))
         else {
             val tg = dataTypeGateDev(a, false)
-            if (tg != OK) emit(dataTypeAcc(a, false), SWrite(nores.with("st", tg)))
+            if (tg != OK)
+                emit(dataTypeAcc(a, false),
+                     SWrite(nores.with("st", tg)
+                                 .with("stAccept", dataSymlinkAccept(a, tg))))
             else {
                 val io = resolveSel(a, ar.sel)
                 match io {
@@ -2537,7 +2546,8 @@ module nfs4ops {
                             val w = fsWrite(a.fs, a.cfh, ar.off, ar.len, ar.pat)
                             emit(a.with("fs", w.fs2),
                                  SWrite({ st: OK, count: ar.len,
-                                          newSizeBlocks: w.newSizeBlocks }))
+                                          newSizeBlocks: w.newSizeBlocks,
+                                           stAccept: Set(OK) }))
                         }
                     | IoBypass =>
                         // All-ones stateid in WRITE is treated as
@@ -2548,7 +2558,8 @@ module nfs4ops {
                             val w = fsWrite(a.fs, a.cfh, ar.off, ar.len, ar.pat)
                             emit(a.with("fs", w.fs2),
                                  SWrite({ st: OK, count: ar.len,
-                                          newSizeBlocks: w.newSizeBlocks }))
+                                          newSizeBlocks: w.newSizeBlocks,
+                                           stAccept: Set(OK) }))
                         }
                     | IoState(s) =>
                         // WRITE through a stateid lacking WRITE access is
@@ -2559,7 +2570,8 @@ module nfs4ops {
                             val w = fsWrite(a.fs, a.cfh, ar.off, ar.len, ar.pat)
                             emit(a.with("fs", w.fs2),
                                  SWrite({ st: OK, count: ar.len,
-                                          newSizeBlocks: w.newSizeBlocks }))
+                                          newSizeBlocks: w.newSizeBlocks,
+                                           stAccept: Set(OK) }))
                         }
                 }
             }
@@ -2571,11 +2583,13 @@ module nfs4ops {
     // stable across the run (R-CORE-95).
     pure def opCommit(a: Acc): Acc = {
         val g = fhGate(a)
-        if (g != OK) emit(a, SCommit({ st: g }))
+        if (g != OK) emit(a, SCommit({ st: g, stAccept: Set(g) }))
         else {
             val tg = dataTypeGateDev(a, false)
-            if (tg != OK) emit(dataTypeAcc(a, false), SCommit({ st: tg }))
-            else emit(a, SCommit({ st: OK }))
+            if (tg != OK)
+                emit(dataTypeAcc(a, false),
+                     SCommit({ st: tg, stAccept: dataSymlinkAccept(a, tg) }))
+            else emit(a, SCommit({ st: OK, stAccept: Set(OK) }))
         }
     }
 
@@ -2692,8 +2706,10 @@ module nfs4ops {
             // regular files only.
             val tg = dataTypeGateDev(a, false)
             if (tg != OK)
-                emit(dataTypeAcc(a, false), SLockt({ st: tg, deniedOwner: -1,
-                             stAccept: lapseAccept(a) }))
+emit(dataTypeAcc(a, false),
+                     SLockt({ st: tg, deniedOwner: -1,
+                              stAccept: dataSymlinkAccept(a, tg)
+                                            .union(lapseAccept(a)) }))
             else if (lockConflict(a.sdb, ar.client, ar.lockOwner, a.cfh,
                                   ar.lo, ar.hi, ar.wr)) {
                 val who = lockConflictOwner(a.sdb, ar.client, ar.lockOwner,
@@ -3444,7 +3460,7 @@ module nfs4ops {
           tolDirSymlinkStatus: false, tolXattrChange: false,
           tolRenewLapsed: false, tolRflagsConfirm: false,
           tolLinkRefusal: false, tolWideAttrRefusal: false,
-          tolRenameSymlinkStatus: false }
+          tolRenameSymlinkStatus: false, tolDataSymlinkStatus: false }
 
     // Evaluate a whole COMPOUND.  reqTag identifies the request for the
     // 4.1 SEQUENCE replay/false-retry classification.
