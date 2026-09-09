@@ -21,11 +21,11 @@ anything.  Moved, with the id that replaced them:
   GD-13 (type)  -> G4-open-type-before-exist
   GD-17         -> T_RFLAGS_CONFIRM tolerance
   GD-18         -> T_WIDE_ATTR_REFUSAL tolerance
-  GD-19, GD-32  -> nothing: this ganesha DOES police the open-owner seqid
-                   gap, so the model predicts NFS4ERR_BAD_SEQID with no
-                   knob at all.  (The knfsd cell still enables
-                   S4-owner-seqid-gap-unpoliced; the Linux server does
-                   not police it.)
+  GD-19, GD-32  -> nothing, and GD-19 came BACK: this ganesha polices the
+                   open-owner seqid gap only sometimes, in both directions,
+                   so neither a deviation nor a tolerance can state it.  (The
+                   knfsd cell still enables S4-owner-seqid-gap-unpoliced; the
+                   Linux server does not police it.)
   GD-23, GD-24  -> S4-compound-tag-unvalidated  (shared with knfsd)
   GD-33         -> G4-seek-at-eof-not-nxio
   GD-34         -> G4-compound-tag-length-limit
@@ -313,7 +313,42 @@ GD_30_READ_STALE_HOLE = Deviation(
 
 
 
+# GD-19: the open-owner sequence gap, and why it is here rather than in the
+# model.  The walk deliberately sends an OPEN whose owner seqid is two past
+# the last (nfs4_ops.qnt oseq: seqid + 2), which RFC 7530 9.1.7 makes
+# NFS4ERR_BAD_SEQID.  ganesha polices it SOMETIMES: measured across the 4.0
+# corpus, three OPENs answered on the name or the object (NOENT, or the
+# object's status) where the model with the deviation off predicts BAD_SEQID,
+# and in the run before this one -- with the model predicting the ordinary
+# answer instead -- three others came back BAD_SEQID.  Both directions occur,
+# which is why neither a deviation nor a tolerance fits: the two branches
+# leave DIFFERENT state (one OPEN creates an object and a stateid, the other
+# does not), so an accept set would keep replaying against a server the model
+# has already parted from.  reconcilable=False: the owner seqid parts here and
+# the trace stops.
+GD_19_OWNER_SEQID_GAP = Deviation(
+    id="GD-19-owner-seqid-gap",
+    verdict=SERVER,
+    spec="RFC 7530 9.1.7 (the open-owner seqid must be exactly one greater; "
+         "enforcement is the server's)",
+    summary="an OPEN with a two-past owner seqid is policed as BAD_SEQID only "
+            "sometimes; the other times it is answered on its merits",
+    root_cause="ganesha's open-owner sequence check does not fire uniformly",
+    candidate_fix="ganesha: police the gap on every OPEN, or on none",
+    ops=("SOpen",),
+    expected_status=(NFS4ERR_BAD_SEQID, NFS4_OK, NFS4ERR_NOENT,
+                     NFS4ERR_EXIST, NFS4ERR_SHARE_DENIED, NFS4ERR_NOTDIR),
+    actual_status=(NFS4ERR_BAD_SEQID, NFS4_OK, NFS4ERR_NOENT, NFS4ERR_EXIST,
+                   NFS4ERR_SHARE_DENIED, NFS4ERR_NOTDIR),
+    context=lambda f, ctx: ctx.get("minor") == 0 and
+                           (f.expected == NFS4ERR_BAD_SEQID or
+                            f.actual == NFS4ERR_BAD_SEQID),
+    reconcilable=False,
+)
+
+
 NFS4 = Registry("ganesha/nfs4", [
+    GD_19_OWNER_SEQID_GAP,
     GD_6_NAME_HANDLING,
     GD_15_OPENMODE,
     GD_16_EXCL_VERIFIER,

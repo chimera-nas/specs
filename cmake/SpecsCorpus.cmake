@@ -142,6 +142,8 @@ function(specs_corpus_finalize)
     get_filename_component(specs_root "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/.."
                            ABSOLUTE)
     set(mkconfig ${specs_root}/tools/mkconfig.js)
+    set_property(DIRECTORY ${CMAKE_SOURCE_DIR} APPEND
+                 PROPERTY CMAKE_CONFIGURE_DEPENDS ${mkconfig})
     set(gen_js   ${specs_root}/tools/gen.js)
 
     if(NOT NODE_BIN OR (NOT QUINT_BIN AND NOT SPECS_CORPUS_PREBUILT))
@@ -161,6 +163,17 @@ function(specs_corpus_finalize)
                 "specs: family '${fam}' has no ${schema}; a family that a "
                 "consumer configures must declare its knobs")
         endif()
+
+        # Reconfigure when the SCHEMA changes, for the same reason a config
+        # does: the schema is the list of constants mkconfig renders into each
+        # cell module, so adding or retiring one leaves every cfg_*.qnt in an
+        # existing build tree naming a set of constants the model no longer
+        # declares.  Quint elaborates that fine and then fails every batch at
+        # simulate time with an unhelpful bare "undefined", which is a long
+        # way from "you edited a schema".  mkconfig.js itself is listed for
+        # the same reason -- it decides how a knob is rendered.
+        set_property(DIRECTORY ${CMAKE_SOURCE_DIR} APPEND
+                     PROPERTY CMAKE_CONFIGURE_DEPENDS ${schema})
 
         # Build the mkconfig spec.  Cells and configs are parallel lists.
         set(celljson "")

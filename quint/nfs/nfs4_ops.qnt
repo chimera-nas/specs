@@ -448,8 +448,9 @@ module nfs4ops {
         // acceptance: which conflicting lock a server reports when several
         // exist is discretionary; the harness checks the reported conflict
         // is real rather than comparing owners exactly.
-        | SLock({ st: int, sid: Sid, seq: int, deniedOwner: int })
-        | SLockt({ st: int, deniedOwner: int })
+        | SLock({ st: int, sid: Sid, seq: int, deniedOwner: int,
+                  stAccept: Set[int] })
+        | SLockt({ st: int, deniedOwner: int, stAccept: Set[int] })
         | SLocku({ st: int, seq: int })
         | SDelegreturn({ st: int })
         | SLayoutget({ st: int, sid: Sid, seq: int, lo: int, hi: int })
@@ -714,6 +715,32 @@ module nfs4ops {
     // third server, but its coarse pair is NOT the same mapping -- it also
     // collapses SYMLINK to INVAL on the size-setting operations -- so the two
     // are separate ids rather than one shared knob.)
+    // G4-open-type-before-exist, and which types it covers.  Measured against
+    // V6.5: a fail-if-exists OPEN onto an existing DIRECTORY or special file
+    // answers that object's type error ahead of NFS4ERR_EXIST, but onto a
+    // SYMBOLIC LINK it answers EXIST, which is what the model says anyway --
+    // so the branch is not taken for a symlink.  (The registry entry this
+    // came from, GD-13, listed SYMLINK among the statuses it forgave, which
+    // is how the wider claim survived into the model.)
+    // T_RENEW_LAPSED reaches further than RENEW.  RFC 7530 9.6.3 leaves it to
+    // the server how long a client id whose lease has lapsed survives, and
+    // 8.1.3 lets a fresh incarnation of a client purge the old one's state at
+    // a moment of the server's choosing -- the model carries no clock and no
+    // purge, so a server may answer NFS4ERR_EXPIRED (or, for a stateid that
+    // went with the lapsed lease, NFS4ERR_STALE_STATEID) to an OPEN, a LOCK
+    // or a LOCKT wherever the model, which believes the id still live -- or
+    // has not looked at it yet, because it validates the name first --
+    // predicts something else.  The set holds only those ALTERNATIVES: the
+    // predicted status is compared for equality first, and the membership
+    // test runs only when it differs.
+    pure def lapseAccept(a: Acc): Set[int] =
+        if (a.caps.tolRenewLapsed) Set(E_EXPIRED, E_STALE_STATEID)
+        else Set()
+
+    pure def openTypeFirst(a: Acc, childT: Ftype): bool =
+        childT != FReg and childT != FLnk and
+        hasDev(a.caps, "G4-open-type-before-exist")
+
     pure def noWT(a: Acc, st: int, v40: int): int =
         if (st == E_WRONG_TYPE and hasDev(a.caps, "S4-no-wrong-type")) v40
         else st
@@ -2042,10 +2069,11 @@ module nfs4ops {
                             // OPEN without ordering them.  The model keeps the
                             // RFC-literal, POSIX O_EXCL reading -- an existing
                             // name is EXIST whatever its type -- and
-                            // NFS-Ganesha reports the type first.  The OPEN
-                            // fails either way.
-                            if (present and typeErr != OK and
-                                hasDev(a.caps, "G4-open-type-before-exist"))
+                            // NFS-Ganesha reports the type first, EXCEPT for a
+                            // symbolic link, where it reports EXIST as the
+                            // model does (openTypeFirst).  The OPEN fails
+                            // either way.
+                            if (present and openTypeFirst(a, childT))
                                 base.with("st", typeErr)
                                     .with("devs",
                                           Set("G4-open-type-before-exist"))
@@ -2072,9 +2100,7 @@ module nfs4ops {
                                 base.with("file", child)
                                     .with("cinfo", { before: dnd.change,
                                                      after: dnd.change, opaque: false })
-                            else if (present and typeErr != OK and
-                                     hasDev(a.caps,
-                                            "G4-open-type-before-exist"))
+                            else if (present and openTypeFirst(a, childT))
                                 base.with("st", typeErr)
                                     .with("devs",
                                           Set("G4-open-type-before-exist"))
@@ -2115,15 +2141,7 @@ module nfs4ops {
         // a server may set it or not with no observable consequence.
         val ncAcc = if (a.caps.tolRflagsConfirm) Set(false, true)
                     else Set(false)
-        // T_RENEW_LAPSED reaches further than RENEW.  RFC 7530 9.6.3 leaves
-        // it to the server how long a client id whose lease has lapsed
-        // survives, and the model carries no clock at all -- so a server may
-        // answer NFS4ERR_EXPIRED to an OPEN wherever the model, which
-        // believes the id still live (or has not looked at it yet, because it
-        // validates the name first), predicts something else.  The set holds
-        // only that ALTERNATIVE: the predicted status is compared for
-        // equality first, and the membership test runs only when it differs.
-        val stAcc = if (a.caps.tolRenewLapsed) Set(E_EXPIRED) else Set()
+        val stAcc = lapseAccept(a)
         val nores = { st: OK, sid: -1, seq: 0, needConfirm: false,
                       needConfirmAccept: ncAcc, stAccept: stAcc,
                       cinfo: zero, deleg: DNone, recalls: Set() }
@@ -2554,7 +2572,8 @@ module nfs4ops {
     pure def opLock(a: Acc, ar: { wr: bool, lo: int, hi: int, newOwner: bool,
                                   openSid: Sid, lockSid: Sid, lockOwner: int,
                                   oseq: int, lseq: int }): Acc = {
-        val nores = { st: OK, sid: -1, seq: 0, deniedOwner: -1 }
+        val nores = { st: OK, sid: -1, seq: 0, deniedOwner: -1,
+                      stAccept: lapseAccept(a) }
         val g = fhGate(a)
         if (g != OK) emit(a, SLock(nores.with("st", g)))
         else if (ar.lo >= ar.hi)
@@ -2643,9 +2662,11 @@ module nfs4ops {
     pure def opLockt(a: Acc, ar: { client: ClientId, lockOwner: int,
                                    wr: bool, lo: int, hi: int }): Acc = {
         val g = fhGate(a)
-        if (g != OK) emit(a, SLockt({ st: g, deniedOwner: -1 }))
+        if (g != OK) emit(a, SLockt({ st: g, deniedOwner: -1,
+                             stAccept: lapseAccept(a) }))
         else if (ar.lo >= ar.hi)
-            emit(a, SLockt({ st: E_INVAL, deniedOwner: -1 }))
+            emit(a, SLockt({ st: E_INVAL, deniedOwner: -1,
+                             stAccept: lapseAccept(a) }))
         else {
             // Byte-range locking is defined for regular files only, so the
             // same type gate READ/WRITE/COMMIT use applies (RFC 7530 16.11 /
@@ -2657,14 +2678,17 @@ module nfs4ops {
             // regular files only.
             val tg = dataTypeGateDev(a, false)
             if (tg != OK)
-                emit(dataTypeAcc(a, false), SLockt({ st: tg, deniedOwner: -1 }))
+                emit(dataTypeAcc(a, false), SLockt({ st: tg, deniedOwner: -1,
+                             stAccept: lapseAccept(a) }))
             else if (lockConflict(a.sdb, ar.client, ar.lockOwner, a.cfh,
                                   ar.lo, ar.hi, ar.wr)) {
                 val who = lockConflictOwner(a.sdb, ar.client, ar.lockOwner,
                                             a.cfh, ar.lo, ar.hi, ar.wr)
-                emit(a, SLockt({ st: E_DENIED, deniedOwner: who }))
+                emit(a, SLockt({ st: E_DENIED, deniedOwner: who,
+                             stAccept: lapseAccept(a) }))
             }
-            else emit(a, SLockt({ st: OK, deniedOwner: -1 }))
+            else emit(a, SLockt({ st: OK, deniedOwner: -1,
+                             stAccept: lapseAccept(a) }))
         }
     }
 
@@ -3426,15 +3450,15 @@ module nfs4ops {
                     // First op of a 4.1+ compound must be SEQUENCE or a
                     // session-exempt op.
                     //
-                    // G4-op-outside-session-inval: RFC 8881 2.10.6.1 names
-                    // NFS4ERR_OP_NOT_IN_SESSION for exactly this, reported
-                    // against the offending operation, so the reply carries
-                    // one result.  ganesha rejects the message instead --
-                    // NFS4ERR_INVAL, and an EMPTY result array, which is the
-                    // shape of a compound refused before any op ran.
-                    if (hasDev(acc.caps, "G4-op-outside-session-inval"))
-                        hitDev(acc, "G4-op-outside-session-inval")
-                            .with("status", E_INVAL)
+                    // G4-op-outside-session-no-result: RFC 8881 2.10.6.1
+                    // names NFS4ERR_OP_NOT_IN_SESSION for exactly this,
+                    // reported AGAINST the offending operation, so the reply
+                    // carries one result.  ganesha agrees on the status and
+                    // sends no result at all -- the shape of a compound
+                    // refused before any op ran.
+                    if (hasDev(acc.caps, "G4-op-outside-session-no-result"))
+                        hitDev(acc, "G4-op-outside-session-no-result")
+                            .with("status", E_OP_NOT_IN_SESSION)
                             .with("done", true)
                     else {
                         val res = SSequence({ st: E_OP_NOT_IN_SESSION,

@@ -71,7 +71,8 @@ module nfs4Test42 {
     def asLock(r) =
         match r {
             | SLock(x) => x
-            | _ => { st: -999, sid: -1, seq: 0, deniedOwner: -1 }
+            | _ => { st: -999, sid: -1, seq: 0, deniedOwner: -1,
+                     stAccept: Set() }
         }
 
     def asRead(r) =

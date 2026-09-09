@@ -19,7 +19,7 @@
     "G4-exchange-id-no-confirmed-r",
     "G4-bindconn-direction-accepted",
     // No sessions at 4.0, so no compound can be outside one.
-    "G4-op-outside-session-inval"
+    "G4-op-outside-session-no-result"
   ],
   "deviations": [
     // Only the 4.0 walk sends the 256-byte NLONG compound tag (measured with

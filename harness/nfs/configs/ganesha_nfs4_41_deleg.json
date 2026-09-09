@@ -13,7 +13,7 @@
   "deviationsOff": [
     // measured with tools/devliveness.py: this flavour never sends a
     // compound whose first operation is not SEQUENCE.
-    "G4-op-outside-session-inval",
+    "G4-op-outside-session-no-result",
     "S4-no-wrong-type",
     "G4-compound-tag-length-limit",
     "G4-verify-wide-trivial-match",
