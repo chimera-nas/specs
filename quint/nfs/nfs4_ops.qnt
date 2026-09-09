@@ -416,8 +416,8 @@ module nfs4ops {
                     stAccept: Set[int] })
         | SLink({ st: int, cinfo: CInfo, stAccept: Set[int] })
         | SSetattr({ st: int })
-        | SVerify({ st: int })
-        | SNverify({ st: int })
+        | SVerify({ st: int, stAccept: Set[int] })
+        | SNverify({ st: int, stAccept: Set[int] })
         | SSetclientid({ st: int, client: ClientId, tok: int })
         | SSetclientidConfirm({ st: int })
         // TOLERANCE (T_RENEW_LAPSED).  RFC 7530 16.30.4 lists BOTH
@@ -1138,10 +1138,7 @@ module nfs4ops {
         // for every attribute the server advertises.  The compound ends at
         // the GETATTR either way, and there is no comparator arm for the
         // values, so both answers cost the same and neither parts state.
-        else emit(a, SGetattrWide({ st: OK,
-                                    stAccept: if (a.caps.tolWideAttrRefusal)
-                                                  Set(OK, E_INVAL)
-                                              else Set(OK) }))
+        else emit(a, SGetattrWide({ st: OK, stAccept: wideAccept(a, OK) }))
     }
 
     // BIND_CONN_TO_SESSION (RFC 8881 18.34): associates the connection the
@@ -1617,9 +1614,10 @@ module nfs4ops {
     // NFS4ERR_NOT_SAME / continue.
     pure def opVerifySize(a: Acc, sz: int): Acc = {
         val g = fhGate(a)
-        if (g != OK) emit(a, SVerify({ st: g }))
-        else if (cfhNode(a).sizeBlocks == sz) emit(a, SVerify({ st: OK }))
-        else emit(a, SVerify({ st: E_NOT_SAME }))
+        if (g != OK) emit(a, SVerify({ st: g, stAccept: Set(g) }))
+        else if (cfhNode(a).sizeBlocks == sz)
+            emit(a, SVerify({ st: OK, stAccept: Set(OK) }))
+        else emit(a, SVerify({ st: E_NOT_SAME, stAccept: Set(E_NOT_SAME) }))
     }
 
     // VERIFY / NVERIFY over the server's whole supported-attribute set.
@@ -1640,28 +1638,39 @@ module nfs4ops {
     // NFS-Ganesha reads the empty value blob as "no attributes to compare",
     // which trivially matches.  Both are defensible readings of a deliberately
     // under-specified request; VERIFY/NVERIFY change no state either way.
+    // T_WIDE_ATTR_REFUSAL reaches VERIFY and NVERIFY as well as GETATTR: all
+    // three ask for the server's whole supported-attribute bitmap, and RFC
+    // 7530 16.15.4 / RFC 8881 18.31.3 list NFS4ERR_INVAL for a mask the
+    // server will not satisfy exactly as 18.7.3 does for GETATTR.  Neither
+    // operation changes state on any branch.
+    pure def wideAccept(a: Acc, st: int): Set[int] =
+        if (a.caps.tolWideAttrRefusal) Set(st, E_INVAL) else Set(st)
+
     pure def opVerifyWide(a: Acc): Acc = {
         val g = fhGate(a)
-        if (g != OK) emit(a, SVerify({ st: g }))
+        if (g != OK) emit(a, SVerify({ st: g, stAccept: Set(g) }))
         else if (hasDev(a.caps, "G4-verify-wide-trivial-match"))
-            emit(hitDev(a, "G4-verify-wide-trivial-match"), SVerify({ st: OK }))
-        else emit(a, SVerify({ st: E_NOT_SAME }))
+            emit(hitDev(a, "G4-verify-wide-trivial-match"),
+                 SVerify({ st: OK, stAccept: wideAccept(a, OK) }))
+        else emit(a, SVerify({ st: E_NOT_SAME,
+                               stAccept: wideAccept(a, E_NOT_SAME) }))
     }
 
     pure def opNverifyWide(a: Acc): Acc = {
         val g = fhGate(a)
-        if (g != OK) emit(a, SNverify({ st: g }))
+        if (g != OK) emit(a, SNverify({ st: g, stAccept: Set(g) }))
         else if (hasDev(a.caps, "G4-verify-wide-trivial-match"))
             emit(hitDev(a, "G4-verify-wide-trivial-match"),
-                 SNverify({ st: E_SAME }))
-        else emit(a, SNverify({ st: OK }))
+                 SNverify({ st: E_SAME, stAccept: wideAccept(a, E_SAME) }))
+        else emit(a, SNverify({ st: OK, stAccept: wideAccept(a, OK) }))
     }
 
     pure def opNverifySize(a: Acc, sz: int): Acc = {
         val g = fhGate(a)
-        if (g != OK) emit(a, SNverify({ st: g }))
-        else if (cfhNode(a).sizeBlocks == sz) emit(a, SNverify({ st: E_SAME }))
-        else emit(a, SNverify({ st: OK }))
+        if (g != OK) emit(a, SNverify({ st: g, stAccept: Set(g) }))
+        else if (cfhNode(a).sizeBlocks == sz)
+            emit(a, SNverify({ st: E_SAME, stAccept: Set(E_SAME) }))
+        else emit(a, SNverify({ st: OK, stAccept: Set(OK) }))
     }
 
     // ------------------------------------------------------------------
@@ -2078,9 +2087,9 @@ module nfs4ops {
                             // them; the model keeps the RFC-literal, POSIX
                             // O_EXCL reading -- an existing name is EXIST
                             // whatever its type -- and NFS-Ganesha V6.5 was
-                            // measured to agree for every type this corpus
-                            // reaches (see the retired
-                            // G4-open-type-before-exist in the schema).
+                            // measured to agree on THIS disposition, 6 times
+                            // out of 6.  On EXCLUSIVE4 it does not; that is
+                            // G4-open-type-before-exist, on the arm below.
                             if (present) base.with("st", E_EXIST)
                             else {
                                 val o = fsMknode(a.fs, a.cfh, n,
@@ -2104,6 +2113,24 @@ module nfs4ops {
                                 base.with("file", child)
                                     .with("cinfo", { before: dnd.change,
                                                      after: dnd.change, opaque: false })
+                            // G4-open-type-before-exist: RFC 7530 16.16.4 /
+                            // RFC 8881 18.16.4 list NFS4ERR_EXIST and the
+                            // target's own type error for a create that must
+                            // not clobber, without ordering them.  The model
+                            // keeps the RFC-literal, POSIX O_EXCL reading --
+                            // an existing name is EXIST whatever its type.
+                            // NFS-Ganesha V6.5 splits by DISPOSITION, and
+                            // measured cleanly both ways: GUARDED answers
+                            // EXIST (6 of 6 observations) and EXCLUSIVE4
+                            // answers the type error (6 of 6).  So the branch
+                            // is here, on the exclusive arm, and nowhere
+                            // else.  The OPEN fails either way.
+                            else if (present and typeErr != OK and
+                                     hasDev(a.caps,
+                                            "G4-open-type-before-exist"))
+                                base.with("st", typeErr)
+                                    .with("devs",
+                                          Set("G4-open-type-before-exist"))
                             else if (present) base.with("st", E_EXIST)
                             else {
                                 // K4-exclusive-create-mode-zero: the Linux

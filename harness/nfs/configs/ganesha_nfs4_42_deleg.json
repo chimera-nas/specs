@@ -11,6 +11,9 @@
   // A delegation-only corpus reaches almost none of the parent's divergences,
   // and an enabled-but-unexercised deviation fails tools/devliveness.py.
   "deviationsOff": [
+    // a delegation-only walk never drives an EXCLUSIVE4 create onto an
+    // existing object of the wrong type.
+    "G4-open-type-before-exist",
     // measured with tools/devliveness.py: this flavour never sends a
     // compound this server would refuse on its shape.
     "G4-compound-shape-no-result",
