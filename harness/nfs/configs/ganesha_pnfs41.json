@@ -12,8 +12,8 @@
   // divergences are unreachable here.
   "deviationsOff": [
     // measured with tools/devliveness.py: this flavour never sends a
-    // compound whose first operation is not SEQUENCE.
-    "G4-op-outside-session-no-result",
+    // compound this server would refuse on its shape.
+    "G4-compound-shape-no-result",
     "G4-compound-tag-length-limit",
     "G4-verify-wide-trivial-match",
     "G4-open-type-before-exist",

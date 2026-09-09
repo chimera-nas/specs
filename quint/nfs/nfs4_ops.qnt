@@ -451,7 +451,7 @@ module nfs4ops {
         | SLock({ st: int, sid: Sid, seq: int, deniedOwner: int,
                   stAccept: Set[int] })
         | SLockt({ st: int, deniedOwner: int, stAccept: Set[int] })
-        | SLocku({ st: int, seq: int })
+        | SLocku({ st: int, seq: int, stAccept: Set[int] })
         | SDelegreturn({ st: int })
         | SLayoutget({ st: int, sid: Sid, seq: int, lo: int, hi: int })
         | SLayoutreturn({ st: int, present: bool, seq: int })
@@ -576,6 +576,19 @@ module nfs4ops {
     // Append a result; halt the compound when it is an error
     // (first-error-stops, RFC 7530 14.2 / RFC 8881 16.2.4 -- this applies
     // even to "non-error" statuses like NFS4ERR_SAME).
+    // G4-compound-shape-no-result: a compound refused for its SHAPE rather
+    // than for anything an operation did -- the first op is neither SEQUENCE
+    // nor session-exempt (NFS4ERR_OP_NOT_IN_SESSION, RFC 8881 2.10.6.1), or a
+    // solo-only operation is sent alongside others (NFS4ERR_NOT_ONLY_OP, RFC
+    // 8881 18.34.3).  The RFCs report both against the offending operation,
+    // so the reply carries one result; ganesha answers the same status with
+    // an EMPTY result array.  Nothing runs on either side.
+    pure def refuseShape(a: Acc, r: OpRes, st: int): Acc =
+        if (hasDev(a.caps, "G4-compound-shape-no-result"))
+            hitDev(a, "G4-compound-shape-no-result")
+                .with("status", st).with("done", true)
+        else emit(a, r)
+
     pure def emit(a: Acc, r: OpRes): Acc = {
         val st = statusOf(r)
         a.with("results", a.results.append(r))
@@ -1155,7 +1168,8 @@ module nfs4ops {
     pure def opBindConnToSession(a: Acc, ar: { sess: SessId, dir: int }): Acc =
         if (a.minor == 0) emit(a, SBindConnToSession({ st: E_OP_ILLEGAL }))
         else if (not(a.seqDone) and a.nOps > 1)
-            emit(a, SBindConnToSession({ st: E_NOT_ONLY_OP }))
+            refuseShape(a, SBindConnToSession({ st: E_NOT_ONLY_OP }),
+                        E_NOT_ONLY_OP)
         else if (not(a.sdb.sessions.keys().contains(ar.sess)))
             emit(a, SBindConnToSession({ st: E_BADSESSION }))
         // G4-bindconn-direction-accepted: RFC 8881 18.34.3 lists the four
@@ -2705,23 +2719,23 @@ module nfs4ops {
     pure def opLocku(a: Acc, ar: { sid: Sid, argSeq: int, lseq: int,
                                    lo: int, hi: int }): Acc = {
         val g = fhGate(a)
-        if (g != OK) emit(a, SLocku({ st: g, seq: 0 }))
+        if (g != OK) emit(a, SLocku({ st: g, seq: 0, stAccept: lapseAccept(a) }))
         else if (ar.lo >= ar.hi)
-            emit(a, SLocku({ st: E_INVAL, seq: 0 }))
+            emit(a, SLocku({ st: E_INVAL, seq: 0, stAccept: lapseAccept(a) }))
         else if (not(sidLive(a.sdb, ar.sid, KLock)))
-            emit(a, SLocku({ st: E_BAD_STATEID, seq: 0 }))
+            emit(a, SLocku({ st: E_BAD_STATEID, seq: 0, stAccept: lapseAccept(a) }))
         else {
             val l = a.sdb.locks.get(ar.sid)
             if (l.file != a.cfh)
-                emit(a, SLocku({ st: E_BAD_STATEID, seq: 0 }))
+                emit(a, SLocku({ st: E_BAD_STATEID, seq: 0, stAccept: lapseAccept(a) }))
             else if (a.minor == 0 and
                      not(loGateOk(a.sdb, l.client, l.owner, ar.lseq)))
-                emit(a, SLocku({ st: E_BAD_SEQID, seq: 0 }))
+                emit(a, SLocku({ st: E_BAD_SEQID, seq: 0, stAccept: lapseAccept(a) }))
             else {
                 val chk = checkSid(a.sdb, ar.sid, KLock, ar.argSeq)
                 match chk {
-                    | SidOld => emit(a, SLocku({ st: E_OLD_STATEID, seq: 0 }))
-                    | SidBad => emit(a, SLocku({ st: E_BAD_STATEID, seq: 0 }))
+                    | SidOld => emit(a, SLocku({ st: E_OLD_STATEID, seq: 0, stAccept: lapseAccept(a) }))
+                    | SidBad => emit(a, SLocku({ st: E_BAD_STATEID, seq: 0, stAccept: lapseAccept(a) }))
                     | SidOk => {
                         val r = doLocku(a.sdb, ar.sid, ar.lo, ar.hi)
                         val sdb2 = if (a.minor == 0)
@@ -2729,7 +2743,7 @@ module nfs4ops {
                                                 ar.lseq, OK)
                                    else r.sdb2
                         emit(a.with("sdb", sdb2),
-                             SLocku({ st: OK, seq: r.seq }))
+                             SLocku({ st: OK, seq: r.seq, stAccept: lapseAccept(a) }))
                     }
                 }
             }
@@ -3450,23 +3464,12 @@ module nfs4ops {
                     // First op of a 4.1+ compound must be SEQUENCE or a
                     // session-exempt op.
                     //
-                    // G4-op-outside-session-no-result: RFC 8881 2.10.6.1
-                    // names NFS4ERR_OP_NOT_IN_SESSION for exactly this,
-                    // reported AGAINST the offending operation, so the reply
-                    // carries one result.  ganesha agrees on the status and
-                    // sends no result at all -- the shape of a compound
-                    // refused before any op ran.
-                    if (hasDev(acc.caps, "G4-op-outside-session-no-result"))
-                        hitDev(acc, "G4-op-outside-session-no-result")
-                            .with("status", E_OP_NOT_IN_SESSION)
-                            .with("done", true)
-                    else {
-                        val res = SSequence({ st: E_OP_NOT_IN_SESSION,
-                                              replay: false })
-                        acc.with("results", acc.results.append(res))
-                           .with("status", E_OP_NOT_IN_SESSION)
-                           .with("done", true)
-                    }
+                    // Reported against the offending op (one result) by the
+                    // RFC; ganesha sends none -- see refuseShape.
+                    refuseShape(acc,
+                                SSequence({ st: E_OP_NOT_IN_SESSION,
+                                            replay: false }),
+                                E_OP_NOT_IN_SESSION)
                 }
                 else dispatch(acc, r)
             acc2.with("idx", acc.idx + 1)

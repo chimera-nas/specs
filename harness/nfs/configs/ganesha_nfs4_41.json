@@ -31,7 +31,7 @@
   // this side; it stays on for knfsd, which does accept them.
   "deviations": [
     "S4-no-wrong-type",
-    "G4-op-outside-session-no-result",
+    "G4-compound-shape-no-result",
     "S4-change-is-coarse-ctime",
     "G4-verify-wide-trivial-match",
     "G4-setattr-share-denied",

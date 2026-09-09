@@ -18,8 +18,10 @@
     "S4-no-wrong-type",
     "G4-exchange-id-no-confirmed-r",
     "G4-bindconn-direction-accepted",
-    // No sessions at 4.0, so no compound can be outside one.
-    "G4-op-outside-session-no-result"
+    // No sessions at 4.0: a compound cannot be outside one, and
+    // BIND_CONN_TO_SESSION is answered NFS4ERR_OP_ILLEGAL before the
+    // solo-only rule can apply -- so neither shape refusal exists here.
+    "G4-compound-shape-no-result"
   ],
   "deviations": [
     // Only the 4.0 walk sends the 256-byte NLONG compound tag (measured with
