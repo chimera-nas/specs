@@ -93,7 +93,14 @@ jobs:
               set -e
               cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
               cmake --build build -j"$(nproc)"
-              ctest --test-dir build --output-on-failure -LE "samba|ganesha|knfsd"
+              # The gates that need no server, and they are the ones worth
+              # running where the corpus is MADE: devliveness fails when a cell
+              # enables a deviation its own corpus never exercises, so a
+              # deviation that has been fixed cannot sit on as a blindfold.
+              # --no-tests=error because "nothing matched" would otherwise pass
+              # silently, which is how the old bundle-era gates went quiet.
+              ctest --test-dir build --output-on-failure -L devliveness \
+                    --no-tests=error -j "$(nproc)"
             '
           # The corpus is a directory of per-cell trace sets under
           # build/specs-corpus.  Archived from INSIDE it, so it unpacks as the
