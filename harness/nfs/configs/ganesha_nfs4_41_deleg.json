@@ -13,9 +13,7 @@
   "deviationsOff": [
     "S4-no-wrong-type",
     "S4-compound-tag-unvalidated",
-    "S4-link-dir-notdir",
     "G4-compound-tag-length-limit",
-    "G4-getattr-wide-inval",
     "G4-verify-wide-trivial-match",
     "G4-setattr-share-denied",
     "G4-exchange-id-no-confirmed-r",

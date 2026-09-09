@@ -120,6 +120,17 @@ module nfs4 {
     // has to be exact.
     const T_RFLAGS_CONFIRM: bool
 
+    // TOLERANCE: which refusal a LINK reports when more than one applies --
+    // RFC 7530 16.9.4 pins neither the directory-source code (ISDIR vs the
+    // not-a-directory framing NOTDIR) nor its precedence against a malformed
+    // target name.  See opLink / linkAccept.
+    const T_LINK_REFUSAL: bool
+
+    // TOLERANCE: RFC 8881 18.7.3 lets a server answer NFS4ERR_INVAL for an
+    // attribute combination it cannot satisfy, and the wide GETATTR asks for
+    // every attribute the server advertises.  See opGetattrWide.
+    const T_WIDE_ATTR_REFUSAL: bool
+
     // ------------------------------------------------------------------
     // Bounded universes
     // ------------------------------------------------------------------
@@ -255,7 +266,9 @@ module nfs4 {
             tolDirSymlinkStatus: T_DIR_SYMLINK_STATUS,
             tolXattrChange: T_XATTR_CHANGE,
             tolRenewLapsed: T_RENEW_LAPSED,
-            tolRflagsConfirm: T_RFLAGS_CONFIRM and MINOR >= 1
+            tolRflagsConfirm: T_RFLAGS_CONFIRM and MINOR >= 1,
+            tolLinkRefusal: T_LINK_REFUSAL,
+            tolWideAttrRefusal: T_WIDE_ATTR_REFUSAL
         }
         all {
             // ref: in-memory share roots are 0777; the root mode is not

@@ -6,15 +6,20 @@
   // At 4.0 NFS4ERR_WRONG_TYPE does not exist, so S4-no-wrong-type has nothing
   // to rewrite; EXCHANGE_ID and BIND_CONN_TO_SESSION are 4.1+ operations; and
   // OPEN4_RESULT_CONFIRM is not inert here, it drives the handshake, so the
-  // rflagsConfirm tolerance has to come off too.  What 4.0 adds instead is the
-  // open-owner sequence, which is where the seqid deviation lives.
+  // rflagsConfirm tolerance has to come off too.
+  //
+  // S4-owner-seqid-gap-unpoliced is NOT enabled, though the knfsd 4.0 cell
+  // does enable it: this ganesha DOES police the open-owner seqid gap the walk
+  // drives (RFC 7530 9.1.7), answering NFS4ERR_BAD_SEQID, which is exactly
+  // what the model predicts with the deviation off.  The registry entry it was
+  // migrated from (GD-19) forgave the gap opportunistically and so never had
+  // to say how often it fired.
   "deviationsOff": [
     "S4-no-wrong-type",
     "G4-exchange-id-no-confirmed-r",
     "G4-bindconn-direction-accepted"
   ],
   "deviations": [
-    "S4-owner-seqid-gap-unpoliced",
     // Only the 4.0 walk sends the 256-byte NLONG compound tag (measured with
     // tools/devliveness.py), so this is the one profile that can prove it.
     "G4-compound-tag-length-limit"

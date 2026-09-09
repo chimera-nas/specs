@@ -247,7 +247,15 @@ module nfs4ops {
         tolRenewLapsed: bool,
         // TOLERANCE (not a deviation): OPEN4_RESULT_CONFIRM is inert above
         // 4.0 (RFC 8881 18.16), so a server may set it or not.  See opOpen.
-        tolRflagsConfirm: bool
+        tolRflagsConfirm: bool,
+        // TOLERANCE (not a deviation): RFC 7530 16.9.4 pins neither the code
+        // for a LINK whose source is a directory nor its precedence against a
+        // malformed target name.  See opLink.
+        tolLinkRefusal: bool,
+        // TOLERANCE (not a deviation): RFC 8881 18.7.3 lets a server refuse an
+        // attribute combination it cannot satisfy, and the wide GETATTR asks
+        // for all of them.  See opGetattrWide.
+        tolWideAttrRefusal: bool
     }
 
     // Did the cell's config enable this deviation?
@@ -384,7 +392,7 @@ module nfs4ops {
         | SPutfh({ st: int })
         | SGetfh({ st: int, ino: Ino })
         | SSavefh({ st: int })
-        | SGetattrWide({ st: int })
+        | SGetattrWide({ st: int, stAccept: Set[int] })
         | SSecinfo({ st: int })
         | SBindConnToSession({ st: int })
         | SRestorefh({ st: int })
@@ -397,7 +405,7 @@ module nfs4ops {
         | SCreate({ st: int, ino: Ino, cinfo: CInfo })
         | SRemove({ st: int, cinfo: CInfo })
         | SRename({ st: int, cinfoS: CInfo, cinfoT: CInfo })
-        | SLink({ st: int, cinfo: CInfo })
+        | SLink({ st: int, cinfo: CInfo, stAccept: Set[int] })
         | SSetattr({ st: int })
         | SVerify({ st: int })
         | SNverify({ st: int })
@@ -729,17 +737,17 @@ module nfs4ops {
         if (hasDev(a.caps, "S4-change-is-coarse-ctime"))
             hitDev(a, "S4-change-is-coarse-ctime") else a
 
-    // S4-link-dir-notdir: hard-linking a directory is refused by every server,
-    // but the status is not pinned -- RFC 7530 16.9.4 lists NFS4ERR_ISDIR,
-    // which is what the model and chimera answer, while BOTH reference servers
-    // answer NFS4ERR_NOTDIR.  Nothing is linked either way.
-    pure def devLinkDir(a: Acc, st: int): int =
-        if (st == E_ISDIR and hasDev(a.caps, "S4-link-dir-notdir")) E_NOTDIR
-        else st
-
-    pure def devLinkDirHit(a: Acc, st: int): Acc =
-        if (st == E_ISDIR and hasDev(a.caps, "S4-link-dir-notdir"))
-            hitDev(a, "S4-link-dir-notdir") else a
+    // T_LINK_REFUSAL: which refusal a LINK reports when more than one applies.
+    // RFC 7530 16.9.4 lists NFS4ERR_ISDIR for a directory source but pins
+    // neither that code -- NOTDIR is the same refusal framed as a type error,
+    // and either is conformant -- nor its precedence against a malformed
+    // target name, which the model checks first.  Hard-linking a directory is
+    // refused by every server, so nothing is linked whichever code comes back.
+    pure def linkAccept(a: Acc, st: int, srcIsDir: bool): Set[int] =
+        if (not(a.caps.tolLinkRefusal)) Set(st)
+        else if (st == E_ISDIR) Set(E_ISDIR, E_NOTDIR)
+        else if (srcIsDir) Set(st, E_ISDIR, E_NOTDIR)
+        else Set(st)
 
     // K4-rename-symlink-notdir: a symbolic link handed in as the source or
     // target directory of a RENAME.  RFC 7530 16.27.4 lists NFS4ERR_NOTDIR and
@@ -1087,15 +1095,16 @@ module nfs4ops {
     // the status is checked.
     pure def opGetattrWide(a: Acc): Acc = {
         val g = fhGate(a)
-        if (g != OK) emit(a, SGetattrWide({ st: g }))
-        // G4-getattr-wide-inval: RFC 8881 18.7.3 lets a server reject an
-        // attribute request it cannot satisfy, and NFS-Ganesha rejects the
-        // whole supported-attribute bitmap outright.  The compound stops
-        // there on both sides, so nothing downstream parts.
-        else if (hasDev(a.caps, "G4-getattr-wide-inval"))
-            emit(hitDev(a, "G4-getattr-wide-inval"),
-                 SGetattrWide({ st: E_INVAL }))
-        else emit(a, SGetattrWide({ st: OK }))
+        if (g != OK) emit(a, SGetattrWide({ st: g, stAccept: Set(g) }))
+        // T_WIDE_ATTR_REFUSAL: RFC 8881 18.7.3 lets a server answer INVAL for
+        // an attribute combination it cannot satisfy, and this request asks
+        // for every attribute the server advertises.  The compound ends at
+        // the GETATTR either way, and there is no comparator arm for the
+        // values, so both answers cost the same and neither parts state.
+        else emit(a, SGetattrWide({ st: OK,
+                                    stAccept: if (a.caps.tolWideAttrRefusal)
+                                                  Set(OK, E_INVAL)
+                                              else Set(OK) }))
     }
 
     // BIND_CONN_TO_SESSION (RFC 8881 18.34): associates the connection the
@@ -1438,24 +1447,30 @@ module nfs4ops {
     pure def opLink(a: Acc, n: Name): Acc = {
         val zero = { before: 0, after: 0, opaque: false }
         if (a.sfh == -1 or a.cfh == -1)
-            emit(a, SLink({ st: E_NOFILEHANDLE, cinfo: zero }))
+            emit(a, SLink({ st: E_NOFILEHANDLE, cinfo: zero,
+                            stAccept: Set(E_NOFILEHANDLE) }))
         else if (not(fsLive(a.fs, a.sfh)) or not(fsLive(a.fs, a.cfh)))
-            emit(a, SLink({ st: E_STALE, cinfo: zero }))
-        // A malformed newname is validated before the source type: the
-        // Linux server reports the name (NEMPTY -> INVAL, NDOT -> BADNAME)
-        // ahead of the directory-source ISDIR (RFC 7530 16.9 leaves the
-        // ordering open).  The directory-source status itself is ISDIR
-        // (RFC 7530 16.9.4), produced by fsLink below; both real servers
-        // answer NFS4ERR_NOTDIR there instead -- recorded, not modelled.
+            emit(a, SLink({ st: E_STALE, cinfo: zero,
+                            stAccept: Set(E_STALE) }))
+        // A malformed newname is validated before the source type: the model
+        // reports the name (NEMPTY -> INVAL, NDOT -> BADNAME) ahead of the
+        // directory-source ISDIR, and RFC 7530 16.9 leaves that ordering
+        // open, so a server that reports the source type first is equally
+        // right -- which is what linkAccept states when T_LINK_REFUSAL is on.
         else if (nameStatus(n) != OK)
-            emit(a, SLink({ st: nameStatus(n), cinfo: zero }))
+            emit(a, SLink({ st: nameStatus(n), cinfo: zero,
+                            stAccept: linkAccept(a, nameStatus(n),
+                                          fsGet(a.fs, a.sfh).ftype == FDir) }))
         else if (fsGet(a.fs, a.cfh).ftype == FLnk)
-            emit(devDirSymHit(a), SLink({ st: devDirSym(a), cinfo: zero }))
+            emit(devDirSymHit(a), SLink({ st: devDirSym(a), cinfo: zero,
+                                          stAccept: Set(devDirSym(a)) }))
         else {
             val o = fsLink(a.fs, a.sfh, a.cfh, n)
             val st = fsStatus(o.st)
-            emit(devCinfoHit(devLinkDirHit(a.with("fs", o.fs2), st)),
-                 SLink({ st: devLinkDir(a, st), cinfo: devCinfo(a, o.cinfo) }))
+            emit(devCinfoHit(a.with("fs", o.fs2)),
+                 SLink({ st: st, cinfo: devCinfo(a, o.cinfo),
+                         stAccept: linkAccept(a, st,
+                                       fsGet(a.fs, a.sfh).ftype == FDir) }))
         }
     }
 
@@ -2056,10 +2071,22 @@ module nfs4ops {
                                           Set("G4-open-type-before-exist"))
                             else if (present) base.with("st", E_EXIST)
                             else {
+                                // K4-exclusive-create-mode-zero: the Linux
+                                // server leaves the mode at 0 until the
+                                // follow-up SETATTR arrives.  Nothing in the
+                                // model consults a regular file's mode, so
+                                // this parts no state -- only the GETATTR
+                                // that reads it back.
+                                val em = if (hasDev(a.caps,
+                                             "K4-exclusive-create-mode-zero"))
+                                             0 else 384
                                 val o = fsMknode(a.fs, a.cfh, n,
-                                                 mkExclFile(384, x.verf, 0))
+                                                 mkExclFile(em, x.verf, 0))
                                 base.with("file", o.ino).with("fs2", o.fs2)
                                     .with("cinfo", o.cinfo)
+                                    .with("devs", if (em == 0)
+                                        Set("K4-exclusive-create-mode-zero")
+                                        else Set())
                             }
                     }
                 }
@@ -2139,15 +2166,17 @@ module nfs4ops {
         }
         else {
             val res = openResolve(a, ar.claim, ar.how)
-            if (res.st != OK) {
+            // openResolve may have taken a deviating branch on EITHER path --
+            // G4-open-type-before-exist and S4-no-wrong-type on the error
+            // side, K4-exclusive-create-mode-zero on the success side -- so
+            // the ids it reports are folded onto whatever Acc the arms below
+            // produce, once, at the end.
+            val outAcc = if (res.st != OK) {
                 // D4-19 above may have coarsened a symlink parent; record it.
                 val aSym = if (res.st == E_NOTDIR and cfhLive(a) and
                                cfhNode(a).ftype == FLnk)
                                devDirSymHit(a) else a
-                // ... and openResolve itself may have taken a deviating
-                // branch (G4-open-type-before-exist, S4-no-wrong-type).
-                val a0 = res.devs.fold(aSym, (acc, d) => hitDev(acc, d))
-                val a1 = emit(a0, SOpen(nores.with("st", res.st)))
+                val a1 = emit(aSym, SOpen(nores.with("st", res.st)))
                 if (a.minor == 0)
                     a1.with("sdb", ooSettle(a1.sdb, ar.client, ar.owner,
                                             ar.oseq, res.st, false))
@@ -2220,6 +2249,7 @@ module nfs4ops {
                                  recalls: Set() }))
                 }
             }
+            res.devs.fold(outAcc, (acc, d) => hitDev(acc, d))
         }
     }
 
@@ -3355,7 +3385,8 @@ module nfs4ops {
           layoutWholeFile: true,
           devs: Set(), tolHoleTracking: false,
           tolDirSymlinkStatus: false, tolXattrChange: false,
-          tolRenewLapsed: false, tolRflagsConfirm: false }
+          tolRenewLapsed: false, tolRflagsConfirm: false,
+          tolLinkRefusal: false, tolWideAttrRefusal: false }
 
     // Evaluate a whole COMPOUND.  reqTag identifies the request for the
     // 4.1 SEQUENCE replay/false-retry classification.

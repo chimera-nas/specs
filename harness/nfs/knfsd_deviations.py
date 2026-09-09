@@ -11,7 +11,7 @@ the id that replaced them -- note how many are S4-*, meaning the SAME id
 NFS-Ganesha enables, which is what makes them evidence of an ambiguous clause
 rather than of one server's bug:
 
-  KN-3          -> S4-link-dir-notdir            (shared with ganesha)
+  KN-3          -> T_LINK_REFUSAL tolerance      (shared with ganesha)
   KN-4, KN-12   -> T_RENEW_LAPSED tolerance      (shared with ganesha)
   KN-5          -> K4-rename-symlink-notdir      (narrower twin of chimera's
                    own D4-19-dirop-symlink-notdir)
@@ -19,14 +19,15 @@ rather than of one server's bug:
   KN-9          -> S4-owner-seqid-gap-unpoliced  (shared with ganesha)
   KN-15         -> S4-change-is-coarse-ctime     (shared with ganesha)
   KN-20, KN-21  -> S4-compound-tag-unvalidated   (shared with ganesha)
-  KN3-2         -> K3-exclusive-mode-zero
+  KN3-2         -> K3-exclusive-mode-zero, and its NFSv4 twin
+                   K4-exclusive-create-mode-zero
   KN3-3         -> the existing T_ERROR_PRECEDENCE tolerance (shared with
                    ganesha AND with chimera, which already had it)
 
-Retired without a replacement because the model was already corrected and
-knfsd no longer diverges: KN-16 (a directory's nlink -- nfs4_fs.qnt's fsInv
-has counted subdirectories for some time, so the entry was forgiving a
-divergence that no longer existed).
+KN-16 (a directory's nlink) was retired here during the migration and has
+been restored: the model does count subdirectories, and that is exactly why
+the count still differs -- knfsd holds a child created under a name the model
+rejected (KN-1), so the parent carries one link the model has no object for.
 
 See deviations.py for the contract and ganesha_deviations.py for the shape of
 an entry.  Recorded against the kernel of the kvm-test-base guest the harness
@@ -161,7 +162,7 @@ KN_13_NAME_ACCESS = Deviation(
             "model predicts NFS4ERR_BADCHAR",
     root_cause="knfsd maps the component to an access failure",
     candidate_fix="none required (both conformant)",
-    ops=("SLookup", "SRename", "SRemove", "SSecinfo"),
+    ops=("SLookup", "SRename", "SRemove", "SSecinfo", "SCreate", "SOpen"),
     expected_status=NFS4ERR_BADCHAR,
     actual_status=NFS4ERR_ACCESS,
 )
@@ -247,6 +248,30 @@ KN_19_CREATE_SETATTR = Deviation(
 
 
 
+# KN-16: a directory's link count after knfsd leniently accepted a malformed
+# name the model rejected (KN-1).  The name became a real subdirectory on the
+# server and never existed in the model, so the parent's nlink is one higher
+# on the wire -- ext4 counts the child's "..", and so does the model, for the
+# children it has.  Field-only and downstream of KN-1, exactly as KN-18 is for
+# READDIR's name set.  (Retired once during the config migration on the
+# reading that the model had learnt to count subdirectories -- it had, which
+# is precisely why the count now differs by the child knfsd holds and the
+# model does not.)
+KN_16_ATTR_AFTER_LENIENT_NAME = Deviation(
+    id="KN-16-nlink-after-lenient-name",
+    verdict=SERVER,
+    spec="RFC 7530 12.7 (malformed-name acceptance, KN-1) feeds through to "
+         "the parent's numlinks",
+    summary="a directory's nlink is one per leniently-accepted subdirectory "
+            "higher than the model's",
+    root_cause="knfsd holds a subdirectory created under a name the model "
+               "rejected (KN-1)",
+    candidate_fix="none (downstream of KN-1)",
+    ops=("SGetattr",),
+    field=("nlink",),
+)
+
+
 # KN-22: the ACCESS granted-mask differs from the model's type-masking, as
 # GD-22 records for ganesha.  Field-only.
 KN_22_ACCESS = Deviation(
@@ -269,6 +294,7 @@ NFS4 = Registry("knfsd/nfs4", [
     KN_13_NAME_ACCESS,
     KN_14_LOCKT_GRACE,
     KN_17_LIFECYCLE,
+    KN_16_ATTR_AFTER_LENIENT_NAME,
     KN_18_READDIR_NAMES,
     KN_19_CREATE_SETATTR,
     KN_22_ACCESS,

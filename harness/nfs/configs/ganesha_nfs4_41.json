@@ -27,9 +27,7 @@
   "deviations": [
     "S4-no-wrong-type",
     "S4-compound-tag-unvalidated",
-    "S4-link-dir-notdir",
     "S4-change-is-coarse-ctime",
-    "G4-getattr-wide-inval",
     "G4-verify-wide-trivial-match",
     "G4-setattr-share-denied",
     "G4-exchange-id-no-confirmed-r",
@@ -37,8 +35,18 @@
     "G4-bindconn-direction-accepted"
   ],
 
+  // Where the RFCs permit more than one answer and this ganesha picks a
+  // different member of the set than the model does.  linkRefusal and
+  // wideAttrRefusal replace the deviations G4-getattr-wide-inval and
+  // S4-link-dir-notdir, both of which asserted ganesha's answer outright and
+  // were contradicted by V6.5: it accepts the wide attribute bitmap, and it
+  // answers ISDIR for a LINK of a directory exactly as the model does -- what
+  // it actually differs on is the PRECEDENCE of that refusal against a
+  // malformed target name, which no RFC pins.
   "tolerances": {
-    "rflagsConfirm": true
+    "rflagsConfirm": true,
+    "linkRefusal": true,
+    "wideAttrRefusal": true
   },
 
   "policies": {

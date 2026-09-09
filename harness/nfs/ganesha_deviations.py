@@ -15,13 +15,17 @@ anything.  Moved, with the id that replaced them:
   GD-4          -> G4-verify-wide-trivial-match
   GD-5, GD-11   -> S4-no-wrong-type            (shared with knfsd)
   GD-7          -> G4-setattr-share-denied
-  GD-9          -> S4-link-dir-notdir          (shared with knfsd)
+  GD-9          -> T_LINK_REFUSAL tolerance    (shared with knfsd)
   GD-10         -> T_RENEW_LAPSED tolerance    (shared with knfsd)
   GD-12         -> G4-exchange-id-no-confirmed-r
   GD-13 (type)  -> G4-open-type-before-exist
   GD-17         -> T_RFLAGS_CONFIRM tolerance
-  GD-18         -> G4-getattr-wide-inval
-  GD-19, GD-32  -> S4-owner-seqid-gap-unpoliced (shared with knfsd)
+  GD-18         -> T_WIDE_ATTR_REFUSAL tolerance
+  GD-19, GD-32  -> nothing: this ganesha DOES police the open-owner seqid
+                   gap, so the model predicts NFS4ERR_BAD_SEQID with no
+                   knob at all.  (The knfsd cell still enables
+                   S4-owner-seqid-gap-unpoliced; the Linux server does
+                   not police it.)
   GD-23, GD-24  -> S4-compound-tag-unvalidated  (shared with knfsd)
   GD-33         -> G4-seek-at-eof-not-nxio
   GD-34         -> G4-compound-tag-length-limit
@@ -345,6 +349,15 @@ NFS4 = Registry("ganesha/nfs4", [
 # object type (BADTYPE), a permission failure (ACCES), or EXIST where the model
 # predicts EXIST or OK.  A create that one side made and the other did not parts
 # the state, so reconcilable=False.
+#
+# NOTDIR belongs to the same entry for a specific reason: the model treats a
+# name held by a symbolic link as taken (EXIST) and does not follow it, while
+# ganesha's FSAL_VFS creates with openat(O_CREAT), which follows a trailing
+# symlink as POSIX requires -- so the status it reports is whatever resolving
+# the link's TARGET lands on (NOTDIR for a target under a non-directory,
+# measured on d -> "a/b/target" with a as a FIFO).  Predicting that needs
+# multi-component path resolution the model does not have, which is why this
+# stays a recorded residual rather than moving into the model.
 GN_3_CREATE = Deviation(
     id="GN-3-create-disposition",
     verdict=SERVER,
@@ -358,7 +371,7 @@ GN_3_CREATE = Deviation(
     ops=("OCreate",),
     expected_status=(NFS3ERR_EXIST, NFS3_OK, NFS3ERR_ACCES, NFS3ERR_ISDIR),
     actual_status=(NFS3ERR_BADTYPE, NFS3ERR_ACCES, NFS3ERR_EXIST, NFS3_OK,
-                   NFS3ERR_NXIO),
+                   NFS3ERR_NXIO, NFS3ERR_NOTDIR),
     reconcilable=False,
 )
 

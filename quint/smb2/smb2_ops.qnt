@@ -912,6 +912,8 @@ module smb2ops {
     //   SD-9  the check is not applied to an UNLOCK at all, so the unlock is
     //         processed and answers on its own merits (STATUS_RANGE_NOT_LOCKED
     //         for a range this handle does not hold).
+    //   SD-13 the check runs after the byte-range CONFLICT check, so a lock
+    //         that conflicts is refused STATUS_LOCK_NOT_GRANTED first.
     //
     // SD-8 and SD-9 both make the refusal not happen, so they are ordered:
     // SD-8 is the more specific (it is about what the check reads, and it
@@ -934,6 +936,18 @@ module smb2ops {
     // The status the refusal carries once it does happen.
     pure def devLockRefuseSt(acc: Acc): int =
         if (accDev(acc, "SD-2")) ST_INVALID_HANDLE else ST_ACCESS_DENIED
+
+    //   SD-13 the check runs AFTER the byte-range conflict check, so a lock
+    //         that would conflict with a range another handle holds is refused
+    //         STATUS_LOCK_NOT_GRANTED and the access check never reports.
+    //         Only the locking half can conflict, so this is a lock-only
+    //         reordering; SD-8 still outranks it, because a handle SD-8 admits
+    //         never reaches the access check at all.
+    pure def devLockSd13(acc, fid, x) =
+        accDev(acc, "SD-13") and lockNoData(acc, fid) and not(x.unlock) and
+        not(devLockSd8(acc, fid)) and
+        lockConflict(acc.sdb, acc.sdb.opens.get(fid).file, fid,
+                     x.lo, x.hi, x.wr)
 
     // ------------------------------------------------------------------
     // DEVIATION SD-5: FILE_CREATE over an existing DIRECTORY
@@ -1989,6 +2003,7 @@ module smb2ops {
         val acc = if (not(acc0.sdb.opens.keys().contains(fid))) acc0
                   else if (devLockSd8(acc0, fid)) accHit(acc0, "SD-8")
                   else if (devLockSd9(acc0, fid, x.unlock)) accHit(acc0, "SD-9")
+                  else if (devLockSd13(acc0, fid, x)) accHit(acc0, "SD-13")
                   else if (lockNoData(acc0, fid) and accDev(acc0, "SD-2"))
                       accHit(acc0, "SD-2")
                   else acc0
@@ -2006,7 +2021,15 @@ module smb2ops {
         // and every later read, write and unlock over that range keeps testing.
         else if (lockNoData(acc, fid) and not(devLockSd8(acc, fid)) and
                  not(devLockSd9(acc, fid, x.unlock)))
-            emit(acc, RLock({ st: devLockRefuseSt(acc) }), devLockRefuseSt(acc))
+            // SD-13 puts the range-conflict check first, so a conflicting
+            // lock is refused as such and the access check never speaks.
+            // Nothing is locked either way, so replay stays in step.
+            if (devLockSd13(acc, fid, x))
+                emit(acc, RLock({ st: ST_LOCK_NOT_GRANTED }),
+                     ST_LOCK_NOT_GRANTED)
+            else
+                emit(acc, RLock({ st: devLockRefuseSt(acc) }),
+                     devLockRefuseSt(acc))
         else {
             val o = acc.sdb.opens.get(fid)
             if (x.unlock)

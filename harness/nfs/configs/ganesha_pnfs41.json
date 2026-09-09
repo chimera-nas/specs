@@ -12,9 +12,7 @@
   // divergences are unreachable here.
   "deviationsOff": [
     "S4-compound-tag-unvalidated",
-    "S4-link-dir-notdir",
     "G4-compound-tag-length-limit",
-    "G4-getattr-wide-inval",
     "G4-verify-wide-trivial-match",
     "G4-open-type-before-exist",
     "G4-bindconn-direction-accepted"

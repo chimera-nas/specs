@@ -471,12 +471,25 @@ module nfs3 {
         else supported
     }
 
+    // G3-access-special-inval: ganesha's FSAL_VFS answers an ACCESS on a
+    // socket or a FIFO with NFS3ERR_INVAL rather than reporting which of the
+    // requested bits it would grant.  RFC 1813 3.3.4 lists no INVAL for
+    // ACCESS and makes the reply the granted subset of the mask whatever the
+    // object is, so this is a divergence and not a latitude; nothing is
+    // mutated either way, so nothing downstream parts.
+    pure def accessInval3(n: Node): bool =
+        dev("G3-access-special-inval") and
+        (n.ftype == TSock or n.ftype == TFifo)
+
     action applyAccess(o: Fid, mask: int): bool = all {
         fs' = fs,
         removed' = removed,
         nextFid' = nextFid,
-        devHits' = Set(),
-        lastOp' = OAccess({ obj: o, mask: mask, status: OK,
+        devHits' = if (accessInval3(fs.get(o)))
+                       Set("G3-access-special-inval") else Set(),
+        lastOp' = OAccess({ obj: o, mask: mask,
+                            status: if (accessInval3(fs.get(o)))
+                                        ERR_INVAL else OK,
                             access: accessReply3(fs.get(o), mask) }),
     }
 
@@ -1095,8 +1108,9 @@ module nfs3 {
         // nor a POSIX EPERM among LINK's errors, so the status for a directory
         // source is unspecified and servers differ -- the model and chimera
         // answer ISDIR, NFS-Ganesha answers NFS3ERR_BADTYPE.  (The NFSv4 LINK
-        // path is a separate divergence, S4-link-dir-notdir, and ganesha does
-        // NOT take it: its v4 LINK of a directory answers NFS4ERR_ISDIR.)
+        // path is unspecified in the same way but lands elsewhere: ganesha
+        // answers NFS4ERR_ISDIR there, which is what the model predicts, so
+        // v4 needs only the T_LINK_REFUSAL tolerance and no deviation.)
         if (fs.get(o).ftype == TDir) all {
             fs' = fs,
             removed' = removed,

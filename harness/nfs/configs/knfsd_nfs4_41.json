@@ -24,9 +24,19 @@
   "deviations": [
     "S4-no-wrong-type",
     "S4-compound-tag-unvalidated",
-    "S4-link-dir-notdir",
-    "S4-change-is-coarse-ctime"
+    "S4-change-is-coarse-ctime",
+    "K4-exclusive-create-mode-zero"
   ],
+
+  // RFC 7530 16.9.4 pins neither the code for a LINK whose source is a
+  // directory nor its precedence against a malformed target name, and the
+  // Linux server reports the source type where the model reports the name.
+  // Replaces S4-link-dir-notdir, which claimed knfsd answers NFS4ERR_NOTDIR
+  // there; measured against the kvm-test-base guest, it answers ISDIR, which
+  // is what the model already predicts.
+  "tolerances": {
+    "linkRefusal": true
+  },
 
   "policies": {
     "minor": 1,

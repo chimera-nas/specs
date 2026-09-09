@@ -258,6 +258,12 @@ class Replayer:
         # Replies whose status the MODEL named as one of several conformant
         # answers (a `stAccept` membership hit).  Reported, never fatal.
         self.status_dev = 0
+        # The same, counted for the compound being checked right now.  A
+        # compound whose status or result count differs BECAUSE one of its
+        # ops took a conformant answer the model did not predict is explained
+        # by that acceptance, exactly as it would be by a per-op status
+        # finding -- see reconcile().
+        self.tol_status = 0
         self.compounds = 0
         self.cur_open_client = None
         self.dry = False              # encode only, no server (--dry-run)
@@ -676,6 +682,7 @@ class Replayer:
             # a status that matched a non-OK expectation.
             if "stAccept" in v and ast in v["stAccept"]:
                 self.status_dev += 1
+                self.tol_status += 1
                 return
             self.classify_status_mismatch(tag, v, est, ast, wire, mism, req)
             return
@@ -1113,6 +1120,7 @@ class Replayer:
             return rep
 
         ctx = {"cur": None, "saved": None}
+        self.tol_status = 0
         n = min(len(exp_results), len(rep["results"]))
         for i in range(n):
             eop = ops[i]["tag"] if i < len(ops) else "?"
@@ -1127,13 +1135,18 @@ class Replayer:
             self.check_result(exp_results[i], rep["results"][i], ctx,
                               mism, ops[i] if i < len(ops) else None)
 
-        if len(rep["results"]) != len(exp_results):
-            self.fnd(mism, "compound", "results", len(exp_results),
-                     len(rep["results"]),
-                     f"statuses {[r['status'] for r in rep['results']]}")
-        if rep["status"] != exp_status:
-            self.fnd(mism, "compound", "status", exp_status,
-                     rep["status"])
+        # The compound's status IS its last result's, and a compound ends at
+        # the first op that fails -- so when an op answered with a status the
+        # model itself listed as conformant, both the compound status and the
+        # result count follow from that one acceptance and say nothing new.
+        if not self.tol_status:
+            if len(rep["results"]) != len(exp_results):
+                self.fnd(mism, "compound", "results", len(exp_results),
+                         len(rep["results"]),
+                         f"statuses {[r['status'] for r in rep['results']]}")
+            if rep["status"] != exp_status:
+                self.fnd(mism, "compound", "status", exp_status,
+                         rep["status"])
 
         # Record the reply for future SEQUENCE replays of this slot.
         if seq_req is not None and rep["results"] \

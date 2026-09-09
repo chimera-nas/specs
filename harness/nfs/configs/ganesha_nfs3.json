@@ -7,7 +7,8 @@
   // permission bug that chimera's in-engine backends carry
   // (create-search-perm-1771) is NOT enabled here.
   "deviations": [
-    "G3-link-dir-badtype"
+    "G3-link-dir-badtype",
+    "G3-access-special-inval"
   ],
 
   // RFC 1813 mandates no error precedence when more than one condition
