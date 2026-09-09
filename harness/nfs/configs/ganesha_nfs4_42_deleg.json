@@ -12,7 +12,6 @@
   // and an enabled-but-unexercised deviation fails tools/devliveness.py.
   "deviationsOff": [
     "S4-no-wrong-type",
-    "S4-compound-tag-unvalidated",
     "G4-compound-tag-length-limit",
     "G4-verify-wide-trivial-match",
     "G4-setattr-share-denied",

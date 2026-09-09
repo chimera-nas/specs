@@ -255,7 +255,11 @@ module nfs4ops {
         // TOLERANCE (not a deviation): RFC 8881 18.7.3 lets a server refuse an
         // attribute combination it cannot satisfy, and the wide GETATTR asks
         // for all of them.  See opGetattrWide.
-        tolWideAttrRefusal: bool
+        tolWideAttrRefusal: bool,
+        // TOLERANCE (not a deviation): RFC 7530 16.27.4 lists NFS4ERR_NOTDIR
+        // and Table 7 NFS4ERR_SYMLINK for a RENAME through a symbolic-link
+        // directory handle.  See renameSymAccept.
+        tolRenameSymlinkStatus: bool
     }
 
     // Did the cell's config enable this deviation?
@@ -404,7 +408,8 @@ module nfs4ops {
         | SReaddir({ st: int, names: Set[Name], stAccept: Set[int] })
         | SCreate({ st: int, ino: Ino, cinfo: CInfo })
         | SRemove({ st: int, cinfo: CInfo })
-        | SRename({ st: int, cinfoS: CInfo, cinfoT: CInfo })
+        | SRename({ st: int, cinfoS: CInfo, cinfoT: CInfo,
+                    stAccept: Set[int] })
         | SLink({ st: int, cinfo: CInfo, stAccept: Set[int] })
         | SSetattr({ st: int })
         | SVerify({ st: int })
@@ -431,7 +436,7 @@ module nfs4ops {
         // CB_RECALL before this op can eventually succeed (the op itself
         // returns NFS4ERR_DELAY under the conflictDelays profile).
         | SOpen({ st: int, sid: Sid, seq: int, needConfirm: bool,
-                  needConfirmAccept: Set[bool],
+                  needConfirmAccept: Set[bool], stAccept: Set[int],
                   cinfo: CInfo, deleg: DelegRes, recalls: Set[Sid] })
         | SOpenConfirm({ st: int, seq: int })
         | SOpenDowngrade({ st: int, seq: int })
@@ -749,19 +754,16 @@ module nfs4ops {
         else if (srcIsDir) Set(st, E_ISDIR, E_NOTDIR)
         else Set(st)
 
-    // K4-rename-symlink-notdir: a symbolic link handed in as the source or
-    // target directory of a RENAME.  RFC 7530 16.27.4 lists NFS4ERR_NOTDIR and
-    // Table 7 lists NFS4ERR_SYMLINK; the model and NFS-Ganesha answer the
-    // specific SYMLINK, the Linux server the generic NOTDIR -- and only for
-    // RENAME, which is why this is a narrower id than chimera's D4-19 rather
-    // than the same knob.
-    pure def devRenameSym(a: Acc): int =
-        if (hasDev(a.caps, "K4-rename-symlink-notdir")) E_NOTDIR
-        else devDirSym(a)
-
-    pure def devRenameSymHit(a: Acc): Acc =
-        if (hasDev(a.caps, "K4-rename-symlink-notdir"))
-            hitDev(a, "K4-rename-symlink-notdir") else devDirSymHit(a)
+    // T_RENAME_SYMLINK_STATUS: a symbolic link handed in as the source or
+    // target directory of a RENAME.  RFC 7530 16.27.4 lists NFS4ERR_NOTDIR
+    // and Table 7 lists NFS4ERR_SYMLINK, so either is conformant; the model
+    // and NFS-Ganesha answer the specific SYMLINK and the Linux server picks
+    // between the two.  Replaces the single-answer deviation
+    // K4-rename-symlink-notdir, which asserted NOTDIR and was contradicted by
+    // the SYMLINK knfsd gives for the same shape elsewhere in the corpus.
+    pure def renameSymAccept(a: Acc): Set[int] =
+        if (a.caps.tolRenameSymlinkStatus) Set(E_SYMLINK, E_NOTDIR)
+        else Set(devDirSym(a))
 
     // G4-setattr-share-denied: RFC 8881 9.1.4.3 makes the anonymous stateid
     // usable for a size change only when no conflicting OPEN exists, and
@@ -1404,19 +1406,24 @@ module nfs4ops {
     pure def opRename(a: Acc, ar: { oldname: Name, newname: Name }): Acc = {
         val zero = { before: 0, after: 0, opaque: false }
         if (a.sfh == -1 or a.cfh == -1)
-            emit(a, SRename({ st: E_NOFILEHANDLE, cinfoS: zero, cinfoT: zero }))
+            emit(a, SRename({ st: E_NOFILEHANDLE, cinfoS: zero,
+                              cinfoT: zero, stAccept: Set(E_NOFILEHANDLE) }))
         else if (not(fsLive(a.fs, a.sfh)) or not(fsLive(a.fs, a.cfh)))
-            emit(a, SRename({ st: E_STALE, cinfoS: zero, cinfoT: zero }))
+            emit(a, SRename({ st: E_STALE, cinfoS: zero, cinfoT: zero,
+                              stAccept: Set(E_STALE) }))
         else if (nameStatus(ar.oldname) != OK)
             emit(a, SRename({ st: nameStatus(ar.oldname),
-                              cinfoS: zero, cinfoT: zero }))
+                              cinfoS: zero, cinfoT: zero,
+                              stAccept: Set(nameStatus(ar.oldname)) }))
         else if (nameStatus(ar.newname) != OK)
             emit(a, SRename({ st: nameStatus(ar.newname),
-                              cinfoS: zero, cinfoT: zero }))
+                              cinfoS: zero, cinfoT: zero,
+                              stAccept: Set(nameStatus(ar.newname)) }))
         else if (fsGet(a.fs, a.sfh).ftype == FLnk or
                  fsGet(a.fs, a.cfh).ftype == FLnk)
-            emit(devRenameSymHit(a),
-                 SRename({ st: devRenameSym(a), cinfoS: zero, cinfoT: zero }))
+            emit(devDirSymHit(a),
+                 SRename({ st: devDirSym(a), cinfoS: zero, cinfoT: zero,
+                           stAccept: renameSymAccept(a) }))
         else {
             // Rename-over unlinks the target: other-client delegations on
             // it force a recall + NFS4ERR_DELAY, mirroring REMOVE.  (The
@@ -1429,14 +1436,16 @@ module nfs4ops {
             if (recalls.size() > 0) {
                 emit(a.with("sdb", recalls.fold(a.sdb, (acc, s) =>
                                                 doRecallDeleg(acc, s))),
-                     SRename({ st: E_DELAY, cinfoS: zero, cinfoT: zero }))
+                     SRename({ st: E_DELAY, cinfoS: zero, cinfoT: zero,
+                               stAccept: Set(E_DELAY) }))
             } else {
                 val o = fsRename(a.fs, a.sfh, ar.oldname, a.cfh, ar.newname,
                                  pinnedInos(a.sdb))
                 emit(devCinfoHit(a.with("fs", o.fs2)),
                      SRename({ st: fsStatus(o.st),
                                cinfoS: devCinfo(a, o.cinfoS),
-                               cinfoT: devCinfo(a, o.cinfoT) }))
+                               cinfoT: devCinfo(a, o.cinfoT),
+                               stAccept: Set(fsStatus(o.st)) }))
             }
         }
     }
@@ -2106,8 +2115,17 @@ module nfs4ops {
         // a server may set it or not with no observable consequence.
         val ncAcc = if (a.caps.tolRflagsConfirm) Set(false, true)
                     else Set(false)
+        // T_RENEW_LAPSED reaches further than RENEW.  RFC 7530 9.6.3 leaves
+        // it to the server how long a client id whose lease has lapsed
+        // survives, and the model carries no clock at all -- so a server may
+        // answer NFS4ERR_EXPIRED to an OPEN wherever the model, which
+        // believes the id still live (or has not looked at it yet, because it
+        // validates the name first), predicts something else.  The set holds
+        // only that ALTERNATIVE: the predicted status is compared for
+        // equality first, and the membership test runs only when it differs.
+        val stAcc = if (a.caps.tolRenewLapsed) Set(E_EXPIRED) else Set()
         val nores = { st: OK, sid: -1, seq: 0, needConfirm: false,
-                      needConfirmAccept: ncAcc,
+                      needConfirmAccept: ncAcc, stAccept: stAcc,
                       cinfo: zero, deleg: DNone, recalls: Set() }
         val g = fhGate(a)
         // 4.0: the owner-seqid gate runs first and BAD_SEQID does not
@@ -2239,6 +2257,7 @@ module nfs4ops {
                     emit(a.with("fs", res.fs2).with("sdb", sdbF)
                           .with("cfh", res.file),
                          SOpen({ st: OK, sid: o.sid, seq: o.seq,
+                                 stAccept: stAcc,
                                  needConfirm: o.needConfirm,
                                  needConfirmAccept:
                                      if (a.caps.tolRflagsConfirm)
@@ -3386,7 +3405,8 @@ module nfs4ops {
           devs: Set(), tolHoleTracking: false,
           tolDirSymlinkStatus: false, tolXattrChange: false,
           tolRenewLapsed: false, tolRflagsConfirm: false,
-          tolLinkRefusal: false, tolWideAttrRefusal: false }
+          tolLinkRefusal: false, tolWideAttrRefusal: false,
+          tolRenameSymlinkStatus: false }
 
     // Evaluate a whole COMPOUND.  reqTag identifies the request for the
     // 4.1 SEQUENCE replay/false-retry classification.
@@ -3405,11 +3425,24 @@ module nfs4ops {
                          not(sessionExempt(r))) {
                     // First op of a 4.1+ compound must be SEQUENCE or a
                     // session-exempt op.
-                    val res = SSequence({ st: E_OP_NOT_IN_SESSION,
-                                          replay: false })
-                    acc.with("results", acc.results.append(res))
-                       .with("status", E_OP_NOT_IN_SESSION)
-                       .with("done", true)
+                    //
+                    // G4-op-outside-session-inval: RFC 8881 2.10.6.1 names
+                    // NFS4ERR_OP_NOT_IN_SESSION for exactly this, reported
+                    // against the offending operation, so the reply carries
+                    // one result.  ganesha rejects the message instead --
+                    // NFS4ERR_INVAL, and an EMPTY result array, which is the
+                    // shape of a compound refused before any op ran.
+                    if (hasDev(acc.caps, "G4-op-outside-session-inval"))
+                        hitDev(acc, "G4-op-outside-session-inval")
+                            .with("status", E_INVAL)
+                            .with("done", true)
+                    else {
+                        val res = SSequence({ st: E_OP_NOT_IN_SESSION,
+                                              replay: false })
+                        acc.with("results", acc.results.append(res))
+                           .with("status", E_OP_NOT_IN_SESSION)
+                           .with("done", true)
+                    }
                 }
                 else dispatch(acc, r)
             acc2.with("idx", acc.idx + 1)

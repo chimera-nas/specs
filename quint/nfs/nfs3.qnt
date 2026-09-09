@@ -471,25 +471,12 @@ module nfs3 {
         else supported
     }
 
-    // G3-access-special-inval: ganesha's FSAL_VFS answers an ACCESS on a
-    // socket or a FIFO with NFS3ERR_INVAL rather than reporting which of the
-    // requested bits it would grant.  RFC 1813 3.3.4 lists no INVAL for
-    // ACCESS and makes the reply the granted subset of the mask whatever the
-    // object is, so this is a divergence and not a latitude; nothing is
-    // mutated either way, so nothing downstream parts.
-    pure def accessInval3(n: Node): bool =
-        dev("G3-access-special-inval") and
-        (n.ftype == TSock or n.ftype == TFifo)
-
     action applyAccess(o: Fid, mask: int): bool = all {
         fs' = fs,
         removed' = removed,
         nextFid' = nextFid,
-        devHits' = if (accessInval3(fs.get(o)))
-                       Set("G3-access-special-inval") else Set(),
-        lastOp' = OAccess({ obj: o, mask: mask,
-                            status: if (accessInval3(fs.get(o)))
-                                        ERR_INVAL else OK,
+        devHits' = Set(),
+        lastOp' = OAccess({ obj: o, mask: mask, status: OK,
                             access: accessReply3(fs.get(o), mask) }),
     }
 

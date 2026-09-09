@@ -31,6 +31,7 @@ anything.  Moved, with the id that replaced them:
   GD-34         -> G4-compound-tag-length-limit
   GD-35         -> the existing T_HOLE_TRACKING tolerance
   GD-25/26 (BIND_CONN) -> G4-bindconn-direction-accepted
+  GD-28         -> G4-op-outside-session-inval
   GD-21 (DESTROY_CLIENTID) -> G4-destroy-clientid-busy-first
   GN-2          -> G3-link-dir-badtype
   GN-4          -> the existing T_ERROR_PRECEDENCE tolerance (shared with
@@ -279,21 +280,6 @@ GD_27_FH_IDENTITY = Deviation(
     context=lambda f, ctx: f.kind == "fh_identity",
 )
 
-# GD-28: the compound-status companion of GD-27.
-GD_28_COMPOUND_MVM = Deviation(
-    id="GD-28-compound-minorversion",
-    verdict=SERVER,
-    spec="RFC 8881 2.2 (a bad minorversion vs a malformed compound is the "
-         "server's to distinguish)",
-    summary="a compound the model calls NFS4ERR_OP_NOT_IN_SESSION is "
-            "NFS4ERR_INVAL to ganesha",
-    root_cause="ganesha reports INVAL where the model predicts "
-               "OP_NOT_IN_SESSION for an op used outside a session",
-    candidate_fix="none required (defensible)",
-    ops=("compound",),
-    expected_status=NFS4ERR_OP_NOT_IN_SESSION,
-    actual_status=NFS4ERR_INVAL,
-)
 
 
 
@@ -337,7 +323,6 @@ NFS4 = Registry("ganesha/nfs4", [
     GD_25_RESIDUAL2,
     GD_26_RESIDUAL2_STATUS,
     GD_27_FH_IDENTITY,
-    GD_28_COMPOUND_MVM,
     GD_30_READ_STALE_HOLE,
 ])
 
@@ -394,7 +379,35 @@ GN_5_ATTR_FIELDS = Deviation(
            "wcc.after.nlink", "file_attributes.size", "readdirplus[b].size"),
 )
 
+# GN-6: an ACCESS on a socket or a FIFO answers NFS3ERR_INVAL instead of the
+# granted subset of the requested mask.  RFC 1813 3.3.4 lists no INVAL for
+# ACCESS at all, so ganesha is wrong -- but it is wrong only SOMETIMES, and
+# that is why this is recorded rather than modelled.  Measured across the
+# ganesha_nfs3 corpus: seven ACCESS calls on sockets and FIFOs, six answered
+# with the ordinary granted mask and one (a socket, full 0x3F mask) answered
+# INVAL, with no property of the call -- type, mask, mode -- separating them.
+# A model branch was tried and had to be reverted: it predicted INVAL for all
+# seven and failed six traces that had passed before.  Nothing is mutated, so
+# replay continues.
+GN_6_ACCESS_SPECIAL = Deviation(
+    id="GN-6-access-special-inval",
+    verdict=SERVER,
+    spec="RFC 1813 3.3.4 (ACCESS returns the granted subset of the mask; no "
+         "NFS3ERR_INVAL is listed for the procedure)",
+    summary="ACCESS on a socket or FIFO intermittently returns NFS3ERR_INVAL "
+            "where the model reports the type-applicable bits",
+    root_cause="ganesha's FSAL_VFS refuses the access check on a special file "
+               "under a condition this corpus has not isolated",
+    candidate_fix="ganesha: answer on the granted bits for a special file as "
+                  "for any other object",
+    ops=("OAccess",),
+    expected_status=NFS3_OK,
+    actual_status=NFS3ERR_INVAL,
+)
+
+
 NFS3 = Registry("ganesha/nfs3", [
+    GN_6_ACCESS_SPECIAL,
     GN_3_CREATE,
     GN_5_ATTR_FIELDS,
 ])

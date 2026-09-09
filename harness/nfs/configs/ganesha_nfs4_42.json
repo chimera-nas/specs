@@ -27,7 +27,6 @@
   // cell instead.
   "deviations": [
     "S4-no-wrong-type",
-    "S4-compound-tag-unvalidated",
     "S4-change-is-coarse-ctime",
     "G4-verify-wide-trivial-match",
     "G4-setattr-share-denied",

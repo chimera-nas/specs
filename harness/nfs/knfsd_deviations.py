@@ -13,8 +13,8 @@ rather than of one server's bug:
 
   KN-3          -> T_LINK_REFUSAL tolerance      (shared with ganesha)
   KN-4, KN-12   -> T_RENEW_LAPSED tolerance      (shared with ganesha)
-  KN-5          -> K4-rename-symlink-notdir      (narrower twin of chimera's
-                   own D4-19-dirop-symlink-notdir)
+  KN-5          -> T_RENAME_SYMLINK_STATUS tolerance (knfsd gives BOTH
+                   framings, so the acceptance is what the model can state)
   KN-6          -> S4-no-wrong-type              (shared with ganesha)
   KN-9          -> S4-owner-seqid-gap-unpoliced  (shared with ganesha)
   KN-15         -> S4-change-is-coarse-ctime     (shared with ganesha)
@@ -272,6 +272,36 @@ KN_16_ATTR_AFTER_LENIENT_NAME = Deviation(
 )
 
 
+# KN-23: the open-owner / stateid bookkeeping parts.  knfsd answers an OPEN
+# with NFS4ERR_BAD_SEQID for an owner the model has never used (owner (3,2) at
+# oseq 1, with the model's table holding only (4,1)), a CLOSE with
+# NFS4ERR_BAD_STATEID for a stateid the model still holds, and a LOCK with
+# NFS4ERR_OLD_STATEID where the model predicts BAD_SEQID -- all downstream of a
+# client id the two sides retired at different moments (KN-17's cause, on the
+# per-owner tables rather than the client one).  RFC 7530 9.1.3/9.1.7 make the
+# owner's sequence and the stateid's generation the server's bookkeeping, and
+# the model carries no lease clock, so once the two disagree about which
+# incarnation of a client id is live they cannot be brought back into step
+# within a trace.  reconcilable=False: the trace stops here.
+KN_23_OWNER_STATEID_LIFECYCLE = Deviation(
+    id="KN-23-owner-stateid-lifecycle",
+    verdict=SERVER,
+    spec="RFC 7530 9.1.3 / 9.1.7 (the open-owner sequence and stateid "
+         "generation are the server's bookkeeping)",
+    summary="OPEN/CLOSE/LOCK answer BAD_SEQID / BAD_STATEID / OLD_STATEID for "
+            "owners and stateids the model believes are fresh",
+    root_cause="knfsd and the model retired a client id at different moments, "
+               "so the per-owner seqid and stateid generations parted",
+    candidate_fix="none within a trace (the model has no lease clock); the "
+                  "walk could stop reusing an owner across a SETCLIENTID",
+    ops=("SOpen", "SClose", "SLock", "SLocku", "SOpenConfirm",
+         "SOpenDowngrade"),
+    actual_status=(NFS4ERR_BAD_SEQID, NFS4ERR_BAD_STATEID,
+                   NFS4ERR_OLD_STATEID),
+    reconcilable=False,
+)
+
+
 # KN-22: the ACCESS granted-mask differs from the model's type-masking, as
 # GD-22 records for ganesha.  Field-only.
 KN_22_ACCESS = Deviation(
@@ -296,6 +326,7 @@ NFS4 = Registry("knfsd/nfs4", [
     KN_17_LIFECYCLE,
     KN_16_ATTR_AFTER_LENIENT_NAME,
     KN_18_READDIR_NAMES,
+    KN_23_OWNER_STATEID_LIFECYCLE,
     KN_19_CREATE_SETATTR,
     KN_22_ACCESS,
 ])

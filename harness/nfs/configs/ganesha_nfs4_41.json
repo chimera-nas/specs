@@ -24,9 +24,14 @@
   // ever sends the 256-byte NLONG compound tag -- only the 4.0 walk does -- so
   // enabling it would be a claim the corpus cannot prove.  It is on in the 4.0
   // cell instead.
+  // The compound tag: this ganesha DOES validate it.  Measured across the 4.0
+  // corpus -- 8 malformed tags reached it, 8 were refused with NFS4ERR_INVAL
+  // and an empty result array, none accepted -- so S4-compound-tag-unvalidated
+  // (which claims neither reference server polices the tag) is not enabled on
+  // this side; it stays on for knfsd, which does accept them.
   "deviations": [
     "S4-no-wrong-type",
-    "S4-compound-tag-unvalidated",
+    "G4-op-outside-session-inval",
     "S4-change-is-coarse-ctime",
     "G4-verify-wide-trivial-match",
     "G4-setattr-share-denied",

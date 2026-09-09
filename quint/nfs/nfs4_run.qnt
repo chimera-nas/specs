@@ -42,7 +42,8 @@ module nfs4Default {
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
-        T_WIDE_ATTR_REFUSAL = false
+        T_WIDE_ATTR_REFUSAL = false,
+        T_RENAME_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }
 
@@ -75,7 +76,8 @@ module nfs4V40 {
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
-        T_WIDE_ATTR_REFUSAL = false
+        T_WIDE_ATTR_REFUSAL = false,
+        T_RENAME_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }
 
@@ -108,7 +110,8 @@ module nfs4V41 {
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
-        T_WIDE_ATTR_REFUSAL = false
+        T_WIDE_ATTR_REFUSAL = false,
+        T_RENAME_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }
 
@@ -163,7 +166,8 @@ module nfs4Memfs42 {
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
-        T_WIDE_ATTR_REFUSAL = false
+        T_WIDE_ATTR_REFUSAL = false,
+        T_RENAME_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }
 
@@ -200,7 +204,8 @@ module nfs4Memfs42Deleg {
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
-        T_WIDE_ATTR_REFUSAL = false
+        T_WIDE_ATTR_REFUSAL = false,
+        T_RENAME_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }
 
@@ -232,7 +237,8 @@ module nfs4Memfs41Deleg {
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
-        T_WIDE_ATTR_REFUSAL = false
+        T_WIDE_ATTR_REFUSAL = false,
+        T_RENAME_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }
 
@@ -264,7 +270,8 @@ module nfs4Memfs41 {
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
-        T_WIDE_ATTR_REFUSAL = false
+        T_WIDE_ATTR_REFUSAL = false,
+        T_RENAME_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }
 
@@ -296,7 +303,8 @@ module nfs4Memfs40 {
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
-        T_WIDE_ATTR_REFUSAL = false
+        T_WIDE_ATTR_REFUSAL = false,
+        T_RENAME_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }
 
@@ -333,7 +341,8 @@ module nfs4Pnfs42 {
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
-        T_WIDE_ATTR_REFUSAL = false
+        T_WIDE_ATTR_REFUSAL = false,
+        T_RENAME_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }
 
@@ -365,7 +374,8 @@ module nfs4Pnfs41 {
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
-        T_WIDE_ATTR_REFUSAL = false
+        T_WIDE_ATTR_REFUSAL = false,
+        T_RENAME_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }
 
@@ -399,7 +409,8 @@ module nfs4PnfsMandatory {
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
-        T_WIDE_ATTR_REFUSAL = false
+        T_WIDE_ATTR_REFUSAL = false,
+        T_RENAME_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }
 
@@ -434,6 +445,7 @@ module nfs4AllMandatory {
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
-        T_WIDE_ATTR_REFUSAL = false
+        T_WIDE_ATTR_REFUSAL = false,
+        T_RENAME_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }

@@ -40,7 +40,8 @@ module nfs4Test42 {
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
-        T_WIDE_ATTR_REFUSAL = false
+        T_WIDE_ATTR_REFUSAL = false,
+        T_RENAME_SYMLINK_STATUS = false
     ).* from "./nfs4"
 
     def lastStatus: int =
@@ -58,7 +59,7 @@ module nfs4Test42 {
     def resAt(i: int): OpRes = lastResults[i]
 
     val noOpen = { st: -999, sid: -1, seq: 0, needConfirm: false,
-                   needConfirmAccept: Set(false),
+                   needConfirmAccept: Set(false), stAccept: Set(),
                    cinfo: { before: 0, after: 0, opaque: false }, deleg: DNone,
                    recalls: Set() }
     def asOpen(r) =
@@ -882,7 +883,8 @@ module nfs4Test40 {
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
-        T_WIDE_ATTR_REFUSAL = false
+        T_WIDE_ATTR_REFUSAL = false,
+        T_RENAME_SYMLINK_STATUS = false
     ).* from "./nfs4"
 
     def lastStatus: int =
@@ -903,7 +905,7 @@ module nfs4Test40 {
         match r {
             | SOpen(x) => x
             | _ => { st: -999, sid: -1, seq: 0, needConfirm: false,
-                     needConfirmAccept: Set(false),
+                     needConfirmAccept: Set(false), stAccept: Set(),
                      cinfo: { before: 0, after: 0, opaque: false }, deleg: DNone,
                      recalls: Set() }
         }

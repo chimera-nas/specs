@@ -131,6 +131,11 @@ module nfs4 {
     // every attribute the server advertises.  See opGetattrWide.
     const T_WIDE_ATTR_REFUSAL: bool
 
+    // TOLERANCE: RFC 7530 16.27.4 lists NFS4ERR_NOTDIR and Table 7 lists
+    // NFS4ERR_SYMLINK for a RENAME whose source or target directory handle is
+    // a symbolic link.  See renameSymAccept.
+    const T_RENAME_SYMLINK_STATUS: bool
+
     // ------------------------------------------------------------------
     // Bounded universes
     // ------------------------------------------------------------------
@@ -268,7 +273,8 @@ module nfs4 {
             tolRenewLapsed: T_RENEW_LAPSED,
             tolRflagsConfirm: T_RFLAGS_CONFIRM and MINOR >= 1,
             tolLinkRefusal: T_LINK_REFUSAL,
-            tolWideAttrRefusal: T_WIDE_ATTR_REFUSAL
+            tolWideAttrRefusal: T_WIDE_ATTR_REFUSAL,
+            tolRenameSymlinkStatus: T_RENAME_SYMLINK_STATUS
         }
         all {
             // ref: in-memory share roots are 0777; the root mode is not
