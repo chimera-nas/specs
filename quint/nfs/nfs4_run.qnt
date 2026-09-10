@@ -38,13 +38,11 @@ module nfs4Default {
         DEVS = Set(),
         HAZARDS = Set(),
         T_HOLE_TRACKING = false,
-        T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
         T_WIDE_ATTR_REFUSAL = false,
-        T_RENAME_SYMLINK_STATUS = false,
         T_DATA_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }
@@ -74,13 +72,11 @@ module nfs4V40 {
         DEVS = Set(),
         HAZARDS = Set(),
         T_HOLE_TRACKING = false,
-        T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
         T_WIDE_ATTR_REFUSAL = false,
-        T_RENAME_SYMLINK_STATUS = false,
         T_DATA_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }
@@ -110,13 +106,11 @@ module nfs4V41 {
         DEVS = Set(),
         HAZARDS = Set(),
         T_HOLE_TRACKING = false,
-        T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
         T_WIDE_ATTR_REFUSAL = false,
-        T_RENAME_SYMLINK_STATUS = false,
         T_DATA_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }
@@ -168,13 +162,11 @@ module nfs4Memfs42 {
         DEVS = Set(),
         HAZARDS = Set(),
         T_HOLE_TRACKING = false,
-        T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
         T_WIDE_ATTR_REFUSAL = false,
-        T_RENAME_SYMLINK_STATUS = false,
         T_DATA_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }
@@ -208,13 +200,11 @@ module nfs4Memfs42Deleg {
         DEVS = Set(),
         HAZARDS = Set(),
         T_HOLE_TRACKING = false,
-        T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
         T_WIDE_ATTR_REFUSAL = false,
-        T_RENAME_SYMLINK_STATUS = false,
         T_DATA_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }
@@ -243,13 +233,11 @@ module nfs4Memfs41Deleg {
         DEVS = Set(),
         HAZARDS = Set(),
         T_HOLE_TRACKING = false,
-        T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
         T_WIDE_ATTR_REFUSAL = false,
-        T_RENAME_SYMLINK_STATUS = false,
         T_DATA_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }
@@ -278,13 +266,11 @@ module nfs4Memfs41 {
         DEVS = Set(),
         HAZARDS = Set(),
         T_HOLE_TRACKING = false,
-        T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
         T_WIDE_ATTR_REFUSAL = false,
-        T_RENAME_SYMLINK_STATUS = false,
         T_DATA_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }
@@ -313,13 +299,11 @@ module nfs4Memfs40 {
         DEVS = Set(),
         HAZARDS = Set(),
         T_HOLE_TRACKING = false,
-        T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
         T_WIDE_ATTR_REFUSAL = false,
-        T_RENAME_SYMLINK_STATUS = false,
         T_DATA_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }
@@ -353,13 +337,11 @@ module nfs4Pnfs42 {
         DEVS = Set(),
         HAZARDS = Set(),
         T_HOLE_TRACKING = false,
-        T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
         T_WIDE_ATTR_REFUSAL = false,
-        T_RENAME_SYMLINK_STATUS = false,
         T_DATA_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }
@@ -388,13 +370,11 @@ module nfs4Pnfs41 {
         DEVS = Set(),
         HAZARDS = Set(),
         T_HOLE_TRACKING = false,
-        T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
         T_WIDE_ATTR_REFUSAL = false,
-        T_RENAME_SYMLINK_STATUS = false,
         T_DATA_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }
@@ -425,13 +405,11 @@ module nfs4PnfsMandatory {
         DEVS = Set(),
         HAZARDS = Set(),
         T_HOLE_TRACKING = false,
-        T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
         T_WIDE_ATTR_REFUSAL = false,
-        T_RENAME_SYMLINK_STATUS = false,
         T_DATA_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }
@@ -463,13 +441,11 @@ module nfs4AllMandatory {
         DEVS = Set(),
         HAZARDS = Set(),
         T_HOLE_TRACKING = false,
-        T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
         T_WIDE_ATTR_REFUSAL = false,
-        T_RENAME_SYMLINK_STATUS = false,
         T_DATA_SYMLINK_STATUS = false
     ).* from "./nfs4"
 }

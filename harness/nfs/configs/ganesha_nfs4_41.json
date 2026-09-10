@@ -52,8 +52,7 @@
     "rflagsConfirm": true,
     "linkRefusal": true,
     "wideAttrRefusal": true,
-    "dataSymlinkStatus": true,
-    "renameSymlinkStatus": true
+    "dataSymlinkStatus": true
   },
 
   "policies": {

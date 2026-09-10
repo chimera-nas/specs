@@ -233,10 +233,6 @@ module nfs4ops {
         // byte-granular view.  Turns SEEK's `stAccept`/`offsetAccept`/`eofAccept`
         // sets from singletons into the set of conformant answers.
         tolHoleTracking: bool,
-        // TOLERANCE (not a deviation): RFC 7530 Table 7 lists both
-        // NFS4ERR_SYMLINK and NFS4ERR_NOTDIR for READDIR on a symbolic link.
-        // See opReaddir.
-        tolDirSymlinkStatus: bool,
         // TOLERANCE: whether an extended-attribute-only mutation advances the
         // change attribute is left to the server by RFC 8276, and chimera's
         // backends answer differently.  See Inode.chgOpaque.
@@ -256,10 +252,6 @@ module nfs4ops {
         // attribute combination it cannot satisfy, and the wide GETATTR asks
         // for all of them.  See opGetattrWide.
         tolWideAttrRefusal: bool,
-        // TOLERANCE (not a deviation): RFC 7530 16.27.4 lists NFS4ERR_NOTDIR
-        // and Table 7 NFS4ERR_SYMLINK for a RENAME through a symbolic-link
-        // directory handle.  See renameSymAccept.
-        tolRenameSymlinkStatus: bool,
         // TOLERANCE (not a deviation): RFC 7530 Table 7 lists NFS4ERR_SYMLINK
         // and NFS4ERR_INVAL for READ/WRITE/COMMIT/LOCKT on a symbolic-link
         // current filehandle.  See dataSymlinkAccept.
@@ -401,17 +393,17 @@ module nfs4ops {
         | SGetfh({ st: int, ino: Ino })
         | SSavefh({ st: int })
         | SGetattrWide({ st: int, stAccept: Set[int] })
-        | SSecinfo({ st: int })
+        | SSecinfo({ st: int, stAccept: Set[int] })
         | SBindConnToSession({ st: int })
         | SRestorefh({ st: int })
-        | SLookup({ st: int, child: Ino })
-        | SLookupp({ st: int, parent: Ino })
+        | SLookup({ st: int, child: Ino, stAccept: Set[int] })
+        | SLookupp({ st: int, parent: Ino, stAccept: Set[int] })
         | SGetattr({ st: int, attrs: AttrSnap })
         | SReadlink({ st: int, target: str })
         | SAccess({ st: int, supported: int, access: int })
         | SReaddir({ st: int, names: Set[Name], stAccept: Set[int] })
-        | SCreate({ st: int, ino: Ino, cinfo: CInfo })
-        | SRemove({ st: int, cinfo: CInfo })
+        | SCreate({ st: int, ino: Ino, cinfo: CInfo, stAccept: Set[int] })
+        | SRemove({ st: int, cinfo: CInfo, stAccept: Set[int] })
         | SRename({ st: int, cinfoS: CInfo, cinfoT: CInfo,
                     stAccept: Set[int] })
         | SLink({ st: int, cinfo: CInfo, stAccept: Set[int] })
@@ -695,16 +687,6 @@ module nfs4ops {
     // Only the PARENT case: CREATE, REMOVE, RENAME, LINK and OPEN(CLAIM_NULL)
     // reach chimera's VFS path resolution, which reports ENOTDIR without
     // saying what the object was.  Where the current filehandle ITSELF is the
-    // symlink -- LOOKUP, LOOKUPP, READDIR, SECINFO -- chimera checks the type
-    // in the NFSv4 layer, where it still knows, and answers the specific
-    // NFS4ERR_SYMLINK exactly as the model does (measured; the pair does not
-    // appear in either direction on those ops).
-    pure def devDirSym(a: Acc): int =
-        if (hasDev(a.caps, "D4-19-dirop-symlink-notdir")) E_NOTDIR else E_SYMLINK
-
-    pure def devDirSymHit(a: Acc): Acc =
-        if (hasDev(a.caps, "D4-19-dirop-symlink-notdir"))
-            hitDev(a, "D4-19-dirop-symlink-notdir") else a
 
     // D4-15: chimera answers the coarse 4.0-style type error on the data-path
     // and size-setting ops -- NFS4ERR_ISDIR for a directory, NFS4ERR_INVAL for
@@ -777,6 +759,24 @@ module nfs4ops {
         if (hasDev(a.caps, "S4-change-is-coarse-ctime"))
             hitDev(a, "S4-change-is-coarse-ctime") else a
 
+    // A directory-requiring operation that meets a SYMBOLIC LINK where it
+    // needed a directory -- LOOKUP/LOOKUPP/READDIR/SECINFO on a symlink
+    // current filehandle, CREATE/REMOVE/RENAME/LINK on a symlink parent.
+    // RFC 7530 Table 7 lists NFS4ERR_SYMLINK *and* NFS4ERR_NOTDIR for every
+    // one of them, so both are conformant and neither is the answer.
+    //
+    // UNCONDITIONAL, and that is the point: where a specification permits
+    // several answers, a corpus that pins one is not testing conformance, it
+    // is testing which implementation it was written beside.  A knob would
+    // only be right if the two answers were mutually exclusive ASSUMPTIONS an
+    // implementation makes -- these are not; nothing is looked up, created or
+    // removed on either branch, so no state parts and nothing downstream
+    // depends on which arrived.  Replaces chimera's D4-19-dirop-symlink-notdir,
+    // knfsd's K4-rename-symlink-notdir, and the T_DIR_SYMLINK_STATUS and
+    // T_RENAME_SYMLINK_STATUS tolerances, all four of which said this same
+    // sentence about one operation each.
+    pure val DIR_SYM_ACCEPT = Set(E_SYMLINK, E_NOTDIR)
+
     // T_LINK_REFUSAL: which refusal a LINK reports when more than one applies.
     // RFC 7530 16.9.4 lists NFS4ERR_ISDIR for a directory source but pins
     // neither that code -- NOTDIR is the same refusal framed as a type error,
@@ -789,16 +789,6 @@ module nfs4ops {
         else if (srcIsDir) Set(st, E_ISDIR, E_NOTDIR)
         else Set(st)
 
-    // T_RENAME_SYMLINK_STATUS: a symbolic link handed in as the source or
-    // target directory of a RENAME.  RFC 7530 16.27.4 lists NFS4ERR_NOTDIR
-    // and Table 7 lists NFS4ERR_SYMLINK, so either is conformant; the model
-    // and NFS-Ganesha answer the specific SYMLINK and the Linux server picks
-    // between the two.  Replaces the single-answer deviation
-    // K4-rename-symlink-notdir, which asserted NOTDIR and was contradicted by
-    // the SYMLINK knfsd gives for the same shape elsewhere in the corpus.
-    pure def renameSymAccept(a: Acc): Set[int] =
-        if (a.caps.tolRenameSymlinkStatus) Set(E_SYMLINK, E_NOTDIR)
-        else Set(devDirSym(a))
 
     // G4-setattr-share-denied: RFC 8881 9.1.4.3 makes the anonymous stateid
     // usable for a size change only when no conflicting OPEN exists, and
@@ -1063,19 +1053,20 @@ module nfs4ops {
     pure def opLookup(a: Acc, n: Name): Acc = {
         val g = fhGate(a)
         val ns = nameStatus(n)
-        if (g != OK) emit(a, SLookup({ st: g, child: -1 }))
-        else if (ns != OK) emit(a, SLookup({ st: ns, child: -1 }))
+        if (g != OK) emit(a, SLookup({ st: g, child: -1 , stAccept: Set(g) }))
+        else if (ns != OK) emit(a, SLookup({ st: ns, child: -1 , stAccept: Set(ns) }))
         else {
             val nd = cfhNode(a)
             if (nd.ftype == FLnk)
-                emit(a, SLookup({ st: E_SYMLINK, child: -1 }))
+                emit(a, SLookup({ st: E_SYMLINK, child: -1,
+                                  stAccept: DIR_SYM_ACCEPT }))
             else if (nd.ftype != FDir)
-                emit(a, SLookup({ st: E_NOTDIR, child: -1 }))
+                emit(a, SLookup({ st: E_NOTDIR, child: -1 , stAccept: Set(E_NOTDIR) }))
             else if (not(fsHasEnt(a.fs, a.cfh, n)))
-                emit(a, SLookup({ st: E_NOENT, child: -1 }))
+                emit(a, SLookup({ st: E_NOENT, child: -1 , stAccept: Set(E_NOENT) }))
             else {
                 val c = fsChild(a.fs, a.cfh, n)
-                emit(a.with("cfh", c), SLookup({ st: OK, child: c }))
+                emit(a.with("cfh", c), SLookup({ st: OK, child: c , stAccept: Set(OK) }))
             }
         }
     }
@@ -1085,13 +1076,14 @@ module nfs4ops {
     // (op text) or SYMLINK (error table) is conformant; NOTDIR modeled.
     pure def opLookupp(a: Acc): Acc = {
         val g = fhGate(a)
-        if (g != OK) emit(a, SLookupp({ st: g, parent: -1 }))
+        if (g != OK) emit(a, SLookupp({ st: g, parent: -1 , stAccept: Set(g) }))
         else {
             val nd = cfhNode(a)
             if (nd.ftype == FLnk)
-                emit(a, SLookupp({ st: E_SYMLINK, parent: -1 }))
+                emit(a, SLookupp({ st: E_SYMLINK, parent: -1,
+                                   stAccept: DIR_SYM_ACCEPT }))
             else if (nd.ftype != FDir)
-                emit(a, SLookupp({ st: E_NOTDIR, parent: -1 }))
+                emit(a, SLookupp({ st: E_NOTDIR, parent: -1 , stAccept: Set(E_NOTDIR) }))
             // D4-1: the model's namespace is the exported tree and stops at
             // its root, so LOOKUPP there is NFS4ERR_NOENT.  chimera's does
             // not: the export is a name in the server's pseudo-filesystem, so
@@ -1102,12 +1094,12 @@ module nfs4ops {
             else if (a.cfh == ROOT and hasDev(a.caps, "D4-1-lookupp-pseudoroot"))
                 emit(hitDev(a, "D4-1-lookupp-pseudoroot")
                          .with("cfh", PSEUDO_INO),
-                     SLookupp({ st: OK, parent: PSEUDO_INO }))
+                     SLookupp({ st: OK, parent: PSEUDO_INO , stAccept: Set(OK) }))
             else if (a.cfh == ROOT)
-                emit(a, SLookupp({ st: E_NOENT, parent: -1 }))
+                emit(a, SLookupp({ st: E_NOENT, parent: -1 , stAccept: Set(E_NOENT) }))
             else
                 emit(a.with("cfh", nd.parent),
-                     SLookupp({ st: OK, parent: nd.parent }))
+                     SLookupp({ st: OK, parent: nd.parent , stAccept: Set(OK) }))
         }
     }
 
@@ -1193,14 +1185,16 @@ module nfs4ops {
     pure def opSecinfo(a: Acc, n: Name): Acc = {
         val g = fhGate(a)
         val ns = nameStatus(n)
-        if (g != OK) emit(a, SSecinfo({ st: g }))
-        else if (ns != OK) emit(a, SSecinfo({ st: ns }))
+        if (g != OK) emit(a, SSecinfo({ st: g , stAccept: Set(g) }))
+        else if (ns != OK) emit(a, SSecinfo({ st: ns , stAccept: Set(ns) }))
         else {
             val nd = cfhNode(a)
-            if (nd.ftype == FLnk) emit(a, SSecinfo({ st: E_SYMLINK }))
-            else if (nd.ftype != FDir) emit(a, SSecinfo({ st: E_NOTDIR }))
+            if (nd.ftype == FLnk)
+                emit(a, SSecinfo({ st: E_SYMLINK,
+                                   stAccept: DIR_SYM_ACCEPT }))
+            else if (nd.ftype != FDir) emit(a, SSecinfo({ st: E_NOTDIR , stAccept: Set(E_NOTDIR) }))
             else if (not(fsHasEnt(a.fs, a.cfh, n)))
-                emit(a, SSecinfo({ st: E_NOENT }))
+                emit(a, SSecinfo({ st: E_NOENT , stAccept: Set(E_NOENT) }))
             // D4-21: SECINFO consumes the current filehandle (RFC 7530
             // 17.31.3 / RFC 8881 18.29.3), so the next op that uses it
             // answers NFS4ERR_NOFILEHANDLE.  4.1+ says so outright; on 4.0
@@ -1208,11 +1202,11 @@ module nfs4ops {
             // req->fhlen for every minor version, so a 4.0 compound loses it
             // too.
             else if (a.minor >= 1)
-                emit(a.with("cfh", -1), SSecinfo({ st: OK }))
+                emit(a.with("cfh", -1), SSecinfo({ st: OK , stAccept: Set(OK) }))
             else if (hasDev(a.caps, "D4-21-secinfo-consumes-fh"))
                 emit(hitDev(a, "D4-21-secinfo-consumes-fh").with("cfh", -1),
-                     SSecinfo({ st: OK }))
-            else emit(a, SSecinfo({ st: OK }))
+                     SSecinfo({ st: OK , stAccept: Set(OK) }))
+            else emit(a, SSecinfo({ st: OK , stAccept: Set(OK) }))
         }
     }
 
@@ -1327,9 +1321,7 @@ module nfs4ops {
             // backends, so they stay exact.
             if (nd.ftype == FLnk)
                 emit(a, SReaddir({ st: E_SYMLINK, names: Set(),
-                                   stAccept: if (a.caps.tolDirSymlinkStatus)
-                                                 Set(E_SYMLINK, E_NOTDIR)
-                                             else Set(E_SYMLINK) }))
+                                   stAccept: DIR_SYM_ACCEPT }))
             else if (nd.ftype != FDir)
                 emit(a, SReaddir({ st: E_NOTDIR, names: Set(),
                                    stAccept: Set(E_NOTDIR) }))
@@ -1343,10 +1335,12 @@ module nfs4ops {
     pure def opCreate(a: Acc, ar: { ctype: Ftype, name: Name, mode: int,
                                     target: str }): Acc = {
         val g = fhGate(a)
-        val bad = { st: g, ino: -1, cinfo: { before: 0, after: 0, opaque: false } }
+        val bad = { st: g, ino: -1, cinfo: { before: 0, after: 0, opaque: false },
+                    stAccept: Set(g) }
         if (g != OK) emit(a, SCreate(bad))
         else if (nameStatus(ar.name) != OK)
-            emit(a, SCreate(bad.with("st", nameStatus(ar.name))))
+            emit(a, SCreate(bad.with("st", nameStatus(ar.name))
+                                .with("stAccept", Set(nameStatus(ar.name)))))
         // The current filehandle must be a usable directory before the
         // requested object type is considered (RFC 7530 16.4 / RFC 8881 18.4):
         // a symlink current filehandle is NFS4ERR_SYMLINK, any other
@@ -1363,13 +1357,17 @@ module nfs4ops {
         else if (hasDev(a.caps, "D4-18-create-type-before-parent") and
                  ar.ctype == FReg and cfhNode(a).ftype != FDir)
             emit(hitDev(a, "D4-18-create-type-before-parent"),
-                 SCreate(bad.with("st", E_BADTYPE)))
+                 SCreate(bad.with("st", E_BADTYPE)
+                              .with("stAccept", Set(E_BADTYPE))))
         else if (cfhNode(a).ftype == FLnk)
-            emit(devDirSymHit(a), SCreate(bad.with("st", devDirSym(a))))
+            emit(a, SCreate(bad.with("st", E_SYMLINK)
+                                .with("stAccept", DIR_SYM_ACCEPT)))
         else if (cfhNode(a).ftype != FDir)
-            emit(a, SCreate(bad.with("st", E_NOTDIR)))
+            emit(a, SCreate(bad.with("st", E_NOTDIR)
+                              .with("stAccept", Set(E_NOTDIR))))
         else if (ar.ctype == FReg)
-            emit(a, SCreate(bad.with("st", E_BADTYPE)))
+            emit(a, SCreate(bad.with("st", E_BADTYPE)
+                              .with("stAccept", Set(E_BADTYPE))))
         else {
             // D4-4: chimera creates every symbolic link with mode 0755,
             // whatever the CREATE asked for -- the mode argument is dropped at
@@ -1385,14 +1383,15 @@ module nfs4ops {
                 else mkSpecial(ar.ctype, ar.mode, 0)
             val o = fsMknode(a.fs, a.cfh, ar.name, node)
             if (o.st != FsOk)
-                emit(a, SCreate(bad.with("st", fsStatus(o.st))))
+                emit(a, SCreate(bad.with("st", fsStatus(o.st))
+                                    .with("stAccept", Set(fsStatus(o.st)))))
             else
                 emit(devCinfoHit(
                          (if (ar.ctype == FLnk and lnkMode != ar.mode)
                               hitDev(a, "D4-4-symlink-mode-0755") else a)
                              .with("fs", o.fs2).with("cfh", o.ino)),
                      SCreate({ st: OK, ino: o.ino,
-                               cinfo: devCinfo(a, o.cinfo) }))
+                               cinfo: devCinfo(a, o.cinfo) , stAccept: Set(OK) }))
         }
     }
 
@@ -1404,12 +1403,13 @@ module nfs4ops {
     pure def opRemove(a: Acc, n: Name): Acc = {
         val g = fhGate(a)
         val ns = nameStatus(n)
-        if (g != OK) emit(a, SRemove({ st: g, cinfo: { before: 0, after: 0, opaque: false } }))
+        if (g != OK) emit(a, SRemove({ st: g, cinfo: { before: 0, after: 0, opaque: false } , stAccept: Set(g) }))
         else if (ns != OK)
-            emit(a, SRemove({ st: ns, cinfo: { before: 0, after: 0, opaque: false } }))
+            emit(a, SRemove({ st: ns, cinfo: { before: 0, after: 0, opaque: false } , stAccept: Set(ns) }))
         else if (cfhNode(a).ftype == FLnk)
-            emit(devDirSymHit(a),
-                 SRemove({ st: devDirSym(a), cinfo: { before: 0, after: 0, opaque: false } }))
+            emit(a, SRemove({ st: E_SYMLINK,
+                              cinfo: { before: 0, after: 0, opaque: false },
+                              stAccept: DIR_SYM_ACCEPT }))
         else {
             // Delegations held by other clients on the victim force a
             // recall; REMOVE observes NFS4ERR_DELAY until they return
@@ -1422,12 +1422,12 @@ module nfs4ops {
             if (recalls.size() > 0) {
                 emit(a.with("sdb", recalls.fold(a.sdb, (acc, s) =>
                                                 doRecallDeleg(acc, s))),
-                     SRemove({ st: E_DELAY, cinfo: { before: 0, after: 0, opaque: false } }))
+                     SRemove({ st: E_DELAY, cinfo: { before: 0, after: 0, opaque: false } , stAccept: Set(E_DELAY) }))
             } else {
                 val o = fsRemove(a.fs, a.cfh, n, pinnedInos(a.sdb))
                 emit(devCinfoHit(a.with("fs", o.fs2)),
                      SRemove({ st: fsStatus(o.st),
-                               cinfo: devCinfo(a, o.cinfo) }))
+                               cinfo: devCinfo(a, o.cinfo) , stAccept: Set(fsStatus(o.st)) }))
             }
         }
     }
@@ -1454,9 +1454,8 @@ module nfs4ops {
                               stAccept: Set(nameStatus(ar.newname)) }))
         else if (fsGet(a.fs, a.sfh).ftype == FLnk or
                  fsGet(a.fs, a.cfh).ftype == FLnk)
-            emit(devDirSymHit(a),
-                 SRename({ st: devDirSym(a), cinfoS: zero, cinfoT: zero,
-                           stAccept: renameSymAccept(a) }))
+            emit(a, SRename({ st: E_SYMLINK, cinfoS: zero, cinfoT: zero,
+                             stAccept: DIR_SYM_ACCEPT }))
         else {
             // Rename-over unlinks the target: other-client delegations on
             // it force a recall + NFS4ERR_DELAY, mirroring REMOVE.  (The
@@ -1504,8 +1503,8 @@ module nfs4ops {
                             stAccept: linkAccept(a, nameStatus(n),
                                           fsGet(a.fs, a.sfh).ftype == FDir) }))
         else if (fsGet(a.fs, a.cfh).ftype == FLnk)
-            emit(devDirSymHit(a), SLink({ st: devDirSym(a), cinfo: zero,
-                                          stAccept: Set(devDirSym(a)) }))
+            emit(a, SLink({ st: E_SYMLINK, cinfo: zero,
+                            stAccept: DIR_SYM_ACCEPT }))
         else {
             val o = fsLink(a.fs, a.sfh, a.cfh, n)
             val st = fsStatus(o.st)
@@ -2029,14 +2028,14 @@ module nfs4ops {
                 }
             | OCNull(n) => {
                 val dnd = cfhNode(a)
-                // D4-19: a symlink handed in as the parent directory.  Only
-                // the CREATE forms: chimera resolves those through the VFS,
-                // which reports the generic ENOTDIR, while a plain OPEN of an
-                // existing name answers the specific NFS4ERR_SYMLINK from the
-                // NFSv4 layer (measured on memfs, diskfs and cairn).
-                if (dnd.ftype == FLnk)
-                    base.with("st", if (how == HNoCreate) E_SYMLINK
-                                    else devDirSym(a))
+                // A symlink handed in as the parent directory: the same
+                // Table 7 latitude as every other directory-requiring op, so
+                // the specific answer is predicted and the generic one
+                // accepted (DIR_SYM_ACCEPT).  chimera resolves the CREATE
+                // forms through the VFS, which reports the generic ENOTDIR,
+                // and answers the specific SYMLINK for a plain OPEN of an
+                // existing name; both are now in the set.
+                if (dnd.ftype == FLnk) base.with("st", E_SYMLINK)
                 else if (dnd.ftype != FDir) base.with("st", E_NOTDIR)
                 else {
                     val present = fsHasEnt(a.fs, a.cfh, n)
@@ -2234,11 +2233,17 @@ module nfs4ops {
             // zero on the success side -- so the ids it reports are folded
             // onto whatever Acc the arms below produce, once, at the end.
             val outAcc = if (res.st != OK) {
-                // D4-19 above may have coarsened a symlink parent; record it.
-                val aSym = if (res.st == E_NOTDIR and cfhLive(a) and
-                               cfhNode(a).ftype == FLnk)
-                               devDirSymHit(a) else a
-                val a1 = emit(aSym, SOpen(nores.with("st", res.st)))
+                // A symlink handed in as the parent is the Table 7 latitude
+                // every other directory-requiring op has (DIR_SYM_ACCEPT);
+                // OPEN carries it here because openResolve's record has no
+                // acceptance field of its own.
+                val a1 = emit(a, SOpen(nores.with("st", res.st)
+                                            .with("stAccept",
+                                                  if (res.st == E_SYMLINK and
+                                                      cfhLive(a) and
+                                                      cfhNode(a).ftype == FLnk)
+                                                      stAcc.union(DIR_SYM_ACCEPT)
+                                                  else stAcc)))
                 if (a.minor == 0)
                     a1.with("sdb", ooSettle(a1.sdb, ar.client, ar.owner,
                                             ar.oseq, res.st, false))
@@ -3528,10 +3533,10 @@ emit(dataTypeAcc(a, false),
           conflictDelays: true, closeFreesLocks: true,
           layoutWholeFile: true,
           devs: Set(), tolHoleTracking: false,
-          tolDirSymlinkStatus: false, tolXattrChange: false,
+          tolXattrChange: false,
           tolRenewLapsed: false, tolRflagsConfirm: false,
           tolLinkRefusal: false, tolWideAttrRefusal: false,
-          tolRenameSymlinkStatus: false, tolDataSymlinkStatus: false }
+          tolDataSymlinkStatus: false }
 
     // Evaluate a whole COMPOUND.  reqTag identifies the request for the
     // 4.1 SEQUENCE replay/false-retry classification.

@@ -87,12 +87,6 @@ module nfs4 {
     // membership-tests instead of comparing for equality.
     const T_HOLE_TRACKING: bool
 
-    // RFC 7530 16.24.4 Table 7 lists BOTH NFS4ERR_SYMLINK and NFS4ERR_NOTDIR
-    // for READDIR on a symbolic link, so either is conformant -- and which one
-    // chimera gives depends on which VFS backend resolved the handle.  One
-    // corpus serves every backend a cell is replayed against, so with this on
-    // READDIR's reply carries both in `stAccept`.
-    const T_DIR_SYMLINK_STATUS: bool
 
     // RFC 8276 leaves it to the server whether writing an extended attribute
     // advances the object's change attribute, and chimera's backends answer
@@ -131,10 +125,6 @@ module nfs4 {
     // every attribute the server advertises.  See opGetattrWide.
     const T_WIDE_ATTR_REFUSAL: bool
 
-    // TOLERANCE: RFC 7530 16.27.4 lists NFS4ERR_NOTDIR and Table 7 lists
-    // NFS4ERR_SYMLINK for a RENAME whose source or target directory handle is
-    // a symbolic link.  See renameSymAccept.
-    const T_RENAME_SYMLINK_STATUS: bool
 
     // TOLERANCE: RFC 7530 Table 7 lists NFS4ERR_SYMLINK and NFS4ERR_INVAL for
     // READ / WRITE / COMMIT / LOCKT on a symbolic-link current filehandle.
@@ -299,13 +289,11 @@ module nfs4 {
             // without a new parameter on forty functions.
             devs: DEVS,
             tolHoleTracking: T_HOLE_TRACKING,
-            tolDirSymlinkStatus: T_DIR_SYMLINK_STATUS,
             tolXattrChange: T_XATTR_CHANGE,
             tolRenewLapsed: T_RENEW_LAPSED,
             tolRflagsConfirm: T_RFLAGS_CONFIRM and MINOR >= 1,
             tolLinkRefusal: T_LINK_REFUSAL,
             tolWideAttrRefusal: T_WIDE_ATTR_REFUSAL,
-            tolRenameSymlinkStatus: T_RENAME_SYMLINK_STATUS,
             tolDataSymlinkStatus: T_DATA_SYMLINK_STATUS
         }
         all {

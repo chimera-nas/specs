@@ -15,13 +15,8 @@
   ],
 
   // Only the 4.0 walk RENAMEs through a symbolic-link directory handle, which
-  // is why renameSymlinkStatus is stated here rather than in the parent.  It
-  // replaces the deviation K4-rename-symlink-notdir: knfsd answers NOTDIR for
-  // some of these and the specific SYMLINK for others, and RFC 7530 16.27.4
-  // lists both, so what the model can state is the acceptance and not a pick.
   "tolerances": {
-    "renewLapsed": true,
-    "renameSymlinkStatus": true
+    "renewLapsed": true
   },
 
   "policies": {
