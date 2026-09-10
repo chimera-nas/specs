@@ -3116,23 +3116,27 @@ emit(dataTypeAcc(a, false),
                         // (Measured: the model answered block 2 where V6.5 on
                         // ext4 answered 0.)  For SEEK_HOLE the model's answer
                         // is the late bound, as before.
+                        // Two different reasons the offset may differ, and
+                        // they are worth keeping apart.
                         //
-                        // The third case is G4-seek-at-eof-not-nxio reaching
-                        // further than its own branch above.  That branch
-                        // fires when the MODEL puts sa_offset at or past EOF;
-                        // but with a real allocation map the server's EOF is
-                        // its own, and a file the model sizes in bytes can end
-                        // earlier there -- so the server takes its at-EOF
-                        // behaviour (NFS4_OK at some earlier hole) for a query
-                        // the model still considers interior.  Measured: a
-                        // SEEK_HOLE at byte 24576 answered 0.  Scoped to the
-                        // cells that enable the deviation, so a hole-tracking
-                        // backend without it still has its offset pinned.
+                        // G4-seek-at-eof-not-nxio: measured in BOTH
+                        // directions -- a SEEK_HOLE at byte 24576 and a
+                        // SEEK_DATA at byte 8192 each answered 0 -- so this
+                        // server does not treat sa_offset as a floor at all,
+                        // which RFC 7862 15.11.3 requires of the reply.  With
+                        // it on the model cannot pin the offset to anything
+                        // narrower than the file.
+                        //
+                        // T_HOLE_TRACKING alone is the conformant case: a
+                        // backend with a real allocation map tracks whole
+                        // blocks, so it finds DATA earlier than the model's
+                        // byte-granular map does and a HOLE no later -- but
+                        // never before sa_offset, so the floor still checks.
                         val offOk =
                             if (not(a.caps.tolHoleTracking)) Set(off)
-                            else if (ar.whatData) ar.off.to(nd.sizeBlocks)
                             else if (hasDev(a.caps, "G4-seek-at-eof-not-nxio"))
                                 0.to(nd.sizeBlocks)
+                            else if (ar.whatData) ar.off.to(nd.sizeBlocks)
                             else ar.off.to(off)
                         emit(a, SSeek({ st: OK, eof: eof, offset: off,
                                         // A data search that finds only real
