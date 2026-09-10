@@ -22,7 +22,6 @@
   // evidence that the clause is ambiguous rather than that one server has a
   // bug.
   "deviations": [
-    "S4-no-wrong-type",
     "S4-compound-tag-unvalidated",
     "S4-change-is-coarse-ctime"
   ],

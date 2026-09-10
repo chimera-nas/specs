@@ -252,10 +252,6 @@ module nfs4ops {
         // attribute combination it cannot satisfy, and the wide GETATTR asks
         // for all of them.  See opGetattrWide.
         tolWideAttrRefusal: bool,
-        // TOLERANCE (not a deviation): RFC 7530 Table 7 lists NFS4ERR_SYMLINK
-        // and NFS4ERR_INVAL for READ/WRITE/COMMIT/LOCKT on a symbolic-link
-        // current filehandle.  See dataSymlinkAccept.
-        tolDataSymlinkStatus: bool
     }
 
     // Did the cell's config enable this deviation?
@@ -407,7 +403,7 @@ module nfs4ops {
         | SRename({ st: int, cinfoS: CInfo, cinfoT: CInfo,
                     stAccept: Set[int] })
         | SLink({ st: int, cinfo: CInfo, stAccept: Set[int] })
-        | SSetattr({ st: int })
+        | SSetattr({ st: int, stAccept: Set[int] })
         | SVerify({ st: int, stAccept: Set[int] })
         | SNverify({ st: int, stAccept: Set[int] })
         | SSetclientid({ st: int, client: ClientId, tok: int })
@@ -451,7 +447,8 @@ module nfs4ops {
         | SLockt({ st: int, deniedOwner: int, stAccept: Set[int] })
         | SLocku({ st: int, seq: int, stAccept: Set[int] })
         | SDelegreturn({ st: int })
-        | SLayoutget({ st: int, sid: Sid, seq: int, lo: int, hi: int })
+        | SLayoutget({ st: int, sid: Sid, seq: int, lo: int, hi: int,
+                       stAccept: Set[int] })
         | SLayoutreturn({ st: int, present: bool, seq: int })
         | SLayoutcommit({ st: int, newSizeBlocks: int })
         | SGetdeviceinfo({ st: int })
@@ -466,14 +463,14 @@ module nfs4ops {
         | SSeek({ st: int, eof: bool, offset: int,
                   stAccept: Set[int], offsetAccept: Set[int],
                   eofAccept: Set[bool] })
-        | SCopy({ st: int, copied: int })
+        | SCopy({ st: int, copied: int, stAccept: Set[int] })
         // blocks/isData describe the requested range block by block; a
         // server may legally return a shorter prefix (see opReadPlus).
         | SReadPlus({ st: int, eof: bool, count: int,
                       blocks: List[int], isData: List[bool] })
         | SIoAdvise({ st: int })
         | SWriteSame({ st: int, count: int })
-        | SClone({ st: int })
+        | SClone({ st: int, stAccept: Set[int] })
         | SGetxattr({ st: int, sym: int })
         | SSetxattr({ st: int })
         | SListxattrs({ st: int, names: Set[Name] })
@@ -696,14 +693,7 @@ module nfs4ops {
     // LOCKT, which answer the symlink arm exactly
     // (chimera_nfs4_data_nonreg_status), and true for ALLOCATE/DEALLOCATE/SEEK,
     // which do not.
-    pure def devCoarseType(a: Acc, st: int, coarsenSymlink: bool): int =
-        if (not(hasDev(a.caps, "D4-15-coarse-type-error"))) st
-        else if (st == E_WRONG_TYPE) E_INVAL
-        else if (st == E_SYMLINK and coarsenSymlink) E_INVAL
-        else st
 
-    pure def coarseHit(a: Acc, rfc: int, chimera: int): Acc =
-        if (rfc != chimera) hitDev(a, "D4-15-coarse-type-error") else a
 
     // S4-no-wrong-type: RFC 8881 introduced NFS4ERR_WRONG_TYPE as the more
     // specific successor of the 4.0-era type errors and made it a SHOULD --
@@ -731,13 +721,7 @@ module nfs4ops {
         if (a.caps.tolRenewLapsed) Set(E_EXPIRED, E_STALE_STATEID)
         else Set()
 
-    pure def noWT(a: Acc, st: int, v40: int): int =
-        if (st == E_WRONG_TYPE and hasDev(a.caps, "S4-no-wrong-type")) v40
-        else st
 
-    pure def noWTHit(a: Acc, st: int): Acc =
-        if (st == E_WRONG_TYPE and hasDev(a.caps, "S4-no-wrong-type"))
-            hitDev(a, "S4-no-wrong-type") else a
 
     // S4-change-is-coarse-ctime: both reference servers derive the change
     // attribute from the object's ctime in nanoseconds, and ctime moves at the
@@ -1524,34 +1508,28 @@ module nfs4ops {
     pure def opSetattr(a: Acc, ar: { mode: int, sizeBlocks: int,
                                      sel: SidSel }): Acc = {
         val g = fhGate(a)
-        if (g != OK) emit(a, SSetattr({ st: g }))
+        if (g != OK) emit(a, SSetattr({ st: g , stAccept: Set(g) }))
         else {
             val nd = cfhNode(a)
             if (ar.sizeBlocks >= 0 and nd.ftype != FReg) {
-                val rfcSt0 = if (nd.ftype == FDir and a.minor == 0) E_ISDIR
-                             else if (a.minor == 0) E_INVAL
-                             else E_WRONG_TYPE
-                // S4-no-wrong-type: the 4.0 answer, in every minor version.
-                val rfcSt = noWT(a, rfcSt0,
-                                 if (nd.ftype == FDir) E_ISDIR else E_INVAL)
-                // D4-15: chimera keeps the 4.0-style coarse pair in every
-                // minor version -- ISDIR for a directory, INVAL for anything
-                // else non-regular -- where 4.1+ says WRONG_TYPE.
-                val devSt = if (not(hasDev(a.caps, "D4-15-coarse-type-error")))
-                                rfcSt
-                            else if (nd.ftype == FDir) E_ISDIR
-                            else E_INVAL
-                emit(coarseHit(noWTHit(a, rfcSt0), rfcSt, devSt),
-                     SSetattr({ st: devSt }))
+                // RFC 8881 15.1.2.9 makes WRONG_TYPE the more specific
+                // successor of the 4.0-era answer, and a SHOULD -- so predict
+                // it and accept the older one (wrongTypeAccept).  A directory
+                // is ISDIR in every minor version.
+                val v40 = if (nd.ftype == FDir) E_ISDIR else E_INVAL
+                val st  = if (a.minor == 0 or nd.ftype == FDir) v40
+                          else E_WRONG_TYPE
+                emit(a, SSetattr({ st: st,
+                                   stAccept: wrongTypeAccept(st, v40) }))
             }
             else if (ar.sizeBlocks >= 0) {
                 val io = resolveSel(a, ar.sel)
                 match io {
-                    | IoError(e) => emit(a, SSetattr({ st: e }))
+                    | IoError(e) => emit(a, SSetattr({ st: e , stAccept: Set(e) }))
                     | IoAnon =>
                         if (anyDeny(a.sdb, a.cfh, 2))
                             emit(devLockedHit(a, E_LOCKED),
-                                 SSetattr({ st: devLocked(a, E_LOCKED) }))
+                                 SSetattr({ st: devLocked(a, E_LOCKED) , stAccept: Set(devLocked(a, E_LOCKED)) }))
                         else {
                             val fs1 = fsResize(a.fs, a.cfh, ar.sizeBlocks)
                             val fs2 = if (ar.mode >= 0) fsChmod(fs1, a.cfh, ar.mode)
@@ -1563,14 +1541,14 @@ module nfs4ops {
                             val sdbR = revokeLayoutsOn(a.sdb, a.cfh)
                             emit(a.with("fs", maybeReap(fs2, sdbR, a.cfh))
                                   .with("sdb", sdbR),
-                                 SSetattr({ st: OK }))
+                                 SSetattr({ st: OK , stAccept: Set(OK) }))
                         }
                     | IoBypass =>
                         // READ-bypass acts as anonymous outside READ
                         // (RFC 8881 8.2.3); deny check still applies.
                         if (anyDeny(a.sdb, a.cfh, 2))
                             emit(devLockedHit(a, E_LOCKED),
-                                 SSetattr({ st: devLocked(a, E_LOCKED) }))
+                                 SSetattr({ st: devLocked(a, E_LOCKED) , stAccept: Set(devLocked(a, E_LOCKED)) }))
                         else {
                             val fs1 = fsResize(a.fs, a.cfh, ar.sizeBlocks)
                             val fs2 = if (ar.mode >= 0) fsChmod(fs1, a.cfh, ar.mode)
@@ -1582,11 +1560,11 @@ module nfs4ops {
                             val sdbR = revokeLayoutsOn(a.sdb, a.cfh)
                             emit(a.with("fs", maybeReap(fs2, sdbR, a.cfh))
                                   .with("sdb", sdbR),
-                                 SSetattr({ st: OK }))
+                                 SSetattr({ st: OK , stAccept: Set(OK) }))
                         }
                     | IoState(s) =>
                         if (not(bitsOverlap(ioMode(a, io), 2)))
-                            emit(a, SSetattr({ st: E_OPENMODE }))
+                            emit(a, SSetattr({ st: E_OPENMODE , stAccept: Set(E_OPENMODE) }))
                         else {
                             val fs1 = fsResize(a.fs, a.cfh, ar.sizeBlocks)
                             val fs2 = if (ar.mode >= 0) fsChmod(fs1, a.cfh, ar.mode)
@@ -1598,13 +1576,13 @@ module nfs4ops {
                             val sdbR = revokeLayoutsOn(a.sdb, a.cfh)
                             emit(a.with("fs", maybeReap(fs2, sdbR, a.cfh))
                                   .with("sdb", sdbR),
-                                 SSetattr({ st: OK }))
+                                 SSetattr({ st: OK , stAccept: Set(OK) }))
                         }
                 }
             } else if (ar.mode >= 0)
                 emit(a.with("fs", fsChmod(a.fs, a.cfh, ar.mode)),
-                     SSetattr({ st: OK }))
-            else emit(a, SSetattr({ st: OK }))
+                     SSetattr({ st: OK , stAccept: Set(OK) }))
+            else emit(a, SSetattr({ st: OK , stAccept: Set(OK) }))
         }
     }
 
@@ -2020,10 +1998,12 @@ module nfs4ops {
                     val nd = cfhNode(a)
                     if (nd.ftype == FDir) base.with("st", E_ISDIR)
                     else if (nd.ftype == FLnk) base.with("st", E_SYMLINK)
-                    // S4-no-wrong-type: a 4.0 server answers SYMLINK for
-                    // every non-directory special OPEN target.
+                    // A 4.0 server answers SYMLINK for every non-directory
+                    // special OPEN target; 4.1+ prefers WRONG_TYPE and both
+                    // are conformant (the acceptance rides on the reply).
                     else if (nd.ftype != FReg)
-                        base.with("st", noWT(a, E_WRONG_TYPE, E_SYMLINK))
+                        base.with("st", if (a.minor == 0) E_SYMLINK
+                                        else E_WRONG_TYPE)
                     else base.with("file", a.cfh)
                 }
             | OCNull(n) => {
@@ -2049,8 +2029,7 @@ module nfs4ops {
                         if (childT == FDir) E_ISDIR
                         else if (childT == FLnk) E_SYMLINK
                         else if (childT != FReg)
-                            (if (a.minor == 0) E_SYMLINK
-                             else noWT(a, E_WRONG_TYPE, E_SYMLINK))
+                            (if (a.minor == 0) E_SYMLINK else E_WRONG_TYPE)
                         else OK
                     match how {
                         | HNoCreate =>
@@ -2457,6 +2436,41 @@ module nfs4ops {
     // symlink -> SYMLINK (acceptance: INVAL also conformant in 4.0, the
     // op text vs Table 7 disagree, R-CORE-91); other non-regular ->
     // 4.0 INVAL / 4.1+ WRONG_TYPE.
+    // The type error a non-regular object owes an operation that needs a
+    // regular file, and every answer conformant for it.
+    //
+    // UNCONDITIONAL, for the same reason as DIR_SYM_ACCEPT.  RFC 7530 Table 7
+    // lists NFS4ERR_SYMLINK *and* NFS4ERR_INVAL for READ/WRITE/COMMIT on a
+    // symbolic link (rfc-notes R-CORE-91/96/97), and RFC 8881 15.1.2.9 makes
+    // NFS4ERR_WRONG_TYPE the more specific successor of INVAL with R-ATTR-25
+    // marking the choice server-specific -- a SHOULD, not a MUST.  A directory
+    // is the one type the RFCs do pin, so ISDIR stays exact.
+    //
+    // Worth saying plainly: NOT ONE implementation this corpus is replayed
+    // against returns WRONG_TYPE.  chimera answers the 4.0-style pair
+    // (D4-15-coarse-type-error), and so do NFS-Ganesha and the Linux server
+    // (S4-no-wrong-type).  Three independent servers agreeing against the
+    // model is the model being wrong about which answer is required, not
+    // three servers being wrong -- so the specific answer is predicted, the
+    // older one accepted, and both deviations are gone.
+    // Mirrors dataTypeGate below, arm for arm.  A directory is the one type
+    // the RFCs pin (ISDIR); every other non-regular type has two conformant
+    // answers and this names both.
+    pure def dataTypeAccept(a: Acc): Set[int] = {
+        val t = cfhNode(a).ftype
+        if (t == FReg) Set(OK)
+        else if (t == FDir) Set(E_ISDIR)
+        else if (t == FLnk) Set(E_SYMLINK, E_INVAL)
+        else if (a.minor == 0) Set(E_INVAL)
+        else Set(E_WRONG_TYPE, E_INVAL)
+    }
+
+    // The same latitude where the 4.0-era answer is not INVAL: OPEN answers
+    // SYMLINK for every non-directory special target at 4.0, and SETATTR(size)
+    // answers ISDIR for a directory.  `alt` is that older answer.
+    pure def wrongTypeAccept(st: int, alt: int): Set[int] =
+        if (st == alt) Set(st) else Set(st, alt)
+
     pure def dataTypeGate(a: Acc): int = {
         val t = cfhNode(a).ftype
         if (t == FReg) OK
@@ -2464,38 +2478,9 @@ module nfs4ops {
         else if (t == FLnk) E_SYMLINK
         else if (a.minor == 0) E_INVAL
         // S4-no-wrong-type: the 4.0 answer, in every minor version.
-        else noWT(a, E_WRONG_TYPE, E_INVAL)
+        else E_WRONG_TYPE
     }
 
-    // The same gate as chimera answers it (D4-15), and the accumulator that
-    // records the divergence when there was one.
-    // T_DATA_SYMLINK_STATUS: RFC 7530 Table 7 lists NFS4ERR_SYMLINK *and*
-    // NFS4ERR_INVAL for READ / WRITE / COMMIT / LOCKT on a symbolic-link
-    // current filehandle (rfc-notes R-CORE-91/96/97), so either is
-    // conformant.  The model answers the specific SYMLINK; NFS-Ganesha
-    // answers the generic INVAL.  Deliberately not chimera's
-    // D4-15-coarse-type-error, which is a DIFFERENT mapping: that one also
-    // collapses SYMLINK on the size-setting operations, where V6.5 has not
-    // been measured.
-    pure def dataSymlinkAccept(a: Acc, st: int): Set[int] =
-        if (a.caps.tolDataSymlinkStatus and st == E_SYMLINK)
-            Set(E_SYMLINK, E_INVAL)
-        else Set(st)
-
-    pure def dataTypeGateDev(a: Acc, coarsenSymlink: bool): int =
-        devCoarseType(a, dataTypeGate(a), coarsenSymlink)
-
-    // The guard matters: a caller reaches this after a gate that may have
-    // failed on the FILEHANDLE rather than the type, and dataTypeGate reads
-    // the current inode.
-    pure def dataTypeAcc(a: Acc, coarsenSymlink: bool): Acc =
-        if (not(cfhLive(a))) a
-        else {
-            val t = cfhNode(a).ftype
-            val wt = t != FReg and t != FDir and t != FLnk and a.minor > 0
-            coarseHit(noWTHit(a, if (wt) E_WRONG_TYPE else OK),
-                      dataTypeGate(a), dataTypeGateDev(a, coarsenSymlink))
-        }
 
     pure def opRead(a: Acc, ar: { sel: SidSel, off: int, len: int }): Acc = {
         val nores = { st: OK, count: 0, eof: false, blocks: [],
@@ -2503,11 +2488,11 @@ module nfs4ops {
         val g = fhGate(a)
         if (g != OK) emit(a, SRead(nores.with("st", g)))
         else {
-            val tg = dataTypeGateDev(a, false)
+            val tg = dataTypeGate(a)
             if (tg != OK)
-                emit(dataTypeAcc(a, false),
+                emit(a,
                      SRead(nores.with("st", tg)
-                                .with("stAccept", dataSymlinkAccept(a, tg))))
+                                .with("stAccept", dataTypeAccept(a))))
             else {
                 val io = resolveSel(a, ar.sel)
                 match io {
@@ -2562,11 +2547,11 @@ module nfs4ops {
         val g = fhGate(a)
         if (g != OK) emit(a, SWrite(nores.with("st", g)))
         else {
-            val tg = dataTypeGateDev(a, false)
+            val tg = dataTypeGate(a)
             if (tg != OK)
-                emit(dataTypeAcc(a, false),
+                emit(a,
                      SWrite(nores.with("st", tg)
-                                 .with("stAccept", dataSymlinkAccept(a, tg))))
+                                 .with("stAccept", dataTypeAccept(a))))
             else {
                 val io = resolveSel(a, ar.sel)
                 match io {
@@ -2617,10 +2602,10 @@ module nfs4ops {
         val g = fhGate(a)
         if (g != OK) emit(a, SCommit({ st: g, stAccept: Set(g) }))
         else {
-            val tg = dataTypeGateDev(a, false)
+            val tg = dataTypeGate(a)
             if (tg != OK)
-                emit(dataTypeAcc(a, false),
-                     SCommit({ st: tg, stAccept: dataSymlinkAccept(a, tg) }))
+                emit(a,
+                     SCommit({ st: tg, stAccept: dataTypeAccept(a) }))
             else emit(a, SCommit({ st: OK, stAccept: Set(OK) }))
         }
     }
@@ -2736,11 +2721,11 @@ module nfs4ops {
             // not order the two.  opLock needs no twin gate: its target is
             // reached only through an open stateid, and openResolve admits
             // regular files only.
-            val tg = dataTypeGateDev(a, false)
+            val tg = dataTypeGate(a)
             if (tg != OK)
-emit(dataTypeAcc(a, false),
+emit(a,
                      SLockt({ st: tg, deniedOwner: -1,
-                              stAccept: dataSymlinkAccept(a, tg)
+                              stAccept: dataTypeAccept(a)
                                             .union(lapseAccept(a)) }))
             else if (lockConflict(a.sdb, ar.client, ar.lockOwner, a.cfh,
                                   ar.lo, ar.hi, ar.wr)) {
@@ -2824,16 +2809,18 @@ emit(dataTypeAcc(a, false),
 
     pure def opLayoutget(a: Acc, ar: { rw: bool, lo: int, hi: int,
                                        sel: SidSel }): Acc = {
-        val nores = { st: OK, sid: -1, seq: 0, lo: 0, hi: 0 }
+        val nores = { st: OK, sid: -1, seq: 0, lo: 0, hi: 0,
+                      stAccept: Set(OK) }
         if (a.minor < 1) emit(a, SLayoutget(nores.with("st", E_OP_ILLEGAL)))
         else if (not(a.caps.pnfs)) emit(a, SLayoutget(nores.with("st", E_NOTSUPP)))
         else {
             val g = fhGate(a)
             if (g != OK) emit(a, SLayoutget(nores.with("st", g)))
             else if (cfhNode(a).ftype != FReg)
-                emit(noWTHit(a, E_WRONG_TYPE),
-                     SLayoutget(nores.with("st",
-                                           noWT(a, E_WRONG_TYPE, E_INVAL))))
+                emit(a, SLayoutget(nores.with("st", E_WRONG_TYPE)
+                                        .with("stAccept",
+                                              wrongTypeAccept(E_WRONG_TYPE,
+                                                              E_INVAL))))
             else {
                 val io = resolveSel(a, ar.sel)
                 match io {
@@ -2855,7 +2842,8 @@ emit(dataTypeAcc(a, false),
                                             ar.rw)
                         emit(a.with("sdb", r.sdb2),
                              SLayoutget({ st: OK, sid: r.sid, seq: r.seq,
-                                          lo: ar.lo, hi: ar.hi }))
+                                          lo: ar.lo, hi: ar.hi,
+                                          stAccept: Set(OK) }))
                     }
                 }
             }
@@ -2956,7 +2944,7 @@ emit(dataTypeAcc(a, false),
         val g = fhGate(a)
         if (g != OK) g
         else {
-            val tg = dataTypeGateDev(a, true)
+            val tg = dataTypeGate(a)
             if (tg != OK) tg
             else {
                 val io = resolveSel(a, sel)
@@ -3012,7 +3000,7 @@ emit(dataTypeAcc(a, false),
         else if (not(a.caps.sparse)) emit(a, SAllocate({ st: E_NOTSUPP }))
         else {
             val g = io42Gate(a, ar.sel, true)
-            if (g != OK) emit(devLockedHit(dataTypeAcc(a, true), g),
+            if (g != OK) emit(devLockedHit(a, g),
                               SAllocate({ st: devLocked(a, g) }))
             else if (ar.len <= 0) emit(a, SAllocate({ st: E_INVAL }))
             else emit(a.with("fs", fsAllocate(a.fs, a.cfh, ar.off, ar.len)),
@@ -3024,7 +3012,7 @@ emit(dataTypeAcc(a, false),
         else if (not(a.caps.sparse)) emit(a, SDeallocate({ st: E_NOTSUPP }))
         else {
             val g = io42Gate(a, ar.sel, true)
-            if (g != OK) emit(devLockedHit(dataTypeAcc(a, true), g),
+            if (g != OK) emit(devLockedHit(a, g),
                               SDeallocate({ st: devLocked(a, g) }))
             else if (ar.len <= 0) emit(a, SDeallocate({ st: E_INVAL }))
             else emit(a.with("fs", fsDeallocate(a.fs, a.cfh, ar.off, ar.len)),
@@ -3070,7 +3058,7 @@ emit(dataTypeAcc(a, false),
         else {
             val g = io42Gate(a, ar.sel, false)
             if (g != OK)
-                emit(dataTypeAcc(a, true),
+                emit(a,
                      SSeek(nores.with("st", g).with("stAccept", Set(g))))
             else {
                 val nd = cfhNode(a)
@@ -3172,7 +3160,7 @@ emit(dataTypeAcc(a, false),
     // is why copyRange generates concrete open stateids only.
     pure def opCopy(a: Acc, ar: { srcSel: SidSel, dstSel: SidSel,
                                   srcOff: int, dstOff: int, cnt: int }): Acc = {
-        val nores = { st: OK, copied: 0 }
+        val nores = { st: OK, copied: 0, stAccept: Set(OK) }
         if (a.minor < 2) emit(a, SCopy(nores.with("st", E_OP_ILLEGAL)))
         else if (not(a.caps.copy)) emit(a, SCopy(nores.with("st", E_NOTSUPP)))
         else if (a.sfh == -1 or a.cfh == -1)
@@ -3184,12 +3172,14 @@ emit(dataTypeAcc(a, false),
         else {
             val src = fsGet(a.fs, a.sfh)
             val dst = fsGet(a.fs, a.cfh)
-            if (src.ftype != FReg or dst.ftype != FReg)
-                emit(noWTHit(a, if (src.ftype == FDir or dst.ftype == FDir) OK
-                                else E_WRONG_TYPE),
-                     SCopy(nores.with("st",
-                    if (src.ftype == FDir or dst.ftype == FDir) E_ISDIR
-                    else noWT(a, E_WRONG_TYPE, E_INVAL))))
+            if (src.ftype != FReg or dst.ftype != FReg) {
+                val isdir = src.ftype == FDir or dst.ftype == FDir
+                val st    = if (isdir) E_ISDIR else E_WRONG_TYPE
+                emit(a, SCopy(nores.with("st", st)
+                                   .with("stAccept",
+                                         wrongTypeAccept(st, if (isdir) E_ISDIR
+                                                             else E_INVAL))))
+            }
             else {
                 val cnt = if (ar.cnt == 0) imax(0, src.sizeBlocks - ar.srcOff)
                           else ar.cnt
@@ -3213,7 +3203,7 @@ emit(dataTypeAcc(a, false),
                     val w = range(0, cnt).foldl(a.fs, (acc, i) =>
                         fsWrite(acc, a.cfh, ar.dstOff + i, 1,
                                 data.syms[i]).fs2)
-                    emit(a.with("fs", w), SCopy({ st: OK, copied: cnt }))
+                    emit(a.with("fs", w), SCopy({ st: OK, copied: cnt, stAccept: Set(OK) }))
                 }
             }
         }
@@ -3314,28 +3304,31 @@ emit(dataTypeAcc(a, false),
     // overlapping ranges of one file is NFS4ERR_INVAL.
     pure def opClone(a: Acc, ar: { srcSel: SidSel, dstSel: SidSel,
                                    srcOff: int, dstOff: int, cnt: int }): Acc = {
-        if (a.minor < 2) emit(a, SClone({ st: E_OP_ILLEGAL }))
+        if (a.minor < 2) emit(a, SClone({ st: E_OP_ILLEGAL , stAccept: Set(E_OP_ILLEGAL) }))
         else if (a.sfh == -1 or a.cfh == -1)
-            emit(a, SClone({ st: E_NOFILEHANDLE }))
+            emit(a, SClone({ st: E_NOFILEHANDLE , stAccept: Set(E_NOFILEHANDLE) }))
         else if (not(fsLive(a.fs, a.sfh)) or not(fsLive(a.fs, a.cfh)))
-            emit(a, SClone({ st: E_STALE }))
+            emit(a, SClone({ st: E_STALE , stAccept: Set(E_STALE) }))
         else {
             // Both stateids are resolved before the operation is judged
             // unsupported, so a bad stateid outranks NFS4ERR_NOTSUPP.
             val sg = cloneSidGate(a, ar.srcSel, a.sfh)
             val dg = cloneSidGate(a, ar.dstSel, a.cfh)
-            if (sg != OK) emit(a, SClone({ st: sg }))
-            else if (dg != OK) emit(a, SClone({ st: dg }))
-            else if (not(a.caps.clone)) emit(a, SClone({ st: E_NOTSUPP }))
+            if (sg != OK) emit(a, SClone({ st: sg , stAccept: Set(sg) }))
+            else if (dg != OK) emit(a, SClone({ st: dg , stAccept: Set(dg) }))
+            else if (not(a.caps.clone)) emit(a, SClone({ st: E_NOTSUPP , stAccept: Set(E_NOTSUPP) }))
             else {
                 val src = fsGet(a.fs, a.sfh)
                 val dst = fsGet(a.fs, a.cfh)
-                if (src.ftype != FReg or dst.ftype != FReg)
-                    emit(noWTHit(a, if (src.ftype == FDir or dst.ftype == FDir)
-                                        OK else E_WRONG_TYPE),
-                         SClone({ st:
-                        if (src.ftype == FDir or dst.ftype == FDir) E_ISDIR
-                        else noWT(a, E_WRONG_TYPE, E_INVAL) }))
+                if (src.ftype != FReg or dst.ftype != FReg) {
+                    val isdir = src.ftype == FDir or dst.ftype == FDir
+                    val st    = if (isdir) E_ISDIR else E_WRONG_TYPE
+                    emit(a, SClone({ st: st,
+                                     stAccept:
+                                         wrongTypeAccept(st,
+                                                         if (isdir) E_ISDIR
+                                                         else E_INVAL) }))
+                }
                 else {
                     val cnt = if (ar.cnt == 0)
                                   imax(0, src.sizeBlocks - ar.srcOff)
@@ -3343,20 +3336,20 @@ emit(dataTypeAcc(a, false),
                     if (a.sfh == a.cfh and
                         ar.srcOff < ar.dstOff + cnt and
                         ar.dstOff < ar.srcOff + cnt)
-                        emit(a, SClone({ st: E_INVAL }))
+                        emit(a, SClone({ st: E_INVAL , stAccept: Set(E_INVAL) }))
                     else if (cnt == 0)
                         // Nothing to clone (count 0 with the source offset at
                         // or past EOF): success, no state change.
-                        emit(a, SClone({ st: OK }))
+                        emit(a, SClone({ st: OK , stAccept: Set(OK) }))
                     else if (ar.srcOff + cnt > src.sizeBlocks)
-                        emit(a, SClone({ st: E_INVAL }))
+                        emit(a, SClone({ st: E_INVAL , stAccept: Set(E_INVAL) }))
                     else
                         // Reflink: the destination takes the source's block
                         // CONTENT, so a hole in the source stays a hole.
                         emit(a.with("fs",
                                     fsCopyBlocks(a.fs, a.sfh, ar.srcOff,
                                                  a.cfh, ar.dstOff, cnt)),
-                             SClone({ st: OK }))
+                             SClone({ st: OK , stAccept: Set(OK) }))
                 }
             }
         }
@@ -3535,8 +3528,7 @@ emit(dataTypeAcc(a, false),
           devs: Set(), tolHoleTracking: false,
           tolXattrChange: false,
           tolRenewLapsed: false, tolRflagsConfirm: false,
-          tolLinkRefusal: false, tolWideAttrRefusal: false,
-          tolDataSymlinkStatus: false }
+          tolLinkRefusal: false, tolWideAttrRefusal: false }
 
     // Evaluate a whole COMPOUND.  reqTag identifies the request for the
     // 4.1 SEQUENCE replay/false-retry classification.

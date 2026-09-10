@@ -3,13 +3,6 @@
   "description": "The same Linux kernel server at plain NFSv4.0 -- SETCLIENTID/SETCLIENTID_CONFIRM, per-owner seqids and OPEN_CONFIRM carry the state machine. Mirrors chimera's nfs4_memfs40 cell.",
   "traceStem": "knfsd40",
 
-  // NFS4ERR_WRONG_TYPE does not exist at 4.0, so S4-no-wrong-type has nothing
-  // to rewrite.  What 4.0 adds instead is the open-owner sequence, which knfsd
-  // does not police, and RENEW, whose answer for a lapsed lease is the
-  // server's to time.
-  "deviationsOff": [
-    "S4-no-wrong-type"
-  ],
   "deviations": [
     "S4-owner-seqid-gap-unpoliced"
   ],

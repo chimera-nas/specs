@@ -40,8 +40,7 @@ module nfs4Test42 {
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
-        T_WIDE_ATTR_REFUSAL = false,
-        T_DATA_SYMLINK_STATUS = false
+        T_WIDE_ATTR_REFUSAL = false
     ).* from "./nfs4"
 
     def lastStatus: int =
@@ -92,7 +91,8 @@ module nfs4Test42 {
     def asLayoutget(r) =
         match r {
             | SLayoutget(x) => x
-            | _ => { st: -999, sid: -1, seq: 0, lo: -1, hi: -1 }
+            | _ => { st: -999, sid: -1, seq: 0, lo: -1, hi: -1,
+                     stAccept: Set() }
         }
 
     def asLayoutreturn(r) =
@@ -885,8 +885,7 @@ module nfs4Test40 {
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
         T_LINK_REFUSAL = false,
-        T_WIDE_ATTR_REFUSAL = false,
-        T_DATA_SYMLINK_STATUS = false
+        T_WIDE_ATTR_REFUSAL = false
     ).* from "./nfs4"
 
     def lastStatus: int =

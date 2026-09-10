@@ -126,10 +126,6 @@ module nfs4 {
     const T_WIDE_ATTR_REFUSAL: bool
 
 
-    // TOLERANCE: RFC 7530 Table 7 lists NFS4ERR_SYMLINK and NFS4ERR_INVAL for
-    // READ / WRITE / COMMIT / LOCKT on a symbolic-link current filehandle.
-    // See dataSymlinkAccept.
-    const T_DATA_SYMLINK_STATUS: bool
 
     // HAZARDS: input patterns the implementation under test cannot SURVIVE.
     //
@@ -293,8 +289,7 @@ module nfs4 {
             tolRenewLapsed: T_RENEW_LAPSED,
             tolRflagsConfirm: T_RFLAGS_CONFIRM and MINOR >= 1,
             tolLinkRefusal: T_LINK_REFUSAL,
-            tolWideAttrRefusal: T_WIDE_ATTR_REFUSAL,
-            tolDataSymlinkStatus: T_DATA_SYMLINK_STATUS
+            tolWideAttrRefusal: T_WIDE_ATTR_REFUSAL
         }
         all {
             // ref: in-memory share roots are 0777; the root mode is not

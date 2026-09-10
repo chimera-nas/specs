@@ -17,7 +17,6 @@
   },
 
   "deviations": [
-    "S4-no-wrong-type",
     "S4-compound-tag-unvalidated",
     "S4-change-is-coarse-ctime",
     "K4-exclusive-create-mode-zero"

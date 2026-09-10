@@ -23,7 +23,6 @@
     // measured with tools/devliveness.py: this flavour never sends a
     // compound this server would refuse on its shape.
     "G4-compound-shape-no-result",
-    "S4-no-wrong-type",
     "G4-compound-tag-length-limit",
     "G4-verify-wide-trivial-match",
     "G4-setattr-share-denied",

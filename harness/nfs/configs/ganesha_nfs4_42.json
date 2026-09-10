@@ -38,7 +38,6 @@
   // cell instead.
   "deviations": [
     "G4-compound-shape-no-result",
-    "S4-no-wrong-type",
     "S4-change-is-coarse-ctime",
     "G4-open-type-before-exist",
     "G4-verify-wide-trivial-match",
@@ -70,8 +69,7 @@
     "holeTracking": true,
     "rflagsConfirm": true,
     "linkRefusal": true,
-    "wideAttrRefusal": true,
-    "dataSymlinkStatus": true
+    "wideAttrRefusal": true
   },
 
   "policies": {
