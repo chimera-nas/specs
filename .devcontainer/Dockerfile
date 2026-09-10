@@ -95,6 +95,22 @@ RUN apt-get -y update && \
         qemu-system-x86 qemu-utils && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# Ubuntu's debug-symbol archive, configured but NOT installed from.  The
+# nfs-ganesha package is stripped, so a core dump from a crashing server
+# resolves every frame inside it to `??`; harness/nfs/run_nfs_mbt.sh pulls
+# nfs-ganesha-dbgsym on demand, in the post-mortem path only, and that needs
+# the source list and keyring to be here already.  Configuring the archive
+# costs a few kilobytes; installing the symbols would cost tens of megabytes
+# on every image, for a case that arises only when a server dies.
+RUN apt-get -y update && \
+    apt-get -y --no-install-recommends install ubuntu-dbgsym-keyring && \
+    . /etc/os-release && \
+    printf 'deb http://ddebs.ubuntu.com %s main restricted universe multiverse\n\
+deb http://ddebs.ubuntu.com %s-updates main restricted universe multiverse\n' \
+        "$VERSION_CODENAME" "$VERSION_CODENAME" \
+        > /etc/apt/sources.list.d/ddebs.list && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
 # The replay harness speaks SMB2 through `smbprotocol`, a pure-Python SMB2/3
 # client.  It is used at its RAW layer -- the harness hand-builds each
 # SMB2CreateRequest / SMB2SetInfoRequest / ... and reads the reply status

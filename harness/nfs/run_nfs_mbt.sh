@@ -369,7 +369,12 @@ ganesha_start() {
     rm -f "$GANESHA_LOG"
     # -F foreground, -x fatal on config errors, -p a pidfile of our own so
     # concurrent instances never fight over /var/run/ganesha.
-    run_in_server_ns setsid "$GANESHA" -F -x -f "$GANESHA_CONF" -L "$GANESHA_LOG" \
+    # -L: the log FILE is buffered, and a segfault takes the buffer with it --
+    # which is exactly the run whose last lines matter.  GANESHA_LOG_DEST lets
+    # the post-mortem replay say STDERR instead, where glibc leaves the stream
+    # unbuffered and the shell redirect below catches every line.
+    run_in_server_ns setsid "$GANESHA" -F -x -f "$GANESHA_CONF" \
+        -L "${GANESHA_LOG_DEST:-$GANESHA_LOG}" \
         -N "NIV_${LOGLEVEL}" -p "$GANESHA_PID_FILE" \
         > "$GANESHA_OUT" 2>&1 &
     SERVER_PID=$!
@@ -695,20 +700,40 @@ post_mortem() {
              "log only (no backtrace)"
     fi
     LOGLEVEL=DEBUG
+    GANESHA_LOG_DEST=STDERR
     if ganesha_start; then
         # shellcheck disable=SC2046  # replay_args intentionally word-splits
         run_in_ns timeout "$TIMEOUT" python3 "$REPLAYER" "${BASE_ARGS[@]}" \
             $(replay_args) --owner-epoch "${EPOCH}-pm" --trace "$t" || true
     fi
-    echo "=== ganesha NIV_DEBUG log (last 200 lines) ==="
-    tail -200 "$GANESHA_LOG" 2>/dev/null || true
+    echo "=== ganesha NIV_DEBUG log (last 200 lines, unbuffered) ==="
+    tail -200 "$GANESHA_OUT" 2>/dev/null || true
+    # The distribution package is stripped, so every frame inside ganesha
+    # resolves to ?? until the -dbgsym package is present.  Fetch it HERE
+    # rather than baking it into the image: it is tens of megabytes that only
+    # a crashing run ever needs, and a crashing run is rare enough to pay a
+    # download for.  Failure is not fatal -- an unsymbolised backtrace still
+    # says which library and which thread.
+    if ls "$CORE_DIR"/core.* >/dev/null 2>&1 && command -v gdb >/dev/null 2>&1
+    then
+        echo "=== fetching ganesha debug symbols ==="
+        apt-get update -qq >/dev/null 2>&1 || true
+        apt-get install -y --no-install-recommends -qq \
+            nfs-ganesha-dbgsym libntirpc-dbgsym >/dev/null 2>&1 \
+            || echo "post-mortem: no -dbgsym packages available; " \
+                    "frames inside ganesha will read ??"
+    fi
     for c in "$CORE_DIR"/core.*; do
         [ -e "$c" ] || continue
         echo "=== backtrace from $(basename "$c") ==="
         if command -v gdb >/dev/null 2>&1; then
-            gdb -batch -n \
-                -ex "thread apply all bt" \
-                "$GANESHA" "$c" 2>&1 | tail -120
+            # `bt` alone is the CRASHING thread, and it is the one that
+            # matters -- print it first and unabridged, because
+            # `thread apply all bt` puts it last and a tail can lose it.
+            gdb -batch -n -ex "bt full" "$GANESHA" "$c" 2>&1 | head -60
+            echo "--- all threads ---"
+            gdb -batch -n -ex "thread apply all bt" "$GANESHA" "$c" 2>&1 \
+                | head -150
         else
             echo "post-mortem: gdb is not installed; core kept at $c"
         fi
@@ -716,7 +741,10 @@ post_mortem() {
     [ -n "$prev_pattern" ] && \
         printf '%s\n' "$prev_pattern" > /proc/sys/kernel/core_pattern 2>/dev/null || true
     LOGLEVEL=$prev_level
-    SERVER_PID=""
+    GANESHA_LOG_DEST=""
+    # stop_server, not SERVER_PID="": the post-mortem replay may have left a
+    # server alive (a crash that does not reproduce is itself worth knowing,
+    # and the process must not outlive the trace either way).
     stop_server
 }
 
