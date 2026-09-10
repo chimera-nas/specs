@@ -668,6 +668,58 @@ replay_args() {
     esac
 }
 
+# The server died.  Replay the SAME trace once more with its log turned up and
+# cores enabled, so the run that found a crash also explains it -- a crash is
+# rare enough, and reproducible enough when it happens, that paying one extra
+# replay for a backtrace is cheaper than asking someone to reproduce it later
+# with different flags.  Nothing here can change the verdict: the trace has
+# already been counted as a failure.
+#
+# core_pattern is a HOST-wide sysctl, not a namespaced one, so this only works
+# in a privileged container and only politely: the previous value is put back
+# afterwards.  Where it is not writable the DEBUG log alone still narrows the
+# crash to an operation.
+post_mortem() {
+    local t=$1 prev_level=$LOGLEVEL prev_pattern="" c
+    [ "${SPECS_NFS_POSTMORTEM:-1}" = "1" ] || return 0
+    [ "$SERVER" = "ganesha" ] || return 0
+    echo "=== post-mortem: replaying $(basename "$t") at NIV_DEBUG ==="
+    CORE_DIR="${SESSION_DIR}/cores"
+    mkdir -p "$CORE_DIR"
+    ulimit -c unlimited 2>/dev/null || true
+    if [ -w /proc/sys/kernel/core_pattern ]; then
+        prev_pattern=$(cat /proc/sys/kernel/core_pattern 2>/dev/null || true)
+        echo "${CORE_DIR}/core.%e.%p" > /proc/sys/kernel/core_pattern 2>/dev/null || true
+    else
+        echo "post-mortem: /proc/sys/kernel/core_pattern is not writable; " \
+             "log only (no backtrace)"
+    fi
+    LOGLEVEL=DEBUG
+    if ganesha_start; then
+        # shellcheck disable=SC2046  # replay_args intentionally word-splits
+        run_in_ns timeout "$TIMEOUT" python3 "$REPLAYER" "${BASE_ARGS[@]}" \
+            $(replay_args) --owner-epoch "${EPOCH}-pm" --trace "$t" || true
+    fi
+    echo "=== ganesha NIV_DEBUG log (last 200 lines) ==="
+    tail -200 "$GANESHA_LOG" 2>/dev/null || true
+    for c in "$CORE_DIR"/core.*; do
+        [ -e "$c" ] || continue
+        echo "=== backtrace from $(basename "$c") ==="
+        if command -v gdb >/dev/null 2>&1; then
+            gdb -batch -n \
+                -ex "thread apply all bt" \
+                "$GANESHA" "$c" 2>&1 | tail -120
+        else
+            echo "post-mortem: gdb is not installed; core kept at $c"
+        fi
+    done
+    [ -n "$prev_pattern" ] && \
+        printf '%s\n' "$prev_pattern" > /proc/sys/kernel/core_pattern 2>/dev/null || true
+    LOGLEVEL=$prev_level
+    SERVER_PID=""
+    stop_server
+}
+
 n_ok=0; n_skip=0; n_fail=0; n_other=0
 EPOCH="$$-$(date +%s)"
 for t in "${TRACES[@]}"; do
@@ -702,6 +754,7 @@ for t in "${TRACES[@]}"; do
         tail -60 "$GANESHA_LOG" 2>/dev/null || true
         SERVER_PID=""
         [ "$rc" = "0" ] && { n_ok=$((n_ok - 1)); n_fail=$((n_fail + 1)); }
+        post_mortem "$t"
     fi
     stop_server
 done

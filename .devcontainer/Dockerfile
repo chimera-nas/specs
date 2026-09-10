@@ -78,11 +78,16 @@ RUN if [ -n "$APT_MIRROR" ]; then \
 #                           a matching host, so the knfsd tests run on amd64.
 # python3-pip            -- the replay harness's SMB2 client (see below)
 # reuse                  -- the SPDX lint this repo's CI enforces
+# gdb                    -- only ever used post mortem: when a server under
+#                           test DIES, harness/nfs/run_nfs_mbt.sh replays the
+#                           trace once more with cores enabled and prints a
+#                           backtrace, so the run that found the crash is also
+#                           the run that explains it
 RUN apt-get -y update && \
     apt-get -y --no-install-recommends upgrade && \
     apt-get -y --no-install-recommends install apt-utils && \
     apt-get -y --no-install-recommends install \
-        cmake ninja-build make git curl ca-certificates less vim psmisc jq \
+        cmake ninja-build make git curl ca-certificates less vim psmisc jq gdb \
         python3 python3-pip python3-venv nodejs npm reuse \
         iproute2 net-tools tshark tcpdump procps \
         samba smbclient samba-common-bin libsmbclient \
