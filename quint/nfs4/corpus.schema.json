@@ -62,6 +62,16 @@
         "K4-exclusive-create-mode-zero": "RFC 7530 16.16.5 (OPEN with EXCLUSIVE4 carries a verifier INSTEAD of create attributes, and the client is told to follow with a SETATTR).  The model gives an exclusively-created file the mode the walk asked for (0600), which is what chimera and NFS-Ganesha report; the Linux server creates it mode 0 and leaves it there until the SETATTR arrives.  Field-only, and nothing in the model consults a regular file's mode, so nothing downstream parts.  The NFSv3 analogue is K3-exclusive-mode-zero in quint/nfs3, recorded against the same server for the same reason."
       }
     },
+    "HAZARDS": {
+      "kind": "hazard",
+      "key": "hazards",
+      "type": "devset",
+      "default": [],
+      "doc": "Input patterns the implementation under test cannot SURVIVE.  The fifth knob kind, and the only one that changes what the corpus CONTAINS rather than what it predicts: a feature says what the server offers, a policy which of several legal behaviours it chose, a tolerance which answers are all conformant, a deviation what it does wrong -- and every one of those still produces a reply the model can state.  A hazard is the case where there is no reply to state, because the server dies; the only thing a model can do with that is not send the pattern.  Gated by tools/devliveness.py exactly like DEVS, so a hazard the corpus never reaches is DEAD and fails the build rather than quietly narrowing the corpus forever, and CLEARED IN THE STRICT TWIN exactly like DEVS, so the extended tier goes on generating the pattern and the crash stays measured while the gating tier steers around it.",
+      "known": {
+        "G4-close-after-io-advise-segv": "NFS-Ganesha V6.5 (FSAL_VFS, NFSv4.2) takes a SIGSEGV in the NFSv4 CLOSE handler when the open stateid being closed has previously been named by an IO_ADVISE.  RFC 7862 15.5 makes IO_ADVISE a hint that changes no state and is permitted against an open stateid, and RFC 8881 18.2 makes CLOSE of that stateid unconditional, so nothing about the sequence is irregular.  Measured on two independent traces of the stepData42 flavour: ganesha42_stepData42_80_0x7_2 (IO_ADVISE, then a WRITE refused NFS4ERR_OPENMODE, then CLOSE) and _0x7_6 (IO_ADVISE, then READ, then CLOSE) -- the refused WRITE is NOT part of the trigger, which three traces that do refused-WRITE-then-CLOSE and replay clean confirm.  The last lines the server logs are `process_one_op: Request N: opcode 4 is OP_CLOSE` and `nfs4_op_close: Entering NFS v4 CLOSE handler`, and the fault is one frame below nfs4_op_close, on an ntirpc worker.  Deterministic: same compound, every run, and it still reproduces under NIV_DEBUG at a tenth the speed, so it is not a race.  The fence suppresses CLOSE of an advised stateid; the open simply outlives the trace, and every other CLOSE path stays exercised."
+      }
+    },
     "T_HOLE_TRACKING": {
       "kind": "tolerance",
       "key": "tolerances.holeTracking",

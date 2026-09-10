@@ -8,6 +8,12 @@
     "writeDelegation": "supported"
   },
 
+  // measured with tools/devliveness.py: this flavour never aims an IO_ADVISE
+  // at an open stateid, so the hazard its parent fences is unreachable here.
+  "hazardsOff": [
+    "G4-close-after-io-advise-segv"
+  ],
+
   // A delegation-only corpus reaches almost none of the parent's divergences,
   // and an enabled-but-unexercised deviation fails tools/devliveness.py.
   "deviationsOff": [

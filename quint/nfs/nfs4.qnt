@@ -141,6 +141,26 @@ module nfs4 {
     // See dataSymlinkAccept.
     const T_DATA_SYMLINK_STATUS: bool
 
+    // HAZARDS: input patterns the implementation under test cannot SURVIVE.
+    //
+    // The fifth knob kind, and the only one that changes what the corpus
+    // CONTAINS rather than what it predicts.  A feature says what the server
+    // offers, a policy which legal behaviour it chose, a tolerance which
+    // answers are all conformant, a deviation what it does wrong -- and every
+    // one of those still produces a reply the model can state.  A hazard is
+    // the case where there is no reply to state because the server dies, so
+    // the only thing the model can do is not send the pattern.
+    //
+    // Declared, cited and measured in the family schema like any other id,
+    // gated by tools/devliveness.py like any other id -- a hazard the corpus
+    // never reaches is DEAD and fails the build, so it cannot outlive the fix
+    // upstream.  And CLEARED IN THE STRICT TWIN, like DEVS: the extended tier
+    // goes on generating the pattern, so the crash stays measured even while
+    // the gating tier steers around it.
+    const HAZARDS: Set[str]
+
+    pure def haz(id: str): bool = HAZARDS.contains(id)
+
     // ------------------------------------------------------------------
     // Bounded universes
     // ------------------------------------------------------------------
@@ -234,6 +254,12 @@ module nfs4 {
     // divergence somewhere else.
     var devHits: Set[str]
 
+    // Open stateids an IO_ADVISE has been sent against.  Generation-side
+    // bookkeeping for the G4-close-after-io-advise-segv hazard and nothing
+    // else: the protocol model has no reason to care, so this stays out of
+    // StateDB.
+    var advisedOpens: Set[Sid]
+
     action init = {
         nondet cPnfs = oneOf(capChoices(F_PNFS))
         nondet cRd = oneOf(capChoices(F_READ_DELEG))
@@ -296,6 +322,7 @@ module nfs4 {
             // feature is FeatMandatory -- then mismatch is a failure).
             lastOp' = LInit({ minor: MINOR, caps: c }),
             devHits' = Set(),
+            advisedOpens' = Set(),
         }
     }
 
@@ -304,6 +331,33 @@ module nfs4 {
     // ------------------------------------------------------------------
 
     // The one transition shape: evaluate a compound, record the label.
+    // The open stateids a compound aimed an IO_ADVISE at.  Only KOpen counts:
+    // an anonymous IO_ADVISE names no state and cannot be the one the CLOSE
+    // later trips over.
+    pure def advisedIn(ops: List[OpReq]): Set[Sid] =
+        ops.foldl(Set(), (acc, o) =>
+            match o {
+                | RIoAdvise(x) =>
+                    match x.sel {
+                        | SelRef(r) => if (r.kind == KOpen) acc.union(Set(r.sid))
+                                       else acc
+                        | _ => acc
+                    }
+                | _ => acc
+            })
+
+    // G4-close-after-io-advise-segv: an open stateid this trace has already
+    // aimed an IO_ADVISE at must not be CLOSEd -- see the hazard's entry in
+    // the schema.  Recorded as a hit whenever the state the fence exists for
+    // has actually been reached, so devliveness can tell a live fence from one
+    // whose bug was fixed upstream.
+    def fencedOpens: Set[Sid] =
+        if (haz("G4-close-after-io-advise-segv")) advisedOpens else Set()
+
+    def fenceHit: Set[str] =
+        if (fencedOpens.intersect(usableOpens).size() > 0)
+            Set("G4-close-after-io-advise-segv") else Set()
+
     action runC(ops: List[OpReq]): bool = {
         val out = evalCompound(fs, sdb, MINOR, caps, tag, ops)
         all {
@@ -315,7 +369,8 @@ module nfs4 {
             lastOp' = LCompound({ tag: tag, tagName: "", ops: ops,
                                   status: out.status,
                                   results: out.results }),
-            devHits' = out.devHits,
+            devHits' = out.devHits.union(fenceHit),
+            advisedOpens' = advisedOpens.union(advisedIn(ops)),
         }
     }
 
@@ -378,7 +433,8 @@ module nfs4 {
                 prev' = { valid: false, tag: 0, ops: [] },
                 lastOp' = LCompound({ tag: tag, tagName: t, ops: ops,
                                       status: E_INVAL, results: [] }),
-                devHits' = tagDevs(t),
+                devHits' = tagDevs(t).union(fenceHit),
+                advisedOpens' = advisedOpens.union(advisedIn(ops)),
             }
         else {
             val out = evalCompound(fs, sdb, MINOR, caps, tag, ops)
@@ -391,7 +447,8 @@ module nfs4 {
                 lastOp' = LCompound({ tag: tag, tagName: t, ops: ops,
                                       status: out.status,
                                       results: out.results }),
-                devHits' = out.devHits.union(tagDevs(t)),
+                devHits' = out.devHits.union(tagDevs(t)).union(fenceHit),
+                advisedOpens' = advisedOpens.union(advisedIn(ops)),
             }
         }
 
@@ -427,7 +484,10 @@ module nfs4 {
                                       ops: prev.ops,
                                       status: out.status,
                                       results: out.results }),
-                devHits' = out.devHits,
+                devHits' = out.devHits.union(fenceHit),
+                // A retransmission replays prev.ops; anything it advised was
+                // advised the first time round.
+                advisedOpens' = advisedOpens,
             }
         },
     }
@@ -1271,9 +1331,9 @@ module nfs4 {
 
     action closeOpen = all {
         genReady,
-        usableOpens.size() > 0,
+        usableOpens.exclude(fencedOpens).size() > 0,
         {
-            nondet s = oneOf(usableOpens)
+            nondet s = oneOf(usableOpens.exclude(fencedOpens))
             val o = sdb.opens.get(s)
             nondet exact = oneOf(Set(false, true))
             runC(withSess(o.client,

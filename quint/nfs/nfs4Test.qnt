@@ -34,6 +34,7 @@ module nfs4Test42 {
         // enabled and no tolerance relaxed, so a model branch that only a
         // deviating implementation takes can never shape what they check.
         DEVS = Set(),
+        HAZARDS = Set(),
         T_HOLE_TRACKING = false,
         T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
@@ -880,6 +881,7 @@ module nfs4Test40 {
         // enabled and no tolerance relaxed, so a model branch that only a
         // deviating implementation takes can never shape what they check.
         DEVS = Set(),
+        HAZARDS = Set(),
         T_HOLE_TRACKING = false,
         T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,

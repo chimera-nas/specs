@@ -3088,17 +3088,37 @@ emit(dataTypeAcc(a, false),
                 else {
                     val r = fsSeek(nd, ar.off, ar.whatData)
                     if (ar.whatData and not(r.found))
-                        // No data between the offset and EOF.
-                        emit(a, SSeek(seekExact(E_NXIO, false, 0)))
+                        // No data between the offset and EOF -- as the MODEL's
+                        // byte-granular map sees it.  A backend with a real
+                        // allocation map tracks whole blocks, so a range the
+                        // model calls a hole can be allocated there and SEEK
+                        // answers OK.  The OK branch below already accepts
+                        // NXIO; this is the same latitude read the other way,
+                        // and leaving it off was an asymmetry, not a check.
+                        if (a.caps.tolHoleTracking)
+                            emit(a, SSeek({ st: E_NXIO, eof: false, offset: 0,
+                                            stAccept: Set(E_NXIO, OK),
+                                            offsetAccept: 0.to(nd.sizeBlocks),
+                                            eofAccept: Set(false, true) }))
+                        else emit(a, SSeek(seekExact(E_NXIO, false, 0)))
                     else {
                         val off = r.offset
                         val eof = off >= nd.sizeBlocks
                         // Which offsets a hole-tracking backend may answer
                         // instead: a hole no later than the model's, or data
                         // no earlier than it.
+                        // Which offsets a hole-tracking backend may answer
+                        // instead.  For SEEK_DATA the range starts at the
+                        // QUERIED offset, not at the model's answer: block
+                        // granularity means a one-byte write allocates a whole
+                        // block, so the backend legitimately finds data
+                        // EARLIER than the model's byte-granular map does.
+                        // (Measured: the model answered block 2 where V6.5 on
+                        // ext4 answered 0.)  For SEEK_HOLE the model's answer
+                        // is the late bound, as before.
                         val offOk =
                             if (not(a.caps.tolHoleTracking)) Set(off)
-                            else if (ar.whatData) off.to(nd.sizeBlocks)
+                            else if (ar.whatData) ar.off.to(nd.sizeBlocks)
                             else ar.off.to(off)
                         emit(a, SSeek({ st: OK, eof: eof, offset: off,
                                         // A data search that finds only real
@@ -3241,10 +3261,16 @@ emit(dataTypeAcc(a, false),
                                        pat: int, blocknum: bool }): Acc = {
         val nores = { st: OK, count: 0 }
         if (a.minor < 2) emit(a, SWriteSame(nores.with("st", E_OP_ILLEGAL)))
-        else if (ar.blocknum)
-            emit(a, SWriteSame(nores.with("st", E_UNION_NOTSUPP)))
+        // The capability check comes FIRST: RFC 7862 15.13.3 makes
+        // NFS4ERR_UNION_NOTSUPP the answer for a block-number ADB, but a
+        // server that does not implement WRITE_SAME at all refuses the
+        // OPERATION -- NFS4ERR_NOTSUPP -- whatever the argument says, and
+        // V6.5 does exactly that.  The other order had the model predict
+        // UNION_NOTSUPP from a server that has no WRITE_SAME to union over.
         else if (not(a.caps.writeSame))
             emit(a, SWriteSame(nores.with("st", E_NOTSUPP)))
+        else if (ar.blocknum)
+            emit(a, SWriteSame(nores.with("st", E_UNION_NOTSUPP)))
         else {
             val g = io42Gate(a, ar.sel, true)
             if (g != OK) emit(a, SWriteSame(nores.with("st", g)))

@@ -7,6 +7,12 @@
     "pnfs": "supported"
   },
 
+  // measured with tools/devliveness.py: this flavour never aims an IO_ADVISE
+  // at an open stateid, so the hazard its parent fences is unreachable here.
+  "hazardsOff": [
+    "G4-close-after-io-advise-segv"
+  ],
+
   // The stepPnfs and stepData flavors never send a tagged compound, never
   // GETATTR the wide bitmap and never VERIFY it, so most of the parent's
   // divergences are unreachable here.

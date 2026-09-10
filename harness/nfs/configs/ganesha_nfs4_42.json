@@ -6,7 +6,7 @@
   // xattr, readPlus and writeSame were asserted here because this cell mirrors
   // chimera's nfs4_memfs42 -- but a feature knob describes the SERVER, not the
   // cell it is modelled on, and V6.5 answers NFS4ERR_NOTSUPP (10004) to
-  // GETXATTR, SETXATTR, LISTXATTRS, READ_PLUS and WRITE_SAME.  Measured: ten
+  // GETXATTR, SETXATTR, LISTXATTRS, READ_PLUS, WRITE_SAME and CLONE.  Measured: ten
   // traces of this cell were being SKIPped on a capability mismatch rather
   // than replayed, which is the coverage this suite exists to have.
   //
@@ -24,7 +24,7 @@
     "readPlus": "unsupported",
     "ioAdvise": "supported",
     "writeSame": "unsupported",
-    "clone": "supported"
+    "clone": "unsupported"
   },
 
   // Every id is declared, with its citation and the registry entry it
@@ -59,6 +59,13 @@
   // two are siblings so that a 4.2 knob is never inherited into a profile
   // that cannot reach it.  Both are the same server, so both say the same
   // thing; see ganesha_nfs4_41.json for what they replace.
+  // A pattern this ganesha cannot SURVIVE, so the corpus does not send it --
+  // see the hazard's entry in the schema for the measurement.  The strict
+  // twin clears it, which is where the crash goes on being demonstrated.
+  "hazards": [
+    "G4-close-after-io-advise-segv"
+  ],
+
   "tolerances": {
     "holeTracking": true,
     "rflagsConfirm": true,

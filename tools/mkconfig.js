@@ -127,12 +127,17 @@ function mergeConfig(parent, child) {
   }
   // Deviations are a set: a child may add with "deviations" or subtract with
   // "deviationsOff", which is what lets a fixed-in-one-backend deviation be
-  // retired for that cell alone.
-  const base = new Set(parent.deviations || [])
-  for (const d of child.deviations || []) base.add(d)
-  for (const d of child.deviationsOff || []) base.delete(d)
-  out.deviations = [...base].sort()
-  delete out.deviationsOff
+  // retired for that cell alone.  Hazards merge by the same rule and for the
+  // same reason -- a flavour that cannot REACH the pattern a hazard fences
+  // must be able to say so, or devliveness calls the hazard dead.
+  for (const [add, sub, key] of [['deviations', 'deviationsOff', 'deviations'],
+                                 ['hazards', 'hazardsOff', 'hazards']]) {
+    const base = new Set(parent[add] || [])
+    for (const d of child[add] || []) base.add(d)
+    for (const d of child[sub] || []) base.delete(d)
+    out[key] = [...base].sort()
+    delete out[sub]
+  }
   return out
 }
 

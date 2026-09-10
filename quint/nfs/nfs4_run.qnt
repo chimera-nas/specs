@@ -36,6 +36,7 @@ module nfs4Default {
         // modules tools/mkconfig.js renders out of chimera's configs, which
         // is where a deviation is switched on.
         DEVS = Set(),
+        HAZARDS = Set(),
         T_HOLE_TRACKING = false,
         T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
@@ -71,6 +72,7 @@ module nfs4V40 {
         // modules tools/mkconfig.js renders out of chimera's configs, which
         // is where a deviation is switched on.
         DEVS = Set(),
+        HAZARDS = Set(),
         T_HOLE_TRACKING = false,
         T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
@@ -106,6 +108,7 @@ module nfs4V41 {
         // modules tools/mkconfig.js renders out of chimera's configs, which
         // is where a deviation is switched on.
         DEVS = Set(),
+        HAZARDS = Set(),
         T_HOLE_TRACKING = false,
         T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
@@ -163,6 +166,7 @@ module nfs4Memfs42 {
         // modules tools/mkconfig.js renders out of chimera's configs, which
         // is where a deviation is switched on.
         DEVS = Set(),
+        HAZARDS = Set(),
         T_HOLE_TRACKING = false,
         T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
@@ -202,6 +206,7 @@ module nfs4Memfs42Deleg {
         // modules tools/mkconfig.js renders out of chimera's configs, which
         // is where a deviation is switched on.
         DEVS = Set(),
+        HAZARDS = Set(),
         T_HOLE_TRACKING = false,
         T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
@@ -236,6 +241,7 @@ module nfs4Memfs41Deleg {
         // modules tools/mkconfig.js renders out of chimera's configs, which
         // is where a deviation is switched on.
         DEVS = Set(),
+        HAZARDS = Set(),
         T_HOLE_TRACKING = false,
         T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
@@ -270,6 +276,7 @@ module nfs4Memfs41 {
         // modules tools/mkconfig.js renders out of chimera's configs, which
         // is where a deviation is switched on.
         DEVS = Set(),
+        HAZARDS = Set(),
         T_HOLE_TRACKING = false,
         T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
@@ -304,6 +311,7 @@ module nfs4Memfs40 {
         // modules tools/mkconfig.js renders out of chimera's configs, which
         // is where a deviation is switched on.
         DEVS = Set(),
+        HAZARDS = Set(),
         T_HOLE_TRACKING = false,
         T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
@@ -343,6 +351,7 @@ module nfs4Pnfs42 {
         // modules tools/mkconfig.js renders out of chimera's configs, which
         // is where a deviation is switched on.
         DEVS = Set(),
+        HAZARDS = Set(),
         T_HOLE_TRACKING = false,
         T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
@@ -377,6 +386,7 @@ module nfs4Pnfs41 {
         // modules tools/mkconfig.js renders out of chimera's configs, which
         // is where a deviation is switched on.
         DEVS = Set(),
+        HAZARDS = Set(),
         T_HOLE_TRACKING = false,
         T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
@@ -413,6 +423,7 @@ module nfs4PnfsMandatory {
         // modules tools/mkconfig.js renders out of chimera's configs, which
         // is where a deviation is switched on.
         DEVS = Set(),
+        HAZARDS = Set(),
         T_HOLE_TRACKING = false,
         T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,
@@ -450,6 +461,7 @@ module nfs4AllMandatory {
         // modules tools/mkconfig.js renders out of chimera's configs, which
         // is where a deviation is switched on.
         DEVS = Set(),
+        HAZARDS = Set(),
         T_HOLE_TRACKING = false,
         T_DIR_SYMLINK_STATUS = false,
         T_XATTR_CHANGE = false,

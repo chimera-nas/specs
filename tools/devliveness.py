@@ -35,7 +35,16 @@ import sys
 
 
 def load_config(path):
-    """Resolve `extends` the same way mkconfig.js does, for `deviations`."""
+    """Resolve `extends` the same way mkconfig.js does.
+
+    HAZARDS are gated exactly as DEVS are, and for the same reason.  A hazard
+    changes what the corpus CONTAINS rather than what it predicts -- it is the
+    knob for a pattern the server cannot survive -- which makes an unexercised
+    one worse than an unexercised deviation, not better: it would go on
+    narrowing every corpus this cell generates, for a crash nobody has seen
+    since.  So a dead hazard fails the build like a dead deviation, and both
+    live in the same set here.
+    """
     with open(path) as fh:
         text = re.sub(r"^\s*//.*$", "", fh.read(), flags=re.M)
     cfg = json.loads(text)
@@ -45,7 +54,9 @@ def load_config(path):
                               cfg["extends"])
         enabled |= load_config(parent)
     enabled |= set(cfg.get("deviations", []))
+    enabled |= set(cfg.get("hazards", []))
     enabled -= set(cfg.get("deviationsOff", []))
+    enabled -= set(cfg.get("hazardsOff", []))
     return enabled
 
 
