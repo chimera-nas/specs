@@ -244,10 +244,6 @@ module nfs4ops {
         // TOLERANCE (not a deviation): OPEN4_RESULT_CONFIRM is inert above
         // 4.0 (RFC 8881 18.16), so a server may set it or not.  See opOpen.
         tolRflagsConfirm: bool,
-        // TOLERANCE (not a deviation): RFC 7530 16.9.4 pins neither the code
-        // for a LINK whose source is a directory nor its precedence against a
-        // malformed target name.  See opLink.
-        tolLinkRefusal: bool,
         // TOLERANCE (not a deviation): RFC 8881 18.7.3 lets a server refuse an
         // attribute combination it cannot satisfy, and the wide GETATTR asks
         // for all of them.  See opGetattrWide.
@@ -761,15 +757,18 @@ module nfs4ops {
     // sentence about one operation each.
     pure val DIR_SYM_ACCEPT = Set(E_SYMLINK, E_NOTDIR)
 
-    // T_LINK_REFUSAL: which refusal a LINK reports when more than one applies.
-    // RFC 7530 16.9.4 lists NFS4ERR_ISDIR for a directory source but pins
-    // neither that code -- NOTDIR is the same refusal framed as a type error,
-    // and either is conformant -- nor its precedence against a malformed
-    // target name, which the model checks first.  Hard-linking a directory is
-    // refused by every server, so nothing is linked whichever code comes back.
+    // Which refusal a LINK reports when more than one applies.  RFC 7530
+    // 16.9.4 lists NFS4ERR_ISDIR for a directory source but pins neither that
+    // code -- NOTDIR is the same refusal framed as a type error, and either is
+    // conformant -- nor its precedence against a malformed target name, which
+    // the model checks first.  Hard-linking a directory is refused by every
+    // server, so nothing is linked whichever code comes back.
+    //
+    // UNCONDITIONAL: this was T_LINK_REFUSAL, a knob, and a precedence no
+    // specification states is not something an implementation can be
+    // configured to have.
     pure def linkAccept(a: Acc, st: int, srcIsDir: bool): Set[int] =
-        if (not(a.caps.tolLinkRefusal)) Set(st)
-        else if (st == E_ISDIR) Set(E_ISDIR, E_NOTDIR)
+        if (st == E_ISDIR) Set(E_ISDIR, E_NOTDIR)
         else if (srcIsDir) Set(st, E_ISDIR, E_NOTDIR)
         else Set(st)
 
@@ -1332,23 +1331,25 @@ module nfs4ops {
         // illegal ctype.  Both real servers (ganesha and the Linux server)
         // answer SYMLINK for a symlink parent; chimera answers the generic
         // NFS4ERR_NOTDIR, recorded on the chimera side (D4-17).
-        // D4-18: the model reports the parent first, and distinguishes a
-        // symlink parent from any other non-directory, as NFS-Ganesha and the
-        // Linux server do.  chimera reports the ILLEGAL OBJECT TYPE first --
-        // NFS4ERR_BADTYPE for a type CREATE cannot make -- whatever is wrong
-        // with the parent.  Both are conformant: RFC 7530 16.4.4 and
-        // RFC 8881 18.4 order neither.  Nothing is created either way.
-        else if (hasDev(a.caps, "D4-18-create-type-before-parent") and
-                 ar.ctype == FReg and cfhNode(a).ftype != FDir)
-            emit(hitDev(a, "D4-18-create-type-before-parent"),
-                 SCreate(bad.with("st", E_BADTYPE)
-                              .with("stAccept", Set(E_BADTYPE))))
+        // When BOTH are wrong -- an unusable parent AND a type CREATE cannot
+        // make -- which one is reported is the server's: RFC 7530 16.4.4 and
+        // RFC 8881 18.4 order neither check, and nothing is created either
+        // way.  The model reports the parent, as NFS-Ganesha and the Linux
+        // server do, and accepts the NFS4ERR_BADTYPE chimera reports instead.
+        // (Was D4-18-create-type-before-parent, a knob for a precedence no
+        // specification states.)
         else if (cfhNode(a).ftype == FLnk)
             emit(a, SCreate(bad.with("st", E_SYMLINK)
-                                .with("stAccept", DIR_SYM_ACCEPT)))
+                                .with("stAccept",
+                                      if (ar.ctype == FReg)
+                                          DIR_SYM_ACCEPT.union(Set(E_BADTYPE))
+                                      else DIR_SYM_ACCEPT)))
         else if (cfhNode(a).ftype != FDir)
             emit(a, SCreate(bad.with("st", E_NOTDIR)
-                              .with("stAccept", Set(E_NOTDIR))))
+                              .with("stAccept",
+                                    if (ar.ctype == FReg)
+                                        Set(E_NOTDIR, E_BADTYPE)
+                                    else Set(E_NOTDIR))))
         else if (ar.ctype == FReg)
             emit(a, SCreate(bad.with("st", E_BADTYPE)
                               .with("stAccept", Set(E_BADTYPE))))
@@ -1481,7 +1482,7 @@ module nfs4ops {
         // reports the name (NEMPTY -> INVAL, NDOT -> BADNAME) ahead of the
         // directory-source ISDIR, and RFC 7530 16.9 leaves that ordering
         // open, so a server that reports the source type first is equally
-        // right -- which is what linkAccept states when T_LINK_REFUSAL is on.
+        // right -- which is what linkAccept states, unconditionally.
         else if (nameStatus(n) != OK)
             emit(a, SLink({ st: nameStatus(n), cinfo: zero,
                             stAccept: linkAccept(a, nameStatus(n),
@@ -3528,7 +3529,7 @@ emit(a,
           devs: Set(), tolHoleTracking: false,
           tolXattrChange: false,
           tolRenewLapsed: false, tolRflagsConfirm: false,
-          tolLinkRefusal: false, tolWideAttrRefusal: false }
+          tolWideAttrRefusal: false }
 
     // Evaluate a whole COMPOUND.  reqTag identifies the request for the
     // 4.1 SEQUENCE replay/false-retry classification.

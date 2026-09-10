@@ -26,7 +26,6 @@
       "known": {
         "D4-1-lookupp-pseudoroot": "RFC 7530 16.14.4 / RFC 8881 18.14.4: LOOKUPP at the root of the namespace served answers NFS4ERR_NOENT.  chimera's exported root is a name in the server's pseudo-filesystem rather than the top of the namespace, so LOOKUPP there succeeds and the current filehandle becomes the node above the export.  Modelled as a walk onto an abstract pseudo-root inode, so the GETFH that follows is still checked rather than abandoned.",
         "D4-4-symlink-mode-0755": "RFC 7530 5.8.1.6 makes mode a plain attribute of every object, symbolic links included, and CREATE(NF4LNK) carries one; chimera reports 0755 for every symbolic link whatever the create asked for.  The mode of a symlink is never consulted for access (POSIX), so this is a reporting divergence -- but a GETATTR does read it back.",
-        "D4-18-create-type-before-parent": "CREATE into an unusable parent with an object type CREATE cannot make.  The model reports the parent first, as NFS-Ganesha and the Linux server do; chimera reports the illegal type first (NFS4ERR_BADTYPE).  Both are conformant -- RFC 7530 16.4.4 and RFC 8881 18.4 order neither -- and nothing is created either way.",
         "D4-20-access-root-execute": "RFC 8881 18.1.4: the server SHOULD NOT set ACCESS4_EXECUTE unless an execute bit is set.  chimera's root/AUTH_NONE DAC override grants it on a file with no execute bit anywhere in its mode, where the reference servers withhold it.  ACCESS is advisory (18.1: the operation itself is the authoritative check), so the coarser privileged override opens no hole, and `supported` and every other bit still match exactly.",
         "D4-21-secinfo-consumes-fh": "RFC 8881 18.29.3 makes SECINFO consume the current filehandle, so the next operation that uses it answers NFS4ERR_NOFILEHANDLE; RFC 7530 17.31.3 leaves it in place on 4.0.  chimera zeroes req->fhlen for every minor version, so a 4.0 compound loses the handle too.",
 
@@ -97,14 +96,6 @@
       "type": "bool",
       "default": false,
       "doc": "RFC 8881 18.16 makes OPEN4_RESULT_CONFIRM meaningful only for the 4.0 OPEN_CONFIRM handshake, so above 4.0 the flag is inert and a server may set it or not with no observable consequence.  The model predicts needConfirm = false there; ganesha sets the flag in cases it does not.  With this on OPEN's reply carries both values in needConfirmAccept.  The model auto-gates it to MINOR >= 1, where the flag drives nothing; below that it has to be exact.  Replaces GD-17-open-rflags-confirm."
-    },
-    "T_LINK_REFUSAL": {
-      "kind": "tolerance",
-      "key": "tolerances.linkRefusal",
-      "type": "bool",
-      "default": false,
-      "doc": "RFC 7530 16.9.4 lists NFS4ERR_ISDIR for a LINK whose source is a directory but pins neither that code nor its precedence against a malformed target name -- and hard-linking a directory is refused by every server, so which refusal is reported is exactly the unspecified part.  The model validates the name first and reports the source type as ISDIR.  With this on, LINK's reply carries stAccept: a directory source accepts ISDIR or the not-a-directory framing NOTDIR, and where the name is ALSO malformed the source-type refusal joins the name error in the set, because the order of the two checks is the server's.  Replaces S4-link-dir-notdir, which asserted NOTDIR outright and was contradicted by both reference servers: measured against NFS-Ganesha V6.5 and the Linux server, each answers ISDIR for a directory source with a well-formed name and reports the source type ahead of the name error when both apply.",
-      "note": "The registry entries this supersedes (GD-9, KN-3) forgave the whole set {ISDIR, NOTDIR, INVAL, BADNAME, BADCHAR} on any LINK, which is why the single-answer claim they were collapsed into went unnoticed."
     },
     "T_WIDE_ATTR_REFUSAL": {
       "kind": "tolerance",

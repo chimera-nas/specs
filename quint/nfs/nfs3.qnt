@@ -1097,7 +1097,7 @@ module nfs3 {
         // answer ISDIR, NFS-Ganesha answers NFS3ERR_BADTYPE.  (The NFSv4 LINK
         // path is unspecified in the same way but lands elsewhere: ganesha
         // answers NFS4ERR_ISDIR there, which is what the model predicts, so
-        // v4 needs only the T_LINK_REFUSAL tolerance and no deviation.)
+        // the v4 model accepts both codes unconditionally and needs no knob.)
         if (fs.get(o).ftype == TDir) all {
             fs' = fs,
             removed' = removed,

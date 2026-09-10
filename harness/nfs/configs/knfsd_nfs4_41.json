@@ -28,9 +28,6 @@
   // Replaces S4-link-dir-notdir, which claimed knfsd answers NFS4ERR_NOTDIR
   // there; measured against the kvm-test-base guest, it answers ISDIR, which
   // is what the model already predicts.
-  "tolerances": {
-    "linkRefusal": true
-  },
 
   "policies": {
     "minor": 1,

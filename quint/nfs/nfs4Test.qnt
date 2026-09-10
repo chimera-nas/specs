@@ -39,7 +39,6 @@ module nfs4Test42 {
         T_XATTR_CHANGE = false,
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
-        T_LINK_REFUSAL = false,
         T_WIDE_ATTR_REFUSAL = false
     ).* from "./nfs4"
 
@@ -884,7 +883,6 @@ module nfs4Test40 {
         T_XATTR_CHANGE = false,
         T_RENEW_LAPSED = false,
         T_RFLAGS_CONFIRM = false,
-        T_LINK_REFUSAL = false,
         T_WIDE_ATTR_REFUSAL = false
     ).* from "./nfs4"
 

@@ -64,9 +64,7 @@
 
         "PD17f": "POSIX.1-2024 link(): ENOENT (missing source) vs EEXIST (existing target) priority. link with a missing source and an existing target reports EEXIST; the model reports the source error. Root cause: target existence checked before source resolution. Candidate fix: none required; listed for visibility.",
 
-        "PD17h": "POSIX.1-2024 rmdir(): ENOTDIR (victim not a directory) vs EACCES (unwritable parent) priority (unspecified). rmdir of a non-directory in an unwritable parent reports EACCES; the model reports the type error first. Root cause: the delete gate's parent fast path denies before the child's type is ever fetched. Candidate fix: none required; listed for visibility.",
 
-        "PD17i": "POSIX.1-2024 rmdir(): ENOTEMPTY (victim not empty) vs EACCES (unwritable parent) priority (unspecified). rmdir of a non-empty directory in an unwritable parent reports EACCES; the model reports the emptiness error first. Root cause: the delete gate denies before the child is examined. Candidate fix: none required; listed for visibility.",
 
         "PD18": "POSIX.1-2024 access()/faccessat(): checks use the process's real (or with AT_EACCESS, effective) credentials. faccessat evaluates permissions against the HOST process uid/gid (getuid()/getgid()) instead of the chimera credential, ignores supplementary groups and AT_EACCESS; running as root it grants nearly everything. Root cause: src/posix/posix_faccessat.c callback uses getuid()/getgid() over a stat result. Candidate fix: evaluate against chimera_posix_effective_cred (or issue a VFS ACCESS op with the request credential).",
 

@@ -1441,31 +1441,22 @@ module posixops {
             else {
                 val dnode = fs.inodes.get(r.par)
                 val vnode = fs.inodes.get(r.ino)
-                // PD17h/PD17i: chimera's delete gate judges the PARENT --
-                // write permission and the sticky rule both -- before the
-                // child is examined at all, so a non-directory victim (PD17h)
-                // or a non-empty one (PD17i) in a parent that denies the
-                // removal answers that denial where the model names the
-                // child's error.  POSIX leaves the priority unspecified.
-                if (dev(caps, "PD17h") and vnode.ftype != FDir and
-                        not(mayWrite(cr, dnode)))
-                    hit(outErr(fs, ps, EACCES), Set("PD17h"))
-                else if (dev(caps, "PD17h") and vnode.ftype != FDir and
-                         not(stickyOk(caps, cr, dnode, vnode)))
-                    hit(outErrA(fs, ps, errSticky(caps), stickyAccept(caps)),
-                        Set("PD17h"))
-                else if (dev(caps, "PD17i") and vnode.ftype == FDir and
-                         vnode.ents.keys().size() > 0 and
-                         not(mayWrite(cr, dnode)))
-                    hit(outErr(fs, ps, EACCES), Set("PD17i"))
-                else if (dev(caps, "PD17i") and vnode.ftype == FDir and
-                         vnode.ents.keys().size() > 0 and
-                         not(stickyOk(caps, cr, dnode, vnode)))
-                    hit(outErrA(fs, ps, errSticky(caps), stickyAccept(caps)),
-                        Set("PD17i"))
-                else if (vnode.ftype != FDir) outErr(fs, ps, ENOTDIR)
+                // Which error wins when BOTH the child and the parent would
+                // refuse -- a non-directory or non-empty victim in a parent
+                // that denies the removal -- is left unspecified by POSIX.
+                // An implementation whose delete gate judges the parent first
+                // answers EACCES (or the sticky error); the model names the
+                // child's error and accepts the parent's.  UNCONDITIONAL:
+                // this was PD17h and PD17i, two knobs for a priority no
+                // standard states.
+                val delGate =
+                    (if (not(mayWrite(cr, dnode))) Set(EACCES) else Set())
+                    .union(if (not(stickyOk(caps, cr, dnode, vnode)))
+                               stickyAccept(caps).union(Set(errSticky(caps)))
+                           else Set())
+                if (vnode.ftype != FDir) outErrA(fs, ps, ENOTDIR, delGate)
                 else if (vnode.ents.keys().size() > 0)
-                    outErr(fs, ps, errNonempty(caps))
+                    outErrA(fs, ps, errNonempty(caps), delGate)
                 else if (not(mayWrite(cr, dnode))) outErr(fs, ps, EACCES)
                 else if (not(stickyOk(caps, cr, dnode, vnode)))
                     outErrA(fs, ps, errSticky(caps), stickyAccept(caps))
