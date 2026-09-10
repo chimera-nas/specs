@@ -34,6 +34,8 @@ NFS_V4 = 4
 NFSPROC4_COMPOUND = 1
 
 NFS4_OK = 0
+# RFC 7862 15.2.2: the one COPY failure that still carries a body.
+NFS4ERR_OFFLOAD_NO_REQS = 10094
 
 # Operation numbers (RFC 7530 16.2 / 8881 18 / 7862 15 / 8276 8)
 OP_ACCESS = 3
@@ -1181,8 +1183,17 @@ def _dec_write_response(u):
 
 
 def _dec_copy(u, st):
+    # RFC 7862 15.2.2: COPY4res is a union on the status with THREE arms, not
+    # two.  NFS4_OK carries the write response and the two bools;
+    # NFS4ERR_OFFLOAD_NO_REQS carries only the bools; and every other status
+    # -- NFS4ERR_NOTSUPP among them -- is `void`, so nothing follows.  Reading
+    # a length4 on the general error path is what produced "XDR underrun: need
+    # 8 bytes at offset 116, have 116" the moment a server without COPY was
+    # actually asked for one.
+    if st == NFS4ERR_OFFLOAD_NO_REQS:
+        return {"consecutive": u.boolean(), "synchronous": u.boolean()}
     if st != NFS4_OK:
-        return {"bytes_copied": u.uint64()}
+        return {}
     out = _dec_write_response(u)
     out["consecutive"] = u.boolean()
     out["synchronous"] = u.boolean()

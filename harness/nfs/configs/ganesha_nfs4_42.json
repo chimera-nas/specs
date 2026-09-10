@@ -6,7 +6,7 @@
   // xattr, readPlus and writeSame were asserted here because this cell mirrors
   // chimera's nfs4_memfs42 -- but a feature knob describes the SERVER, not the
   // cell it is modelled on, and V6.5 answers NFS4ERR_NOTSUPP (10004) to
-  // GETXATTR, SETXATTR, LISTXATTRS, READ_PLUS, WRITE_SAME and CLONE.  Measured: ten
+  // GETXATTR, SETXATTR, LISTXATTRS, READ_PLUS, WRITE_SAME, CLONE and COPY.  Measured: ten
   // traces of this cell were being SKIPped on a capability mismatch rather
   // than replayed, which is the coverage this suite exists to have.
   //
@@ -20,7 +20,7 @@
     "writeDelegation": "unsupported",
     "xattr": "unsupported",
     "sparse": "supported",
-    "copy": "supported",
+    "copy": "unsupported",
     "readPlus": "unsupported",
     "ioAdvise": "supported",
     "writeSame": "unsupported",
