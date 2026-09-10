@@ -3116,9 +3116,23 @@ emit(dataTypeAcc(a, false),
                         // (Measured: the model answered block 2 where V6.5 on
                         // ext4 answered 0.)  For SEEK_HOLE the model's answer
                         // is the late bound, as before.
+                        //
+                        // The third case is G4-seek-at-eof-not-nxio reaching
+                        // further than its own branch above.  That branch
+                        // fires when the MODEL puts sa_offset at or past EOF;
+                        // but with a real allocation map the server's EOF is
+                        // its own, and a file the model sizes in bytes can end
+                        // earlier there -- so the server takes its at-EOF
+                        // behaviour (NFS4_OK at some earlier hole) for a query
+                        // the model still considers interior.  Measured: a
+                        // SEEK_HOLE at byte 24576 answered 0.  Scoped to the
+                        // cells that enable the deviation, so a hole-tracking
+                        // backend without it still has its offset pinned.
                         val offOk =
                             if (not(a.caps.tolHoleTracking)) Set(off)
                             else if (ar.whatData) ar.off.to(nd.sizeBlocks)
+                            else if (hasDev(a.caps, "G4-seek-at-eof-not-nxio"))
+                                0.to(nd.sizeBlocks)
                             else ar.off.to(off)
                         emit(a, SSeek({ st: OK, eof: eof, offset: off,
                                         // A data search that finds only real
