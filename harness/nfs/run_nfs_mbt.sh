@@ -717,10 +717,13 @@ post_mortem() {
     if ls "$CORE_DIR"/core.* >/dev/null 2>&1 && command -v gdb >/dev/null 2>&1
     then
         echo "=== fetching ganesha debug symbols ==="
-        apt-get update -qq >/dev/null 2>&1 || true
-        apt-get install -y --no-install-recommends -qq \
-            nfs-ganesha-dbgsym libntirpc-dbgsym >/dev/null 2>&1 \
-            || echo "post-mortem: no -dbgsym packages available; " \
+        # Not silenced: when this fails the backtrace is unreadable, and the
+        # reason apt gives is the only thing that says why.
+        apt-get update 2>&1 | tail -5 || true
+        apt-cache policy nfs-ganesha-dbgsym 2>&1 | head -4 || true
+        apt-get install -y --no-install-recommends \
+            nfs-ganesha-dbgsym 2>&1 | tail -8 \
+            || echo "post-mortem: nfs-ganesha-dbgsym would not install; " \
                     "frames inside ganesha will read ??"
     fi
     for c in "$CORE_DIR"/core.*; do

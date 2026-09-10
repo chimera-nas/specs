@@ -105,9 +105,8 @@ RUN apt-get -y update && \
 RUN apt-get -y update && \
     apt-get -y --no-install-recommends install ubuntu-dbgsym-keyring && \
     . /etc/os-release && \
-    printf 'deb http://ddebs.ubuntu.com %s main restricted universe multiverse\n\
-deb http://ddebs.ubuntu.com %s-updates main restricted universe multiverse\n' \
-        "$VERSION_CODENAME" "$VERSION_CODENAME" \
+    printf 'deb http://ddebs.ubuntu.com %s main restricted universe multiverse\n' \
+        "$VERSION_CODENAME" \
         > /etc/apt/sources.list.d/ddebs.list && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
