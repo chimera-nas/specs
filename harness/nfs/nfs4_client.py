@@ -1524,16 +1524,29 @@ class Nfs4Client:
         rtag = u.opaque_var()
         nres = u.uint32()
         results = []
-        for _ in range(nres):
-            opnum = u.uint32()
-            opstatus = u.uint32()
-            dec = DECODERS.get(opnum)
-            if dec is None:
-                raise XdrError(f"no decoder for op {opnum}")
-            fields = dec(u, opstatus)
-            fields["op"] = opnum
-            fields["status"] = opstatus
-            results.append(fields)
-        u.done()
+        # A decode failure here says the harness and the server disagree about
+        # the SHAPE of a reply, which is unreadable from the message alone --
+        # "need 8 bytes at offset 116" names neither the operation nor what
+        # was on the wire.  Re-raise with both: the opcodes decoded so far,
+        # the one that failed, and the reply itself.  Costs nothing until
+        # something goes wrong, and what goes wrong here is always a surprise.
+        seen = []
+        try:
+            for _ in range(nres):
+                opnum = u.uint32()
+                opstatus = u.uint32()
+                dec = DECODERS.get(opnum)
+                if dec is None:
+                    raise XdrError(f"no decoder for op {opnum}")
+                seen.append((opnum, opstatus))
+                fields = dec(u, opstatus)
+                fields["op"] = opnum
+                fields["status"] = opstatus
+                results.append(fields)
+            u.done()
+        except XdrError as e:
+            raise XdrError(
+                f"{e}; compound status {status}, nres {nres}, "
+                f"decoded {seen}, reply {raw.hex()}") from None
         return {"status": status, "tag": rtag, "results": results,
                 "raw": raw}
