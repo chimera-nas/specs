@@ -139,20 +139,25 @@ RUN npm install -g "@informalsystems/quint@$(cat /tmp/.quint-version)" && \
     quint --version && \
     rm -f /tmp/.quint-version
 
-# quint downloads its Rust evaluator the first time it simulates, into ~/.quint.
-# CI runners reach the network through internal mirrors only, so that download
-# arrives truncated and every trace generation fails.  Warm the cache here,
-# where the network is available and the result is baked into the image.
-# Double quotes, so quint's prime operator (n') needs no escaping: inside single
-# quotes a backslash is literal and would end the string early.
+# No Rust-evaluator warm-up here any more.
 #
-# The closing ls is the check: if the evaluator did not land, fail here where it
-# is fixable rather than in every generation job downstream.
-RUN printf "module warm {\n  var n: int\n  action init = n' = 0\n  action step = n' = n + 1\n}\n" \
-        > /tmp/warm.qnt && \
-    { quint run /tmp/warm.qnt --max-steps=1 --max-samples=1 > /dev/null 2>&1 || true ; } && \
-    rm -f /tmp/warm.qnt && \
-    ls -d /root/.quint/rust-evaluator-*/quint_evaluator
+# quint downloads that evaluator the first time it simulates, and these runners
+# reach the network through internal mirrors that truncate it -- so this image
+# used to warm the cache and then ASSERT the result had landed, on the grounds
+# that failing here beat failing in every generation job downstream.
+#
+# Generation no longer uses it.  It drives the TYPESCRIPT backend
+# (SPECS_QUINT_BACKEND, defaulted in cmake/SpecsCorpus.cmake and tools/
+# mkconfig.js), because quint ships the Rust evaluator only for glibc 2.39 and
+# up -- newer than ubuntu 22.04 and rocky 9 carry -- and a corpus generated on
+# every build has to generate everywhere.  So the assertion was failing image
+# builds over a component nothing asks for: a truncated download took the whole
+# image with it.
+#
+# The rust backend stays available as an opt-in, and it fetches its own
+# evaluator when someone selects it.  A half-warmed cache would be worse than
+# none: the truncation is what breaks generation, so baking a broken evaluator
+# into the image would hide the fault rather than surface it.
 
 # Samba ships a system-wide default smb.conf and a set of state directories
 # under /var/lib/samba.  The harness never uses them: every test writes a
