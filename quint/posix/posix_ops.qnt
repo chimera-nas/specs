@@ -204,8 +204,15 @@ module posixops {
 
     // Mode of a newly created directory: umask-filtered, plus inherited
     // S_ISGID when the policy says so.
+    // mkdir cannot set the set-user-ID bit.  XSH mkdir initializes "the file
+    // permission bits" from mode and gives S_ISUID no meaning on a directory,
+    // and the implementations mask it off before the filesystem is reached:
+    // Linux in vfs_mkdir() (mode &= S_IRWXUGO|S_ISVTX) and FreeBSD in
+    // ufs_mkdir() (va_mode & 0777).  Measured against ext4: mkdir("/b/d",
+    // 04755) under a set-group-ID parent lands 02755, not 06755.
     pure def newDirMode(caps: Caps, m: int, mask: int, dnode: Inode): int = {
-        val base = applyUmask(m, mask)
+        val asked = applyUmask(m, mask)
+        val base  = if (bitOn(asked, MB_SUID)) asked - MB_SUID else asked
         if (caps.sgidInherit and bitOn(dnode.mode, MB_SGID) and
                 not(bitOn(base, MB_SGID)))
             base + MB_SGID
