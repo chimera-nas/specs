@@ -503,9 +503,17 @@ module nfs4fs {
 
     // SETATTR mode (or any pure-metadata attribute): change advances, the
     // exclusive-create verifier survives (time_modify untouched).
+    // A symbolic link's permission bits are fixed at 0777 and do not move.
+    // Linux has no lchmod(), so a server over a real filesystem cannot apply
+    // a mode to a link, and chimera's in-engine backends refuse it for the
+    // same reason (see the symlink note in memfs_apply_attrs) -- honouring it
+    // in only some of them made an ACCESS or GETATTR of the same link answer
+    // differently per backend.  The SETATTR still succeeds and still bumps
+    // the change attribute; it just moves no bits.  Stated here rather than
+    // at each caller so no SETATTR arm can be missed.
     pure def fsChmod(fs: Fs, f: Ino, m: int): Fs =
         fs.with("inodes", fs.inodes.setBy(f, x => x
-              .with("mode", m)
+              .with("mode", if (x.ftype == FLnk) x.mode else m)
               .with("change", fs.chg)))
           .with("chg", fs.chg + 1)
 

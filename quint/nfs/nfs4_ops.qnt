@@ -1371,14 +1371,17 @@ module nfs4ops {
             emit(a, SCreate(bad.with("st", E_BADTYPE)
                               .with("stAccept", Set(E_BADTYPE))))
         else {
-            // D4-4: chimera creates every symbolic link with mode 0755,
-            // whatever the CREATE asked for -- the mode argument is dropped at
-            // creation, not at reporting: a later SETATTR of the mode DOES
-            // take, and a GETATTR then reads it back.  RFC 7530 5.8.1.6 makes
-            // mode a plain attribute of every object, symbolic links included,
-            // and 16.4 carries createattrs for NF4LNK like any other type.
-            val lnkMode = if (hasDev(a.caps, "D4-4-symlink-mode-0755")) 493
-                          else ar.mode
+            // A symbolic link's permission bits are not a portable
+            // observable.  RFC 7530 5.8.1.6 does make mode an attribute of
+            // every object and 16.4 carries createattrs for NF4LNK -- but
+            // POSIX leaves a link's bits unspecified and Linux fixes every
+            // symlink at 0777, discarding whatever a creator asks for, so a
+            // server over a real filesystem CANNOT honour the request.  The
+            // model says 0777 for every backend, which is what the in-engine
+            // ones now store too; predicting the requested mode described
+            // only half of them (was D4-4-symlink-mode-0755).  A later
+            // SETATTR of the mode still takes, and a GETATTR reads that back.
+            val lnkMode = 511
             val node =
                 if (ar.ctype == FDir) mkDir(ar.mode, a.cfh, 0)
                 else if (ar.ctype == FLnk) mkSymlink(ar.target, lnkMode, 0)
@@ -1389,9 +1392,7 @@ module nfs4ops {
                                     .with("stAccept", Set(fsStatus(o.st)))))
             else
                 emit(devCinfoHit(
-                         (if (ar.ctype == FLnk and lnkMode != ar.mode)
-                              hitDev(a, "D4-4-symlink-mode-0755") else a)
-                             .with("fs", o.fs2).with("cfh", o.ino)),
+                         a.with("fs", o.fs2).with("cfh", o.ino)),
                      SCreate({ st: OK, ino: o.ino,
                                cinfo: devCinfo(a, o.cinfo) , stAccept: Set(OK) }))
         }
