@@ -220,6 +220,17 @@ module nfs4ops {
         // (false) -- (free) XOR (LOCKS_HELD) per RFC 7530 9.10 /
         // RFC 8881 9.8.
         closeFreesLocks: bool,
+        // Where the exported filesystem sits in the server's NFSv4 namespace,
+        // which is a deployment choice, not a divergence.  true: the cell's
+        // filesystem IS the "/" export, so PUTROOTFH lands on its root and the
+        // model's ROOT is the root of the namespace served -- LOOKUPP there has
+        // no parent (RFC 7530 16.14.4 / RFC 8881 18.14.4, NFS4ERR_NOENT).
+        // false: the filesystem is a NAMED export, one entry in the server's
+        // pseudo-filesystem (RFC 7530 7.3), so ROOT has the pseudo-root above
+        // it and LOOKUPP there walks onto it; NOENT belongs one level higher.
+        // Both are conformant and both are served by chimera, so the cell picks
+        // one and the corpus tests exactly that shape.
+        rootExport: bool,
         // The known divergences the implementation under test still carries
         // (nfs4.qnt's DEVS, bound from the cell's config).  Carried here
         // because Caps is the one thing every evaluation step already has in
@@ -253,14 +264,15 @@ module nfs4ops {
     // Did the cell's config enable this deviation?
     pure def hasDev(c: Caps, id: str): bool = c.devs.contains(id)
 
-    // D4-1: the abstract identity of the pseudo-filesystem node ABOVE the
-    // export.  chimera's namespace does not stop at the exported root: a
-    // LOOKUPP there walks into the server's pseudo-filesystem, which holds
-    // the shares.  The model has nothing to say about that node -- it is not
-    // part of the exported tree -- but it does have to name it, because the
-    // harness has to learn its filehandle and check the answer is stable.
-    // Chosen inside the harness's ino table (V4_MAX_INOS) and far above
-    // anything a trace allocates.
+    // The abstract identity of the pseudo-filesystem node ABOVE a NAMED
+    // export (see Caps.rootExport).  With a named export the namespace does
+    // not stop at the exported root: a LOOKUPP there walks into the server's
+    // pseudo-filesystem, which holds the shares.  The model has nothing to say
+    // about that node -- it is not part of the exported tree -- but it does
+    // have to name it, because the harness has to learn its filehandle and
+    // check the answer is stable.  Unreachable in a rootExport cell, where the
+    // exported root IS the namespace root.  Chosen inside the harness's ino
+    // table (V4_MAX_INOS) and far above anything a trace allocates.
     pure val PSEUDO_INO: Ino = 4095
 
     // ------------------------------------------------------------------
@@ -589,7 +601,7 @@ module nfs4ops {
 
     pure def cfhLive(a: Acc): bool =
         a.cfh == PSEUDO_INO or (a.cfh != -1 and fsLive(a.fs, a.cfh))
-    // D4-1: a stand-in inode for the pseudo-filesystem node above the export,
+    // A stand-in inode for the pseudo-filesystem node above a named export,
     // so an op that reaches it has something to read rather than falling off
     // the map.  Only its type is ever consulted; the generator never aims an
     // attribute-reading op at it (the only op that can follow the LOOKUPP
@@ -643,8 +655,8 @@ module nfs4ops {
     // Returns OK when the cfh is usable.
     pure def fhGate(a: Acc): int =
         if (a.cfh == -1) E_NOFILEHANDLE
-        // D4-1: the node above the export exists and is a usable directory;
-        // the model knows only that much about it.
+        // The pseudo-filesystem node above a named export exists and is a
+        // usable directory; the model knows only that much about it.
         else if (a.cfh == PSEUDO_INO) OK
         else if (not(fsLive(a.fs, a.cfh))) E_STALE
         else OK
@@ -1067,16 +1079,21 @@ module nfs4ops {
                                    stAccept: DIR_SYM_ACCEPT }))
             else if (nd.ftype != FDir)
                 emit(a, SLookupp({ st: E_NOTDIR, parent: -1 , stAccept: Set(E_NOTDIR) }))
-            // D4-1: the model's namespace is the exported tree and stops at
-            // its root, so LOOKUPP there is NFS4ERR_NOENT.  chimera's does
-            // not: the export is a name in the server's pseudo-filesystem, so
-            // the walk succeeds and the current filehandle becomes the node
-            // above it.  Modelled rather than forgiven, so the GETFH that
-            // follows is still checked -- the pseudo-root's filehandle has to
-            // be a real, stable handle.
-            else if (a.cfh == ROOT and hasDev(a.caps, "D4-1-lookupp-pseudoroot"))
-                emit(hitDev(a, "D4-1-lookupp-pseudoroot")
-                         .with("cfh", PSEUDO_INO),
+            // The top of the server's namespace has no parent, whichever node
+            // that is.  In a NAMED-export cell it is the pseudo-root, which a
+            // LOOKUPP from the exported root walks onto; in a rootExport cell
+            // it is the exported root itself and the pseudo-root is never
+            // reached.  Both answer NFS4ERR_NOENT here (RFC 7530 16.14.4 /
+            // RFC 8881 18.14.4).
+            else if (a.cfh == PSEUDO_INO)
+                emit(a, SLookupp({ st: E_NOENT, parent: -1 , stAccept: Set(E_NOENT) }))
+            else if (a.cfh == ROOT and not(a.caps.rootExport))
+                // A named export is one entry in the server's pseudo-filesystem
+                // (RFC 7530 7.3), so the walk succeeds and the current
+                // filehandle becomes the node above it.  Modelled rather than
+                // skipped, so the GETFH that follows is still checked -- the
+                // pseudo-root's filehandle has to be a real, stable handle.
+                emit(a.with("cfh", PSEUDO_INO),
                      SLookupp({ st: OK, parent: PSEUDO_INO , stAccept: Set(OK) }))
             else if (a.cfh == ROOT)
                 emit(a, SLookupp({ st: E_NOENT, parent: -1 , stAccept: Set(E_NOENT) }))
@@ -3526,6 +3543,9 @@ emit(a,
           clone: copyOk,
           conflictDelays: true, closeFreesLocks: true,
           layoutWholeFile: true,
+          // The self-tests exercise the exported tree, never the namespace
+          // above it, so they read as the root-export shape.
+          rootExport: true,
           devs: Set(), tolHoleTracking: false,
           tolXattrChange: false,
           tolRenewLapsed: false, tolRflagsConfirm: false,

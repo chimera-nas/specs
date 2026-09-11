@@ -30,6 +30,13 @@ module nfs4Test42 {
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
         P_LAYOUT_WHOLE_FILE = true,
+        // The self-tests exercise the exported tree, never the server
+        // namespace above it, so they take the root-export shape: ROOT is
+        // the root of the namespace served and there is no pseudo-root to
+        // walk onto.  The named-export shape is covered by a cell
+        // (configs/nfs4_memfs41.json), which is where it can be replayed
+        // against a server that really is deployed that way.
+        P_ROOT_EXPORT = true,
         // The self-tests assert the STANDARD, always: no deviation is
         // enabled and no tolerance relaxed, so a model branch that only a
         // deviating implementation takes can never shape what they check.
@@ -874,6 +881,13 @@ module nfs4Test40 {
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
         P_LAYOUT_WHOLE_FILE = true,
+        // The self-tests exercise the exported tree, never the server
+        // namespace above it, so they take the root-export shape: ROOT is
+        // the root of the namespace served and there is no pseudo-root to
+        // walk onto.  The named-export shape is covered by a cell
+        // (configs/nfs4_memfs41.json), which is where it can be replayed
+        // against a server that really is deployed that way.
+        P_ROOT_EXPORT = true,
         // The self-tests assert the STANDARD, always: no deviation is
         // enabled and no tolerance relaxed, so a model branch that only a
         // deviating implementation takes can never shape what they check.

@@ -55,9 +55,16 @@ module nfs4 {
     //    (client, file), so a LAYOUTRETURN of a sub-range retires all of it
     //    and LAYOUTCOMMIT ignores the committed range (vs per-range
     //    accounting).
+    //  - P_ROOT_EXPORT: the cell's filesystem is the "/" export, so PUTROOTFH
+    //    lands on its root and the model's ROOT is the root of the namespace
+    //    served (vs a NAMED export, one entry in the server's pseudo-
+    //    filesystem, with the pseudo-root above it).  The two shapes give
+    //    LOOKUPP at ROOT different -- and both conformant -- answers; see
+    //    Caps.rootExport and opLookupp.
     const P_CONFLICT_DELAYS: bool
     const P_CLOSE_FREES_LOCKS: bool
     const P_LAYOUT_WHOLE_FILE: bool
+    const P_ROOT_EXPORT: bool
 
     // Known divergences the implementation under test still carries, named by
     // the consumer's config rather than forgiven by the replay harness after
@@ -274,6 +281,7 @@ module nfs4 {
             conflictDelays: P_CONFLICT_DELAYS,
             closeFreesLocks: P_CLOSE_FREES_LOCKS,
             layoutWholeFile: P_LAYOUT_WHOLE_FILE,
+            rootExport: P_ROOT_EXPORT,
             // Threaded through Caps rather than passed beside it: every
             // evaluation step already carries Caps, so a deviating branch can
             // ask `hasDev(a, "...")` wherever the divergence actually is
