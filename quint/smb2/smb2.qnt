@@ -1188,13 +1188,11 @@ module smb2 {
 
     // A create that varies its access and disposition but SHARES everything.
     //
-    // The share-all part is what keeps this flavor about notifications.  A
-    // restrictive ShareAccess makes some later create fail arbitration, and a
-    // truncating create that is refused is DEVIATIONS-SMB.md CD-3 -- a
-    // non-reconcilable deviation that abandons the trace, taking the remaining
-    // hundreds of steps of notify coverage with it.  Share arbitration is
-    // stepCore's and stepShare's subject; here it is only a way to lose the
-    // trace.
+    // The share-all part is what keeps this flavor about notifications: a
+    // restrictive ShareAccess makes some later create fail arbitration, and
+    // the resulting refusals would spend the remaining hundreds of steps of
+    // notify coverage on the create path instead.  Share arbitration is
+    // stepCore's and stepShare's subject; here it is only a distraction.
     action smbCreateShared = all {
         trees.size() > 0,
         liveInos.size() < MAX_OBJECTS,

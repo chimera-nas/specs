@@ -560,35 +560,8 @@ module smb2ops {
                  if (acc < 0 or x < acc) x else acc)).caching
     }
 
-    // The same lookup with NO CLIENT TERM: any lease bound to key `k` on file
-    // `f`, whoever owns it.  Used only by DEVIATION CD-5, below.
-    pure def grantUnderKeyAnyClient(sdb: StateDB, f: Ino, self: FileId,
-                                    k: LeaseKey): Caching = {
-        val members = opensOfFile(sdb, f).exclude(Set(self)).filter(fid =>
-            isLeaseGrantEstablished(sdb.opens.get(fid).caching) and
-            leaseKeyOf(sdb.opens.get(fid).caching) == k)
-        if (members.size() == 0) CNone
-        else sdb.opens.get(members.fold(-1, (acc, x) =>
-                 if (acc < 0 or x < acc) x else acc)).caching
-    }
-
-    // Exactly the condition grantCaching's CD-5 arm tests: this open would
-    // mint a fresh lease under `x.key`, but a lease is already bound to that
-    // key on this file by ANOTHER client, so chimera's reply inherits its
-    // version.  Asked separately at the call site because grantCaching returns
-    // a Caching, not the step's accumulator.
-    pure def dev5Fired(sdb: StateDB, f: Ino, self: FileId, oplock: OplockReq,
-                       sess: SessionId, devs: Set[str]): bool =
-        match oplock {
-            | OrLease(x) =>
-                dev5(devs) and
-                not(isLeaseGrant(grantUnderKey(sdb, f, self, x.key, sess))) and
-                isLeaseGrant(grantUnderKeyAnyClient(sdb, f, self, x.key))
-            | _ => false
-        }
-
     // Is this lease v2, and at what epoch?  CNone answers as an unversioned
-    // lease, which is what CD-5's `else` arms fall back to anyway.
+    // lease.
     pure def cachV2(c: Caching): bool =
         match c { | CLease(j) => j.v2 | _ => false }
 
@@ -713,41 +686,17 @@ module smb2ops {
                 val st = { r: req.r, w: req.w and sole,
                            h: req.h and not(capsHandle) }
                 if (not(isLeaseGrant(joined))) {
-                    // DEVIATION CD-5.  MS-SMB2 3.3.5.9.8 identifies a lease by
-                    // (ClientGuid, LeaseKey): the LeaseTable is looked up in
-                    // GlobalLeaseTableList by the opening session's client, so
-                    // two DIFFERENT clients using the same LeaseKey value on
-                    // the same file hold two separate leases, each with its own
-                    // version and epoch.  chimera hangs its grant off the
-                    // file's claim state keyed by the lease key alone, with no
-                    // client term, so a second client's RqLs open lands on the
-                    // first client's lease -- and build_rqls_response follows
-                    // `of->grant->is_v2`, so a v2 request that met another
-                    // client's v1 lease is answered as v1, epoch 0, and its
-                    // later breaks carry epoch 0 too.
-                    //
-                    // Only the VERSION is modelled here, not a full coalesce.
-                    // That is deliberate: what the wire actually shows is the
-                    // response's version and epoch (the granted STATE is the
-                    // same under either reading on every trace seen so far), so
-                    // claiming the state is inherited too would be asserting
-                    // more than has been measured.  If chimera really does
-                    // coalesce, a trace where the two states differ will say so
-                    // as a mismatch rather than passing quietly.
-                    //
-                    // Observed on smb2ForceL2_stepLease_300_0x31_7: client 2
-                    // holds a v1 lease under key 2 on 'b' (state 49); client 1
-                    // opens 'b' v2 under key 2 at state 113 and the wire
-                    // answers epoch 0 where the model says 2, and the break at
-                    // state 119 likewise.  This also settles the model's open
-                    // question Q-6 (whether lease-owner identity should drop
-                    // the session term) against dropping it: the standard says
-                    // the term belongs there, and it is chimera that omits it.
-                    val foreign =
-                        if (dev5(devs)) grantUnderKeyAnyClient(sdb, f, self,
-                                                               x.key)
-                        else CNone
-                    val inherit = isLeaseGrant(foreign)
+                    // A fresh lease.  MS-SMB2 3.3.5.9.8 identifies a lease by
+                    // (ClientGuid, LeaseKey) -- the LeaseTable is looked up in
+                    // GlobalLeaseTableList by the opening session's client, and
+                    // the LeaseKey only inside it -- so a lease bound to this
+                    // key by ANOTHER client is a different lease and lends this
+                    // one neither its version nor its epoch.  (chimera keyed
+                    // its grant on the lease key alone until CD-5 was fixed,
+                    // and answered a v2 request as v1 at epoch 0 when it met
+                    // another client's v1 lease.  Settles the model's open
+                    // question Q-6 -- whether lease-owner identity should drop
+                    // the session term -- against dropping it.)
                     CLease({ key: x.key,
                              st: st,
                              // A v2 lease is granted at the client's epoch + 1
@@ -763,11 +712,10 @@ module smb2ops {
                              // smb_proc_create.c ("No caching state was
                              // established (granted NONE), so the v2 epoch does
                              // NOT advance -- it is echoed unchanged").
-                             epoch: if (inherit) cachEpoch(foreign)
-                                    else if (not(x.v2)) 0
+                             epoch: if (not(x.v2)) 0
                                     else if (bitsEmpty(st)) x.epoch
                                     else x.epoch + 1,
-                             v2: if (inherit) cachV2(foreign) else x.v2,
+                             v2: x.v2,
                              // A real grant exactly when caching was actually
                              // established -- chimera's `req_vfs != 0`.  A
                              // bare RqLs reply is not a lease and binds no key.
@@ -862,37 +810,9 @@ module smb2ops {
     // Did the cell enable this deviation?
     pure def accDev(acc: Acc, id: str): bool = acc.devs.contains(id)
 
-    // CD-5 is consulted from grantCaching, which is handed the raw set.
-    pure def dev5(devs: Set[str]): bool = devs.contains("CD-5")
-
     // Record that `id` shaped the reply being built.
     pure def accHit(acc: Acc, id: str): Acc =
         acc.with("devHits", acc.devHits.union(Set(id)))
-
-    // DEVIATION CD-3, in the two places a CREATE is refused after chimera has
-    // already opened the file.
-    //
-    // MS-FSA 2.1.5.1.2 adjudicates an open BEFORE it modifies anything, so a
-    // refused CREATE must leave the file exactly as it found it -- which is
-    // why decideCreate's filesystem effect (dec.fs2) is committed on the
-    // success path only, and nowhere else (SD-7).  chimera builds the VFS open
-    // flags with CHIMERA_VFS_OPEN_TRUNCATE and calls chimera_vfs_open_at
-    // before ANY of the arbitration runs (smb_proc_create.c), so a truncating
-    // disposition has already emptied the file by the time the open is
-    // refused -- whether the refusal is the share-mode claim or the lease-key
-    // binding rule.  A failed operation with a destructive side effect.
-    //
-    // This is the case a harness registry could not express.  The REPLY is
-    // identical on both sides -- both say SHARING_VIOLATION, both say
-    // INVALID_PARAMETER -- and only the state differs, so the old entry could
-    // only mark itself non-reconcilable and abandon the trace.  Modelled here,
-    // the model loses the data too, and every read, size query and hole check
-    // that follows keeps testing.
-    pure def devTruncSdb(acc: Acc, trunc: bool, sdb: StateDB, fs2: Fs): StateDB =
-        if (trunc and accDev(acc, "CD-3")) sdb.with("fs", fs2) else sdb
-
-    pure def devTruncate(acc: Acc, trunc: bool, fs2: Fs): Acc =
-        if (trunc and accDev(acc, "CD-3")) accHit(acc, "CD-3") else acc
 
     // ------------------------------------------------------------------
     // DEVIATIONS SD-2 / SD-8 / SD-9: the LOCK access check, three ways
@@ -1623,17 +1543,10 @@ module smb2ops {
                         leaseKeyOf(o.caching) == selfKey and
                         o.file != dec.ino
                     }))
-                    // DEVIATION CD-3, second arm.  Same root cause as the
-                    // sharing-violation arm below: chimera has already opened
-                    // the file with CHIMERA_VFS_OPEN_TRUNCATE by the time any
-                    // of this is adjudicated, so a truncating disposition
-                    // empties the file whatever the refusal turns out to be.
-                    // Observed at smb2ForceL2_stepLease_300_0x31_5 state 209
-                    // (an OVERWRITE_IF refused here) and confirmed by the
-                    // reads at states 217 and 257, which found the first two
-                    // blocks gone and the file short.
-                    emit(devTruncate(acc, trunc, dec.fs2).with("sdb",
-                             devTruncSdb(acc, trunc, sdb1, dec.fs2)),
+                    // Refused before the file is touched, exactly as the
+                    // sharing-violation arm below: a truncating disposition
+                    // replaces the contents only once the open is granted.
+                    emit(acc.with("sdb", sdb1),
                          RCreate({ st: ST_INVALID_PARAMETER, fid: -1, act: 0,
                                    ino: -1, caching: CNone, breaks: Set(),
                                    parked: false, durable: false }),
@@ -1674,9 +1587,12 @@ module smb2ops {
                     val n2 = breakNotes(sdb2, dec.ino, h2, BITS_RW)
                     val sdb3 = h2.fold(sdb2, (a, fid) =>
                                    doBreakOne(a, fid, BITS_RW))
-                    // DEVIATION CD-3, first arm: see devTruncSdb.
-                    emit(devTruncate(acc, trunc, dec.fs2).with("sdb",
-                             devTruncSdb(acc, trunc, sdb3, dec.fs2)),
+                    // MS-FSA 2.1.5.1.2: the open is adjudicated BEFORE the
+                    // file is modified, so a refused CREATE leaves it exactly
+                    // as it found it -- decideCreate's filesystem effect
+                    // (dec.fs2) is committed on the success path only, and
+                    // nowhere else (SD-7).
+                    emit(acc.with("sdb", sdb3),
                          RCreate({ st: ST_SHARING_VIOLATION, fid: -1, act: 0,
                                    ino: -1, caching: CNone,
                                    breaks: n1.union(n2), parked: false,
@@ -1710,12 +1626,6 @@ module smb2ops {
                     // --- grant this open's own caching ----------------------
                     val gr = grantCaching(sdb3, dec.ino, ins.fid, x.oplock,
                                           acc.caps, acc.sess, acc.devs)
-                    // Did CD-5 shape that grant?  The same condition the
-                    // branch in grantCaching tests, asked here so the step can
-                    // record the hit -- tools/devliveness.py fails a cell that
-                    // enables a deviation its corpus never reaches.
-                    val d5 = dev5Fired(sdb3, dec.ino, ins.fid, x.oplock,
-                                       acc.sess, acc.devs)
                     val sdb4 = doSetCaching(sdb3, ins.fid, gr)
                     val sdb4b = if (x.delOnClose)
                                    sdb4.with("deletePending",
@@ -1759,8 +1669,7 @@ module smb2ops {
                     val sdb7 = stEmitEv(sdb6, x.dir,
                                         createNotifyCls(dec.act, x.isDir),
                                         x.name, "")
-                    emit((if (d5) accHit(acc, "CD-5") else acc)
-                             .with("sdb", sdb7).with("cfid", ins.fid),
+                    emit(acc.with("sdb", sdb7).with("cfid", ins.fid),
                          RCreate({ st: ST_SUCCESS, fid: ins.fid,
                                    act: dec.act, ino: dec.ino,
                                    caching: gr, breaks: n1.union(n2),
