@@ -422,8 +422,11 @@ class Replayer:
             # The model's ROOT is the export root.  Where the server puts a
             # pseudo-fs above it, PUTROOTFH would land elsewhere, so the
             # harness substitutes the export root handle it resolved at
-            # start.  (LOOKUPP at the root is then the one place the two
-            # namespaces differ; the model expects NOENT.)
+            # start.  Every cell here is a ROOT export (ganesha "Pseudo = /",
+            # knfsd "fsid=0"), so the two coincide and LOOKUPP at ROOT is
+            # NOENT -- which is what those cells declare with
+            # policies.rootExport.  A NAMED-export cell would answer the walk
+            # onto the pseudo-root instead; see P_ROOT_EXPORT.
             return c4.enc_putfh(self.fh[0])
         if tag == "RPutfh":
             return c4.enc_putfh(self.real_fh(v))

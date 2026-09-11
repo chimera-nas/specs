@@ -33,6 +33,12 @@
   },
 
   "policies": {
+    // This cell is a ROOT export: run_nfs_mbt.sh gives ganesha
+    // "Pseudo = /" and knfsd "fsid=0", so PUTROOTFH lands on the export
+    // itself and the model's ROOT is the root of the namespace served --
+    // LOOKUPP there has no parent.  chimera's memfs cells are NAMED
+    // exports and take the other shape; see P_ROOT_EXPORT.
+    "rootExport": true,
     "minor": 2,
     "conflictDelays": true,
     "closeFreesLocks": true,
