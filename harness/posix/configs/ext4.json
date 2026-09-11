@@ -1,0 +1,56 @@
+{
+  "family": "posix",
+  "description": "Linux ext4, mounted strictatime inside the kvm-test-base guest the runner boots, driven through real syscalls by harness/posix/posix_driver.py.  This is the reference POSIX implementation the model is written against, so its value is the reverse of the other cells': where this one needs a deviation, the suspicion falls on the model first.",
+  "traceStem": "ext4",
+
+  // Measured by `posix_replay.py --probe` against the guest's ext4 on
+  // 2026-09-02, not assumed.  --check-profile re-measures and fails on drift,
+  // which is what keeps these honest as the kernel moves.
+  "features": {
+    "copyRange": "supported",
+    "cloneRange": "unsupported",
+    "seekHole": "supported",
+    "root": "explore"
+  },
+
+  "policies": {
+    "gidFromParent": "unsupported",
+    "sgidInherit": "supported",
+    "writeClearsSetids": "supported",
+    "pwriteAppends": "supported",
+    "renameCtime": "supported",
+    "strictAtime": "supported",
+    "stickyWriteArm": "unsupported",
+    "chownSuppGroup": "supported",
+    "rmdirEnotempty": "supported",
+    "stickyEacces": "unsupported",
+    "unlinkDirIsdir": "supported",
+    "lockEagain": "supported"
+  },
+
+  "deviations": [],
+
+  "batches": [
+    { "flavor": "step",            "steps": 128, "traces": 10, "seed": "0x1"   },
+    { "flavor": "step",            "steps": 128, "traces": 6,  "seed": "0x2"   },
+    { "flavor": "step",            "steps": 256, "traces": 3,  "seed": "0x100" },
+    { "flavor": "step",            "steps": 512, "traces": 2,  "seed": "0x5"   },
+    { "flavor": "stepNamespace",   "steps": 128, "traces": 4,  "seed": "0x1"   },
+    { "flavor": "stepNamespace",   "steps": 256, "traces": 2,  "seed": "0x9"   },
+    { "flavor": "stepDescriptors", "steps": 128, "traces": 4,  "seed": "0x1"   },
+    { "flavor": "stepMetadata",    "steps": 128, "traces": 4,  "seed": "0x1"   },
+    { "flavor": "stepDirs",        "steps": 128, "traces": 3,  "seed": "0x1"   },
+    { "flavor": "stepData",        "steps": 128, "traces": 4,  "seed": "0x1"   },
+    { "flavor": "stepLocks",       "steps": 128, "traces": 6,  "seed": "0x1"   },
+    { "flavor": "stepLocks",       "steps": 256, "traces": 3,  "seed": "0x7"   },
+    { "flavor": "stepPerms",       "steps": 128, "traces": 5,  "seed": "0x1"   },
+    { "flavor": "stepLinks",       "steps": 128, "traces": 5,  "seed": "0x1"   },
+    { "flavor": "stepFds",         "steps": 128, "traces": 5,  "seed": "0x1"   },
+    { "flavor": "stepTooLong",     "steps": 128, "traces": 4,  "seed": "0x1"   },
+    { "flavor": "stepPrefix",      "steps": 128, "traces": 5,  "seed": "0x1"   },
+    { "flavor": "stepFallocate",   "steps": 128, "traces": 4,  "seed": "0x1"   },
+    { "flavor": "stepVectored",    "steps": 128, "traces": 4,  "seed": "0x1"   },
+    { "flavor": "stepLockOps",     "steps": 128, "traces": 4,  "seed": "0x1"   },
+    { "flavor": "stepDevice",      "steps": 128, "traces": 3,  "seed": "0x1"   }
+  ]
+}
