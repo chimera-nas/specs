@@ -33,8 +33,15 @@ the mode of an EXCLUSIVE-created file before the client's follow-up SETATTR
 checked for the RFC's ordering invariants only, never for a particular
 server's constants.
 
-Every divergence is a Finding looked up in the server's deviation
-registry (see deviations.py and nfs4_replay.py for the contract).
+Every reply is compared EXACTLY against what the model predicted: what a
+server does differently is stated in the model and switched on by the cell's
+config, so the trace's expectation is already the truth.  The one exception is
+a place where RFC 1813 itself permits several answers to one call -- it
+mandates no error precedence when two conditions apply at once -- and the
+model emits a `statusAccept` set beside the status it predicts; check_status
+membership-tests it.  A handful of divergences that could not be stated in the
+model are still looked up in the server's registry (see deviations.py and the
+docstrings of ganesha_deviations.py / knfsd_deviations.py for which).
 """
 
 import argparse
@@ -93,6 +100,9 @@ class Replayer:
         self.attr_skips = 0
         self.history = []
         self.deviations_hit = {}
+        # Replies whose status the MODEL named as one of several conformant
+        # answers (a `statusAccept` membership hit).  Reported, never fatal.
+        self.status_dev = 0
         self.unmatched = []
         self.rpcs = 0
         self._cur = None              # (step, tag, op, post_fs)
@@ -187,9 +197,25 @@ class Replayer:
                      f"fid {fid} changed fileid")
 
     def check_status(self, expected, actual, mism):
-        """True if the reply status matches (proceed with OK-path checks)."""
+        """True if the reply status matches (proceed with OK-path checks).
+
+        The tolerance rule, and there is only one of it: where RFC 1813 itself
+        permits several answers to one call -- it mandates no error precedence
+        when more than one condition applies -- the model emits a
+        `statusAccept` set beside the `status` it predicts, and this is a
+        membership test over it.  Absent (every op but the three that can carry
+        a tolerance) means exact match, so an empty set and a missing field are
+        the same thing here.  An accepted alternative skips the OK-path checks,
+        because the model's own state followed the status it predicted and the
+        reply fields behind the other answer are not the model's to check.
+        Mirrors check_status in chimera's nfs3_mbt_replay.c.
+        """
         if actual == expected:
             return True
+        op = self._cur[2] if self._cur else None
+        if op and actual in (op.get("statusAccept") or ()):
+            self.status_dev += 1
+            return False
         self.fnd(mism, "status", expected, actual)
         return False
 

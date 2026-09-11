@@ -2,9 +2,28 @@ version = 1
 
 # Files that carry no inline SPDX header: the pinned quint version marker, the
 # declared release version, and the git ignore list.  Everything else tags its
-# license in-file.  VERSION is read verbatim by bundle.sh and by consumers, so
-# it holds a bare version string and nothing else.
+# license in-file.  VERSION is read verbatim by consumers, so it holds a bare
+# version string and nothing else.
 [[annotations]]
 path = [".quint-version", "VERSION", ".gitignore"]
+SPDX-FileCopyrightText = "2026 The Quint Specs Authors"
+SPDX-License-Identifier = "MIT"
+
+# The per-family corpus schemas.  JSON has no comment syntax, so these cannot
+# carry an inline header.  Each one declares the knobs its model family exposes
+# -- which optional features an implementation may have, which of several legal
+# behaviours it chose -- and is the contract a consumer's config is validated
+# against; see cmake/SpecsCorpus.cmake.
+[[annotations]]
+path = ["quint/*/corpus.schema.json"]
+SPDX-FileCopyrightText = "2026 The Quint Specs Authors"
+SPDX-License-Identifier = "MIT"
+
+# The per-cell corpus configs a conformance harness in this repo owns.  Same
+# reason as the schemas: JSON carries no inline header.  One config fully
+# determines one corpus -- the constants the model is instantiated with, the
+# deviations the server under test is known to carry, and the batch list.
+[[annotations]]
+path = ["harness/*/configs/*.json"]
 SPDX-FileCopyrightText = "2026 The Quint Specs Authors"
 SPDX-License-Identifier = "MIT"

@@ -1,0 +1,37 @@
+{
+  "family": "s3",
+  "modelFile": "./s3",
+  "modelModule": "s3",
+
+  // The S3 model is spec-first: it states the documented AWS behaviour
+  // (us-east-1).  It has no feature or policy knobs -- there is nothing
+  // optional in the modelled surface -- but it does carry the one kind of knob
+  // every family needs: the set of KNOWN DEVIATIONS a given implementation
+  // still has.  Enabling one makes the model predict what that implementation
+  // actually does, so the trace's expectation is already the truth and replay
+  // is an exact match.  The harness no longer needs a registry, and the
+  // deviation stops being something a reader has to remember.
+  //
+  // Every id must be declared here, with a citation, before a config may
+  // enable it, and tools/devliveness.py fails the build if a cell enables one
+  // its corpus never exercises -- so an entry cannot outlive its fix.
+  "consts": {
+    "DEVS": {
+      "kind": "deviation",
+      "key": "deviations",
+      "type": "devset",
+      "doc": "Known chimera divergences from AWS S3, per cell.",
+      "known": {
+        "delete-object-200": "AWS DeleteObject answers 204 No Content for a key it removed (S3 API Reference, DeleteObject); chimera answers 200 OK.",
+        "delete-object-missing-404": "AWS DeleteObject is idempotent -- 204 for a key that was never there; chimera answers 404 NoSuchKey.",
+        "delete-bucket-nonempty-500": "AWS DeleteBucket answers 409 BucketNotEmpty; chimera maps BUCKET_NOT_EMPTY through its default 500 InternalError.",
+        "copy-self-200": "AWS rejects a CopyObject of an object onto itself with no metadata directive: 400 InvalidRequest; chimera performs it and answers 200.",
+        "range-full-200": "AWS answers 206 for every satisfiable Range including one covering the whole object (RFC 7233 4.1); chimera collapses a whole-object range to 200."
+      }
+    }
+  },
+
+  "selfTests": [
+    { "name": "s3Test", "module": "s3Test", "file": "./s3Test", "maxSamples": 200 }
+  ]
+}

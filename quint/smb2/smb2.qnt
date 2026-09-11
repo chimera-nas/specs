@@ -48,6 +48,22 @@ module smb2 {
     // trace's LInit says so.
     const P_FORCE_LEVEL2: bool
 
+    // The KNOWN DEVIATIONS the implementation under test still carries.  This
+    // model states MS-SMB2 / MS-FSA; where the server under test disagrees on
+    // purpose -- a bug that is understood, cited and not yet fixed -- the cell
+    // says so HERE, in its config, and the model then predicts what that
+    // server actually does.  The trace's expectation is therefore already the
+    // truth, replay is an exact match, and the harness needs no registry of
+    // forgivable differences.
+    //
+    // One Set constant rather than a constant per deviation: adding one costs
+    // no schema signature change, and a config names only what it enables.
+    // Every id must be declared, with a citation, in smb2/corpus.schema.json
+    // before a config may switch it on.
+    const DEVS: Set[str]
+
+    pure def dev(id: str): bool = DEVS.contains(id)
+
     // ------------------------------------------------------------------
     // Config constants (bound the state space; the harness maps symbols to
     // wire values)
@@ -138,6 +154,12 @@ module smb2 {
     var caps: Caps
     var tag: int
     var lastOp: Label
+    // Which deviations shaped the step just taken.  This is what makes a
+    // deviation falsifiable: tools/devliveness.py fails the build when a config
+    // enables one that no trace in its corpus ever records here, so a
+    // deviation that has been fixed cannot sit on quietly forgiving the same
+    // divergence elsewhere.
+    var devHits: Set[str]
 
     action init = {
         nondet cOp = oneOf(capChoices(F_OPLOCKS))
@@ -159,18 +181,20 @@ module smb2 {
             caps' = c,
             tag' = 1,
             lastOp' = LInit({ dialect: DIALECT, caps: c }),
+            devHits' = Set(),
         }
     }
 
     // The one transition shape: evaluate a message, record the label.
     action runM(msg: Msg): bool = {
-        val out = evalMsg(sdb, caps, msg)
+        val out = evalMsg(sdb, caps, DEVS, msg)
         all {
             sdb' = out.sdb2,
             caps' = caps,
             tag' = tag + 1,
             lastOp' = LMsg({ tag: tag, msg: msg, results: out.results,
                              notes: out.notes }),
+            devHits' = out.devHits,
         }
     }
 
@@ -1164,13 +1188,11 @@ module smb2 {
 
     // A create that varies its access and disposition but SHARES everything.
     //
-    // The share-all part is what keeps this flavor about notifications.  A
-    // restrictive ShareAccess makes some later create fail arbitration, and a
-    // truncating create that is refused is DEVIATIONS-SMB.md CD-3 -- a
-    // non-reconcilable deviation that abandons the trace, taking the remaining
-    // hundreds of steps of notify coverage with it.  Share arbitration is
-    // stepCore's and stepShare's subject; here it is only a way to lose the
-    // trace.
+    // The share-all part is what keeps this flavor about notifications: a
+    // restrictive ShareAccess makes some later create fail arbitration, and
+    // the resulting refusals would spend the remaining hundreds of steps of
+    // notify coverage on the create path instead.  Share arbitration is
+    // stepCore's and stepShare's subject; here it is only a distraction.
     action smbCreateShared = all {
         trees.size() > 0,
         liveInos.size() < MAX_OBJECTS,

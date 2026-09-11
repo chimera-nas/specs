@@ -1,0 +1,27 @@
+{
+  "extends": "./_smbd.json",
+  "family": "smb2",
+  "description": "the same core surface drawn through the CACHING create profile (oplock and lease contexts on the wire, which this smbd answers with no grant at all) plus compounds, against Samba. No deviation of this smbd is reachable from this flavour, so the cell states the standard exactly and is its own strict twin -- and it GATES, rather than reporting.",
+  "traceStem": "smb2Base",
+
+  // Which of the smbd profile's deviations this flavour can actually REACH.
+  // tools/devliveness.py fails a cell that enables one its own corpus never
+  // records having taken, so each flavour switches off what it cannot reach:
+  // byte-range locks are drawn only by stepInfo, SET_INFO renames only by
+  // stepNs, and a FILE_CREATE onto an existing directory only by the flavours
+  // that make directories.  Switching a deviation off in a cell that never
+  // takes its branch does not change one byte of that cell's corpus -- it is a
+  // statement about coverage, not about the server.
+  "deviationsOff": [
+    "SD-2",
+    "SD-4",
+    "SD-5",
+    "SD-8",
+    "SD-9",
+    "SD-13"
+  ],
+
+  "batches": [
+    { "flavor": "stepReq", "steps": 500, "traces": 8, "seed": "0x11" }
+  ]
+}

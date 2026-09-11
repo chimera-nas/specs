@@ -32,7 +32,14 @@ module posixTestStd {
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatOff,
-        P_ERR_LOCK_AGAIN = FeatMandatory
+        P_ERR_LOCK_AGAIN = FeatMandatory,
+        // DEVS = Set(): the self-tests check the STANDARD, so no
+        // implementation deviation is switched on here.  That is the point of
+        // keeping them separate from the generated corpus -- a config may
+        // describe a server that gets something wrong, but the model's own
+        // tests always assert POSIX.1-2024.
+        DEVS = Set(),
+        T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
 
     // ---------------- helpers ----------------
@@ -920,7 +927,14 @@ module posixTestRoot {
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatOff,
-        P_ERR_LOCK_AGAIN = FeatMandatory
+        P_ERR_LOCK_AGAIN = FeatMandatory,
+        // DEVS = Set(): the self-tests check the STANDARD, so no
+        // implementation deviation is switched on here.  That is the point of
+        // keeping them separate from the generated corpus -- a config may
+        // describe a server that gets something wrong, but the model's own
+        // tests always assert POSIX.1-2024.
+        DEVS = Set(),
+        T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
 
     def lastE = match lastOp {

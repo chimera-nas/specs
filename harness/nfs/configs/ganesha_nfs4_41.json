@@ -1,0 +1,67 @@
+{
+  "family": "nfs4",
+  "description": "The same ganesha spoken to at NFSv4.1: sessions and the slot replay discipline, with none of the 4.2 data operations (the model gates every one of them on MINOR >= 2). Mirrors chimera's nfs4_memfs41 cell for features and policies.",
+  "traceStem": "ganesha41",
+
+  "features": {
+    "pnfs": "unsupported",
+    "readDelegation": "unsupported",
+    "writeDelegation": "unsupported",
+    "xattr": "unsupported",
+    "sparse": "unsupported",
+    "copy": "unsupported",
+    "readPlus": "unsupported",
+    "ioAdvise": "unsupported",
+    "writeSame": "unsupported",
+    "clone": "unsupported"
+  },
+
+  // As at 4.2 minus the two that need RFC 7862 operations to exist:
+  // G4-seek-at-eof-not-nxio (SEEK is 4.2) has nothing to fire on here, and
+  // holeTracking with it.
+  // G4-compound-tag-length-limit is NOT enabled here even though ganesha has
+  // it: measured with tools/devliveness.py, no trace this profile generates
+  // ever sends the 256-byte NLONG compound tag -- only the 4.0 walk does -- so
+  // enabling it would be a claim the corpus cannot prove.  It is on in the 4.0
+  // cell instead.
+  // The compound tag: this ganesha DOES validate it.  Measured across the 4.0
+  // corpus -- 8 malformed tags reached it, 8 were refused with NFS4ERR_INVAL
+  // and an empty result array, none accepted -- so S4-compound-tag-unvalidated
+  // (which claims neither reference server polices the tag) is not enabled on
+  // this side; it stays on for knfsd, which does accept them.
+  "deviations": [
+    "G4-compound-shape-no-result",
+    "S4-change-is-coarse-ctime",
+    "G4-open-type-before-exist",
+    "G4-verify-wide-trivial-match",
+    "G4-setattr-share-denied",
+    "G4-exchange-id-no-confirmed-r",
+    "G4-bindconn-direction-accepted"
+  ],
+
+  "tolerances": {
+    "rflagsConfirm": true,
+    "wideAttrRefusal": true
+  },
+
+  "policies": {
+    // This cell is a ROOT export: run_nfs_mbt.sh gives ganesha
+    // "Pseudo = /" and knfsd "fsid=0", so PUTROOTFH lands on the export
+    // itself and the model's ROOT is the root of the namespace served --
+    // LOOKUPP there has no parent.  chimera's memfs cells are NAMED
+    // exports and take the other shape; see P_ROOT_EXPORT.
+    "rootExport": true,
+    "minor": 1,
+    "conflictDelays": true,
+    "closeFreesLocks": true,
+    "layoutWholeFile": true
+  },
+
+  "batches": [
+    { "flavor": "step",          "steps": 80, "traces": 8, "seed": "0x7" },
+    { "flavor": "stepState",     "steps": 80, "traces": 8, "seed": "0x7" },
+    { "flavor": "stepNamespace", "steps": 80, "traces": 8, "seed": "0x7" },
+    { "flavor": "stepData",      "steps": 80, "traces": 8, "seed": "0x7" },
+    { "flavor": "stepTypes",     "steps": 80, "traces": 6, "seed": "0x7" }
+  ]
+}

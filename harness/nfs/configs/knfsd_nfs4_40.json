@@ -1,0 +1,18 @@
+{
+  "extends": "./knfsd_nfs4_41.json",
+  "description": "The same Linux kernel server at plain NFSv4.0 -- SETCLIENTID/SETCLIENTID_CONFIRM, per-owner seqids and OPEN_CONFIRM carry the state machine. Mirrors chimera's nfs4_memfs40 cell.",
+  "traceStem": "knfsd40",
+
+  "deviations": [
+    "S4-owner-seqid-gap-unpoliced"
+  ],
+
+  // Only the 4.0 walk RENAMEs through a symbolic-link directory handle, which
+  "tolerances": {
+    "renewLapsed": true
+  },
+
+  "policies": {
+    "minor": 0
+  }
+}

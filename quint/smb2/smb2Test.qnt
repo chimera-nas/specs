@@ -21,7 +21,9 @@ module smb2Test {
         F_DIRLEASE = FeatMandatory,
         F_DURABLE = FeatMandatory,
         P_LEASE_OPEN_BREAK = true,
-        P_FORCE_LEVEL2 = false
+        P_FORCE_LEVEL2 = false,
+        // The self-tests / run instances assert the STANDARD: no deviations.
+        DEVS = Set()
     ).* from "./smb2"
 
     // ------------------------------------------------------------------
@@ -2776,7 +2778,9 @@ module smb2TestNoDurable {
         F_DIRLEASE = FeatMandatory,
         F_DURABLE = FeatOff,
         P_LEASE_OPEN_BREAK = true,
-        P_FORCE_LEVEL2 = false
+        P_FORCE_LEVEL2 = false,
+        // The self-tests / run instances assert the STANDARD: no deviations.
+        DEVS = Set()
     ).* from "./smb2"
 
     def lastResults: List[Res] =
@@ -2848,7 +2852,9 @@ module smb2TestNoLease {
         F_DIRLEASE = FeatOff,
         F_DURABLE = FeatOff,
         P_LEASE_OPEN_BREAK = true,
-        P_FORCE_LEVEL2 = false
+        P_FORCE_LEVEL2 = false,
+        // The self-tests / run instances assert the STANDARD: no deviations.
+        DEVS = Set()
     ).* from "./smb2"
 
     def lastResults: List[Res] =

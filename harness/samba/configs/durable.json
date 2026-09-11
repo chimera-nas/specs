@@ -1,0 +1,27 @@
+{
+  "family": "smb2",
+  "description": "the durable-handle lifecycle: request, grant, park across a transport drop, reconnect, reclaim, and the reclaim denial matrix. Oplocks and leases are mandatory because a durable grant is impossible without one of them (MS-SMB2 3.3.5.9.6/.10). Generated but NOT driven -- run_samba_mbt.sh configures smbd with `durable handles = no`, and smb2_replay.py skips any trace whose profile turns a caching capability on, so this cell reports a ctest SKIP.",
+  "traceStem": "smb2Durable",
+
+  "features": {
+    "oplocks": "supported",
+    "leases": "supported",
+    "dirLeases": "unsupported",
+    "durable": "supported"
+  },
+
+  "policies": {
+    // 0x0300
+    "dialect": 768,
+    "leaseOpenBreak": true,
+    "forceLevel2": false
+  },
+
+  // No deviations: nothing in this corpus is ever replayed against Samba, so
+  // enabling one here would be a claim nothing checks.
+  "deviations": [],
+
+  "batches": [
+    { "flavor": "stepDurable", "steps": 300, "traces": 8, "seed": "0x41" }
+  ]
+}

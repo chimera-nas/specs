@@ -1,0 +1,52 @@
+{
+  "family": "nfs4",
+  "description": "The same Linux kernel server at NFSv4.1: sessions and the slot replay discipline, with none of the 4.2 data operations. Mirrors chimera's nfs4_memfs41 cell for features and policies.",
+  "traceStem": "knfsd41",
+
+  "features": {
+    "pnfs": "unsupported",
+    "readDelegation": "unsupported",
+    "writeDelegation": "unsupported",
+    "xattr": "unsupported",
+    "sparse": "unsupported",
+    "copy": "unsupported",
+    "readPlus": "unsupported",
+    "ioAdvise": "unsupported",
+    "writeSame": "unsupported",
+    "clone": "unsupported"
+  },
+
+  "deviations": [
+    "S4-compound-tag-unvalidated",
+    "S4-change-is-coarse-ctime",
+    "K4-exclusive-create-mode-zero"
+  ],
+
+  // RFC 7530 16.9.4 pins neither the code for a LINK whose source is a
+  // directory nor its precedence against a malformed target name, and the
+  // Linux server reports the source type where the model reports the name.
+  // Replaces S4-link-dir-notdir, which claimed knfsd answers NFS4ERR_NOTDIR
+  // there; measured against the kvm-test-base guest, it answers ISDIR, which
+  // is what the model already predicts.
+
+  "policies": {
+    // This cell is a ROOT export: run_nfs_mbt.sh gives ganesha
+    // "Pseudo = /" and knfsd "fsid=0", so PUTROOTFH lands on the export
+    // itself and the model's ROOT is the root of the namespace served --
+    // LOOKUPP there has no parent.  chimera's memfs cells are NAMED
+    // exports and take the other shape; see P_ROOT_EXPORT.
+    "rootExport": true,
+    "minor": 1,
+    "conflictDelays": true,
+    "closeFreesLocks": true,
+    "layoutWholeFile": true
+  },
+
+  "batches": [
+    { "flavor": "step",          "steps": 80, "traces": 8, "seed": "0x7" },
+    { "flavor": "stepState",     "steps": 80, "traces": 8, "seed": "0x7" },
+    { "flavor": "stepNamespace", "steps": 80, "traces": 8, "seed": "0x7" },
+    { "flavor": "stepData",      "steps": 80, "traces": 8, "seed": "0x7" },
+    { "flavor": "stepTypes",     "steps": 80, "traces": 6, "seed": "0x7" }
+  ]
+}

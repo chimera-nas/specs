@@ -1,0 +1,26 @@
+{
+  "family": "nfs3",
+  "description": "The Linux kernel NFS server (nfs-kernel-server in the kvm-test-base guest the harness boots) exporting ext4, spoken to at NFSv3. Same batch list as the ganesha and chimera nfs3 cells; only the divergence set differs.",
+  "traceStem": "knfsd3",
+
+  "deviations": [
+    "K3-exclusive-mode-zero"
+  ],
+
+  // As for ganesha: the host kernel decides the order in which two
+  // simultaneously-true conditions are reported, and the exclusive verifier
+  // lives in the file's timestamps.
+  "tolerances": {
+    "errorPrecedence": true,
+    "exclusiveRetryVerifier": true
+  },
+
+  "batches": [
+    { "flavor": "step",      "steps": 128, "traces": 10, "seed": "0x1"   },
+    { "flavor": "step",      "steps": 256, "traces": 3,  "seed": "0x100" },
+    { "flavor": "stepChurn", "steps": 128, "traces": 6,  "seed": "0x1"   },
+    { "flavor": "stepChurn", "steps": 256, "traces": 2,  "seed": "0x200" },
+    { "flavor": "stepDir",   "steps": 128, "traces": 4,  "seed": "0x1"   },
+    { "flavor": "stepExcl",  "steps": 128, "traces": 3,  "seed": "0x1"   }
+  ]
+}

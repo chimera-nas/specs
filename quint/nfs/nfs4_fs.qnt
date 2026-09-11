@@ -72,6 +72,13 @@ module nfs4fs {
         target: str,
         // Abstract change-attribute value (unique across all inode states).
         change: int,
+        // True once an extended attribute has been written to this inode.
+        // chimera's backends disagree about whether an xattr-only mutation
+        // advances the change attribute -- memfs and diskfs do, cairn does
+        // not -- and one corpus is replayed against all of them, so from that
+        // point the model stops PREDICTING this inode's change attribute (see
+        // AttrSnap.changeOpaque and the T_XATTR_CHANGE tolerance).
+        chgOpaque: bool,
         // Extended attributes: name -> value symbol (RFC 8276).
         xattrs: Name -> int,
         // The verifier a file was EXCLUSIVE4-created with (0 = none); used
@@ -91,7 +98,7 @@ module nfs4fs {
     // change_info4 prediction (abstract before/after values of a directory's
     // change attribute).  Whether the server reports atomic=true is its own
     // choice; the harness checks before/after consistency only when it does.
-    type CInfo = { before: int, after: int }
+    type CInfo = { before: int, after: int, opaque: bool }
 
     pure val ROOT: Ino = 0
 
@@ -108,13 +115,13 @@ module nfs4fs {
     pure def mkDir(m: int, par: Ino, chgv: int): Inode = {
         ftype: FDir, mode: m, nlink: 2, blocks: Map(), sizeBlocks: 0,
         ents: Map(), parent: par, target: "", change: chgv,
-        xattrs: Map(), xverf: 0
+        xattrs: Map(), xverf: 0, chgOpaque: false
     }
 
     pure def mkFile(m: int, chgv: int): Inode = {
         ftype: FReg, mode: m, nlink: 1, blocks: Map(), sizeBlocks: 0,
         ents: Map(), parent: ROOT, target: "", change: chgv,
-        xattrs: Map(), xverf: 0
+        xattrs: Map(), xverf: 0, chgOpaque: false
     }
 
     pure def mkExclFile(m: int, v: int, chgv: int): Inode =
@@ -123,13 +130,13 @@ module nfs4fs {
     pure def mkSymlink(tgt: str, m: int, chgv: int): Inode = {
         ftype: FLnk, mode: m, nlink: 1, blocks: Map(), sizeBlocks: 0,
         ents: Map(), parent: ROOT, target: tgt, change: chgv,
-        xattrs: Map(), xverf: 0
+        xattrs: Map(), xverf: 0, chgOpaque: false
     }
 
     pure def mkSpecial(ft: Ftype, m: int, chgv: int): Inode = {
         ftype: ft, mode: m, nlink: 1, blocks: Map(), sizeBlocks: 0,
         ents: Map(), parent: ROOT, target: "", change: chgv,
-        xattrs: Map(), xverf: 0
+        xattrs: Map(), xverf: 0, chgOpaque: false
     }
 
     pure def fsInit(rootMode: int): Fs = {
@@ -192,10 +199,10 @@ module nfs4fs {
         val dnode = fs.inodes.get(d)
         if (dnode.ftype != FDir)
             { fs2: fs, st: FsNotdir, ino: -1,
-              cinfo: { before: dnode.change, after: dnode.change } }
+              cinfo: { before: dnode.change, after: dnode.change, opaque: false } }
         else if (fsHasEnt(fs, d, n))
             { fs2: fs, st: FsExist, ino: -1,
-              cinfo: { before: dnode.change, after: dnode.change } }
+              cinfo: { before: dnode.change, after: dnode.change, opaque: false } }
         else {
             val child = fs.nextIno
             val node1 = if (node.ftype == FDir) node.with("parent", d) else node
@@ -211,7 +218,7 @@ module nfs4fs {
                 .with("nextIno", fs.nextIno + 1)
                 .with("chg", fs.chg + 2)
             { fs2: fsA, st: FsOk, ino: child,
-              cinfo: { before: dnode.change, after: fs.chg + 1 } }
+              cinfo: { before: dnode.change, after: fs.chg + 1, opaque: false } }
         }
     }
 
@@ -228,7 +235,7 @@ module nfs4fs {
             { fs2: Fs, st: FsStatus, cinfo: CInfo, gone: Ino, orphaned: Ino } = {
         val dnode = fs.inodes.get(d)
         val same = { fs2: fs, st: FsOk,
-                     cinfo: { before: dnode.change, after: dnode.change },
+                     cinfo: { before: dnode.change, after: dnode.change, opaque: false },
                      gone: -1, orphaned: -1 }
         if (dnode.ftype != FDir) same.with("st", FsNotdir)
         else if (not(fsHasEnt(fs, d, n))) same.with("st", FsNoent)
@@ -259,7 +266,7 @@ module nfs4fs {
                             .with("change", fs.chg + 1)))
                 { fs2: fsB.with("chg", fs.chg + 2),
                   st: FsOk,
-                  cinfo: { before: dnode.change, after: fs.chg },
+                  cinfo: { before: dnode.change, after: fs.chg, opaque: false },
                   gone: if (dies) victim else -1,
                   orphaned: if (orphans) victim else -1 }
             }
@@ -288,8 +295,8 @@ module nfs4fs {
         val sdnode = fs.inodes.get(sd)
         val tdnode = fs.inodes.get(td)
         val same = { fs2: fs, st: FsOk,
-                     cinfoS: { before: sdnode.change, after: sdnode.change },
-                     cinfoT: { before: tdnode.change, after: tdnode.change },
+                     cinfoS: { before: sdnode.change, after: sdnode.change, opaque: false },
+                     cinfoT: { before: tdnode.change, after: tdnode.change, opaque: false },
                      gone: -1, orphaned: -1 }
         if (sdnode.ftype != FDir or tdnode.ftype != FDir)
             same.with("st", FsNotdir)
@@ -374,8 +381,8 @@ module nfs4fs {
                       st: FsOk,
                       cinfoS: { before: sdnode.change,
                                 after: if (sd == td) fs.chg + 2
-                                       else fs.chg + 1 },
-                      cinfoT: { before: tdnode.change, after: fs.chg + 2 },
+                                       else fs.chg + 1, opaque: false },
+                      cinfoT: { before: tdnode.change, after: fs.chg + 2, opaque: false },
                       gone: if (tgtDies) tgt else -1,
                       orphaned: if (tgtOrphans) tgt else -1 }
                 }
@@ -390,7 +397,7 @@ module nfs4fs {
             { fs2: Fs, st: FsStatus, cinfo: CInfo } = {
         val dnode = fs.inodes.get(d)
         val same = { fs2: fs, st: FsOk,
-                     cinfo: { before: dnode.change, after: dnode.change } }
+                     cinfo: { before: dnode.change, after: dnode.change, opaque: false } }
         if (dnode.ftype != FDir) same.with("st", FsNotdir)
         else if (fs.inodes.get(obj).ftype == FDir) same.with("st", FsIsdir)
         else if (fsHasEnt(fs, d, n)) same.with("st", FsExist)
@@ -404,7 +411,7 @@ module nfs4fs {
                     .with("change", fs.chg + 1)))
             { fs2: fsA.with("chg", fs.chg + 2),
               st: FsOk,
-              cinfo: { before: dnode.change, after: fs.chg + 1 } }
+              cinfo: { before: dnode.change, after: fs.chg + 1, opaque: false } }
         }
     }
 
@@ -580,6 +587,7 @@ module nfs4fs {
         else
             { fs2: fs.with("inodes", fs.inodes.setBy(o, x => x
                   .with("xattrs", x.xattrs.put(n, v))
+                  .with("chgOpaque", true)
                   .with("change", fs.chg)))
               .with("chg", fs.chg + 1),
               st: FsOk }
@@ -593,6 +601,7 @@ module nfs4fs {
         else
             { fs2: fs.with("inodes", fs.inodes.setBy(o, x => x
                   .with("xattrs", mapDrop(x.xattrs, n))
+                  .with("chgOpaque", true)
                   .with("change", fs.chg)))
               .with("chg", fs.chg + 1),
               st: FsOk }

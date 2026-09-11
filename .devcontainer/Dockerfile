@@ -78,16 +78,36 @@ RUN if [ -n "$APT_MIRROR" ]; then \
 #                           a matching host, so the knfsd tests run on amd64.
 # python3-pip            -- the replay harness's SMB2 client (see below)
 # reuse                  -- the SPDX lint this repo's CI enforces
+# gdb                    -- only ever used post mortem: when a server under
+#                           test DIES, harness/nfs/run_nfs_mbt.sh replays the
+#                           trace once more with cores enabled and prints a
+#                           backtrace, so the run that found the crash is also
+#                           the run that explains it
 RUN apt-get -y update && \
     apt-get -y --no-install-recommends upgrade && \
     apt-get -y --no-install-recommends install apt-utils && \
     apt-get -y --no-install-recommends install \
-        cmake ninja-build make git curl ca-certificates less vim psmisc jq \
+        cmake ninja-build make git curl ca-certificates less vim psmisc jq gdb \
         python3 python3-pip python3-venv nodejs npm reuse \
         iproute2 net-tools tshark tcpdump procps \
         samba smbclient samba-common-bin libsmbclient \
         nfs-ganesha nfs-ganesha-vfs nfs-ganesha-mem rpcbind \
         qemu-system-x86 qemu-utils && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Ubuntu's debug-symbol archive, configured but NOT installed from.  The
+# nfs-ganesha package is stripped, so a core dump from a crashing server
+# resolves every frame inside it to `??`; harness/nfs/run_nfs_mbt.sh pulls
+# nfs-ganesha-dbgsym on demand, in the post-mortem path only, and that needs
+# the source list and keyring to be here already.  Configuring the archive
+# costs a few kilobytes; installing the symbols would cost tens of megabytes
+# on every image, for a case that arises only when a server dies.
+RUN apt-get -y update && \
+    apt-get -y --no-install-recommends install ubuntu-dbgsym-keyring && \
+    . /etc/os-release && \
+    printf 'deb http://ddebs.ubuntu.com %s main restricted universe multiverse\n' \
+        "$VERSION_CODENAME" \
+        > /etc/apt/sources.list.d/ddebs.list && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # The replay harness speaks SMB2 through `smbprotocol`, a pure-Python SMB2/3
@@ -119,20 +139,25 @@ RUN npm install -g "@informalsystems/quint@$(cat /tmp/.quint-version)" && \
     quint --version && \
     rm -f /tmp/.quint-version
 
-# quint downloads its Rust evaluator the first time it simulates, into ~/.quint.
-# CI runners reach the network through internal mirrors only, so that download
-# arrives truncated and every trace generation fails.  Warm the cache here,
-# where the network is available and the result is baked into the image.
-# Double quotes, so quint's prime operator (n') needs no escaping: inside single
-# quotes a backslash is literal and would end the string early.
+# No Rust-evaluator warm-up here any more.
 #
-# The closing ls is the check: if the evaluator did not land, fail here where it
-# is fixable rather than in every generation job downstream.
-RUN printf "module warm {\n  var n: int\n  action init = n' = 0\n  action step = n' = n + 1\n}\n" \
-        > /tmp/warm.qnt && \
-    { quint run /tmp/warm.qnt --max-steps=1 --max-samples=1 > /dev/null 2>&1 || true ; } && \
-    rm -f /tmp/warm.qnt && \
-    ls -d /root/.quint/rust-evaluator-*/quint_evaluator
+# quint downloads that evaluator the first time it simulates, and these runners
+# reach the network through internal mirrors that truncate it -- so this image
+# used to warm the cache and then ASSERT the result had landed, on the grounds
+# that failing here beat failing in every generation job downstream.
+#
+# Generation no longer uses it.  It drives the TYPESCRIPT backend
+# (SPECS_QUINT_BACKEND, defaulted in cmake/SpecsCorpus.cmake and tools/
+# mkconfig.js), because quint ships the Rust evaluator only for glibc 2.39 and
+# up -- newer than ubuntu 22.04 and rocky 9 carry -- and a corpus generated on
+# every build has to generate everywhere.  So the assertion was failing image
+# builds over a component nothing asks for: a truncated download took the whole
+# image with it.
+#
+# The rust backend stays available as an opt-in, and it fetches its own
+# evaluator when someone selects it.  A half-warmed cache would be worse than
+# none: the truncation is what breaks generation, so baking a broken evaluator
+# into the image would hide the fault rather than surface it.
 
 # Samba ships a system-wide default smb.conf and a set of state directories
 # under /var/lib/samba.  The harness never uses them: every test writes a

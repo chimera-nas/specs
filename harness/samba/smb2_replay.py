@@ -9,11 +9,16 @@ This harness is what makes that claim falsifiable against a server nobody
 wrote the model alongside: it drives the generated ITF traces at a real smbd
 and compares every reply to the result the model baked into the trace.
 
-  * A disagreement the registry in samba_deviations.py covers is reported as
-    a DEVIATION and does not fail the run -- Samba is allowed to deviate, but
-    only enumerably, with a citation.
-  * Any other disagreement is a MISMATCH and fails.  It is either a model bug
-    or an unanalyzed Samba behavior, and both deserve to be looked at.
+Every reply must MATCH.  Where Samba is known to diverge, the model was told
+to predict the divergence -- the deviations the cell's config enables
+(harness/samba/configs/*.json, declared in quint/smb2/corpus.schema.json) --
+so what the trace expects is already what this server does and the comparison
+is exact.  A disagreement here is a MISMATCH and fails: it is either a model
+bug or an unanalyzed Samba behavior, and both deserve to be looked at.
+
+The one exception is CHANGE_NOTIFY.  Three divergences (SD-10, SD-11, SD-12)
+cannot be written into the model -- see samba_deviations.py for why -- and
+they alone are still forgiven from a registry.  Nothing else is.
 
 Usage:
     smb2_replay.py --server 127.0.0.1 --share share --share-path /srv/share \\
@@ -206,11 +211,6 @@ class Replayer:
         self.sess_client = {}   # model sess id -> client symbol
         self.trees = {}         # model tree id -> (Conn, wire tid)
         self.fids = {}          # model fid -> (Conn, wire fid bytes)
-        # model fid -> how it was opened: the DesiredAccess profile and whether
-        # the disposition truncated.  Several deviation entries turn on these,
-        # and the per-command trace record does not repeat them.
-        self.fid_access = {}
-        self.fid_act = {}
         self.chain_fid = None   # model fid the current chain's CREATE made
         self.ino_of = {}        # model ino -> server IndexNumber
         self.model_of_ino = {}  # server IndexNumber -> model ino
@@ -244,26 +244,13 @@ class Replayer:
         self.deviations_seen[d.id] = self.deviations_seen.get(d.id, 0) + 1
         self.deviation_verdict[d.id] = d.verdict
 
-    def cmd_ctx(self, cmd):
-        """Harness-side facts a deviation entry may need.
-
-        `access` is the DesiredAccess profile of the handle the command
-        targets -- the trace records it on the CREATE, not on every later
-        command against that handle.
-        """
-        tag = jtag(cmd)
-        v = jval(cmd)
-        if tag == "CCreate":
-            return {"access": v["access"], "create_action": None}
-        sel = v if tag in ("CClose", "CFlush", "CQueryBasic") else v.get("fid")
-        if isinstance(sel, dict) and jtag(sel) == "FidRef":
-            fid = jint(jval(sel))
-            return {"access": self.fid_access.get(fid),
-                    "create_action": self.fid_act.get(fid)}
-        return {"access": None, "create_action": None}
-
     def check_status(self, op, exp, got, cmd, res, what, ctx=None):
-        """Compare one status.  Returns True if replay may continue."""
+        """Compare one status.  Returns True if replay may continue.
+
+        The registry lookup can only ever match a CHANGE_NOTIFY op now: every
+        other Samba divergence is predicted by the model itself, so for every
+        other op this is an exact comparison and a difference is a MISMATCH.
+        """
         if exp == got:
             return True
         d = DEV.find(op, exp, got, None, None, None, cmd, res, ctx or {})
@@ -440,10 +427,8 @@ class Replayer:
         cv = jval(cmd)
         exp = jint(rv["st"]) & 0xFFFFFFFF
         what = self.describe(cmd)
-        ctx = self.cmd_ctx(cmd)
-        ctx["wire_status"] = status
 
-        if not self.check_status(rtag, exp, status, cv, rv, what, ctx):
+        if not self.check_status(rtag, exp, status, cv, rv, what):
             return
         if status != W.ST_SUCCESS:
             if rtag == "RCreate":
@@ -476,8 +461,6 @@ class Replayer:
         if self.chain_fid is None:
             return
         self.fids.pop(self.chain_fid, None)
-        self.fid_access.pop(self.chain_fid, None)
-        self.fid_act.pop(self.chain_fid, None)
         self.chain_fid = None
 
     def check_create(self, cv, rv, parsed, conn, what):
@@ -496,11 +479,6 @@ class Replayer:
         model_fid = jint(rv["fid"])
         if model_fid >= 0:
             self.fids[model_fid] = (conn, wire_fid)
-            self.fid_access[model_fid] = cv["access"]
-            # The CreateAction, which is what decides whether the server had to
-            # open the backing object for write (CREATED / OVERWRITTEN /
-            # SUPERSEDED) or merely opened it (OPENED).
-            self.fid_act[model_fid] = jint(rv["act"])
             self.chain_fid = model_fid
 
         if self.args.check_identity:
@@ -558,18 +536,9 @@ class Replayer:
         got //= BS
         if want == got:
             return
-        d = DEV.find("RCreate", status, status, "truncate-on-refused-open",
-                     None, None, cv, rv, {})
-        if d is None:
-            self.mism("%s: the open was refused by both, but the file is %d "
-                      "block(s) in the model and %d on the server -- a refused "
-                      "CREATE modified something", what, want, got)
-            return
-        self.deviation(d, "%s: refused open left %d block(s) in the model and "
-                          "%d on the server (%s)", what, want, got, d.summary)
-        if not d.is_reconcilable(cv, rv, {}):
-            self.abort_cause = d
-            raise Abort()
+        self.mism("%s: the open was refused by both, but the file is %d "
+                  "block(s) in the model and %d on the server -- a refused "
+                  "CREATE modified something", what, want, got)
 
     def peek_size(self, name, conn):
         """The server's current EndOfFile for `name`, or 0 / None.
@@ -711,8 +680,6 @@ class Replayer:
             return
         fid = jint(jval(sel))
         self.fids.pop(fid, None)
-        self.fid_access.pop(fid, None)
-        self.fid_act.pop(fid, None)
 
     # -- message dispatch --------------------------------------------------
 
@@ -1053,8 +1020,6 @@ class Replayer:
         for k, (c, _f) in list(self.fids.items()):
             if c is conn:
                 self.fids.pop(k, None)
-                self.fid_access.pop(k, None)
-                self.fid_act.pop(k, None)
 
     # -- trace driver ------------------------------------------------------
 

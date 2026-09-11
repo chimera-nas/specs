@@ -7,7 +7,11 @@
 // model regression is caught before it can invalidate generated traces.
 
 module s3Test {
-    import s3.* from "./s3"
+    // DEVS = Set(): the self-tests check the STANDARD, so no implementation
+    // deviation is switched on here.  That is the point of keeping them
+    // separate from the generated corpus -- a config may describe a server that
+    // gets something wrong, but the model's own tests always assert AWS.
+    import s3(DEVS = Set()).* from "./s3"
 
     // Key shorthands (component lists).
     pure val kA: Key = ["a"]

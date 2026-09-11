@@ -1,0 +1,41 @@
+{
+  "extends": "./ganesha_nfs4_42.json",
+  "description": "The 4.2 ganesha with delegations SERVED: identical capabilities, but both delegation features asserted so the grant / recall / return lifecycle is generated rather than assumed absent. The stepDeleg flavor drives that lifecycle and nothing else.",
+  "traceStem": "ganesha42Deleg",
+
+  "features": {
+    "readDelegation": "supported",
+    "writeDelegation": "supported"
+  },
+
+  // measured with tools/devliveness.py: this flavour never aims an IO_ADVISE
+  // at an open stateid, so the hazard its parent fences is unreachable here.
+  "hazardsOff": [
+    "G4-close-after-io-advise-segv"
+  ],
+
+  // A delegation-only corpus reaches almost none of the parent's divergences,
+  // and an enabled-but-unexercised deviation fails tools/devliveness.py.
+  "deviationsOff": [
+    // a delegation-only walk never drives an EXCLUSIVE4 create onto an
+    // existing object of the wrong type.
+    "G4-open-type-before-exist",
+    // measured with tools/devliveness.py: this flavour never sends a
+    // compound this server would refuse on its shape.
+    "G4-compound-shape-no-result",
+    "G4-compound-tag-length-limit",
+    "G4-verify-wide-trivial-match",
+    "G4-setattr-share-denied",
+    "G4-exchange-id-no-confirmed-r",
+    "G4-bindconn-direction-accepted",
+    "G4-seek-at-eof-not-nxio"
+  ],
+
+  "tolerances": {
+    "holeTracking": false
+  },
+
+  "batches": [
+    { "flavor": "stepDeleg", "steps": 80, "traces": 10, "seed": "0x7" }
+  ]
+}

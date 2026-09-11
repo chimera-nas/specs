@@ -1,0 +1,59 @@
+{
+  "family": "nfs3",
+  "modelFile": "../nfs/nfs3",
+  "modelModule": "nfs3",
+
+  "selfTests": [
+    { "name": "nfs3Test", "module": "nfs3Test", "file": "../nfs/nfs3Test", "maxSamples": 500 }
+  ],
+
+  "extraSources": ["../nfs/nfs3.qnt", "../nfs/nfs3Test.qnt"],
+
+  // An NFSv3 server has no optional surface to advertise and no minor version
+  // to pick, so this family declares no feature or policy knobs.  What it does
+  // declare is the two kinds of knob every family needs once the harness stops
+  // arguing with the corpus:
+  //
+  //   DEVIATIONS -- the implementation is wrong here, on purpose, for now.
+  //     Enabling one makes the model predict what chimera actually does, so
+  //     the trace's expectation is already the truth and replay is an exact
+  //     match.  Every id must be declared below, with a citation, before a
+  //     config may enable it, and tools/devliveness.py fails the build if a
+  //     cell enables one its corpus never exercises -- so an entry cannot
+  //     outlive its fix.
+  //
+  //   TOLERANCES -- the STANDARD permits several answers to one call, so no
+  //     boolean pins the reply and nothing is being forgiven.  The model emits
+  //     a `statusAccept` set beside the status it predicts and the harness
+  //     membership-tests instead of comparing; a cell that does not enable the
+  //     tolerance still demands the exact answer.
+  "consts": {
+    "DEVS": {
+      "kind": "deviation",
+      "key": "deviations",
+      "type": "devset",
+      "doc": "Known chimera divergences from RFC 1813, per cell.",
+      "known": {
+
+
+        "G3-link-dir-badtype": "RFC 1813 3.3.15 (LINK; the directory-source status is unspecified).  ganesha refuses a directory hard link with NFS3ERR_BADTYPE where the model -- and chimera -- answer NFS3ERR_ISDIR.  RFC 1813 3.3.15 lists neither ISDIR nor a POSIX EPERM among LINK's errors, so servers differ.  Nothing is linked, so nothing downstream parts.  Replaces the ganesha registry's GN-2-link-dir-badtype.  Note the NFSv4 LINK path lands elsewhere: there ganesha agrees with the model (NFS4ERR_ISDIR), and so does the Linux server, so the v4 model simply accepts both codes and the unspecified precedence, with no knob at all.",
+
+        "K3-exclusive-mode-zero": "RFC 1813 3.3.8 (the mode of an EXCLUSIVE-created file is undefined until the client's SETATTR).  knfsd creates the exclusive file with no permission bits until the follow-up SETATTR, where the model -- like ganesha and chimera -- uses 0600.  RFC-undefined, so this is a knfsd-specific choice rather than a defect; it is recorded as a deviation because the model has to predict SOME mode for the attribute comparison to mean anything.  Replaces the knfsd registry's KN3-2-exclusive-mode-zero."
+      }
+    },
+    "T_ERROR_PRECEDENCE": {
+      "kind": "tolerance",
+      "key": "tolerances.errorPrecedence",
+      "type": "bool",
+      "default": false,
+      "doc": "RFC 1813 mandates no error precedence when more than one condition applies to a request. With this on, the two cases the corpus reaches accept the host kernel's order as well as the model's: LINK of a directory onto an existing name (ISDIR or EXIST), and RENAME of a non-directory onto a NON-EMPTY directory (ISDIR or NOTEMPTY). Off means the cell demands the model's order exactly."
+    },
+    "T_EXCL_RETRY_VERIFIER": {
+      "kind": "tolerance",
+      "key": "tolerances.exclusiveRetryVerifier",
+      "type": "bool",
+      "default": false,
+      "doc": "RFC 1813 3.3.8 says an EXCLUSIVE create retry presenting the same verifier 'should' succeed idempotently -- a guarantee for a true RETRANSMIT. chimera stores the verifier in the file's atime/mtime, the mechanism the RFC itself suggests, so on a backend that resolves through the host kernel an intervening READ bumps atime, the verifier no longer matches, and the retry answers EXIST. Permitted, because this is not a retransmit. With this on both answers are accepted; off demands the idempotent OK."
+    }
+  }
+}

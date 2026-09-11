@@ -1,0 +1,106 @@
+{
+  "family": "smb2",
+  "modelFile": "./smb2",
+  "modelModule": "smb2",
+
+  "prelude": [
+    "import nfs4fs.* from \"../nfs/nfs4_fs\"",
+    "import smb2state.* from \"./smb2_state\"",
+    "import smb2ops.* from \"./smb2_ops\""
+  ],
+
+  "selfTests": [
+    { "name": "smb2Test",          "module": "smb2Test",          "file": "./smb2Test", "maxSamples": 200 },
+    { "name": "smb2TestNoDurable", "module": "smb2TestNoDurable", "file": "./smb2Test", "maxSamples": 200 },
+    { "name": "smb2TestNoLease",   "module": "smb2TestNoLease",   "file": "./smb2Test", "maxSamples": 200 }
+  ],
+
+  "extraSources": ["../nfs/nfs4_fs.qnt"],
+
+  "consts": {
+    "DEVS": {
+      "kind": "deviation",
+      "key": "deviations",
+      "type": "devset",
+      "doc": "Known divergences from MS-SMB2 / MS-FSA, per cell. The model states the standard; enabling an id here makes it predict what the server under test actually does, so the trace's expectation is already the truth and replay is an exact match. CD-* are chimera's, SD-* are Samba's (measured against the smbd in this repo's devcontainer, harness/samba). Every id must be declared below, with a citation, before a config may enable it, and tools/devliveness.py fails the build if a cell enables one its corpus never exercises -- so an entry cannot outlive its fix.",
+      "known": {
+        "SD-2": "SAMBA. MS-SMB2 3.3.5.14 (Receiving an SMB2 LOCK Request): a LOCK on a handle holding neither FILE_READ_DATA nor FILE_WRITE_DATA is refused with STATUS_INVALID_HANDLE rather than STATUS_ACCESS_DENIED. Measured directly: a DELETE-only and an attribute-only handle both answer 0xC0000008, while read-only and write-only handles lock successfully. So Samba does make the access check the spec calls for -- it just reports the wrong status for it. (This entry began as a `both`: the model performed no access check at all and granted the lock. That half is fixed, leaving only Samba's status.) Both sides refuse and neither takes a lock, so only the STATUS diverges. Fix: samba: return STATUS_ACCESS_DENIED from the LOCK GrantedAccess check. Model: smb2_ops.qnt devLockRefuseSt, taken in doCmdLock.",
+        "SD-4": "SAMBA. MS-FSA 2.1.5.14.11 (Set FileRenameInformation): Samba checks the destination for a collision before it checks that the handle holds DELETE access, so a rename that fails both ways reports the collision instead of the access failure. Measured directly: with a handle opened without DELETE, a rename onto a FREE name answers STATUS_ACCESS_DENIED, while a rename onto an EXISTING name answers STATUS_OBJECT_NAME_COLLISION -- so the target lookup runs first. The spec's algorithm makes the DELETE-access check an early precondition, which is the order the model encodes. Neither side renames anything, so the namespace stays in step. Fix: samba: hoist the GrantedAccess DELETE check above the destination lookup in the rename path. Model: smb2_ops.qnt devRenameSd4, taken in doCmdSetRename.",
+        "SD-5": "SAMBA. MS-FSA 2.1.5.1.2 (Open of Existing File), disposition ordering: FILE_CREATE onto an existing DIRECTORY opened with FILE_NON_DIRECTORY_FILE reports STATUS_FILE_IS_A_DIRECTORY instead of STATUS_OBJECT_NAME_COLLISION. Samba runs the create-options TYPE check ahead of the FILE_CREATE collision check, but only in one direction. Measured on all four corners: existing directory + NON_DIRECTORY_FILE answers 0xC00000BA, while existing FILE + DIRECTORY_FILE answers 0xC0000035 (collision), not STATUS_NOT_A_DIRECTORY -- so the ordering is asymmetric. The spec makes the FILE_CREATE collision the first thing the existing-target path decides, before the type is consulted at all, which is the order the model encodes. Both sides refuse and neither creates anything, so the namespace stays in step. Fix: samba: decide the FILE_CREATE collision before the create-options type check, so both directions agree. Model: smb2_ops.qnt devCreateSd5, taken in doCmdCreate.",
+        "SD-8": "SAMBA. MS-SMB2 3.3.5.14 (Receiving an SMB2 LOCK Request); MS-FSA 2.1.5.1.2 on the transience of a truncate's write: a handle whose CREATE actually created or overwrote the file may take byte-range locks even when its DesiredAccess carried no data access -- the write the server took to do that is treated as if the handle kept it. The CreateAction decides it exactly. Holding DesiredAccess fixed at DELETE-only and varying only whether the file already existed: act=OPENED refuses LOCK with 0xC0000008, while act=CREATED (FILE_CREATE, or FILE_OPEN_IF on a missing name) and act=OVERWRITTEN both GRANT it. Samba opens the backing descriptor for write when it has to create or truncate, and its lock path consults that descriptor rather than the SMB GrantedAccess. Samba itself does not treat the write as retained for SHARE purposes -- the same handle denies a later writer nothing -- so its two checks disagree with each other, which is what makes this a bug rather than an interpretation. Fix: samba: check the SMB GrantedAccess in the LOCK path, not the descriptor's open mode. Model: smb2_ops.qnt devLockSd8, taken in doCmdLock; it reads Open.createAct, which exists for this entry alone. A lock the deviating server GRANTS is now a lock the model holds too, so the reads, writes and unlocks that follow over that range keep testing -- the case the old registry could only abandon.",
+        "SD-13": "SAMBA. MS-SMB2 3.3.5.14 (Receiving an SMB2 LOCK Request): the GrantedAccess check is specified to run before the request is processed, but Samba evaluates the byte-range CONFLICT first -- so a lock on a handle with no data access that also overlaps a range another handle holds is refused STATUS_LOCK_NOT_GRANTED (0xC0000055), not the STATUS_INVALID_HANDLE that SD-2 records for the access check itself.  Measured on three traces of the stepInfo flavour: an attribute-only handle (GrantedAccess = FILE_READ_ATTRIBUTES alone, CreateAction OPENED, so neither SD-8 nor SD-9 applies) asking for a range already locked by a different handle on the same file.  The same handle answers 0xC0000008 when the range is free, which is what makes this a reordering rather than a different status for the same check.  Neither side takes a lock, so replay stays in step.  Fix: samba: apply the LOCK GrantedAccess check before consulting the brlock database.  Model: smb2_ops.qnt devLockSd13, taken in doCmdLock.  Numbered 13 because the harness registry harness/samba/samba_deviations.py already holds SD-10, SD-11 and SD-12 for CHANGE_NOTIFY.",
+
+        "SD-9": "SAMBA. MS-SMB2 3.3.5.14 (Receiving an SMB2 LOCK Request): the GrantedAccess check is applied to a lock request but not to an unlock request, so an unlock on a handle with no data access is processed and answers STATUS_RANGE_NOT_LOCKED. Measured on one handle: DELETE-only and attribute-only handles, act=OPENED, refuse LOCK with 0xC0000008 and then accept the matching UNLOCK, answering 0xC000007E. The spec conditions the whole request on the access check, not just its locking half. Distinct from SD-2 (which is about the STATUS the check reports) and SD-8 (which is about WHAT it consults): here the check does not run at all. Neither side unlocks anything, so replay stays in step. Fix: samba: apply the LOCK GrantedAccess check before dispatching either half of the request. Model: smb2_ops.qnt devLockSd9, taken in doCmdLock; consulted only for an unlock SD-8 did not already admit, so its liveness needs an act=OPENED handle, which is how it was measured."
+      }
+    },
+    "DIALECT": {
+      "kind": "policy",
+      "key": "policies.dialect",
+      "type": "int",
+      "default": 768,
+      "doc": "the negotiated dialect the trace pins (0x0202 = 514 ... 0x0311 = 785). Recorded in LInit for the harness, which puts it on the wire; the model does not branch on it. 768 is 0x0300."
+    },
+    "F_OPLOCKS": {
+      "kind": "feature",
+      "key": "features.oplocks",
+      "type": "enum",
+      "values": {
+        "supported": "FeatMandatory",
+        "explore": "FeatIfAdvertised",
+        "unsupported": "FeatOff"
+      },
+      "default": "unsupported",
+      "doc": "legacy oplocks (chimera's set_smb_oplocks). 'supported' fails the suite if the server does not advertise them, rather than passing vacuously; 'explore' lets init draw support on or off; 'unsupported' removes the whole grant/break lifecycle from the corpus."
+    },
+    "F_LEASES": {
+      "kind": "feature",
+      "key": "features.leases",
+      "type": "enum",
+      "values": {
+        "supported": "FeatMandatory",
+        "explore": "FeatIfAdvertised",
+        "unsupported": "FeatOff"
+      },
+      "default": "unsupported",
+      "doc": "SMB2 leases (chimera's set_smb_leases)."
+    },
+    "F_DIRLEASE": {
+      "kind": "feature",
+      "key": "features.dirLeases",
+      "type": "enum",
+      "values": {
+        "supported": "FeatMandatory",
+        "explore": "FeatIfAdvertised",
+        "unsupported": "FeatOff"
+      },
+      "default": "unsupported",
+      "doc": "directory leases. Off in every corpus generated so far."
+    },
+    "F_DURABLE": {
+      "kind": "feature",
+      "key": "features.durable",
+      "type": "enum",
+      "values": {
+        "supported": "FeatMandatory",
+        "explore": "FeatIfAdvertised",
+        "unsupported": "FeatOff"
+      },
+      "default": "unsupported",
+      "doc": "durable/persistent handles (chimera's persistent_handles). A durable grant is impossible without a BATCH oplock or a HANDLE-caching lease (MS-SMB2 3.3.5.9.6/.10), so 'supported' here only makes sense alongside oplocks and leases -- otherwise the corpus can only generate refusals (probe D1)."
+    },
+    "P_LEASE_OPEN_BREAK": {
+      "kind": "policy",
+      "key": "policies.leaseOpenBreak",
+      "type": "bool",
+      "default": true,
+      "doc": "does a conflicting CREATE break a peer's lease at OPEN time (MS-FSA-correct, true), or does the lease survive the open and break only on later I/O / namespace work (the reference implementation's Seam-A asymmetry, false)?"
+    },
+    "P_FORCE_LEVEL2": {
+      "kind": "policy",
+      "key": "policies.forceLevel2",
+      "type": "bool",
+      "default": false,
+      "doc": "the share carries SMB2_SHAREFLAG_FORCE_LEVELII_OPLOCK (MS-SMB2 2.2.10), so every caching grant caps to a read cache: exclusive/batch and W/H leases are never handed out and the break lifecycle runs entirely at LEVEL_II / R. A share property, not a negotiated capability -- the harness sets it on the share when the trace's LInit says so."
+    }
+  }
+}

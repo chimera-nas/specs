@@ -219,8 +219,61 @@ module nfs4ops {
         // open either frees them (true) or fails NFS4ERR_LOCKS_HELD
         // (false) -- (free) XOR (LOCKS_HELD) per RFC 7530 9.10 /
         // RFC 8881 9.8.
-        closeFreesLocks: bool
+        closeFreesLocks: bool,
+        // Where the exported filesystem sits in the server's NFSv4 namespace,
+        // which is a deployment choice, not a divergence.  true: the cell's
+        // filesystem IS the "/" export, so PUTROOTFH lands on its root and the
+        // model's ROOT is the root of the namespace served -- LOOKUPP there has
+        // no parent (RFC 7530 16.14.4 / RFC 8881 18.14.4, NFS4ERR_NOENT).
+        // false: the filesystem is a NAMED export, one entry in the server's
+        // pseudo-filesystem (RFC 7530 7.3), so ROOT has the pseudo-root above
+        // it and LOOKUPP there walks onto it; NOENT belongs one level higher.
+        // Both are conformant and both are served by chimera, so the cell picks
+        // one and the corpus tests exactly that shape.
+        rootExport: bool,
+        // The known divergences the implementation under test still carries
+        // (nfs4.qnt's DEVS, bound from the cell's config).  Carried here
+        // because Caps is the one thing every evaluation step already has in
+        // hand, so a deviating branch can be written where the divergence
+        // actually is rather than reconciled afterwards.  See the `known`
+        // block of quint/nfs4/corpus.schema.json for what each id claims and
+        // the citation that makes it a divergence rather than a choice.
+        devs: Set[str],
+        // TOLERANCE (not a deviation): the backend tracks holes for real, so
+        // RFC 7862 15.11 lets SEEK answer more precisely than the model's
+        // byte-granular view.  Turns SEEK's `stAccept`/`offsetAccept`/`eofAccept`
+        // sets from singletons into the set of conformant answers.
+        tolHoleTracking: bool,
+        // TOLERANCE: whether an extended-attribute-only mutation advances the
+        // change attribute is left to the server by RFC 8276, and chimera's
+        // backends answer differently.  See Inode.chgOpaque.
+        tolXattrChange: bool,
+        // TOLERANCE (not a deviation): RFC 7530 16.30.4 lists both
+        // NFS4ERR_EXPIRED and NFS4ERR_STALE_CLIENTID for RENEW and 9.6.3
+        // leaves a lapsed client id's survival to the server.  See opRenew.
+        tolRenewLapsed: bool,
+        // TOLERANCE (not a deviation): OPEN4_RESULT_CONFIRM is inert above
+        // 4.0 (RFC 8881 18.16), so a server may set it or not.  See opOpen.
+        tolRflagsConfirm: bool,
+        // TOLERANCE (not a deviation): RFC 8881 18.7.3 lets a server refuse an
+        // attribute combination it cannot satisfy, and the wide GETATTR asks
+        // for all of them.  See opGetattrWide.
+        tolWideAttrRefusal: bool,
     }
+
+    // Did the cell's config enable this deviation?
+    pure def hasDev(c: Caps, id: str): bool = c.devs.contains(id)
+
+    // The abstract identity of the pseudo-filesystem node ABOVE a NAMED
+    // export (see Caps.rootExport).  With a named export the namespace does
+    // not stop at the exported root: a LOOKUPP there walks into the server's
+    // pseudo-filesystem, which holds the shares.  The model has nothing to say
+    // about that node -- it is not part of the exported tree -- but it does
+    // have to name it, because the harness has to learn its filehandle and
+    // check the answer is stable.  Unreachable in a rootExport cell, where the
+    // exported root IS the namespace root.  Chosen inside the harness's ino
+    // table (V4_MAX_INOS) and far above anything a trace allocates.
+    pure val PSEUDO_INO: Ino = 4095
 
     // ------------------------------------------------------------------
     // Request / reply shapes
@@ -327,34 +380,49 @@ module nfs4ops {
 
     // Attribute snapshot for GETATTR-class checks.  change is the abstract
     // change value (harness checks consistency, not raw equality).
+    // `changeOpaque` is the one tolerance the `<field>Accept` convention does
+    // not fit: what the harness checks about the change attribute is not a
+    // value in this reply but an INVARIANT across replies (equal abstract =>
+    // equal wire value, distinct abstract => distinct wire value), so there is
+    // no set of acceptable answers to enumerate.  When it is true the model is
+    // saying it can no longer predict this inode's change attribute at all,
+    // and the harness drops the invariant for that inode.  See
+    // nfs4_fs.qnt's Inode.chgOpaque and the T_XATTR_CHANGE tolerance.
     type AttrSnap = { ftype: Ftype, mode: int, nlink: int,
-                      sizeBlocks: int, change: int }
+                      sizeBlocks: int, change: int, changeOpaque: bool }
 
     type OpRes =
         | SPutrootfh({ st: int })
         | SPutfh({ st: int })
         | SGetfh({ st: int, ino: Ino })
         | SSavefh({ st: int })
-        | SGetattrWide({ st: int })
-        | SSecinfo({ st: int })
+        | SGetattrWide({ st: int, stAccept: Set[int] })
+        | SSecinfo({ st: int, stAccept: Set[int] })
         | SBindConnToSession({ st: int })
         | SRestorefh({ st: int })
-        | SLookup({ st: int, child: Ino })
-        | SLookupp({ st: int, parent: Ino })
+        | SLookup({ st: int, child: Ino, stAccept: Set[int] })
+        | SLookupp({ st: int, parent: Ino, stAccept: Set[int] })
         | SGetattr({ st: int, attrs: AttrSnap })
         | SReadlink({ st: int, target: str })
         | SAccess({ st: int, supported: int, access: int })
-        | SReaddir({ st: int, names: Set[Name] })
-        | SCreate({ st: int, ino: Ino, cinfo: CInfo })
-        | SRemove({ st: int, cinfo: CInfo })
-        | SRename({ st: int, cinfoS: CInfo, cinfoT: CInfo })
-        | SLink({ st: int, cinfo: CInfo })
-        | SSetattr({ st: int })
-        | SVerify({ st: int })
-        | SNverify({ st: int })
+        | SReaddir({ st: int, names: Set[Name], stAccept: Set[int] })
+        | SCreate({ st: int, ino: Ino, cinfo: CInfo, stAccept: Set[int] })
+        | SRemove({ st: int, cinfo: CInfo, stAccept: Set[int] })
+        | SRename({ st: int, cinfoS: CInfo, cinfoT: CInfo,
+                    stAccept: Set[int] })
+        | SLink({ st: int, cinfo: CInfo, stAccept: Set[int] })
+        | SSetattr({ st: int, stAccept: Set[int] })
+        | SVerify({ st: int, stAccept: Set[int] })
+        | SNverify({ st: int, stAccept: Set[int] })
         | SSetclientid({ st: int, client: ClientId, tok: int })
         | SSetclientidConfirm({ st: int })
-        | SRenew({ st: int })
+        // TOLERANCE (T_RENEW_LAPSED).  RFC 7530 16.30.4 lists BOTH
+        // NFS4ERR_EXPIRED and NFS4ERR_STALE_CLIENTID for RENEW, and 9.6.3
+        // leaves it to the server how long a client id whose lease has
+        // lapsed survives -- so a late RENEW may be refused as a stale id,
+        // refused as an expired lease, or simply succeed and refresh it.
+        // Same rule as everywhere: `stAccept` present -> membership test.
+        | SRenew({ st: int, stAccept: Set[int] })
         | SReleaseLockowner({ st: int })
         | SExchangeId({ st: int, client: ClientId, csSeq: int,
                         confirmedR: bool, pnfsMds: bool })
@@ -368,36 +436,49 @@ module nfs4ops {
         // CB_RECALL before this op can eventually succeed (the op itself
         // returns NFS4ERR_DELAY under the conflictDelays profile).
         | SOpen({ st: int, sid: Sid, seq: int, needConfirm: bool,
+                  needConfirmAccept: Set[bool], stAccept: Set[int],
                   cinfo: CInfo, deleg: DelegRes, recalls: Set[Sid] })
         | SOpenConfirm({ st: int, seq: int })
         | SOpenDowngrade({ st: int, seq: int })
         | SClose({ st: int })
-        | SRead({ st: int, count: int, eof: bool, blocks: List[int] })
-        | SWrite({ st: int, count: int, newSizeBlocks: int })
-        | SCommit({ st: int })
+        | SRead({ st: int, count: int, eof: bool, blocks: List[int],
+                  stAccept: Set[int] })
+        | SWrite({ st: int, count: int, newSizeBlocks: int,
+                   stAccept: Set[int] })
+        | SCommit({ st: int, stAccept: Set[int] })
         // denied: the owner symbol of one conflicting lock (-1 if OK).
         // acceptance: which conflicting lock a server reports when several
         // exist is discretionary; the harness checks the reported conflict
         // is real rather than comparing owners exactly.
-        | SLock({ st: int, sid: Sid, seq: int, deniedOwner: int })
-        | SLockt({ st: int, deniedOwner: int })
-        | SLocku({ st: int, seq: int })
+        | SLock({ st: int, sid: Sid, seq: int, deniedOwner: int,
+                  stAccept: Set[int] })
+        | SLockt({ st: int, deniedOwner: int, stAccept: Set[int] })
+        | SLocku({ st: int, seq: int, stAccept: Set[int] })
         | SDelegreturn({ st: int })
-        | SLayoutget({ st: int, sid: Sid, seq: int, lo: int, hi: int })
+        | SLayoutget({ st: int, sid: Sid, seq: int, lo: int, hi: int,
+                       stAccept: Set[int] })
         | SLayoutreturn({ st: int, present: bool, seq: int })
         | SLayoutcommit({ st: int, newSizeBlocks: int })
         | SGetdeviceinfo({ st: int })
         | SAllocate({ st: int })
         | SDeallocate({ st: int })
-        | SSeek({ st: int, eof: bool, offset: int })
-        | SCopy({ st: int, copied: int })
+        // SEEK is the one place in this model where the STANDARD permits
+        // several answers to one call, so the reply carries a sibling accept
+        // set beside each tolerant field.  The harness rule is one rule:
+        // `<field>Accept` present -> membership test, otherwise equality.  On
+        // a cell with T_HOLE_TRACKING off each set is the singleton of the
+        // exact answer, which is equality said the long way.
+        | SSeek({ st: int, eof: bool, offset: int,
+                  stAccept: Set[int], offsetAccept: Set[int],
+                  eofAccept: Set[bool] })
+        | SCopy({ st: int, copied: int, stAccept: Set[int] })
         // blocks/isData describe the requested range block by block; a
         // server may legally return a shorter prefix (see opReadPlus).
         | SReadPlus({ st: int, eof: bool, count: int,
                       blocks: List[int], isData: List[bool] })
         | SIoAdvise({ st: int })
         | SWriteSame({ st: int, count: int })
-        | SClone({ st: int })
+        | SClone({ st: int, stAccept: Set[int] })
         | SGetxattr({ st: int, sym: int })
         | SSetxattr({ st: int })
         | SListxattrs({ st: int, names: Set[Name] })
@@ -421,8 +502,16 @@ module nfs4ops {
         seqClient: ClientId,// client of the SEQUENCE's session (4.1)
         done: bool,         // stop: an op returned non-OK (or replay)
         status: int,        // status of the last executed op
-        results: List[OpRes]
+        results: List[OpRes],
+        devHits: Set[str]   // deviations this compound's answers were shaped by
     }
+
+    // Record that a deviating branch was taken.  Every id emitted here must be
+    // enabled by the cell's config (the branches all guard on hasDev), which
+    // is what lets tools/devliveness.py fail a config that enables a deviation
+    // its corpus never reaches.
+    pure def hitDev(a: Acc, id: str): Acc =
+        a.with("devHits", a.devHits.union(Set(id)))
 
     pure def statusOf(r: OpRes): int =
         match r {
@@ -490,6 +579,19 @@ module nfs4ops {
     // Append a result; halt the compound when it is an error
     // (first-error-stops, RFC 7530 14.2 / RFC 8881 16.2.4 -- this applies
     // even to "non-error" statuses like NFS4ERR_SAME).
+    // G4-compound-shape-no-result: a compound refused for its SHAPE rather
+    // than for anything an operation did -- the first op is neither SEQUENCE
+    // nor session-exempt (NFS4ERR_OP_NOT_IN_SESSION, RFC 8881 2.10.6.1), or a
+    // solo-only operation is sent alongside others (NFS4ERR_NOT_ONLY_OP, RFC
+    // 8881 18.34.3).  The RFCs report both against the offending operation,
+    // so the reply carries one result; ganesha answers the same status with
+    // an EMPTY result array.  Nothing runs on either side.
+    pure def refuseShape(a: Acc, r: OpRes, st: int): Acc =
+        if (hasDev(a.caps, "G4-compound-shape-no-result"))
+            hitDev(a, "G4-compound-shape-no-result")
+                .with("status", st).with("done", true)
+        else emit(a, r)
+
     pure def emit(a: Acc, r: OpRes): Acc = {
         val st = statusOf(r)
         a.with("results", a.results.append(r))
@@ -497,8 +599,16 @@ module nfs4ops {
          .with("done", st != OK)
     }
 
-    pure def cfhLive(a: Acc): bool = a.cfh != -1 and fsLive(a.fs, a.cfh)
-    pure def cfhNode(a: Acc): Inode = fsGet(a.fs, a.cfh)
+    pure def cfhLive(a: Acc): bool =
+        a.cfh == PSEUDO_INO or (a.cfh != -1 and fsLive(a.fs, a.cfh))
+    // A stand-in inode for the pseudo-filesystem node above a named export,
+    // so an op that reaches it has something to read rather than falling off
+    // the map.  Only its type is ever consulted; the generator never aims an
+    // attribute-reading op at it (the only op that can follow the LOOKUPP
+    // that produces it is GETFH).
+    pure val PSEUDO_NODE: Inode = mkDir(365, PSEUDO_INO, 0)
+    pure def cfhNode(a: Acc): Inode =
+        if (a.cfh == PSEUDO_INO) PSEUDO_NODE else fsGet(a.fs, a.cfh)
 
     // Component-name validation, mirroring chimera_nfs4_validate_name()
     // (nfs4_procs.h) exactly, including its order: empty before too-long
@@ -545,6 +655,9 @@ module nfs4ops {
     // Returns OK when the cfh is usable.
     pure def fhGate(a: Acc): int =
         if (a.cfh == -1) E_NOFILEHANDLE
+        // The pseudo-filesystem node above a named export exists and is a
+        // usable directory; the model knows only that much about it.
+        else if (a.cfh == PSEUDO_INO) OK
         else if (not(fsLive(a.fs, a.cfh))) E_STALE
         else OK
 
@@ -561,9 +674,137 @@ module nfs4ops {
             | FsNoxattr => E_NOXATTR
         }
 
-    pure def snapOf(nd: Inode): AttrSnap =
+    // ------------------------------------------------------------------
+    // Known-deviation helpers
+    //
+    // Each of these describes ONE divergence chimera still has from the RFC
+    // answer the model states, and is taken only when the cell's config
+    // enabled that id.  The citation for each lives in the `known` block of
+    // quint/nfs4/corpus.schema.json; the comment here says where the
+    // divergence is.
+    // ------------------------------------------------------------------
+
+    // D4-19: where an operation resolves a NAME under a directory and the
+    // directory it was handed is a symbolic link, the RFCs list both
+    // NFS4ERR_SYMLINK (the specific answer, and what NFS-Ganesha and the Linux
+    // server give) and NFS4ERR_NOTDIR; chimera gives the generic NOTDIR.
+    //
+    // Only the PARENT case: CREATE, REMOVE, RENAME, LINK and OPEN(CLAIM_NULL)
+    // reach chimera's VFS path resolution, which reports ENOTDIR without
+    // saying what the object was.  Where the current filehandle ITSELF is the
+
+    // D4-15: chimera answers the coarse 4.0-style type error on the data-path
+    // and size-setting ops -- NFS4ERR_ISDIR for a directory, NFS4ERR_INVAL for
+    // every other non-regular object, in every minor version -- where the
+    // model states the per-type split (SYMLINK for a symlink, WRONG_TYPE for a
+    // special file on 4.1+).  `coarsenSymlink` is false for READ/WRITE/COMMIT/
+    // LOCKT, which answer the symlink arm exactly
+    // (chimera_nfs4_data_nonreg_status), and true for ALLOCATE/DEALLOCATE/SEEK,
+    // which do not.
+
+
+    // S4-no-wrong-type: RFC 8881 introduced NFS4ERR_WRONG_TYPE as the more
+    // specific successor of the 4.0-era type errors and made it a SHOULD --
+    // and NEITHER reference server implements it.  Both answer what a 4.0
+    // server answers, in every minor version: NFS4ERR_ISDIR for a directory,
+    // NFS4ERR_SYMLINK where the 4.0 tables say SYMLINK, NFS4ERR_INVAL
+    // otherwise.  So the deviation is stated once, as "read the type-error
+    // tables at minor version 0", and each site names the 4.0 answer it would
+    // have given.  (chimera's own D4-15 is the same divergence measured on a
+    // third server, but its coarse pair is NOT the same mapping -- it also
+    // collapses SYMLINK to INVAL on the size-setting operations -- so the two
+    // are separate ids rather than one shared knob.)
+    // T_RENEW_LAPSED reaches further than RENEW.  RFC 7530 9.6.3 leaves it to
+    // the server how long a client id whose lease has lapsed survives, and
+    // 8.1.3 lets a fresh incarnation of a client purge the old one's state at
+    // a moment of the server's choosing -- the model carries no clock and no
+    // purge, so a server may answer NFS4ERR_EXPIRED (or, for a stateid that
+    // went with the lapsed lease, NFS4ERR_STALE_STATEID) to an OPEN, a LOCK
+    // or a LOCKT wherever the model, which believes the id still live -- or
+    // has not looked at it yet, because it validates the name first --
+    // predicts something else.  The set holds only those ALTERNATIVES: the
+    // predicted status is compared for equality first, and the membership
+    // test runs only when it differs.
+    pure def lapseAccept(a: Acc): Set[int] =
+        if (a.caps.tolRenewLapsed) Set(E_EXPIRED, E_STALE_STATEID)
+        else Set()
+
+
+
+    // S4-change-is-coarse-ctime: both reference servers derive the change
+    // attribute from the object's ctime in nanoseconds, and ctime moves at the
+    // kernel's coarse clock tick -- so two mutations inside a tick report the
+    // SAME change value, and a tick boundary between two reads moves it where
+    // nothing was modified.  RFC 7530 5.8.1.4 / RFC 8881 5.8.1.4 require the
+    // value to differ after any modification, so this is a divergence and not
+    // a latitude; but WHEN it bites is a race against a clock, so the honest
+    // thing the model can state is that it no longer predicts the value.  Like
+    // the xattr tolerance, what is dropped is an INVARIANT across replies
+    // (equal abstract <-> equal wire), not a value in one reply, so there is
+    // no set of acceptable answers to enumerate and the `<field>Accept`
+    // convention does not fit: the reply carries `opaque` instead.
+    pure def devCinfo(a: Acc, c: CInfo): CInfo =
+        if (hasDev(a.caps, "S4-change-is-coarse-ctime")) c.with("opaque", true)
+        else c
+
+    pure def devCinfoHit(a: Acc): Acc =
+        if (hasDev(a.caps, "S4-change-is-coarse-ctime"))
+            hitDev(a, "S4-change-is-coarse-ctime") else a
+
+    // A directory-requiring operation that meets a SYMBOLIC LINK where it
+    // needed a directory -- LOOKUP/LOOKUPP/READDIR/SECINFO on a symlink
+    // current filehandle, CREATE/REMOVE/RENAME/LINK on a symlink parent.
+    // RFC 7530 Table 7 lists NFS4ERR_SYMLINK *and* NFS4ERR_NOTDIR for every
+    // one of them, so both are conformant and neither is the answer.
+    //
+    // UNCONDITIONAL, and that is the point: where a specification permits
+    // several answers, a corpus that pins one is not testing conformance, it
+    // is testing which implementation it was written beside.  A knob would
+    // only be right if the two answers were mutually exclusive ASSUMPTIONS an
+    // implementation makes -- these are not; nothing is looked up, created or
+    // removed on either branch, so no state parts and nothing downstream
+    // depends on which arrived.  Replaces chimera's D4-19-dirop-symlink-notdir,
+    // knfsd's K4-rename-symlink-notdir, and the T_DIR_SYMLINK_STATUS and
+    // T_RENAME_SYMLINK_STATUS tolerances, all four of which said this same
+    // sentence about one operation each.
+    pure val DIR_SYM_ACCEPT = Set(E_SYMLINK, E_NOTDIR)
+
+    // Which refusal a LINK reports when more than one applies.  RFC 7530
+    // 16.9.4 lists NFS4ERR_ISDIR for a directory source but pins neither that
+    // code -- NOTDIR is the same refusal framed as a type error, and either is
+    // conformant -- nor its precedence against a malformed target name, which
+    // the model checks first.  Hard-linking a directory is refused by every
+    // server, so nothing is linked whichever code comes back.
+    //
+    // UNCONDITIONAL: this was T_LINK_REFUSAL, a knob, and a precedence no
+    // specification states is not something an implementation can be
+    // configured to have.
+    pure def linkAccept(a: Acc, st: int, srcIsDir: bool): Set[int] =
+        if (st == E_ISDIR) Set(E_ISDIR, E_NOTDIR)
+        else if (srcIsDir) Set(st, E_ISDIR, E_NOTDIR)
+        else Set(st)
+
+
+    // G4-setattr-share-denied: RFC 8881 9.1.4.3 makes the anonymous stateid
+    // usable for a size change only when no conflicting OPEN exists, and
+    // 18.30 reports that conflict as NFS4ERR_LOCKED.  NFS-Ganesha reuses the
+    // share-reservation error instead.  The object is unchanged either way.
+    pure def devLocked(a: Acc, st: int): int =
+        if (st == E_LOCKED and hasDev(a.caps, "G4-setattr-share-denied"))
+            E_SHARE_DENIED else st
+
+    pure def devLockedHit(a: Acc, st: int): Acc =
+        if (st == E_LOCKED and hasDev(a.caps, "G4-setattr-share-denied"))
+            hitDev(a, "G4-setattr-share-denied") else a
+
+    pure def snapAs(c: Caps, nd: Inode): AttrSnap =
         { ftype: nd.ftype, mode: nd.mode, nlink: nd.nlink,
-          sizeBlocks: nd.sizeBlocks, change: nd.change }
+          sizeBlocks: nd.sizeBlocks, change: nd.change,
+          // S4-change-is-coarse-ctime makes the change attribute opaque for
+          // EVERY object, not just one that has been given an xattr: the
+          // divergence is in how the server derives the value at all.
+          changeOpaque: (c.tolXattrChange and nd.chgOpaque) or
+                        c.devs.contains("S4-change-is-coarse-ctime") }
 
     // Inodes that must survive losing their last name: a file with opens or
     // delegations stays reachable through its filehandle until that state
@@ -616,11 +857,33 @@ module nfs4ops {
     // an existing owner must present last+1.  Replays (r == last) are not
     // generated by this model (deferred with the DRC work) and are treated
     // as BAD_SEQID here.
-    pure def ooGateOk(sdb: StateDB, cid: ClientId, owner: int, oseq: int): bool = {
+    pure def ooGateRaw(sdb: StateDB, cid: ClientId, owner: int, oseq: int): bool = {
         val k = (cid, owner)
         if (not(sdb.oo40.keys().contains(k))) true
         else oseq == sdb.oo40.get(k).seqid + 1
     }
+
+    // S4-owner-seqid-gap-unpoliced: RFC 7530 9.1.7 makes the exactly-+1
+    // open-owner sequence a server enforcement point, and NEITHER reference
+    // server polices it -- an OPEN/OPEN_CONFIRM/OPEN_DOWNGRADE/CLOSE/LOCK
+    // presenting a gapped seqid is processed on its merits (the model drives
+    // the gap deliberately: nfs4_ops.qnt oseq = seqid + 2).  With the
+    // deviation on the model stops predicting NFS4ERR_BAD_SEQID for the gap
+    // and ooSettle records the seqid the client actually presented, so the two
+    // sides' owner state stays together -- where the harness registry this
+    // replaced could only abandon the trace at the first gap.
+    pure def ooGateOk(c: Caps, sdb: StateDB, cid: ClientId, owner: int,
+                      oseq: int): bool =
+        hasDev(c, "S4-owner-seqid-gap-unpoliced") or
+        ooGateRaw(sdb, cid, owner, oseq)
+
+    // Recorded once, at OPEN: that is the operation whose seqid the generator
+    // deliberately gaps, so it is where the claim is proved live.  The other
+    // sequenced operations share the relaxed gate without re-recording it.
+    pure def ooGapHit(a: Acc, cid: ClientId, owner: int, oseq: int): Acc =
+        if (hasDev(a.caps, "S4-owner-seqid-gap-unpoliced") and
+            not(ooGateRaw(a.sdb, cid, owner, oseq)))
+            hitDev(a, "S4-owner-seqid-gap-unpoliced") else a
 
     // Record the outcome of a sequenced op: advance the owner seqid iff the
     // status consumes it; create the owner record on first use.
@@ -785,19 +1048,20 @@ module nfs4ops {
     pure def opLookup(a: Acc, n: Name): Acc = {
         val g = fhGate(a)
         val ns = nameStatus(n)
-        if (g != OK) emit(a, SLookup({ st: g, child: -1 }))
-        else if (ns != OK) emit(a, SLookup({ st: ns, child: -1 }))
+        if (g != OK) emit(a, SLookup({ st: g, child: -1 , stAccept: Set(g) }))
+        else if (ns != OK) emit(a, SLookup({ st: ns, child: -1 , stAccept: Set(ns) }))
         else {
             val nd = cfhNode(a)
             if (nd.ftype == FLnk)
-                emit(a, SLookup({ st: E_SYMLINK, child: -1 }))
+                emit(a, SLookup({ st: E_SYMLINK, child: -1,
+                                  stAccept: DIR_SYM_ACCEPT }))
             else if (nd.ftype != FDir)
-                emit(a, SLookup({ st: E_NOTDIR, child: -1 }))
+                emit(a, SLookup({ st: E_NOTDIR, child: -1 , stAccept: Set(E_NOTDIR) }))
             else if (not(fsHasEnt(a.fs, a.cfh, n)))
-                emit(a, SLookup({ st: E_NOENT, child: -1 }))
+                emit(a, SLookup({ st: E_NOENT, child: -1 , stAccept: Set(E_NOENT) }))
             else {
                 val c = fsChild(a.fs, a.cfh, n)
-                emit(a.with("cfh", c), SLookup({ st: OK, child: c }))
+                emit(a.with("cfh", c), SLookup({ st: OK, child: c , stAccept: Set(OK) }))
             }
         }
     }
@@ -807,18 +1071,35 @@ module nfs4ops {
     // (op text) or SYMLINK (error table) is conformant; NOTDIR modeled.
     pure def opLookupp(a: Acc): Acc = {
         val g = fhGate(a)
-        if (g != OK) emit(a, SLookupp({ st: g, parent: -1 }))
+        if (g != OK) emit(a, SLookupp({ st: g, parent: -1 , stAccept: Set(g) }))
         else {
             val nd = cfhNode(a)
             if (nd.ftype == FLnk)
-                emit(a, SLookupp({ st: E_SYMLINK, parent: -1 }))
+                emit(a, SLookupp({ st: E_SYMLINK, parent: -1,
+                                   stAccept: DIR_SYM_ACCEPT }))
             else if (nd.ftype != FDir)
-                emit(a, SLookupp({ st: E_NOTDIR, parent: -1 }))
+                emit(a, SLookupp({ st: E_NOTDIR, parent: -1 , stAccept: Set(E_NOTDIR) }))
+            // The top of the server's namespace has no parent, whichever node
+            // that is.  In a NAMED-export cell it is the pseudo-root, which a
+            // LOOKUPP from the exported root walks onto; in a rootExport cell
+            // it is the exported root itself and the pseudo-root is never
+            // reached.  Both answer NFS4ERR_NOENT here (RFC 7530 16.14.4 /
+            // RFC 8881 18.14.4).
+            else if (a.cfh == PSEUDO_INO)
+                emit(a, SLookupp({ st: E_NOENT, parent: -1 , stAccept: Set(E_NOENT) }))
+            else if (a.cfh == ROOT and not(a.caps.rootExport))
+                // A named export is one entry in the server's pseudo-filesystem
+                // (RFC 7530 7.3), so the walk succeeds and the current
+                // filehandle becomes the node above it.  Modelled rather than
+                // skipped, so the GETFH that follows is still checked -- the
+                // pseudo-root's filehandle has to be a real, stable handle.
+                emit(a.with("cfh", PSEUDO_INO),
+                     SLookupp({ st: OK, parent: PSEUDO_INO , stAccept: Set(OK) }))
             else if (a.cfh == ROOT)
-                emit(a, SLookupp({ st: E_NOENT, parent: -1 }))
+                emit(a, SLookupp({ st: E_NOENT, parent: -1 , stAccept: Set(E_NOENT) }))
             else
                 emit(a.with("cfh", nd.parent),
-                     SLookupp({ st: OK, parent: nd.parent }))
+                     SLookupp({ st: OK, parent: nd.parent , stAccept: Set(OK) }))
         }
     }
 
@@ -826,8 +1107,10 @@ module nfs4ops {
         val g = fhGate(a)
         if (g != OK)
             emit(a, SGetattr({ st: g, attrs: { ftype: FReg, mode: 0, nlink: 0,
-                                               sizeBlocks: 0, change: 0 } }))
-        else emit(a, SGetattr({ st: OK, attrs: snapOf(cfhNode(a)) }))
+                                               sizeBlocks: 0, change: 0,
+                                               changeOpaque: false } }))
+        else emit(devCinfoHit(a),
+                  SGetattr({ st: OK, attrs: snapAs(a.caps, cfhNode(a)) }))
     }
 
     // GETATTR over the server's whole supported-attribute set.  The model
@@ -841,8 +1124,13 @@ module nfs4ops {
     // the status is checked.
     pure def opGetattrWide(a: Acc): Acc = {
         val g = fhGate(a)
-        if (g != OK) emit(a, SGetattrWide({ st: g }))
-        else emit(a, SGetattrWide({ st: OK }))
+        if (g != OK) emit(a, SGetattrWide({ st: g, stAccept: Set(g) }))
+        // T_WIDE_ATTR_REFUSAL: RFC 8881 18.7.3 lets a server answer INVAL for
+        // an attribute combination it cannot satisfy, and this request asks
+        // for every attribute the server advertises.  The compound ends at
+        // the GETATTR either way, and there is no comparator arm for the
+        // values, so both answers cost the same and neither parts state.
+        else emit(a, SGetattrWide({ st: OK, stAccept: wideAccept(a, OK) }))
     }
 
     // BIND_CONN_TO_SESSION (RFC 8881 18.34): associates the connection the
@@ -864,11 +1152,20 @@ module nfs4ops {
     pure def opBindConnToSession(a: Acc, ar: { sess: SessId, dir: int }): Acc =
         if (a.minor == 0) emit(a, SBindConnToSession({ st: E_OP_ILLEGAL }))
         else if (not(a.seqDone) and a.nOps > 1)
-            emit(a, SBindConnToSession({ st: E_NOT_ONLY_OP }))
+            refuseShape(a, SBindConnToSession({ st: E_NOT_ONLY_OP }),
+                        E_NOT_ONLY_OP)
         else if (not(a.sdb.sessions.keys().contains(ar.sess)))
             emit(a, SBindConnToSession({ st: E_BADSESSION }))
+        // G4-bindconn-direction-accepted: RFC 8881 18.34.3 lists the four
+        // channel_dir_from_client4 values and makes anything else
+        // NFS4ERR_INVAL; NFS-Ganesha accepts the out-of-range direction and
+        // answers NFS4_OK.  BIND_CONN_TO_SESSION changes no filesystem or
+        // session state the model tracks, so nothing downstream parts.
         else if (not(Set(1, 2, 3, 7).contains(ar.dir)))
-            emit(a, SBindConnToSession({ st: E_INVAL }))
+            if (hasDev(a.caps, "G4-bindconn-direction-accepted"))
+                emit(hitDev(a, "G4-bindconn-direction-accepted"),
+                     SBindConnToSession({ st: OK }))
+            else emit(a, SBindConnToSession({ st: E_INVAL }))
         else emit(a, SBindConnToSession({ st: OK }))
 
     // SECINFO (RFC 7530 16.31 / RFC 8881 18.29): reports which security
@@ -888,16 +1185,28 @@ module nfs4ops {
     pure def opSecinfo(a: Acc, n: Name): Acc = {
         val g = fhGate(a)
         val ns = nameStatus(n)
-        if (g != OK) emit(a, SSecinfo({ st: g }))
-        else if (ns != OK) emit(a, SSecinfo({ st: ns }))
+        if (g != OK) emit(a, SSecinfo({ st: g , stAccept: Set(g) }))
+        else if (ns != OK) emit(a, SSecinfo({ st: ns , stAccept: Set(ns) }))
         else {
             val nd = cfhNode(a)
-            if (nd.ftype == FLnk) emit(a, SSecinfo({ st: E_SYMLINK }))
-            else if (nd.ftype != FDir) emit(a, SSecinfo({ st: E_NOTDIR }))
+            if (nd.ftype == FLnk)
+                emit(a, SSecinfo({ st: E_SYMLINK,
+                                   stAccept: DIR_SYM_ACCEPT }))
+            else if (nd.ftype != FDir) emit(a, SSecinfo({ st: E_NOTDIR , stAccept: Set(E_NOTDIR) }))
             else if (not(fsHasEnt(a.fs, a.cfh, n)))
-                emit(a, SSecinfo({ st: E_NOENT }))
-            else emit(if (a.minor >= 1) a.with("cfh", -1) else a,
-                      SSecinfo({ st: OK }))
+                emit(a, SSecinfo({ st: E_NOENT , stAccept: Set(E_NOENT) }))
+            // D4-21: SECINFO consumes the current filehandle (RFC 7530
+            // 17.31.3 / RFC 8881 18.29.3), so the next op that uses it
+            // answers NFS4ERR_NOFILEHANDLE.  4.1+ says so outright; on 4.0
+            // the RFC leaves the handle in place, and chimera zeroes
+            // req->fhlen for every minor version, so a 4.0 compound loses it
+            // too.
+            else if (a.minor >= 1)
+                emit(a.with("cfh", -1), SSecinfo({ st: OK , stAccept: Set(OK) }))
+            else if (hasDev(a.caps, "D4-21-secinfo-consumes-fh"))
+                emit(hitDev(a, "D4-21-secinfo-consumes-fh").with("cfh", -1),
+                     SSecinfo({ st: OK , stAccept: Set(OK) }))
+            else emit(a, SSecinfo({ st: OK , stAccept: Set(OK) }))
         }
     }
 
@@ -971,12 +1280,23 @@ module nfs4ops {
         else {
             val nd = cfhNode(a)
             val supported = iand(mask, accessMeaningful(nd.ftype))
-            val access =
+            val rfcAccess =
                 if (iand(supported, ACCESS4_EXECUTE) == ACCESS4_EXECUTE and
                     not(anyExec(nd.mode)))
                     supported - ACCESS4_EXECUTE
                 else supported
-            emit(a, SAccess({ st: OK, supported: supported, access: access }))
+            // D4-20: chimera's root/AUTH_NONE DAC override grants
+            // ACCESS4_EXECUTE on a file with no execute bit anywhere in its
+            // mode, where RFC 8881 18.1.4 says the server SHOULD NOT.  ACCESS
+            // is advisory (18.1: the real operation is the authoritative
+            // check), so the coarser privileged override opens no hole -- and
+            // every other bit, and `supported`, still match exactly.
+            val access =
+                if (hasDev(a.caps, "D4-20-access-root-execute")) supported
+                else rfcAccess
+            emit(if (access != rfcAccess)
+                     hitDev(a, "D4-20-access-root-execute") else a,
+                 SAccess({ st: OK, supported: supported, access: access }))
         }
     }
 
@@ -985,12 +1305,28 @@ module nfs4ops {
     // "." and ".." are never returned (R-CORE-85).
     pure def opReaddir(a: Acc): Acc = {
         val g = fhGate(a)
-        if (g != OK) emit(a, SReaddir({ st: g, names: Set() }))
+        if (g != OK)
+            emit(a, SReaddir({ st: g, names: Set(), stAccept: Set(g) }))
         else {
             val nd = cfhNode(a)
-            if (nd.ftype == FLnk) emit(a, SReaddir({ st: E_SYMLINK, names: Set() }))
-            else if (nd.ftype != FDir) emit(a, SReaddir({ st: E_NOTDIR, names: Set() }))
-            else emit(a, SReaddir({ st: OK, names: nd.ents.keys() }))
+            // TOLERANCE (T_DIR_SYMLINK_STATUS).  RFC 7530 16.24.4 Table 7
+            // lists BOTH NFS4ERR_SYMLINK and NFS4ERR_NOTDIR for READDIR on a
+            // symbolic link, so either answer is conformant -- and which one
+            // chimera gives depends on the backend that resolved it (memfs
+            // answers the specific SYMLINK from the NFSv4 layer; diskfs and
+            // cairn answer the generic NOTDIR from the VFS).  One corpus
+            // serves every backend, so this is stated as an acceptance rather
+            // than predicted.  LOOKUP, LOOKUPP and SECINFO make the same check
+            // and were measured to answer SYMLINK on all three native
+            // backends, so they stay exact.
+            if (nd.ftype == FLnk)
+                emit(a, SReaddir({ st: E_SYMLINK, names: Set(),
+                                   stAccept: DIR_SYM_ACCEPT }))
+            else if (nd.ftype != FDir)
+                emit(a, SReaddir({ st: E_NOTDIR, names: Set(),
+                                   stAccept: Set(E_NOTDIR) }))
+            else emit(a, SReaddir({ st: OK, names: nd.ents.keys(),
+                                    stAccept: Set(OK) }))
         }
     }
 
@@ -999,10 +1335,12 @@ module nfs4ops {
     pure def opCreate(a: Acc, ar: { ctype: Ftype, name: Name, mode: int,
                                     target: str }): Acc = {
         val g = fhGate(a)
-        val bad = { st: g, ino: -1, cinfo: { before: 0, after: 0 } }
+        val bad = { st: g, ino: -1, cinfo: { before: 0, after: 0, opaque: false },
+                    stAccept: Set(g) }
         if (g != OK) emit(a, SCreate(bad))
         else if (nameStatus(ar.name) != OK)
-            emit(a, SCreate(bad.with("st", nameStatus(ar.name))))
+            emit(a, SCreate(bad.with("st", nameStatus(ar.name))
+                                .with("stAccept", Set(nameStatus(ar.name)))))
         // The current filehandle must be a usable directory before the
         // requested object type is considered (RFC 7530 16.4 / RFC 8881 18.4):
         // a symlink current filehandle is NFS4ERR_SYMLINK, any other
@@ -1010,23 +1348,52 @@ module nfs4ops {
         // illegal ctype.  Both real servers (ganesha and the Linux server)
         // answer SYMLINK for a symlink parent; chimera answers the generic
         // NFS4ERR_NOTDIR, recorded on the chimera side (D4-17).
+        // When BOTH are wrong -- an unusable parent AND a type CREATE cannot
+        // make -- which one is reported is the server's: RFC 7530 16.4.4 and
+        // RFC 8881 18.4 order neither check, and nothing is created either
+        // way.  The model reports the parent, as NFS-Ganesha and the Linux
+        // server do, and accepts the NFS4ERR_BADTYPE chimera reports instead.
+        // (Was D4-18-create-type-before-parent, a knob for a precedence no
+        // specification states.)
         else if (cfhNode(a).ftype == FLnk)
-            emit(a, SCreate(bad.with("st", E_SYMLINK)))
+            emit(a, SCreate(bad.with("st", E_SYMLINK)
+                                .with("stAccept",
+                                      if (ar.ctype == FReg)
+                                          DIR_SYM_ACCEPT.union(Set(E_BADTYPE))
+                                      else DIR_SYM_ACCEPT)))
         else if (cfhNode(a).ftype != FDir)
-            emit(a, SCreate(bad.with("st", E_NOTDIR)))
+            emit(a, SCreate(bad.with("st", E_NOTDIR)
+                              .with("stAccept",
+                                    if (ar.ctype == FReg)
+                                        Set(E_NOTDIR, E_BADTYPE)
+                                    else Set(E_NOTDIR))))
         else if (ar.ctype == FReg)
-            emit(a, SCreate(bad.with("st", E_BADTYPE)))
+            emit(a, SCreate(bad.with("st", E_BADTYPE)
+                              .with("stAccept", Set(E_BADTYPE))))
         else {
+            // D4-4: chimera creates every symbolic link with mode 0755,
+            // whatever the CREATE asked for -- the mode argument is dropped at
+            // creation, not at reporting: a later SETATTR of the mode DOES
+            // take, and a GETATTR then reads it back.  RFC 7530 5.8.1.6 makes
+            // mode a plain attribute of every object, symbolic links included,
+            // and 16.4 carries createattrs for NF4LNK like any other type.
+            val lnkMode = if (hasDev(a.caps, "D4-4-symlink-mode-0755")) 493
+                          else ar.mode
             val node =
                 if (ar.ctype == FDir) mkDir(ar.mode, a.cfh, 0)
-                else if (ar.ctype == FLnk) mkSymlink(ar.target, ar.mode, 0)
+                else if (ar.ctype == FLnk) mkSymlink(ar.target, lnkMode, 0)
                 else mkSpecial(ar.ctype, ar.mode, 0)
             val o = fsMknode(a.fs, a.cfh, ar.name, node)
             if (o.st != FsOk)
-                emit(a, SCreate(bad.with("st", fsStatus(o.st))))
+                emit(a, SCreate(bad.with("st", fsStatus(o.st))
+                                    .with("stAccept", Set(fsStatus(o.st)))))
             else
-                emit(a.with("fs", o.fs2).with("cfh", o.ino),
-                     SCreate({ st: OK, ino: o.ino, cinfo: o.cinfo }))
+                emit(devCinfoHit(
+                         (if (ar.ctype == FLnk and lnkMode != ar.mode)
+                              hitDev(a, "D4-4-symlink-mode-0755") else a)
+                             .with("fs", o.fs2).with("cfh", o.ino)),
+                     SCreate({ st: OK, ino: o.ino,
+                               cinfo: devCinfo(a, o.cinfo) , stAccept: Set(OK) }))
         }
     }
 
@@ -1038,11 +1405,13 @@ module nfs4ops {
     pure def opRemove(a: Acc, n: Name): Acc = {
         val g = fhGate(a)
         val ns = nameStatus(n)
-        if (g != OK) emit(a, SRemove({ st: g, cinfo: { before: 0, after: 0 } }))
+        if (g != OK) emit(a, SRemove({ st: g, cinfo: { before: 0, after: 0, opaque: false } , stAccept: Set(g) }))
         else if (ns != OK)
-            emit(a, SRemove({ st: ns, cinfo: { before: 0, after: 0 } }))
+            emit(a, SRemove({ st: ns, cinfo: { before: 0, after: 0, opaque: false } , stAccept: Set(ns) }))
         else if (cfhNode(a).ftype == FLnk)
-            emit(a, SRemove({ st: E_SYMLINK, cinfo: { before: 0, after: 0 } }))
+            emit(a, SRemove({ st: E_SYMLINK,
+                              cinfo: { before: 0, after: 0, opaque: false },
+                              stAccept: DIR_SYM_ACCEPT }))
         else {
             // Delegations held by other clients on the victim force a
             // recall; REMOVE observes NFS4ERR_DELAY until they return
@@ -1055,11 +1424,12 @@ module nfs4ops {
             if (recalls.size() > 0) {
                 emit(a.with("sdb", recalls.fold(a.sdb, (acc, s) =>
                                                 doRecallDeleg(acc, s))),
-                     SRemove({ st: E_DELAY, cinfo: { before: 0, after: 0 } }))
+                     SRemove({ st: E_DELAY, cinfo: { before: 0, after: 0, opaque: false } , stAccept: Set(E_DELAY) }))
             } else {
                 val o = fsRemove(a.fs, a.cfh, n, pinnedInos(a.sdb))
-                emit(a.with("fs", o.fs2),
-                     SRemove({ st: fsStatus(o.st), cinfo: o.cinfo }))
+                emit(devCinfoHit(a.with("fs", o.fs2)),
+                     SRemove({ st: fsStatus(o.st),
+                               cinfo: devCinfo(a, o.cinfo) , stAccept: Set(fsStatus(o.st)) }))
             }
         }
     }
@@ -1069,20 +1439,25 @@ module nfs4ops {
     // predicts NOTEMPTY (Table 7 + POSIX servers); the op text's EXIST is
     // also conformant (R-CORE-73).
     pure def opRename(a: Acc, ar: { oldname: Name, newname: Name }): Acc = {
-        val zero = { before: 0, after: 0 }
+        val zero = { before: 0, after: 0, opaque: false }
         if (a.sfh == -1 or a.cfh == -1)
-            emit(a, SRename({ st: E_NOFILEHANDLE, cinfoS: zero, cinfoT: zero }))
+            emit(a, SRename({ st: E_NOFILEHANDLE, cinfoS: zero,
+                              cinfoT: zero, stAccept: Set(E_NOFILEHANDLE) }))
         else if (not(fsLive(a.fs, a.sfh)) or not(fsLive(a.fs, a.cfh)))
-            emit(a, SRename({ st: E_STALE, cinfoS: zero, cinfoT: zero }))
+            emit(a, SRename({ st: E_STALE, cinfoS: zero, cinfoT: zero,
+                              stAccept: Set(E_STALE) }))
         else if (nameStatus(ar.oldname) != OK)
             emit(a, SRename({ st: nameStatus(ar.oldname),
-                              cinfoS: zero, cinfoT: zero }))
+                              cinfoS: zero, cinfoT: zero,
+                              stAccept: Set(nameStatus(ar.oldname)) }))
         else if (nameStatus(ar.newname) != OK)
             emit(a, SRename({ st: nameStatus(ar.newname),
-                              cinfoS: zero, cinfoT: zero }))
+                              cinfoS: zero, cinfoT: zero,
+                              stAccept: Set(nameStatus(ar.newname)) }))
         else if (fsGet(a.fs, a.sfh).ftype == FLnk or
                  fsGet(a.fs, a.cfh).ftype == FLnk)
-            emit(a, SRename({ st: E_SYMLINK, cinfoS: zero, cinfoT: zero }))
+            emit(a, SRename({ st: E_SYMLINK, cinfoS: zero, cinfoT: zero,
+                             stAccept: DIR_SYM_ACCEPT }))
         else {
             // Rename-over unlinks the target: other-client delegations on
             // it force a recall + NFS4ERR_DELAY, mirroring REMOVE.  (The
@@ -1095,13 +1470,16 @@ module nfs4ops {
             if (recalls.size() > 0) {
                 emit(a.with("sdb", recalls.fold(a.sdb, (acc, s) =>
                                                 doRecallDeleg(acc, s))),
-                     SRename({ st: E_DELAY, cinfoS: zero, cinfoT: zero }))
+                     SRename({ st: E_DELAY, cinfoS: zero, cinfoT: zero,
+                               stAccept: Set(E_DELAY) }))
             } else {
                 val o = fsRename(a.fs, a.sfh, ar.oldname, a.cfh, ar.newname,
                                  pinnedInos(a.sdb))
-                emit(a.with("fs", o.fs2),
-                     SRename({ st: fsStatus(o.st), cinfoS: o.cinfoS,
-                               cinfoT: o.cinfoT }))
+                emit(devCinfoHit(a.with("fs", o.fs2)),
+                     SRename({ st: fsStatus(o.st),
+                               cinfoS: devCinfo(a, o.cinfoS),
+                               cinfoT: devCinfo(a, o.cinfoT),
+                               stAccept: Set(fsStatus(o.st)) }))
             }
         }
     }
@@ -1110,24 +1488,32 @@ module nfs4ops {
     // dir.  acceptance: LINK of a directory is ISDIR (modeled; NOTSUPP
     // also in the valid list, R-CORE-78).
     pure def opLink(a: Acc, n: Name): Acc = {
-        val zero = { before: 0, after: 0 }
+        val zero = { before: 0, after: 0, opaque: false }
         if (a.sfh == -1 or a.cfh == -1)
-            emit(a, SLink({ st: E_NOFILEHANDLE, cinfo: zero }))
+            emit(a, SLink({ st: E_NOFILEHANDLE, cinfo: zero,
+                            stAccept: Set(E_NOFILEHANDLE) }))
         else if (not(fsLive(a.fs, a.sfh)) or not(fsLive(a.fs, a.cfh)))
-            emit(a, SLink({ st: E_STALE, cinfo: zero }))
-        // A malformed newname is validated before the source type: the
-        // Linux server reports the name (NEMPTY -> INVAL, NDOT -> BADNAME)
-        // ahead of the directory-source ISDIR (RFC 7530 16.9 leaves the
-        // ordering open).  The directory-source status itself is ISDIR
-        // (RFC 7530 16.9.4), produced by fsLink below; both real servers
-        // answer NFS4ERR_NOTDIR there instead -- recorded, not modelled.
+            emit(a, SLink({ st: E_STALE, cinfo: zero,
+                            stAccept: Set(E_STALE) }))
+        // A malformed newname is validated before the source type: the model
+        // reports the name (NEMPTY -> INVAL, NDOT -> BADNAME) ahead of the
+        // directory-source ISDIR, and RFC 7530 16.9 leaves that ordering
+        // open, so a server that reports the source type first is equally
+        // right -- which is what linkAccept states, unconditionally.
         else if (nameStatus(n) != OK)
-            emit(a, SLink({ st: nameStatus(n), cinfo: zero }))
+            emit(a, SLink({ st: nameStatus(n), cinfo: zero,
+                            stAccept: linkAccept(a, nameStatus(n),
+                                          fsGet(a.fs, a.sfh).ftype == FDir) }))
         else if (fsGet(a.fs, a.cfh).ftype == FLnk)
-            emit(a, SLink({ st: E_SYMLINK, cinfo: zero }))
+            emit(a, SLink({ st: E_SYMLINK, cinfo: zero,
+                            stAccept: DIR_SYM_ACCEPT }))
         else {
             val o = fsLink(a.fs, a.sfh, a.cfh, n)
-            emit(a.with("fs", o.fs2), SLink({ st: fsStatus(o.st), cinfo: o.cinfo }))
+            val st = fsStatus(o.st)
+            emit(devCinfoHit(a.with("fs", o.fs2)),
+                 SLink({ st: st, cinfo: devCinfo(a, o.cinfo),
+                         stAccept: linkAccept(a, st,
+                                       fsGet(a.fs, a.sfh).ftype == FDir) }))
         }
     }
 
@@ -1140,21 +1526,28 @@ module nfs4ops {
     pure def opSetattr(a: Acc, ar: { mode: int, sizeBlocks: int,
                                      sel: SidSel }): Acc = {
         val g = fhGate(a)
-        if (g != OK) emit(a, SSetattr({ st: g }))
+        if (g != OK) emit(a, SSetattr({ st: g , stAccept: Set(g) }))
         else {
             val nd = cfhNode(a)
-            if (ar.sizeBlocks >= 0 and nd.ftype != FReg)
-                emit(a, SSetattr({ st: if (nd.ftype == FDir and a.minor == 0)
-                                           E_ISDIR
-                                       else if (a.minor == 0) E_INVAL
-                                       else E_WRONG_TYPE }))
+            if (ar.sizeBlocks >= 0 and nd.ftype != FReg) {
+                // RFC 8881 15.1.2.9 makes WRONG_TYPE the more specific
+                // successor of the 4.0-era answer, and a SHOULD -- so predict
+                // it and accept the older one (wrongTypeAccept).  A directory
+                // is ISDIR in every minor version.
+                val v40 = if (nd.ftype == FDir) E_ISDIR else E_INVAL
+                val st  = if (a.minor == 0 or nd.ftype == FDir) v40
+                          else E_WRONG_TYPE
+                emit(a, SSetattr({ st: st,
+                                   stAccept: wrongTypeAccept(st, v40) }))
+            }
             else if (ar.sizeBlocks >= 0) {
                 val io = resolveSel(a, ar.sel)
                 match io {
-                    | IoError(e) => emit(a, SSetattr({ st: e }))
+                    | IoError(e) => emit(a, SSetattr({ st: e , stAccept: Set(e) }))
                     | IoAnon =>
                         if (anyDeny(a.sdb, a.cfh, 2))
-                            emit(a, SSetattr({ st: E_LOCKED }))
+                            emit(devLockedHit(a, E_LOCKED),
+                                 SSetattr({ st: devLocked(a, E_LOCKED) , stAccept: Set(devLocked(a, E_LOCKED)) }))
                         else {
                             val fs1 = fsResize(a.fs, a.cfh, ar.sizeBlocks)
                             val fs2 = if (ar.mode >= 0) fsChmod(fs1, a.cfh, ar.mode)
@@ -1166,13 +1559,14 @@ module nfs4ops {
                             val sdbR = revokeLayoutsOn(a.sdb, a.cfh)
                             emit(a.with("fs", maybeReap(fs2, sdbR, a.cfh))
                                   .with("sdb", sdbR),
-                                 SSetattr({ st: OK }))
+                                 SSetattr({ st: OK , stAccept: Set(OK) }))
                         }
                     | IoBypass =>
                         // READ-bypass acts as anonymous outside READ
                         // (RFC 8881 8.2.3); deny check still applies.
                         if (anyDeny(a.sdb, a.cfh, 2))
-                            emit(a, SSetattr({ st: E_LOCKED }))
+                            emit(devLockedHit(a, E_LOCKED),
+                                 SSetattr({ st: devLocked(a, E_LOCKED) , stAccept: Set(devLocked(a, E_LOCKED)) }))
                         else {
                             val fs1 = fsResize(a.fs, a.cfh, ar.sizeBlocks)
                             val fs2 = if (ar.mode >= 0) fsChmod(fs1, a.cfh, ar.mode)
@@ -1184,11 +1578,11 @@ module nfs4ops {
                             val sdbR = revokeLayoutsOn(a.sdb, a.cfh)
                             emit(a.with("fs", maybeReap(fs2, sdbR, a.cfh))
                                   .with("sdb", sdbR),
-                                 SSetattr({ st: OK }))
+                                 SSetattr({ st: OK , stAccept: Set(OK) }))
                         }
                     | IoState(s) =>
                         if (not(bitsOverlap(ioMode(a, io), 2)))
-                            emit(a, SSetattr({ st: E_OPENMODE }))
+                            emit(a, SSetattr({ st: E_OPENMODE , stAccept: Set(E_OPENMODE) }))
                         else {
                             val fs1 = fsResize(a.fs, a.cfh, ar.sizeBlocks)
                             val fs2 = if (ar.mode >= 0) fsChmod(fs1, a.cfh, ar.mode)
@@ -1200,13 +1594,13 @@ module nfs4ops {
                             val sdbR = revokeLayoutsOn(a.sdb, a.cfh)
                             emit(a.with("fs", maybeReap(fs2, sdbR, a.cfh))
                                   .with("sdb", sdbR),
-                                 SSetattr({ st: OK }))
+                                 SSetattr({ st: OK , stAccept: Set(OK) }))
                         }
                 }
             } else if (ar.mode >= 0)
                 emit(a.with("fs", fsChmod(a.fs, a.cfh, ar.mode)),
-                     SSetattr({ st: OK }))
-            else emit(a, SSetattr({ st: OK }))
+                     SSetattr({ st: OK , stAccept: Set(OK) }))
+            else emit(a, SSetattr({ st: OK , stAccept: Set(OK) }))
         }
     }
 
@@ -1215,9 +1609,10 @@ module nfs4ops {
     // NFS4ERR_NOT_SAME / continue.
     pure def opVerifySize(a: Acc, sz: int): Acc = {
         val g = fhGate(a)
-        if (g != OK) emit(a, SVerify({ st: g }))
-        else if (cfhNode(a).sizeBlocks == sz) emit(a, SVerify({ st: OK }))
-        else emit(a, SVerify({ st: E_NOT_SAME }))
+        if (g != OK) emit(a, SVerify({ st: g, stAccept: Set(g) }))
+        else if (cfhNode(a).sizeBlocks == sz)
+            emit(a, SVerify({ st: OK, stAccept: Set(OK) }))
+        else emit(a, SVerify({ st: E_NOT_SAME, stAccept: Set(E_NOT_SAME) }))
     }
 
     // VERIFY / NVERIFY over the server's whole supported-attribute set.
@@ -1231,23 +1626,46 @@ module nfs4ops {
     // value blob, so `out_len == args->attr_vals.len` is false and the
     // attributes always compare as different.  VERIFY therefore answers
     // NFS4ERR_NOT_SAME and NVERIFY answers NFS4_OK.
+    // G4-verify-wide-trivial-match: RFC 7530 16.15 / RFC 8881 18.31 do not
+    // say what an attrmask carrying FEWER values than bits means.  The model
+    // encodes the reference implementation's length guard -- out_len differs
+    // from the supplied blob, so the attributes compare as different -- while
+    // NFS-Ganesha reads the empty value blob as "no attributes to compare",
+    // which trivially matches.  Both are defensible readings of a deliberately
+    // under-specified request; VERIFY/NVERIFY change no state either way.
+    // T_WIDE_ATTR_REFUSAL reaches VERIFY and NVERIFY as well as GETATTR: all
+    // three ask for the server's whole supported-attribute bitmap, and RFC
+    // 7530 16.15.4 / RFC 8881 18.31.3 list NFS4ERR_INVAL for a mask the
+    // server will not satisfy exactly as 18.7.3 does for GETATTR.  Neither
+    // operation changes state on any branch.
+    pure def wideAccept(a: Acc, st: int): Set[int] =
+        if (a.caps.tolWideAttrRefusal) Set(st, E_INVAL) else Set(st)
+
     pure def opVerifyWide(a: Acc): Acc = {
         val g = fhGate(a)
-        if (g != OK) emit(a, SVerify({ st: g }))
-        else emit(a, SVerify({ st: E_NOT_SAME }))
+        if (g != OK) emit(a, SVerify({ st: g, stAccept: Set(g) }))
+        else if (hasDev(a.caps, "G4-verify-wide-trivial-match"))
+            emit(hitDev(a, "G4-verify-wide-trivial-match"),
+                 SVerify({ st: OK, stAccept: wideAccept(a, OK) }))
+        else emit(a, SVerify({ st: E_NOT_SAME,
+                               stAccept: wideAccept(a, E_NOT_SAME) }))
     }
 
     pure def opNverifyWide(a: Acc): Acc = {
         val g = fhGate(a)
-        if (g != OK) emit(a, SNverify({ st: g }))
-        else emit(a, SNverify({ st: OK }))
+        if (g != OK) emit(a, SNverify({ st: g, stAccept: Set(g) }))
+        else if (hasDev(a.caps, "G4-verify-wide-trivial-match"))
+            emit(hitDev(a, "G4-verify-wide-trivial-match"),
+                 SNverify({ st: E_SAME, stAccept: wideAccept(a, E_SAME) }))
+        else emit(a, SNverify({ st: OK, stAccept: wideAccept(a, OK) }))
     }
 
     pure def opNverifySize(a: Acc, sz: int): Acc = {
         val g = fhGate(a)
-        if (g != OK) emit(a, SNverify({ st: g }))
-        else if (cfhNode(a).sizeBlocks == sz) emit(a, SNverify({ st: E_SAME }))
-        else emit(a, SNverify({ st: OK }))
+        if (g != OK) emit(a, SNverify({ st: g, stAccept: Set(g) }))
+        else if (cfhNode(a).sizeBlocks == sz)
+            emit(a, SNverify({ st: E_SAME, stAccept: Set(E_SAME) }))
+        else emit(a, SNverify({ st: OK, stAccept: Set(OK) }))
     }
 
     // ------------------------------------------------------------------
@@ -1292,11 +1710,14 @@ module nfs4ops {
     // E_OP_ILLEGAL for the mirror-image case.  Not generated under 4.1+ (see
     // nsRenew), because the wire form is a resop the harness cannot decode.
     pure def opRenew(a: Acc, cid: ClientId): Acc =
-        if (a.minor != 0) emit(a, SRenew({ st: E_OP_ILLEGAL }))
+        if (a.minor != 0) emit(a, SRenew({ st: E_OP_ILLEGAL, stAccept: Set(E_OP_ILLEGAL) }))
         else if (not(a.sdb.clients.keys().contains(cid)) or
                  not(a.sdb.clients.get(cid).confirmed))
-            emit(a, SRenew({ st: E_STALE_CLIENTID }))
-        else emit(a, SRenew({ st: OK }))
+            emit(a, SRenew({ st: E_STALE_CLIENTID,
+                             stAccept: if (a.caps.tolRenewLapsed)
+                                           Set(E_STALE_CLIENTID, E_EXPIRED, OK)
+                                       else Set(E_STALE_CLIENTID) }))
+        else emit(a, SRenew({ st: OK, stAccept: Set(OK) }))
 
     // RELEASE_LOCKOWNER (RFC 7530 16.37): frees the lock-owner's stateids;
     // NFS4ERR_LOCKS_HELD while any byte remains locked.
@@ -1338,9 +1759,19 @@ module nfs4ops {
                                   confirmedR: false, pnfsMds: false }))
         else {
             val r = applyExchangeId(a.sdb, ar.ownerSym, ar.verfSym)
-            emit(a.with("sdb", r.sdb2),
+            emit((if (r.confirmedR and
+                      hasDev(a.caps, "G4-exchange-id-no-confirmed-r"))
+                      hitDev(a, "G4-exchange-id-no-confirmed-r") else a)
+                     .with("sdb", r.sdb2),
                  SExchangeId({ st: OK, client: r.clientid, csSeq: r.csSeq,
-                               confirmedR: r.confirmedR,
+                               // G4-exchange-id-no-confirmed-r: RFC 8881
+                               // 18.35.4 sets EXGID4_FLAG_CONFIRMED_R for a
+                               // repeat EXCHANGE_ID of a confirmed
+                               // owner+verifier; NFS-Ganesha returns the same
+                               // client id with the flag clear.
+                               confirmedR: r.confirmedR and
+                                   not(hasDev(a.caps,
+                                       "G4-exchange-id-no-confirmed-r")),
                                // EXCHGID4_FLAG_USE_PNFS_MDS vs USE_NON_PNFS
                                // per the capability profile.
                                pnfsMds: a.caps.pnfs }))
@@ -1439,6 +1870,16 @@ module nfs4ops {
 
     pure def opDestroyClientid(a: Acc, cid: ClientId): Acc =
         if (a.minor == 0) emit(a, SDestroyClientid({ st: E_OP_ILLEGAL }))
+        // G4-destroy-clientid-busy-first: RFC 8881 18.50.3 states both the
+        // sole/final-operation rule and the "no sessions or state remain"
+        // precondition and orders NEITHER against the other.  chimera checks
+        // the compound shape first (NFS4ERR_NOT_ONLY_OP); NFS-Ganesha checks
+        // the client id first (NFS4ERR_CLIENTID_BUSY).  Nothing is destroyed
+        // either way.
+        else if (hasDev(a.caps, "G4-destroy-clientid-busy-first") and
+                 a.sdb.clients.keys().contains(cid) and clientBusy(a.sdb, cid))
+            emit(hitDev(a, "G4-destroy-clientid-busy-first"),
+                 SDestroyClientid({ st: E_CLIENTID_BUSY }))
         else if (if (a.seqDone) a.idx != a.nOps - 1 else a.nOps > 1)
             // RFC 8881 18.50.3: preceded by a SEQUENCE, DESTROY_CLIENTID
             // must be the *final* operation of the compound; with no
@@ -1561,9 +2002,11 @@ module nfs4ops {
     // Returns the typing/creation status plus the file and directory
     // change info.
     pure def openResolve(a: Acc, claim: OpenClaim, how: OpenHow):
-            { st: int, fs2: Fs, file: Ino, cinfo: CInfo, truncated: bool } = {
-        val zero = { before: 0, after: 0 }
-        val base = { st: OK, fs2: a.fs, file: -1, cinfo: zero, truncated: false }
+            { st: int, fs2: Fs, file: Ino, cinfo: CInfo, truncated: bool,
+              devs: Set[str] } = {
+        val zero = { before: 0, after: 0, opaque: false }
+        val base = { st: OK, fs2: a.fs, file: -1, cinfo: zero,
+                     truncated: false, devs: Set() }
         match claim {
             | OCFh =>
                 // CLAIM_FH (4.1+): cfh is the file itself; no create
@@ -1573,11 +2016,23 @@ module nfs4ops {
                     val nd = cfhNode(a)
                     if (nd.ftype == FDir) base.with("st", E_ISDIR)
                     else if (nd.ftype == FLnk) base.with("st", E_SYMLINK)
-                    else if (nd.ftype != FReg) base.with("st", E_WRONG_TYPE)
+                    // A 4.0 server answers SYMLINK for every non-directory
+                    // special OPEN target; 4.1+ prefers WRONG_TYPE and both
+                    // are conformant (the acceptance rides on the reply).
+                    else if (nd.ftype != FReg)
+                        base.with("st", if (a.minor == 0) E_SYMLINK
+                                        else E_WRONG_TYPE)
                     else base.with("file", a.cfh)
                 }
             | OCNull(n) => {
                 val dnd = cfhNode(a)
+                // A symlink handed in as the parent directory: the same
+                // Table 7 latitude as every other directory-requiring op, so
+                // the specific answer is predicted and the generic one
+                // accepted (DIR_SYM_ACCEPT).  chimera resolves the CREATE
+                // forms through the VFS, which reports the generic ENOTDIR,
+                // and answers the specific SYMLINK for a plain OPEN of an
+                // existing name; both are now in the set.
                 if (dnd.ftype == FLnk) base.with("st", E_SYMLINK)
                 else if (dnd.ftype != FDir) base.with("st", E_NOTDIR)
                 else {
@@ -1600,7 +2055,7 @@ module nfs4ops {
                             else if (typeErr != OK) base.with("st", typeErr)
                             else base.with("file", child)
                                      .with("cinfo", { before: dnd.change,
-                                                      after: dnd.change })
+                                                      after: dnd.change, opaque: false })
                         | HUnchecked(u) =>
                             if (present and typeErr != OK)
                                 // acceptance: EXIST is also seen from
@@ -1614,7 +2069,7 @@ module nfs4ops {
                                 base.with("file", child).with("fs2", fs2)
                                     .with("truncated", u.truncate)
                                     .with("cinfo", { before: dnd.change,
-                                                     after: dnd.change })
+                                                     after: dnd.change, opaque: false })
                             } else {
                                 val o = fsMknode(a.fs, a.cfh, n,
                                                  mkFile(u.mode, 0))
@@ -1622,6 +2077,15 @@ module nfs4ops {
                                     .with("cinfo", o.cinfo)
                             }
                         | HGuarded(gm) =>
+                            // RFC 7530 16.16.4 / RFC 8881 18.16.4 list
+                            // NFS4ERR_EXIST and the target's own type error
+                            // for a fail-if-exists OPEN without ordering
+                            // them; the model keeps the RFC-literal, POSIX
+                            // O_EXCL reading -- an existing name is EXIST
+                            // whatever its type -- and NFS-Ganesha V6.5 was
+                            // measured to agree on THIS disposition, 6 times
+                            // out of 6.  On EXCLUSIVE4 it does not; that is
+                            // G4-open-type-before-exist, on the arm below.
                             if (present) base.with("st", E_EXIST)
                             else {
                                 val o = fsMknode(a.fs, a.cfh, n,
@@ -1644,13 +2108,43 @@ module nfs4ops {
                                 x.verf != 0)
                                 base.with("file", child)
                                     .with("cinfo", { before: dnd.change,
-                                                     after: dnd.change })
+                                                     after: dnd.change, opaque: false })
+                            // G4-open-type-before-exist: RFC 7530 16.16.4 /
+                            // RFC 8881 18.16.4 list NFS4ERR_EXIST and the
+                            // target's own type error for a create that must
+                            // not clobber, without ordering them.  The model
+                            // keeps the RFC-literal, POSIX O_EXCL reading --
+                            // an existing name is EXIST whatever its type.
+                            // NFS-Ganesha V6.5 splits by DISPOSITION, and
+                            // measured cleanly both ways: GUARDED answers
+                            // EXIST (6 of 6 observations) and EXCLUSIVE4
+                            // answers the type error (6 of 6).  So the branch
+                            // is here, on the exclusive arm, and nowhere
+                            // else.  The OPEN fails either way.
+                            else if (present and typeErr != OK and
+                                     hasDev(a.caps,
+                                            "G4-open-type-before-exist"))
+                                base.with("st", typeErr)
+                                    .with("devs",
+                                          Set("G4-open-type-before-exist"))
                             else if (present) base.with("st", E_EXIST)
                             else {
+                                // K4-exclusive-create-mode-zero: the Linux
+                                // server leaves the mode at 0 until the
+                                // follow-up SETATTR arrives.  Nothing in the
+                                // model consults a regular file's mode, so
+                                // this parts no state -- only the GETATTR
+                                // that reads it back.
+                                val em = if (hasDev(a.caps,
+                                             "K4-exclusive-create-mode-zero"))
+                                             0 else 384
                                 val o = fsMknode(a.fs, a.cfh, n,
-                                                 mkExclFile(384, x.verf, 0))
+                                                 mkExclFile(em, x.verf, 0))
                                 base.with("file", o.ino).with("fs2", o.fs2)
                                     .with("cinfo", o.cinfo)
+                                    .with("devs", if (em == 0)
+                                        Set("K4-exclusive-create-mode-zero")
+                                        else Set())
                             }
                     }
                 }
@@ -1658,11 +2152,21 @@ module nfs4ops {
         }
     }
 
-    pure def opOpen(a: Acc, ar: { client: ClientId, owner: int, oseq: int,
+    pure def opOpen(a0: Acc, ar: { client: ClientId, owner: int, oseq: int,
                                   claim: OpenClaim, how: OpenHow,
                                   access: int, deny: int }): Acc = {
-        val zero = { before: 0, after: 0 }
+        // S4-owner-seqid-gap-unpoliced is recorded here, before anything else
+        // reads the accumulator, so every arm below carries it.
+        val a = ooGapHit(a0, ar.client, ar.owner, ar.oseq)
+        val zero = { before: 0, after: 0, opaque: false }
+        // TOLERANCE (T_RFLAGS_CONFIRM): above 4.0 there is no OPEN_CONFIRM
+        // handshake, so RFC 8881 18.16 leaves OPEN4_RESULT_CONFIRM inert and
+        // a server may set it or not with no observable consequence.
+        val ncAcc = if (a.caps.tolRflagsConfirm) Set(false, true)
+                    else Set(false)
+        val stAcc = lapseAccept(a)
         val nores = { st: OK, sid: -1, seq: 0, needConfirm: false,
+                      needConfirmAccept: ncAcc, stAccept: stAcc,
                       cinfo: zero, deleg: DNone, recalls: Set() }
         val g = fhGate(a)
         // 4.0: the owner-seqid gate runs first and BAD_SEQID does not
@@ -1672,7 +2176,7 @@ module nfs4ops {
              not(a.sdb.clients.get(ar.client).confirmed)))
             emit(a, SOpen(nores.with("st", E_STALE_CLIENTID)))
         else if (a.minor == 0 and
-                 not(ooGateOk(a.sdb, ar.client, ar.owner, ar.oseq)))
+                 not(ooGateOk(a.caps, a.sdb, ar.client, ar.owner, ar.oseq)))
             emit(a, SOpen(nores.with("st", E_BAD_SEQID)))
         else if (g != OK) {
             val a1 = emit(a, SOpen(nores.with("st", g)))
@@ -1721,8 +2225,34 @@ module nfs4ops {
         }
         else {
             val res = openResolve(a, ar.claim, ar.how)
-            if (res.st != OK) {
-                val a1 = emit(a, SOpen(nores.with("st", res.st)))
+            // openResolve may have taken a deviating branch on EITHER path --
+            // S4-no-wrong-type on the error side, K4-exclusive-create-mode-
+            // zero on the success side -- so the ids it reports are folded
+            // onto whatever Acc the arms below produce, once, at the end.
+            val outAcc = if (res.st != OK) {
+                // Two latitudes ride on this reply, because openResolve's
+                // record has no acceptance field of its own to carry them.
+                //
+                // A symlink handed in as the PARENT is the Table 7 latitude
+                // every other directory-requiring op has (DIR_SYM_ACCEPT).
+                //
+                // A special-file TARGET is the WRONG_TYPE latitude: RFC 8881
+                // 15.1.2.9 makes NFS4ERR_WRONG_TYPE a SHOULD and the more
+                // specific successor of the 4.0-era answer, which for OPEN is
+                // SYMLINK -- openResolve picks between them on the minor
+                // version four lines above.  The model predicts the specific
+                // one and accepts the older one, exactly as the LOOKUP and
+                // data-path sites do; this was the site that decision missed,
+                // and NFS-Ganesha answers SYMLINK at 4.2.
+                val typeAcc =
+                    if (res.st == E_SYMLINK and cfhLive(a) and
+                        cfhNode(a).ftype == FLnk) DIR_SYM_ACCEPT
+                    else if (res.st == E_WRONG_TYPE)
+                        wrongTypeAccept(E_WRONG_TYPE, E_SYMLINK)
+                    else Set()
+                val a1 = emit(a, SOpen(nores.with("st", res.st)
+                                            .with("stAccept",
+                                                  stAcc.union(typeAcc))))
                 if (a.minor == 0)
                     a1.with("sdb", ooSettle(a1.sdb, ar.client, ar.owner,
                                             ar.oseq, res.st, false))
@@ -1785,12 +2315,18 @@ module nfs4ops {
                     emit(a.with("fs", res.fs2).with("sdb", sdbF)
                           .with("cfh", res.file),
                          SOpen({ st: OK, sid: o.sid, seq: o.seq,
+                                 stAccept: stAcc,
                                  needConfirm: o.needConfirm,
-                                 cinfo: res.cinfo,
+                                 needConfirmAccept:
+                                     if (a.caps.tolRflagsConfirm)
+                                         Set(false, true)
+                                     else Set(o.needConfirm),
+                                 cinfo: devCinfo(a, res.cinfo),
                                  deleg: withDeleg.deleg,
                                  recalls: Set() }))
                 }
             }
+            res.devs.fold(outAcc, (acc, d) => hitDev(acc, d))
         }
     }
 
@@ -1811,7 +2347,7 @@ module nfs4ops {
                     emit(a, SOpenConfirm({ st: E_BAD_STATEID, seq: 0 }))
                 else if (not(o.needConfirm))
                     emit(a, SOpenConfirm({ st: E_BAD_STATEID, seq: 0 }))
-                else if (not(ooGateOk(a.sdb, o.client, o.owner, ar.oseq)))
+                else if (not(ooGateOk(a.caps, a.sdb, o.client, o.owner, ar.oseq)))
                     // Wrong seqid on OPEN_CONFIRM: the server releases the
                     // state of the original OPEN (RFC 7530 16.18.5).
                     emit(a.with("sdb", doClose(a.sdb, ar.sid)),
@@ -1834,7 +2370,7 @@ module nfs4ops {
             emit(a, SOpenDowngrade({ st: E_BAD_STATEID, seq: 0 }))
         else {
             val o = a.sdb.opens.get(ar.sid)
-            if (a.minor == 0 and not(ooGateOk(a.sdb, o.client, o.owner, ar.oseq)))
+            if (a.minor == 0 and not(ooGateOk(a.caps, a.sdb, o.client, o.owner, ar.oseq)))
                 emit(a, SOpenDowngrade({ st: E_BAD_SEQID, seq: 0 }))
             else if (o.needConfirm)
                 emit(a, SOpenDowngrade({ st: E_BAD_STATEID, seq: 0 }))
@@ -1874,7 +2410,7 @@ module nfs4ops {
             emit(a, SClose({ st: E_BAD_STATEID }))
         else {
             val o = a.sdb.opens.get(ar.sid)
-            if (a.minor == 0 and not(ooGateOk(a.sdb, o.client, o.owner, ar.oseq)))
+            if (a.minor == 0 and not(ooGateOk(a.caps, a.sdb, o.client, o.owner, ar.oseq)))
                 emit(a, SClose({ st: E_BAD_SEQID }))
             else if (o.needConfirm)
                 // CLOSE of an unconfirmed open (RFC 7530 16.18.5).
@@ -1930,22 +2466,63 @@ module nfs4ops {
     // symlink -> SYMLINK (acceptance: INVAL also conformant in 4.0, the
     // op text vs Table 7 disagree, R-CORE-91); other non-regular ->
     // 4.0 INVAL / 4.1+ WRONG_TYPE.
+    // The type error a non-regular object owes an operation that needs a
+    // regular file, and every answer conformant for it.
+    //
+    // UNCONDITIONAL, for the same reason as DIR_SYM_ACCEPT.  RFC 7530 Table 7
+    // lists NFS4ERR_SYMLINK *and* NFS4ERR_INVAL for READ/WRITE/COMMIT on a
+    // symbolic link (rfc-notes R-CORE-91/96/97), and RFC 8881 15.1.2.9 makes
+    // NFS4ERR_WRONG_TYPE the more specific successor of INVAL with R-ATTR-25
+    // marking the choice server-specific -- a SHOULD, not a MUST.  A directory
+    // is the one type the RFCs do pin, so ISDIR stays exact.
+    //
+    // Worth saying plainly: NOT ONE implementation this corpus is replayed
+    // against returns WRONG_TYPE.  chimera answers the 4.0-style pair
+    // (D4-15-coarse-type-error), and so do NFS-Ganesha and the Linux server
+    // (S4-no-wrong-type).  Three independent servers agreeing against the
+    // model is the model being wrong about which answer is required, not
+    // three servers being wrong -- so the specific answer is predicted, the
+    // older one accepted, and both deviations are gone.
+    // Mirrors dataTypeGate below, arm for arm.  A directory is the one type
+    // the RFCs pin (ISDIR); every other non-regular type has two conformant
+    // answers and this names both.
+    pure def dataTypeAccept(a: Acc): Set[int] = {
+        val t = cfhNode(a).ftype
+        if (t == FReg) Set(OK)
+        else if (t == FDir) Set(E_ISDIR)
+        else if (t == FLnk) Set(E_SYMLINK, E_INVAL)
+        else if (a.minor == 0) Set(E_INVAL)
+        else Set(E_WRONG_TYPE, E_INVAL)
+    }
+
+    // The same latitude where the 4.0-era answer is not INVAL: OPEN answers
+    // SYMLINK for every non-directory special target at 4.0, and SETATTR(size)
+    // answers ISDIR for a directory.  `alt` is that older answer.
+    pure def wrongTypeAccept(st: int, alt: int): Set[int] =
+        if (st == alt) Set(st) else Set(st, alt)
+
     pure def dataTypeGate(a: Acc): int = {
         val t = cfhNode(a).ftype
         if (t == FReg) OK
         else if (t == FDir) E_ISDIR
         else if (t == FLnk) E_SYMLINK
         else if (a.minor == 0) E_INVAL
+        // S4-no-wrong-type: the 4.0 answer, in every minor version.
         else E_WRONG_TYPE
     }
 
+
     pure def opRead(a: Acc, ar: { sel: SidSel, off: int, len: int }): Acc = {
-        val nores = { st: OK, count: 0, eof: false, blocks: [] }
+        val nores = { st: OK, count: 0, eof: false, blocks: [],
+                      stAccept: Set(OK) }
         val g = fhGate(a)
         if (g != OK) emit(a, SRead(nores.with("st", g)))
         else {
             val tg = dataTypeGate(a)
-            if (tg != OK) emit(a, SRead(nores.with("st", tg)))
+            if (tg != OK)
+                emit(a,
+                     SRead(nores.with("st", tg)
+                                .with("stAccept", dataTypeAccept(a))))
             else {
                 val io = resolveSel(a, ar.sel)
                 match io {
@@ -1958,7 +2535,8 @@ module nfs4ops {
                         else {
                             val r = fsReadData(cfhNode(a), ar.off, ar.len)
                             emit(a, SRead({ st: OK, count: r.count,
-                                            eof: r.eof, blocks: r.syms }))
+                                            eof: r.eof, blocks: r.syms,
+                                            stAccept: Set(OK) }))
                         }
                     | IoBypass =>
                         // READ-bypass: the server MAY bypass share checks
@@ -1972,7 +2550,8 @@ module nfs4ops {
                         else {
                             val r = fsReadData(cfhNode(a), ar.off, ar.len)
                             emit(a, SRead({ st: OK, count: r.count,
-                                            eof: r.eof, blocks: r.syms }))
+                                            eof: r.eof, blocks: r.syms,
+                                            stAccept: Set(OK) }))
                         }
                     | IoState(s) =>
                         // discretion: READ via a write-only open is a MAY
@@ -1983,7 +2562,8 @@ module nfs4ops {
                         else {
                             val r = fsReadData(cfhNode(a), ar.off, ar.len)
                             emit(a, SRead({ st: OK, count: r.count,
-                                            eof: r.eof, blocks: r.syms }))
+                                            eof: r.eof, blocks: r.syms,
+                                            stAccept: Set(OK) }))
                         }
                 }
             }
@@ -1992,12 +2572,16 @@ module nfs4ops {
 
     pure def opWrite(a: Acc, ar: { sel: SidSel, off: int, len: int,
                                    pat: int, stable: int }): Acc = {
-        val nores = { st: OK, count: 0, newSizeBlocks: 0 }
+        val nores = { st: OK, count: 0, newSizeBlocks: 0,
+                      stAccept: Set(OK) }
         val g = fhGate(a)
         if (g != OK) emit(a, SWrite(nores.with("st", g)))
         else {
             val tg = dataTypeGate(a)
-            if (tg != OK) emit(a, SWrite(nores.with("st", tg)))
+            if (tg != OK)
+                emit(a,
+                     SWrite(nores.with("st", tg)
+                                 .with("stAccept", dataTypeAccept(a))))
             else {
                 val io = resolveSel(a, ar.sel)
                 match io {
@@ -2009,7 +2593,8 @@ module nfs4ops {
                             val w = fsWrite(a.fs, a.cfh, ar.off, ar.len, ar.pat)
                             emit(a.with("fs", w.fs2),
                                  SWrite({ st: OK, count: ar.len,
-                                          newSizeBlocks: w.newSizeBlocks }))
+                                          newSizeBlocks: w.newSizeBlocks,
+                                           stAccept: Set(OK) }))
                         }
                     | IoBypass =>
                         // All-ones stateid in WRITE is treated as
@@ -2020,7 +2605,8 @@ module nfs4ops {
                             val w = fsWrite(a.fs, a.cfh, ar.off, ar.len, ar.pat)
                             emit(a.with("fs", w.fs2),
                                  SWrite({ st: OK, count: ar.len,
-                                          newSizeBlocks: w.newSizeBlocks }))
+                                          newSizeBlocks: w.newSizeBlocks,
+                                           stAccept: Set(OK) }))
                         }
                     | IoState(s) =>
                         // WRITE through a stateid lacking WRITE access is
@@ -2031,7 +2617,8 @@ module nfs4ops {
                             val w = fsWrite(a.fs, a.cfh, ar.off, ar.len, ar.pat)
                             emit(a.with("fs", w.fs2),
                                  SWrite({ st: OK, count: ar.len,
-                                          newSizeBlocks: w.newSizeBlocks }))
+                                          newSizeBlocks: w.newSizeBlocks,
+                                           stAccept: Set(OK) }))
                         }
                 }
             }
@@ -2043,11 +2630,13 @@ module nfs4ops {
     // stable across the run (R-CORE-95).
     pure def opCommit(a: Acc): Acc = {
         val g = fhGate(a)
-        if (g != OK) emit(a, SCommit({ st: g }))
+        if (g != OK) emit(a, SCommit({ st: g, stAccept: Set(g) }))
         else {
             val tg = dataTypeGate(a)
-            if (tg != OK) emit(a, SCommit({ st: tg }))
-            else emit(a, SCommit({ st: OK }))
+            if (tg != OK)
+                emit(a,
+                     SCommit({ st: tg, stAccept: dataTypeAccept(a) }))
+            else emit(a, SCommit({ st: OK, stAccept: Set(OK) }))
         }
     }
 
@@ -2058,7 +2647,8 @@ module nfs4ops {
     pure def opLock(a: Acc, ar: { wr: bool, lo: int, hi: int, newOwner: bool,
                                   openSid: Sid, lockSid: Sid, lockOwner: int,
                                   oseq: int, lseq: int }): Acc = {
-        val nores = { st: OK, sid: -1, seq: 0, deniedOwner: -1 }
+        val nores = { st: OK, sid: -1, seq: 0, deniedOwner: -1,
+                      stAccept: lapseAccept(a) }
         val g = fhGate(a)
         if (g != OK) emit(a, SLock(nores.with("st", g)))
         else if (ar.lo >= ar.hi)
@@ -2075,7 +2665,7 @@ module nfs4ops {
                 if (o.file != a.cfh or o.needConfirm)
                     emit(a, SLock(nores.with("st", E_BAD_STATEID)))
                 else if (a.minor == 0 and
-                         not(ooGateOk(a.sdb, o.client, o.owner, ar.oseq)))
+                         not(ooGateOk(a.caps, a.sdb, o.client, o.owner, ar.oseq)))
                     emit(a, SLock(nores.with("st", E_BAD_SEQID)))
                 else if (a.minor == 0 and
                          lockHeldByOwner(a.sdb, o.client, ar.lockOwner, o.file))
@@ -2147,9 +2737,11 @@ module nfs4ops {
     pure def opLockt(a: Acc, ar: { client: ClientId, lockOwner: int,
                                    wr: bool, lo: int, hi: int }): Acc = {
         val g = fhGate(a)
-        if (g != OK) emit(a, SLockt({ st: g, deniedOwner: -1 }))
+        if (g != OK) emit(a, SLockt({ st: g, deniedOwner: -1,
+                             stAccept: lapseAccept(a) }))
         else if (ar.lo >= ar.hi)
-            emit(a, SLockt({ st: E_INVAL, deniedOwner: -1 }))
+            emit(a, SLockt({ st: E_INVAL, deniedOwner: -1,
+                             stAccept: lapseAccept(a) }))
         else {
             // Byte-range locking is defined for regular files only, so the
             // same type gate READ/WRITE/COMMIT use applies (RFC 7530 16.11 /
@@ -2160,14 +2752,20 @@ module nfs4ops {
             // reached only through an open stateid, and openResolve admits
             // regular files only.
             val tg = dataTypeGate(a)
-            if (tg != OK) emit(a, SLockt({ st: tg, deniedOwner: -1 }))
+            if (tg != OK)
+emit(a,
+                     SLockt({ st: tg, deniedOwner: -1,
+                              stAccept: dataTypeAccept(a)
+                                            .union(lapseAccept(a)) }))
             else if (lockConflict(a.sdb, ar.client, ar.lockOwner, a.cfh,
                                   ar.lo, ar.hi, ar.wr)) {
                 val who = lockConflictOwner(a.sdb, ar.client, ar.lockOwner,
                                             a.cfh, ar.lo, ar.hi, ar.wr)
-                emit(a, SLockt({ st: E_DENIED, deniedOwner: who }))
+                emit(a, SLockt({ st: E_DENIED, deniedOwner: who,
+                             stAccept: lapseAccept(a) }))
             }
-            else emit(a, SLockt({ st: OK, deniedOwner: -1 }))
+            else emit(a, SLockt({ st: OK, deniedOwner: -1,
+                             stAccept: lapseAccept(a) }))
         }
     }
 
@@ -2184,23 +2782,23 @@ module nfs4ops {
     pure def opLocku(a: Acc, ar: { sid: Sid, argSeq: int, lseq: int,
                                    lo: int, hi: int }): Acc = {
         val g = fhGate(a)
-        if (g != OK) emit(a, SLocku({ st: g, seq: 0 }))
+        if (g != OK) emit(a, SLocku({ st: g, seq: 0, stAccept: lapseAccept(a) }))
         else if (ar.lo >= ar.hi)
-            emit(a, SLocku({ st: E_INVAL, seq: 0 }))
+            emit(a, SLocku({ st: E_INVAL, seq: 0, stAccept: lapseAccept(a) }))
         else if (not(sidLive(a.sdb, ar.sid, KLock)))
-            emit(a, SLocku({ st: E_BAD_STATEID, seq: 0 }))
+            emit(a, SLocku({ st: E_BAD_STATEID, seq: 0, stAccept: lapseAccept(a) }))
         else {
             val l = a.sdb.locks.get(ar.sid)
             if (l.file != a.cfh)
-                emit(a, SLocku({ st: E_BAD_STATEID, seq: 0 }))
+                emit(a, SLocku({ st: E_BAD_STATEID, seq: 0, stAccept: lapseAccept(a) }))
             else if (a.minor == 0 and
                      not(loGateOk(a.sdb, l.client, l.owner, ar.lseq)))
-                emit(a, SLocku({ st: E_BAD_SEQID, seq: 0 }))
+                emit(a, SLocku({ st: E_BAD_SEQID, seq: 0, stAccept: lapseAccept(a) }))
             else {
                 val chk = checkSid(a.sdb, ar.sid, KLock, ar.argSeq)
                 match chk {
-                    | SidOld => emit(a, SLocku({ st: E_OLD_STATEID, seq: 0 }))
-                    | SidBad => emit(a, SLocku({ st: E_BAD_STATEID, seq: 0 }))
+                    | SidOld => emit(a, SLocku({ st: E_OLD_STATEID, seq: 0, stAccept: lapseAccept(a) }))
+                    | SidBad => emit(a, SLocku({ st: E_BAD_STATEID, seq: 0, stAccept: lapseAccept(a) }))
                     | SidOk => {
                         val r = doLocku(a.sdb, ar.sid, ar.lo, ar.hi)
                         val sdb2 = if (a.minor == 0)
@@ -2208,7 +2806,7 @@ module nfs4ops {
                                                 ar.lseq, OK)
                                    else r.sdb2
                         emit(a.with("sdb", sdb2),
-                             SLocku({ st: OK, seq: r.seq }))
+                             SLocku({ st: OK, seq: r.seq, stAccept: lapseAccept(a) }))
                     }
                 }
             }
@@ -2241,14 +2839,18 @@ module nfs4ops {
 
     pure def opLayoutget(a: Acc, ar: { rw: bool, lo: int, hi: int,
                                        sel: SidSel }): Acc = {
-        val nores = { st: OK, sid: -1, seq: 0, lo: 0, hi: 0 }
+        val nores = { st: OK, sid: -1, seq: 0, lo: 0, hi: 0,
+                      stAccept: Set(OK) }
         if (a.minor < 1) emit(a, SLayoutget(nores.with("st", E_OP_ILLEGAL)))
         else if (not(a.caps.pnfs)) emit(a, SLayoutget(nores.with("st", E_NOTSUPP)))
         else {
             val g = fhGate(a)
             if (g != OK) emit(a, SLayoutget(nores.with("st", g)))
             else if (cfhNode(a).ftype != FReg)
-                emit(a, SLayoutget(nores.with("st", E_WRONG_TYPE)))
+                emit(a, SLayoutget(nores.with("st", E_WRONG_TYPE)
+                                        .with("stAccept",
+                                              wrongTypeAccept(E_WRONG_TYPE,
+                                                              E_INVAL))))
             else {
                 val io = resolveSel(a, ar.sel)
                 match io {
@@ -2270,7 +2872,8 @@ module nfs4ops {
                                             ar.rw)
                         emit(a.with("sdb", r.sdb2),
                              SLayoutget({ st: OK, sid: r.sid, seq: r.seq,
-                                          lo: ar.lo, hi: ar.hi }))
+                                          lo: ar.lo, hi: ar.hi,
+                                          stAccept: Set(OK) }))
                     }
                 }
             }
@@ -2427,7 +3030,8 @@ module nfs4ops {
         else if (not(a.caps.sparse)) emit(a, SAllocate({ st: E_NOTSUPP }))
         else {
             val g = io42Gate(a, ar.sel, true)
-            if (g != OK) emit(a, SAllocate({ st: g }))
+            if (g != OK) emit(devLockedHit(a, g),
+                              SAllocate({ st: devLocked(a, g) }))
             else if (ar.len <= 0) emit(a, SAllocate({ st: E_INVAL }))
             else emit(a.with("fs", fsAllocate(a.fs, a.cfh, ar.off, ar.len)),
                       SAllocate({ st: OK }))
@@ -2438,7 +3042,8 @@ module nfs4ops {
         else if (not(a.caps.sparse)) emit(a, SDeallocate({ st: E_NOTSUPP }))
         else {
             val g = io42Gate(a, ar.sel, true)
-            if (g != OK) emit(a, SDeallocate({ st: g }))
+            if (g != OK) emit(devLockedHit(a, g),
+                              SDeallocate({ st: devLocked(a, g) }))
             else if (ar.len <= 0) emit(a, SDeallocate({ st: E_INVAL }))
             else emit(a.with("fs", fsDeallocate(a.fs, a.cfh, ar.off, ar.len)),
                       SDeallocate({ st: OK }))
@@ -2459,26 +3064,116 @@ module nfs4ops {
     //
     // SEEK_HOLE is unaffected: every file has a virtual hole at EOF, so a hole
     // search always finds one.  Allocated-but-unwritten blocks count as data.
+    //
+    // TOLERANCE (T_HOLE_TRACKING).  The model, like memfs at the model's block
+    // granularity, reads every byte below EOF as data and puts the sole hole
+    // at EOF.  A backend that tracks holes for real answers more precisely,
+    // and RFC 7862 15.11 lets it: SEEK_HOLE may find a genuine hole anywhere
+    // between the queried offset and the model's answer, and SEEK_DATA may
+    // skip a never-written range to a later offset -- or find nothing at all
+    // below EOF and answer NFS4ERR_NXIO (15.11.3).  None of that is a defect,
+    // so it is stated as an acceptance rather than recorded as a deviation:
+    // every answer in the set below is a conformant answer to this call.
+    pure def seekExact(st, eof, off) =
+        { st: st, eof: eof, offset: off,
+          stAccept: Set(st), offsetAccept: Set(off), eofAccept: Set(eof) }
+
     pure def opSeek(a: Acc, ar: { sel: SidSel, off: int, whatData: bool }): Acc = {
-        val nores = { st: OK, eof: false, offset: 0 }
-        if (a.minor < 2) emit(a, SSeek(nores.with("st", E_OP_ILLEGAL)))
-        else if (not(a.caps.sparse)) emit(a, SSeek(nores.with("st", E_NOTSUPP)))
+        val nores = seekExact(OK, false, 0)
+        if (a.minor < 2) emit(a, SSeek(nores.with("st", E_OP_ILLEGAL)
+                                            .with("stAccept", Set(E_OP_ILLEGAL))))
+        else if (not(a.caps.sparse))
+            emit(a, SSeek(nores.with("st", E_NOTSUPP)
+                               .with("stAccept", Set(E_NOTSUPP))))
         else {
             val g = io42Gate(a, ar.sel, false)
-            if (g != OK) emit(a, SSeek(nores.with("st", g)))
+            if (g != OK)
+                emit(a,
+                     SSeek(nores.with("st", g).with("stAccept", Set(g))))
             else {
                 val nd = cfhNode(a)
                 if (ar.off >= nd.sizeBlocks)
-                    emit(a, SSeek(nores.with("st", E_NXIO)))
+                    // G4-seek-at-eof-not-nxio: RFC 7862 15.11.3 makes
+                    // NFS4ERR_NXIO the answer when sa_offset is at or past the
+                    // file size.  NFS-Ganesha's FSAL answers NFS4_OK with an
+                    // offset instead -- a hole it located earlier in the file,
+                    // which the model cannot predict, so the reply carries the
+                    // whole file as the accepted offset range.  A READ of any
+                    // of them returns the same bytes, so the disagreement is
+                    // confined to the SEEK reply.
+                    if (hasDev(a.caps, "G4-seek-at-eof-not-nxio"))
+                        emit(hitDev(a, "G4-seek-at-eof-not-nxio"),
+                             SSeek({ st: OK, eof: false, offset: 0,
+                                     stAccept: Set(OK, E_NXIO),
+                                     offsetAccept: 0.to(nd.sizeBlocks),
+                                     eofAccept: Set(false, true) }))
+                    else emit(a, SSeek(seekExact(E_NXIO, false, 0)))
                 else {
                     val r = fsSeek(nd, ar.off, ar.whatData)
                     if (ar.whatData and not(r.found))
-                        // No data between the offset and EOF.
-                        emit(a, SSeek(nores.with("st", E_NXIO)))
-                    else
-                        emit(a, SSeek({ st: OK,
-                                        eof: r.offset >= nd.sizeBlocks,
-                                        offset: r.offset }))
+                        // No data between the offset and EOF -- as the MODEL's
+                        // byte-granular map sees it.  A backend with a real
+                        // allocation map tracks whole blocks, so a range the
+                        // model calls a hole can be allocated there and SEEK
+                        // answers OK.  The OK branch below already accepts
+                        // NXIO; this is the same latitude read the other way,
+                        // and leaving it off was an asymmetry, not a check.
+                        if (a.caps.tolHoleTracking)
+                            emit(a, SSeek({ st: E_NXIO, eof: false, offset: 0,
+                                            stAccept: Set(E_NXIO, OK),
+                                            offsetAccept: 0.to(nd.sizeBlocks),
+                                            eofAccept: Set(false, true) }))
+                        else emit(a, SSeek(seekExact(E_NXIO, false, 0)))
+                    else {
+                        val off = r.offset
+                        val eof = off >= nd.sizeBlocks
+                        // Which offsets a hole-tracking backend may answer
+                        // instead: a hole no later than the model's, or data
+                        // no earlier than it.
+                        // Which offsets a hole-tracking backend may answer
+                        // instead.  For SEEK_DATA the range starts at the
+                        // QUERIED offset, not at the model's answer: block
+                        // granularity means a one-byte write allocates a whole
+                        // block, so the backend legitimately finds data
+                        // EARLIER than the model's byte-granular map does.
+                        // (Measured: the model answered block 2 where V6.5 on
+                        // ext4 answered 0.)  For SEEK_HOLE the model's answer
+                        // is the late bound, as before.
+                        // Two different reasons the offset may differ, and
+                        // they are worth keeping apart.
+                        //
+                        // G4-seek-at-eof-not-nxio: measured in BOTH
+                        // directions -- a SEEK_HOLE at byte 24576 and a
+                        // SEEK_DATA at byte 8192 each answered 0 -- so this
+                        // server does not treat sa_offset as a floor at all,
+                        // which RFC 7862 15.11.3 requires of the reply.  With
+                        // it on the model cannot pin the offset to anything
+                        // narrower than the file.
+                        //
+                        // T_HOLE_TRACKING alone is the conformant case: a
+                        // backend with a real allocation map tracks whole
+                        // blocks, so it finds DATA earlier than the model's
+                        // byte-granular map does and a HOLE no later -- but
+                        // never before sa_offset, so the floor still checks.
+                        val offOk =
+                            if (not(a.caps.tolHoleTracking)) Set(off)
+                            else if (hasDev(a.caps, "G4-seek-at-eof-not-nxio"))
+                                0.to(nd.sizeBlocks)
+                            else if (ar.whatData) ar.off.to(nd.sizeBlocks)
+                            else ar.off.to(off)
+                        emit(a, SSeek({ st: OK, eof: eof, offset: off,
+                                        // A data search that finds only real
+                                        // holes below EOF is NXIO, which the
+                                        // model cannot see coming.
+                                        stAccept:
+                                            if (a.caps.tolHoleTracking and
+                                                ar.whatData)
+                                                Set(OK, E_NXIO)
+                                            else Set(OK),
+                                        offsetAccept: offOk,
+                                        eofAccept:
+                                            offOk.map(o => o >= nd.sizeBlocks) }))
+                    }
                 }
             }
         }
@@ -2495,7 +3190,7 @@ module nfs4ops {
     // is why copyRange generates concrete open stateids only.
     pure def opCopy(a: Acc, ar: { srcSel: SidSel, dstSel: SidSel,
                                   srcOff: int, dstOff: int, cnt: int }): Acc = {
-        val nores = { st: OK, copied: 0 }
+        val nores = { st: OK, copied: 0, stAccept: Set(OK) }
         if (a.minor < 2) emit(a, SCopy(nores.with("st", E_OP_ILLEGAL)))
         else if (not(a.caps.copy)) emit(a, SCopy(nores.with("st", E_NOTSUPP)))
         else if (a.sfh == -1 or a.cfh == -1)
@@ -2507,10 +3202,14 @@ module nfs4ops {
         else {
             val src = fsGet(a.fs, a.sfh)
             val dst = fsGet(a.fs, a.cfh)
-            if (src.ftype != FReg or dst.ftype != FReg)
-                emit(a, SCopy(nores.with("st",
-                    if (src.ftype == FDir or dst.ftype == FDir) E_ISDIR
-                    else E_WRONG_TYPE)))
+            if (src.ftype != FReg or dst.ftype != FReg) {
+                val isdir = src.ftype == FDir or dst.ftype == FDir
+                val st    = if (isdir) E_ISDIR else E_WRONG_TYPE
+                emit(a, SCopy(nores.with("st", st)
+                                   .with("stAccept",
+                                         wrongTypeAccept(st, if (isdir) E_ISDIR
+                                                             else E_INVAL))))
+            }
             else {
                 val cnt = if (ar.cnt == 0) imax(0, src.sizeBlocks - ar.srcOff)
                           else ar.cnt
@@ -2534,7 +3233,7 @@ module nfs4ops {
                     val w = range(0, cnt).foldl(a.fs, (acc, i) =>
                         fsWrite(acc, a.cfh, ar.dstOff + i, 1,
                                 data.syms[i]).fs2)
-                    emit(a.with("fs", w), SCopy({ st: OK, copied: cnt }))
+                    emit(a.with("fs", w), SCopy({ st: OK, copied: cnt, stAccept: Set(OK) }))
                 }
             }
         }
@@ -2605,10 +3304,16 @@ module nfs4ops {
                                        pat: int, blocknum: bool }): Acc = {
         val nores = { st: OK, count: 0 }
         if (a.minor < 2) emit(a, SWriteSame(nores.with("st", E_OP_ILLEGAL)))
-        else if (ar.blocknum)
-            emit(a, SWriteSame(nores.with("st", E_UNION_NOTSUPP)))
+        // The capability check comes FIRST: RFC 7862 15.13.3 makes
+        // NFS4ERR_UNION_NOTSUPP the answer for a block-number ADB, but a
+        // server that does not implement WRITE_SAME at all refuses the
+        // OPERATION -- NFS4ERR_NOTSUPP -- whatever the argument says, and
+        // V6.5 does exactly that.  The other order had the model predict
+        // UNION_NOTSUPP from a server that has no WRITE_SAME to union over.
         else if (not(a.caps.writeSame))
             emit(a, SWriteSame(nores.with("st", E_NOTSUPP)))
+        else if (ar.blocknum)
+            emit(a, SWriteSame(nores.with("st", E_UNION_NOTSUPP)))
         else {
             val g = io42Gate(a, ar.sel, true)
             if (g != OK) emit(a, SWriteSame(nores.with("st", g)))
@@ -2629,26 +3334,31 @@ module nfs4ops {
     // overlapping ranges of one file is NFS4ERR_INVAL.
     pure def opClone(a: Acc, ar: { srcSel: SidSel, dstSel: SidSel,
                                    srcOff: int, dstOff: int, cnt: int }): Acc = {
-        if (a.minor < 2) emit(a, SClone({ st: E_OP_ILLEGAL }))
+        if (a.minor < 2) emit(a, SClone({ st: E_OP_ILLEGAL , stAccept: Set(E_OP_ILLEGAL) }))
         else if (a.sfh == -1 or a.cfh == -1)
-            emit(a, SClone({ st: E_NOFILEHANDLE }))
+            emit(a, SClone({ st: E_NOFILEHANDLE , stAccept: Set(E_NOFILEHANDLE) }))
         else if (not(fsLive(a.fs, a.sfh)) or not(fsLive(a.fs, a.cfh)))
-            emit(a, SClone({ st: E_STALE }))
+            emit(a, SClone({ st: E_STALE , stAccept: Set(E_STALE) }))
         else {
             // Both stateids are resolved before the operation is judged
             // unsupported, so a bad stateid outranks NFS4ERR_NOTSUPP.
             val sg = cloneSidGate(a, ar.srcSel, a.sfh)
             val dg = cloneSidGate(a, ar.dstSel, a.cfh)
-            if (sg != OK) emit(a, SClone({ st: sg }))
-            else if (dg != OK) emit(a, SClone({ st: dg }))
-            else if (not(a.caps.clone)) emit(a, SClone({ st: E_NOTSUPP }))
+            if (sg != OK) emit(a, SClone({ st: sg , stAccept: Set(sg) }))
+            else if (dg != OK) emit(a, SClone({ st: dg , stAccept: Set(dg) }))
+            else if (not(a.caps.clone)) emit(a, SClone({ st: E_NOTSUPP , stAccept: Set(E_NOTSUPP) }))
             else {
                 val src = fsGet(a.fs, a.sfh)
                 val dst = fsGet(a.fs, a.cfh)
-                if (src.ftype != FReg or dst.ftype != FReg)
-                    emit(a, SClone({ st:
-                        if (src.ftype == FDir or dst.ftype == FDir) E_ISDIR
-                        else E_WRONG_TYPE }))
+                if (src.ftype != FReg or dst.ftype != FReg) {
+                    val isdir = src.ftype == FDir or dst.ftype == FDir
+                    val st    = if (isdir) E_ISDIR else E_WRONG_TYPE
+                    emit(a, SClone({ st: st,
+                                     stAccept:
+                                         wrongTypeAccept(st,
+                                                         if (isdir) E_ISDIR
+                                                         else E_INVAL) }))
+                }
                 else {
                     val cnt = if (ar.cnt == 0)
                                   imax(0, src.sizeBlocks - ar.srcOff)
@@ -2656,20 +3366,20 @@ module nfs4ops {
                     if (a.sfh == a.cfh and
                         ar.srcOff < ar.dstOff + cnt and
                         ar.dstOff < ar.srcOff + cnt)
-                        emit(a, SClone({ st: E_INVAL }))
+                        emit(a, SClone({ st: E_INVAL , stAccept: Set(E_INVAL) }))
                     else if (cnt == 0)
                         // Nothing to clone (count 0 with the source offset at
                         // or past EOF): success, no state change.
-                        emit(a, SClone({ st: OK }))
+                        emit(a, SClone({ st: OK , stAccept: Set(OK) }))
                     else if (ar.srcOff + cnt > src.sizeBlocks)
-                        emit(a, SClone({ st: E_INVAL }))
+                        emit(a, SClone({ st: E_INVAL , stAccept: Set(E_INVAL) }))
                     else
                         // Reflink: the destination takes the source's block
                         // CONTENT, so a hole in the source stays a hole.
                         emit(a.with("fs",
                                     fsCopyBlocks(a.fs, a.sfh, ar.srcOff,
                                                  a.cfh, ar.dstOff, cnt)),
-                             SClone({ st: OK }))
+                             SClone({ st: OK , stAccept: Set(OK) }))
                 }
             }
         }
@@ -2833,7 +3543,8 @@ module nfs4ops {
         fs2: Fs,
         sdb2: StateDB,
         status: int,
-        results: List[OpRes]
+        results: List[OpRes],
+        devHits: Set[str]
     }
 
     pure def mkCaps(pnfs: bool, readDeleg: bool, writeDeleg: bool,
@@ -2843,7 +3554,14 @@ module nfs4ops {
           readPlus: copyOk, ioAdvise: copyOk, writeSame: copyOk,
           clone: copyOk,
           conflictDelays: true, closeFreesLocks: true,
-          layoutWholeFile: true }
+          layoutWholeFile: true,
+          // The self-tests exercise the exported tree, never the namespace
+          // above it, so they read as the root-export shape.
+          rootExport: true,
+          devs: Set(), tolHoleTracking: false,
+          tolXattrChange: false,
+          tolRenewLapsed: false, tolRflagsConfirm: false,
+          tolWideAttrRefusal: false }
 
     // Evaluate a whole COMPOUND.  reqTag identifies the request for the
     // 4.1 SEQUENCE replay/false-retry classification.
@@ -2853,7 +3571,7 @@ module nfs4ops {
             fs: fs, sdb: sdb, minor: minor, caps: caps,
             nOps: ops.length(), reqTag: reqTag, idx: 0,
             cfh: -1, sfh: -1, seqDone: false, seqClient: -1,
-            done: false, status: OK, results: []
+            done: false, status: OK, results: [], devHits: Set()
         }
         val aN = ops.foldl(a0, (acc, r) => {
             val acc2 =
@@ -2862,15 +3580,18 @@ module nfs4ops {
                          not(sessionExempt(r))) {
                     // First op of a 4.1+ compound must be SEQUENCE or a
                     // session-exempt op.
-                    val res = SSequence({ st: E_OP_NOT_IN_SESSION,
-                                          replay: false })
-                    acc.with("results", acc.results.append(res))
-                       .with("status", E_OP_NOT_IN_SESSION)
-                       .with("done", true)
+                    //
+                    // Reported against the offending op (one result) by the
+                    // RFC; ganesha sends none -- see refuseShape.
+                    refuseShape(acc,
+                                SSequence({ st: E_OP_NOT_IN_SESSION,
+                                            replay: false }),
+                                E_OP_NOT_IN_SESSION)
                 }
                 else dispatch(acc, r)
             acc2.with("idx", acc.idx + 1)
         })
-        { fs2: aN.fs, sdb2: aN.sdb, status: aN.status, results: aN.results }
+        { fs2: aN.fs, sdb2: aN.sdb, status: aN.status, results: aN.results,
+          devHits: aN.devHits }
     }
 }

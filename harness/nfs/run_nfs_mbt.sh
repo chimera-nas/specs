@@ -369,7 +369,12 @@ ganesha_start() {
     rm -f "$GANESHA_LOG"
     # -F foreground, -x fatal on config errors, -p a pidfile of our own so
     # concurrent instances never fight over /var/run/ganesha.
-    run_in_server_ns setsid "$GANESHA" -F -x -f "$GANESHA_CONF" -L "$GANESHA_LOG" \
+    # -L: the log FILE is buffered, and a segfault takes the buffer with it --
+    # which is exactly the run whose last lines matter.  GANESHA_LOG_DEST lets
+    # the post-mortem replay say STDERR instead, where glibc leaves the stream
+    # unbuffered and the shell redirect below catches every line.
+    run_in_server_ns setsid "$GANESHA" -F -x -f "$GANESHA_CONF" \
+        -L "${GANESHA_LOG_DEST:-$GANESHA_LOG}" \
         -N "NIV_${LOGLEVEL}" -p "$GANESHA_PID_FILE" \
         > "$GANESHA_OUT" 2>&1 &
     SERVER_PID=$!
@@ -668,6 +673,84 @@ replay_args() {
     esac
 }
 
+# The server died.  Replay the SAME trace once more with its log turned up and
+# cores enabled, so the run that found a crash also explains it -- a crash is
+# rare enough, and reproducible enough when it happens, that paying one extra
+# replay for a backtrace is cheaper than asking someone to reproduce it later
+# with different flags.  Nothing here can change the verdict: the trace has
+# already been counted as a failure.
+#
+# core_pattern is a HOST-wide sysctl, not a namespaced one, so this only works
+# in a privileged container and only politely: the previous value is put back
+# afterwards.  Where it is not writable the DEBUG log alone still narrows the
+# crash to an operation.
+post_mortem() {
+    local t=$1 prev_level=$LOGLEVEL prev_pattern="" c
+    [ "${SPECS_NFS_POSTMORTEM:-1}" = "1" ] || return 0
+    [ "$SERVER" = "ganesha" ] || return 0
+    echo "=== post-mortem: replaying $(basename "$t") at NIV_DEBUG ==="
+    CORE_DIR="${SESSION_DIR}/cores"
+    mkdir -p "$CORE_DIR"
+    ulimit -c unlimited 2>/dev/null || true
+    if [ -w /proc/sys/kernel/core_pattern ]; then
+        prev_pattern=$(cat /proc/sys/kernel/core_pattern 2>/dev/null || true)
+        echo "${CORE_DIR}/core.%e.%p" > /proc/sys/kernel/core_pattern 2>/dev/null || true
+    else
+        echo "post-mortem: /proc/sys/kernel/core_pattern is not writable; " \
+             "log only (no backtrace)"
+    fi
+    LOGLEVEL=DEBUG
+    GANESHA_LOG_DEST=STDERR
+    if ganesha_start; then
+        # shellcheck disable=SC2046  # replay_args intentionally word-splits
+        run_in_ns timeout "$TIMEOUT" python3 "$REPLAYER" "${BASE_ARGS[@]}" \
+            $(replay_args) --owner-epoch "${EPOCH}-pm" --trace "$t" || true
+    fi
+    echo "=== ganesha NIV_DEBUG log (last 200 lines, unbuffered) ==="
+    tail -200 "$GANESHA_OUT" 2>/dev/null || true
+    # The distribution package is stripped, so every frame inside ganesha
+    # resolves to ?? until the -dbgsym package is present.  Fetch it HERE
+    # rather than baking it into the image: it is tens of megabytes that only
+    # a crashing run ever needs, and a crashing run is rare enough to pay a
+    # download for.  Failure is not fatal -- an unsymbolised backtrace still
+    # says which library and which thread.
+    if ls "$CORE_DIR"/core.* >/dev/null 2>&1 && command -v gdb >/dev/null 2>&1
+    then
+        echo "=== fetching ganesha debug symbols ==="
+        # Not silenced: when this fails the backtrace is unreadable, and the
+        # reason apt gives is the only thing that says why.
+        apt-get update 2>&1 | tail -5 || true
+        apt-cache policy nfs-ganesha-dbgsym 2>&1 | head -4 || true
+        apt-get install -y --no-install-recommends \
+            nfs-ganesha-dbgsym 2>&1 | tail -8 \
+            || echo "post-mortem: nfs-ganesha-dbgsym would not install; " \
+                    "frames inside ganesha will read ??"
+    fi
+    for c in "$CORE_DIR"/core.*; do
+        [ -e "$c" ] || continue
+        echo "=== backtrace from $(basename "$c") ==="
+        if command -v gdb >/dev/null 2>&1; then
+            # `bt` alone is the CRASHING thread, and it is the one that
+            # matters -- print it first and unabridged, because
+            # `thread apply all bt` puts it last and a tail can lose it.
+            gdb -batch -n -ex "bt full" "$GANESHA" "$c" 2>&1 | head -60
+            echo "--- all threads ---"
+            gdb -batch -n -ex "thread apply all bt" "$GANESHA" "$c" 2>&1 \
+                | head -150
+        else
+            echo "post-mortem: gdb is not installed; core kept at $c"
+        fi
+    done
+    [ -n "$prev_pattern" ] && \
+        printf '%s\n' "$prev_pattern" > /proc/sys/kernel/core_pattern 2>/dev/null || true
+    LOGLEVEL=$prev_level
+    GANESHA_LOG_DEST=""
+    # stop_server, not SERVER_PID="": the post-mortem replay may have left a
+    # server alive (a crash that does not reproduce is itself worth knowing,
+    # and the process must not outlive the trace either way).
+    stop_server
+}
+
 n_ok=0; n_skip=0; n_fail=0; n_other=0
 EPOCH="$$-$(date +%s)"
 for t in "${TRACES[@]}"; do
@@ -692,13 +775,17 @@ for t in "${TRACES[@]}"; do
         fi
     fi
     if [ -n "$SERVER_PID" ] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        # The server DIED.  That is the loudest finding this harness can
+        # produce, and it is exactly the case where nobody will have thought
+        # to set SPECS_NFS_SERVER_LOG in advance -- so the log tail comes out
+        # unconditionally here, unlike the ordinary failure path above.
         echo "=== ganesha exited during $(basename "$t") ==="
-        if [ "${SPECS_NFS_SERVER_LOG:-0}" = "1" ]; then
-            cat "$GANESHA_OUT"
-            tail -60 "$GANESHA_LOG" 2>/dev/null || true
-        fi
+        cat "$GANESHA_OUT" 2>/dev/null || true
+        echo "=== ganesha log (last 60 lines) ==="
+        tail -60 "$GANESHA_LOG" 2>/dev/null || true
         SERVER_PID=""
         [ "$rc" = "0" ] && { n_ok=$((n_ok - 1)); n_fail=$((n_fail + 1)); }
+        post_mortem "$t"
     fi
     stop_server
 done

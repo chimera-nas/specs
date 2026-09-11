@@ -34,6 +34,8 @@ NFS_V4 = 4
 NFSPROC4_COMPOUND = 1
 
 NFS4_OK = 0
+# RFC 7862 15.2.2: the one COPY failure that still carries a body.
+NFS4ERR_OFFLOAD_NO_REQS = 10094
 
 # Operation numbers (RFC 7530 16.2 / 8881 18 / 7862 15 / 8276 8)
 OP_ACCESS = 3
@@ -1181,8 +1183,17 @@ def _dec_write_response(u):
 
 
 def _dec_copy(u, st):
+    # RFC 7862 15.2.2: COPY4res is a union on the status with THREE arms, not
+    # two.  NFS4_OK carries the write response and the two bools;
+    # NFS4ERR_OFFLOAD_NO_REQS carries only the bools; and every other status
+    # -- NFS4ERR_NOTSUPP among them -- is `void`, so nothing follows.  Reading
+    # a length4 on the general error path is what produced "XDR underrun: need
+    # 8 bytes at offset 116, have 116" the moment a server without COPY was
+    # actually asked for one.
+    if st == NFS4ERR_OFFLOAD_NO_REQS:
+        return {"consecutive": u.boolean(), "synchronous": u.boolean()}
     if st != NFS4_OK:
-        return {"bytes_copied": u.uint64()}
+        return {}
     out = _dec_write_response(u)
     out["consecutive"] = u.boolean()
     out["synchronous"] = u.boolean()
@@ -1524,16 +1535,29 @@ class Nfs4Client:
         rtag = u.opaque_var()
         nres = u.uint32()
         results = []
-        for _ in range(nres):
-            opnum = u.uint32()
-            opstatus = u.uint32()
-            dec = DECODERS.get(opnum)
-            if dec is None:
-                raise XdrError(f"no decoder for op {opnum}")
-            fields = dec(u, opstatus)
-            fields["op"] = opnum
-            fields["status"] = opstatus
-            results.append(fields)
-        u.done()
+        # A decode failure here says the harness and the server disagree about
+        # the SHAPE of a reply, which is unreadable from the message alone --
+        # "need 8 bytes at offset 116" names neither the operation nor what
+        # was on the wire.  Re-raise with both: the opcodes decoded so far,
+        # the one that failed, and the reply itself.  Costs nothing until
+        # something goes wrong, and what goes wrong here is always a surprise.
+        seen = []
+        try:
+            for _ in range(nres):
+                opnum = u.uint32()
+                opstatus = u.uint32()
+                dec = DECODERS.get(opnum)
+                if dec is None:
+                    raise XdrError(f"no decoder for op {opnum}")
+                seen.append((opnum, opstatus))
+                fields = dec(u, opstatus)
+                fields["op"] = opnum
+                fields["status"] = opstatus
+                results.append(fields)
+            u.done()
+        except XdrError as e:
+            raise XdrError(
+                f"{e}; compound status {status}, nres {nres}, "
+                f"decoded {seen}, reply {raw.hex()}") from None
         return {"status": status, "tag": rtag, "results": results,
                 "raw": raw}

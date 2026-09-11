@@ -2,25 +2,43 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""Registry of known Samba divergences from the SMB2 model.
+"""What is left of the Samba divergence registry: CHANGE_NOTIFY, only.
 
-The model in quint/smb2 encodes MS-SMB2 / MS-FSA, not any one server.  When
-it is replayed against Samba, a disagreement is one of three things:
+A divergence between the model and a real smbd is one of three things:
 
   1. a MODEL bug -- the spec says what Samba does, and the model is wrong.
      Fix the model; nothing belongs here.
   2. a Samba DEVIATION -- Samba knowingly or unknowingly does something the
-     standard does not describe.  Record it here, with a citation, so the
-     suite keeps running and the divergence stays enumerable.
+     standard does not describe.
   3. an unanalyzed difference -- neither of the above yet.  It must fail.
 
-This file is what separates (2) from (3).  A divergence that matches an
-entry here is reported as a DEVIATION and does not fail the run; anything
-else is a MISMATCH and does.  That is deliberately the same contract the
-POSIX suite uses (chimera's src/posix/tests/quint/posix_deviations.py), and
-the same one the SMB ground-truth probes use with their DEVIATION() macro:
-never used to hide an unanalyzed failure, always carrying a citation and a
-root cause.
+Case 2 no longer belongs here EITHER.  A deviation is now written into the
+model as a branch guarded on the cell's config (quint/smb2/smb2_ops.qnt, and
+`deviations` in configs/*.json), so the trace's expectation is already what
+Samba does and replay is an exact match.  SD-2, SD-4, SD-5, SD-8 and SD-9
+moved there; see quint/smb2/corpus.schema.json for each one's measurement and
+citation, and tools/devliveness.py for the gate that stops one outliving its
+fix.
+
+Three entries could not follow them, and they are all CHANGE_NOTIFY:
+
+  SD-10  Samba raises a different SET of change classes than MS-FSA.
+  SD-11  the CompletionFilter of the FIRST request on a handle is binding.
+  SD-12  an intra-directory rename also reports the old name as REMOVED.
+
+What blocks all three is the same thing, and it is structural rather than a
+matter of effort: Samba delivers ONE model-level mutation as SEVERAL
+completions.  The model buffers events during a message and drains each watch
+once at the end of it (smb2_state.qnt stFireNotifies), and a completion is
+identified by (handle, queue position) -- so "the create woke the first waiter
+with ADDED and the second with MODIFIED" has no representation, and neither
+does SD-12's spurious REMOVED arriving as its own delivery.  SD-10's write and
+create faces additionally turn on DOS-attribute state (the ARCHIVE bit Samba
+stamps, which is what raises the notification at all) that the model does not
+carry, so even the classes are not a function of anything the model knows.
+Modelling them on a guess would make every stepNotify trace wrong; leaving
+them here keeps them enumerable and keeps the flavour running as far as the
+first of them.  That is why the stepNotifyNs flavour still exists.
 
 Reconcilability
 ---------------
@@ -92,26 +110,10 @@ def _extra_removes_in_step(cmd, res, ctx):
     return got is not None and model_recs is not None and got == len(model_recs)
 
 
-# NTSTATUS values referenced below (MS-ERREF 2.3.1).
-ST_SUCCESS = 0x00000000
-ST_UNSUCCESSFUL = 0xC0000001
-ST_NOT_IMPLEMENTED = 0xC0000002
-ST_INVALID_PARAMETER = 0xC000000D
-ST_INVALID_DEVICE_REQUEST = 0xC0000010
-ST_END_OF_FILE = 0xC0000011
-ST_ACCESS_DENIED = 0xC0000022
-ST_OBJECT_NAME_NOT_FOUND = 0xC0000034
-ST_OBJECT_NAME_COLLISION = 0xC0000035
+# The one NTSTATUS still referenced from here: smb2_replay.py's
+# silent-truncate oracle asks whether a refused CREATE was refused for
+# sharing (MS-ERREF 2.3.1).
 ST_SHARING_VIOLATION = 0xC0000043
-ST_FILE_LOCK_CONFLICT = 0xC0000054
-ST_LOCK_NOT_GRANTED = 0xC0000055
-ST_RANGE_NOT_LOCKED = 0xC000007E
-ST_DELETE_PENDING = 0xC0000056
-ST_DIRECTORY_NOT_EMPTY = 0xC0000101
-ST_NOT_A_DIRECTORY = 0xC0000103
-ST_FILE_IS_A_DIRECTORY = 0xC00000BA
-ST_CANNOT_DELETE = 0xC0000121
-ST_NOT_SUPPORTED = 0xC00000BB
 
 
 # Who is wrong.  Both kinds are analyzed and non-fatal, but they mean opposite
@@ -148,9 +150,9 @@ class Deviation:
     # end up with no handle, still in step) and sometimes succeeds (the server
     # holds a handle the model does not know about).
     # Extra guard on (cmd_value, res_value, ctx) -> bool; default always-true.
-    # `ctx` carries harness-side facts the trace does not spell out -- notably
-    # `access`, the model DesiredAccess profile of the handle the command
-    # targets, which is what most of these entries actually turn on.
+    # `ctx` carries harness-side facts the trace does not spell out.  The one
+    # entry that still uses it is SD-12, which is handed the model's and the
+    # wire's FILE_NOTIFY_INFORMATION record lists.
     context: Callable = dataclasses.field(
         default=lambda cmd, res, ctx: True)
     reconcilable: object = True
@@ -292,151 +294,27 @@ KNOWN_DEVIATIONS = [
         ops=("RNotify", "RNotifyAsync"),
         reconcilable=False,
     ),
-
-    Deviation(
-        id="SD-2",
-        verdict=SAMBA,
-        spec="MS-SMB2 3.3.5.14 (Receiving an SMB2 LOCK Request)",
-        summary="a LOCK on a handle holding neither FILE_READ_DATA nor "
-                "FILE_WRITE_DATA is refused with STATUS_INVALID_HANDLE rather "
-                "than STATUS_ACCESS_DENIED",
-        root_cause="measured directly: a DELETE-only and an attribute-only "
-                   "handle both answer 0xC0000008, while read-only and "
-                   "write-only handles lock successfully.  So Samba does make "
-                   "the access check the spec calls for -- it just reports the "
-                   "wrong status for it.  (This entry began as a `both`: the "
-                   "model performed no access check at all and granted the "
-                   "lock.  That half is fixed, leaving only Samba's status.)",
-        candidate_fix="samba: return STATUS_ACCESS_DENIED from the LOCK "
-                      "GrantedAccess check",
-        ops=("RLock",),
-        expected_status=ST_ACCESS_DENIED,
-        actual_status=0xC0000008,
-        # Both sides refuse and neither takes a lock, so replay stays in sync.
-        reconcilable=True,
-    ),
-
-    Deviation(
-        id="SD-4",
-        verdict=SAMBA,
-        spec="MS-FSA 2.1.5.14.11 (Set FileRenameInformation)",
-        summary="Samba checks the destination for a collision before it "
-                "checks that the handle holds DELETE access, so a rename that "
-                "fails both ways reports the collision instead of the access "
-                "failure",
-        root_cause="measured directly: with a handle opened without DELETE, a "
-                   "rename onto a FREE name answers STATUS_ACCESS_DENIED, "
-                   "while a rename onto an EXISTING name answers "
-                   "STATUS_OBJECT_NAME_COLLISION -- so the target lookup runs "
-                   "first. The spec's algorithm makes the DELETE-access check "
-                   "an early precondition, which is the order the model "
-                   "encodes.",
-        candidate_fix="samba: hoist the GrantedAccess DELETE check above the "
-                      "destination lookup in the rename path",
-        ops=("RSetRename",),
-        expected_status=ST_ACCESS_DENIED,
-        actual_status=ST_OBJECT_NAME_COLLISION,
-        # Neither side renames anything, so the namespace stays in step.
-        reconcilable=True,
-    ),
-
-    Deviation(
-        id="SD-5",
-        verdict=SAMBA,
-        spec="MS-FSA 2.1.5.1.2 (Open of Existing File), disposition ordering",
-        summary="FILE_CREATE onto an existing DIRECTORY opened with "
-                "FILE_NON_DIRECTORY_FILE reports STATUS_FILE_IS_A_DIRECTORY "
-                "instead of STATUS_OBJECT_NAME_COLLISION",
-        root_cause="Samba runs the create-options TYPE check ahead of the "
-                   "FILE_CREATE collision check, but only in one direction. "
-                   "Measured on all four corners: existing directory + "
-                   "NON_DIRECTORY_FILE answers 0xC00000BA, while existing "
-                   "FILE + DIRECTORY_FILE answers 0xC0000035 (collision), not "
-                   "STATUS_NOT_A_DIRECTORY -- so the ordering is asymmetric. "
-                   "The spec makes the FILE_CREATE collision the first thing "
-                   "the existing-target path decides, before the type is "
-                   "consulted at all, which is the order the model encodes.",
-        candidate_fix="samba: decide the FILE_CREATE collision before the "
-                      "create-options type check, so both directions agree",
-        ops=("RCreate",),
-        expected_status=ST_OBJECT_NAME_COLLISION,
-        actual_status=ST_FILE_IS_A_DIRECTORY,
-        context=lambda cmd, res, ctx: (cmd["disp"]["tag"] == "DispCreate"
-                                       and not cmd["isDir"]),
-        # Both sides refuse and neither creates anything, so the namespace
-        # stays in step.
-        reconcilable=True,
-    ),
-
-    Deviation(
-        id="SD-8",
-        verdict=SAMBA,
-        spec="MS-SMB2 3.3.5.14 (Receiving an SMB2 LOCK Request); MS-FSA "
-             "2.1.5.1.2 on the transience of a truncate's write",
-        summary="a handle whose CREATE actually created or overwrote the file "
-                "may take byte-range locks even when its DesiredAccess "
-                "carried no data access -- the write the server took to do "
-                "that is treated as if the handle kept it",
-        root_cause="the CreateAction decides it exactly.  Holding "
-                   "DesiredAccess fixed at DELETE-only and varying only "
-                   "whether the file already existed: act=OPENED refuses LOCK "
-                   "with 0xC0000008, while act=CREATED (FILE_CREATE, or "
-                   "FILE_OPEN_IF on a missing name) and act=OVERWRITTEN both "
-                   "GRANT it.  Samba opens the backing descriptor for write "
-                   "when it has to create or truncate, and its lock path "
-                   "consults that descriptor rather than the SMB "
-                   "GrantedAccess.  Samba itself does not treat the write as "
-                   "retained for SHARE purposes -- the same handle denies a "
-                   "later writer nothing -- so its two checks disagree with "
-                   "each other, which is what makes this a bug rather than an "
-                   "interpretation.",
-        candidate_fix="samba: check the SMB GrantedAccess in the LOCK path, "
-                      "not the descriptor's open mode",
-        ops=("RLock",),
-        expected_status=ST_ACCESS_DENIED,
-        # CreateAction: SUPERSEDED=0, OPENED=1, CREATED=2, OVERWRITTEN=3.
-        # Everything except OPENED means the server wrote to the object to
-        # bring it into that state.
-        context=lambda cmd, res, ctx: (ctx.get("access") is not None
-                                       and not ctx["access"].get("r")
-                                       and not ctx["access"].get("w")
-                                       and ctx.get("create_action") is not None
-                                       and ctx["create_action"] != 1),
-        # Reconcilable only when the server ALSO declined to change anything.
-        # A granted lock the model does not know about desyncs every later
-        # read and write over that range; a RANGE_NOT_LOCKED on an unlock
-        # changes nothing on either side.
-        reconcilable=lambda cmd, res, ctx: ctx.get("wire_status") != 0,
-    ),
-
-    Deviation(
-        id="SD-9",
-        verdict=SAMBA,
-        spec="MS-SMB2 3.3.5.14 (Receiving an SMB2 LOCK Request)",
-        summary="the GrantedAccess check is applied to a lock request but not "
-                "to an unlock request, so an unlock on a handle with no data "
-                "access is processed and answers STATUS_RANGE_NOT_LOCKED",
-        root_cause="measured on one handle: DELETE-only and attribute-only "
-                   "handles, act=OPENED, refuse LOCK with 0xC0000008 and then "
-                   "accept the matching UNLOCK, answering 0xC000007E.  The "
-                   "spec conditions the whole request on the access check, not "
-                   "just its locking half.  Distinct from SD-2 (which is about "
-                   "the STATUS the check reports) and SD-8 (which is about "
-                   "WHAT it consults): here the check does not run at all.",
-        candidate_fix="samba: apply the LOCK GrantedAccess check before "
-                      "dispatching either half of the request",
-        ops=("RLock",),
-        expected_status=ST_ACCESS_DENIED,
-        actual_status=ST_RANGE_NOT_LOCKED,
-        context=lambda cmd, res, ctx: (bool(cmd.get("unlock"))
-                                       and ctx.get("access") is not None
-                                       and not ctx["access"].get("r")
-                                       and not ctx["access"].get("w")),
-        # Neither side unlocks anything, so replay stays in step.
-        reconcilable=True,
-    ),
 ]
 
+# MIGRATED -- these are Samba divergences that the MODEL now predicts, gated on
+# the cell's config.  They are gone from here because they are enumerated
+# somewhere better: quint/smb2/corpus.schema.json carries each one's
+# measurement and citation, configs/*.json say which cells claim it, and
+# tools/devliveness.py fails a cell that claims one its corpus never reaches.
+#
+#   SD-2 (samba)  LOCK on a handle with no data access answers
+#                 STATUS_INVALID_HANDLE, not STATUS_ACCESS_DENIED.
+#   SD-4 (samba)  rename checks the destination before the handle's DELETE
+#                 access, so a rename that fails both ways reports the
+#                 collision.
+#   SD-5 (samba)  FILE_CREATE onto an existing DIRECTORY opened
+#                 FILE_NON_DIRECTORY_FILE answers STATUS_FILE_IS_A_DIRECTORY.
+#   SD-8 (samba)  a handle whose CreateAction is not OPENED may lock without
+#                 data access -- and the lock it takes is now a lock the model
+#                 takes too, so the rest of the trace keeps testing instead of
+#                 being abandoned.
+#   SD-9 (samba)  the access check is not applied to an UNLOCK at all.
+#
 # Retired -- the model was wrong and has been fixed, so these no longer occur.
 # Kept as a record of what the exercise found, and of what would resurface if
 # a fix were reverted:
@@ -452,8 +330,6 @@ KNOWN_DEVIATIONS = [
 #                 none of it afterwards (denyCheck vs deny).
 #   SD-6 (model)  the lease-key-to-file binding was enforced on a profile whose
 #                 server advertises no leasing.  Fixed: gated on caps.leases.
-#   SD-10 (samba) CHANGE_NOTIFY event vocabulary; see the entry itself.
-#   SD-11 (samba) a handle's CompletionFilter is fixed at its first request.
 #   SD-7 (model)  a truncating CREATE refused with a sharing violation still
 #                 truncated the file.  Fixed: the disposition's filesystem
 #                 effect is committed on the success path only.  The oracle

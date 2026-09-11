@@ -7,10 +7,13 @@
 #
 # Usage: run_samba_mbt.sh <trace-dir> [trace-glob]
 #
-#   <trace-dir>   directory holding the generated *.itf.json corpus
-#   [trace-glob]  shell glob selecting the batch (default: *.itf.json).
-#                 One ctest per batch, so a divergence names the flavor that
-#                 found it and the batches run in parallel.
+#   <trace-dir>   a CELL's trace directory (build/specs-corpus/samba/smb2/<cell>).
+#                 One config is one cell is one ctest, and the cell replays ALL
+#                 of its directory -- so a divergence names the flavour that
+#                 found it and the cells run in parallel, with no filename
+#                 carving and nothing skipped.
+#   [trace-glob]  shell glob narrowing the run (default: *.itf.json).  For
+#                 driving one trace by hand; CMake never passes it.
 #
 # Everything -- smbd and the replay client -- runs inside a private network
 # namespace, so every concurrent test gets its own 127.0.0.1:445 and the whole

@@ -1,0 +1,28 @@
+{
+  "extends": "./ganesha_nfs4_41.json",
+  "description": "The same ganesha at plain NFSv4.0 -- no sessions, so SETCLIENTID/SETCLIENTID_CONFIRM, per-owner seqids and OPEN_CONFIRM carry the state machine instead. Mirrors chimera's nfs4_memfs40 cell.",
+  "traceStem": "ganesha40",
+
+  "deviationsOff": [
+    "G4-exchange-id-no-confirmed-r",
+    "G4-bindconn-direction-accepted",
+    // No sessions at 4.0: a compound cannot be outside one, and
+    // BIND_CONN_TO_SESSION is answered NFS4ERR_OP_ILLEGAL before the
+    // solo-only rule can apply -- so neither shape refusal exists here.
+    "G4-compound-shape-no-result"
+  ],
+  "deviations": [
+    // Only the 4.0 walk sends the 256-byte NLONG compound tag (measured with
+    // tools/devliveness.py), so this is the one profile that can prove it.
+    "G4-compound-tag-length-limit"
+  ],
+
+  "tolerances": {
+    "rflagsConfirm": false,
+    "renewLapsed": true
+  },
+
+  "policies": {
+    "minor": 0
+  }
+}

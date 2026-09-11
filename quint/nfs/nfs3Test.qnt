@@ -7,13 +7,20 @@
 // model regression is caught before it can invalidate generated traces.
 
 module nfs3Test {
-    import nfs3.* from "./nfs3"
+    // The self-tests assert the STANDARD, always: no deviations enabled, and
+    // no tolerance relaxed.  A cell's config is what says what one server does
+    // with the surface; these say what RFC 1813 says.
+    import nfs3(
+        DEVS = Set(),
+        T_ERROR_PRECEDENCE = false,
+        T_EXCL_RETRY_VERIFIER = false
+    ).* from "./nfs3"
 
     run createThenLookupTest =
         init
             .then(applyCreate(ROOT, "a", Unchecked, 420, ROOT_CRED))
             .expect(lastOp == OCreate({ dir: ROOT, name: "a", cmode: Unchecked,
-                                        mode: 420, verf: -1, status: OK, obj: 1 , cred: ROOT_CRED }))
+                                        mode: 420, verf: -1, status: OK, obj: 1 , cred: ROOT_CRED, statusAccept: Set() }))
             .then(applyLookup(ROOT, "a"))
             .expect(lastOp == OLookup({ dir: ROOT, name: "a", status: OK, child: 1 }))
             .then(applyLookup(ROOT, "b"))
@@ -26,11 +33,11 @@ module nfs3Test {
             .then(applyCreate(ROOT, "a", Guarded, 420, ROOT_CRED))
             .then(applyCreate(ROOT, "a", Guarded, 493, ROOT_CRED))
             .expect(lastOp == OCreate({ dir: ROOT, name: "a", cmode: Guarded,
-                                        mode: 493, verf: -1, status: ERR_EXIST, obj: -1 , cred: ROOT_CRED }))
+                                        mode: 493, verf: -1, status: ERR_EXIST, obj: -1 , cred: ROOT_CRED, statusAccept: Set() }))
             // UNCHECKED over the existing file: same object, mode untouched.
             .then(applyCreate(ROOT, "a", Unchecked, 493, ROOT_CRED))
             .expect(lastOp == OCreate({ dir: ROOT, name: "a", cmode: Unchecked,
-                                        mode: 493, verf: -1, status: OK, obj: 1 , cred: ROOT_CRED }))
+                                        mode: 493, verf: -1, status: OK, obj: 1 , cred: ROOT_CRED, statusAccept: Set() }))
             .expect(fs.get(1).mode == 420)
 
     // RFC 1813 3.3.8: exclusive create is idempotent for the same verifier
@@ -43,7 +50,7 @@ module nfs3Test {
         init
             .then(applyCreateExcl(ROOT, "x", 1))
             .expect(lastOp == OCreate({ dir: ROOT, name: "x", cmode: Exclusive,
-                                        mode: -1, verf: 1, status: OK, obj: 1 , cred: ROOT_CRED }))
+                                        mode: -1, verf: 1, status: OK, obj: 1 , cred: ROOT_CRED, statusAccept: Set() }))
             // Exclusive CREATE carries no mode -- RFC 1813 3.3.8 smuggles the
             // verifier through sattr, so the server picks the created mode.
             // Both real POSIX servers the harness replays against (knfsd,
@@ -55,11 +62,11 @@ module nfs3Test {
             // same verifier -> idempotent success, same object
             .then(applyCreateExcl(ROOT, "x", 1))
             .expect(lastOp == OCreate({ dir: ROOT, name: "x", cmode: Exclusive,
-                                        mode: -1, verf: 1, status: OK, obj: 1 , cred: ROOT_CRED }))
+                                        mode: -1, verf: 1, status: OK, obj: 1 , cred: ROOT_CRED, statusAccept: Set() }))
             // different verifier -> EXIST
             .then(applyCreateExcl(ROOT, "x", 2))
             .expect(lastOp == OCreate({ dir: ROOT, name: "x", cmode: Exclusive,
-                                        mode: -1, verf: 2, status: ERR_EXIST, obj: -1 , cred: ROOT_CRED }))
+                                        mode: -1, verf: 2, status: ERR_EXIST, obj: -1 , cred: ROOT_CRED, statusAccept: Set() }))
 
     // A WRITE (mtime change) invalidates the verifier, so even a same-verifier
     // CREATE afterwards is EXIST; a mode-only SETATTR does not.
@@ -69,12 +76,12 @@ module nfs3Test {
             .then(applySetattr(1, 493, -1, 0))          // mode-only: verifier intact
             .then(applyCreateExcl(ROOT, "y", 1))
             .expect(lastOp == OCreate({ dir: ROOT, name: "y", cmode: Exclusive,
-                                        mode: -1, verf: 1, status: OK, obj: 1 , cred: ROOT_CRED }))
+                                        mode: -1, verf: 1, status: OK, obj: 1 , cred: ROOT_CRED, statusAccept: Set() }))
             .then(applyWrite(1, 0, 1, 1, 2, ROOT_CRED))            // WRITE: clears verifier
             .expect(fs.get(1).xverf == 0)
             .then(applyCreateExcl(ROOT, "y", 1))
             .expect(lastOp == OCreate({ dir: ROOT, name: "y", cmode: Exclusive,
-                                        mode: -1, verf: 1, status: ERR_EXIST, obj: -1 , cred: ROOT_CRED }))
+                                        mode: -1, verf: 1, status: ERR_EXIST, obj: -1 , cred: ROOT_CRED, statusAccept: Set() }))
 
     run writeReadTest =
         init
@@ -172,24 +179,24 @@ module nfs3Test {
             // file over dir -> ISDIR
             .then(applyRename(ROOT, "b", ROOT, "a"))
             .expect(lastOp == ORename({ fromDir: ROOT, fromName: "b",
-                                        toDir: ROOT, toName: "a", status: ERR_ISDIR }))
+                                        toDir: ROOT, toName: "a", status: ERR_ISDIR, statusAccept: Set() }))
             // dir over file -> NOTDIR
             .then(applyRename(ROOT, "a", ROOT, "b"))
             .expect(lastOp == ORename({ fromDir: ROOT, fromName: "a",
-                                        toDir: ROOT, toName: "b", status: ERR_NOTDIR }))
+                                        toDir: ROOT, toName: "b", status: ERR_NOTDIR, statusAccept: Set() }))
             // dir into own subtree -> INVAL
             .then(applyRename(ROOT, "a", 1, "d"))
             .expect(lastOp == ORename({ fromDir: ROOT, fromName: "a",
-                                        toDir: 1, toName: "d", status: ERR_INVAL }))
+                                        toDir: 1, toName: "d", status: ERR_INVAL, statusAccept: Set() }))
             // self-rename -> OK no-op
             .then(applyRename(ROOT, "a", ROOT, "a"))
             .expect(lastOp == ORename({ fromDir: ROOT, fromName: "a",
-                                        toDir: ROOT, toName: "a", status: OK }))
+                                        toDir: ROOT, toName: "a", status: OK, statusAccept: Set() }))
             .expect(fs.get(ROOT).ents.keys() == Set("a", "b", "c"))
             // dir over empty dir -> OK, target dies
             .then(applyRename(ROOT, "a", ROOT, "c"))
             .expect(lastOp == ORename({ fromDir: ROOT, fromName: "a",
-                                        toDir: ROOT, toName: "c", status: OK }))
+                                        toDir: ROOT, toName: "c", status: OK, statusAccept: Set() }))
             .expect(fs.get(ROOT).ents.keys() == Set("b", "c") and
                     fs.get(ROOT).ents.get("c") == 1 and removed == Set(3))
             // file over file -> OK, target dies
@@ -199,27 +206,27 @@ module nfs3Test {
             // nonexistent source -> NOENT
             .then(applyRename(ROOT, "zz", ROOT, "b"))
             .expect(lastOp == ORename({ fromDir: ROOT, fromName: "zz",
-                                        toDir: ROOT, toName: "b", status: ERR_NOENT }))
+                                        toDir: ROOT, toName: "b", status: ERR_NOENT, statusAccept: Set() }))
 
     run linkTest =
         init
             .then(applyCreate(ROOT, "a", Unchecked, 420, ROOT_CRED))
             .then(applyMkdir(ROOT, "d", 493))
             .then(applyLink(1, 2, "x"))
-            .expect(lastOp == OLink({ obj: 1, dir: 2, name: "x", status: OK }))
+            .expect(lastOp == OLink({ obj: 1, dir: 2, name: "x", status: OK, statusAccept: Set() }))
             .expect(fs.get(1).nlink == 2)
             // hardlink-pair rename: no-op, both names remain
             .then(applyRename(ROOT, "a", 2, "x"))
             .expect(lastOp == ORename({ fromDir: ROOT, fromName: "a",
-                                        toDir: 2, toName: "x", status: OK }))
+                                        toDir: 2, toName: "x", status: OK, statusAccept: Set() }))
             .expect(fs.get(ROOT).ents.keys().contains("a") and
                     fs.get(2).ents.keys().contains("x"))
             // link to existing name -> EXIST
             .then(applyLink(1, 2, "x"))
-            .expect(lastOp == OLink({ obj: 1, dir: 2, name: "x", status: ERR_EXIST }))
+            .expect(lastOp == OLink({ obj: 1, dir: 2, name: "x", status: ERR_EXIST, statusAccept: Set() }))
             // link a directory -> ISDIR
             .then(applyLink(2, ROOT, "y"))
-            .expect(lastOp == OLink({ obj: 2, dir: ROOT, name: "y", status: ERR_ISDIR }))
+            .expect(lastOp == OLink({ obj: 2, dir: ROOT, name: "y", status: ERR_ISDIR, statusAccept: Set() }))
             // removing one name keeps the object with nlink 1
             .then(applyRemove(ROOT, "a"))
             .expect(fs.get(1).nlink == 1 and removed == Set())

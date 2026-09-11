@@ -1,0 +1,263 @@
+{
+  "family": "nfs4",
+  "modelFile": "../nfs/nfs4",
+  "modelModule": "nfs4",
+
+  "prelude": [
+    "import nfs4ops.* from \"../nfs/nfs4_ops\""
+  ],
+
+  "selfTests": [
+    { "name": "nfs4Test42", "module": "nfs4Test42", "file": "../nfs/nfs4Test", "maxSamples": 200 },
+    { "name": "nfs4Test40", "module": "nfs4Test40", "file": "../nfs/nfs4Test", "maxSamples": 200 }
+  ],
+
+  "extraSources": [
+    "../nfs/nfs4.qnt", "../nfs/nfs4_ops.qnt", "../nfs/nfs4_fs.qnt",
+    "../nfs/nfs4_state.qnt", "../nfs/nfs4Test.qnt"
+  ],
+
+  "consts": {
+    "DEVS": {
+      "kind": "deviation",
+      "key": "deviations",
+      "type": "devset",
+      "doc": "Known chimera divergences from the NFSv4 RFCs, per cell.  D4-19-dirop-symlink-notdir is gone and NOT replaced by a knob: RFC 7530 Table 7 lists NFS4ERR_SYMLINK and NFS4ERR_NOTDIR for every directory-requiring operation that meets a symbolic link, so both are conformant and the model accepts both unconditionally (DIR_SYM_ACCEPT in nfs4_ops.qnt).  D4-15-coarse-type-error and S4-no-wrong-type went the same way and for a sharper reason: RFC 8881 15.1.2.9 makes NFS4ERR_WRONG_TYPE a SHOULD-strength successor of the 4.0-era answer, and NOT ONE of the three servers this corpus is replayed against returns it -- chimera, NFS-Ganesha and the Linux server all answer the older pair.  Three independent implementations agreeing against the model is the model being wrong about what is required.  dataTypeAccept and wrongTypeAccept state both answers, unconditionally.  A knob would only be right if the two were mutually exclusive assumptions an implementation makes; they are not -- nothing happens on either branch.  Enabling one makes the model PREDICT what chimera actually does at the point of divergence, so the trace's expectation is already the truth and replay is an exact match -- the harness needs no registry, and the divergence stops being something a reader of the C has to remember.  Every id must be declared here, with a citation, before a config may enable it, and tools/devliveness.py fails the build if a cell enables one its corpus never exercises, so an entry cannot outlive its fix.  Four ids the harness registry used to carry are gone rather than migrated, because the model already predicts chimera's answer: D4-2 (ACCESS masked to the type-applicable bits) is what accessMeaningful() now states; D4-16 (READLINK of a directory answers INVAL, not ISDIR) is what opReadlink now states, following RFC 7530 16.25.4 and the servers rather than RFC 8881's later SHOULD; D4-7 (the model's NOTDIR against chimera's SYMLINK) was subsumed by D4-19's mirror; D4-22 (NFS4ERR_RETRY_UNCACHED_REP in place of a SEQUENCE replay, permitted by RFC 8881 2.10.6.1.3) is not exercised by any trace in any cell's corpus.",
+      "known": {
+        "D4-4-symlink-mode-0755": "RFC 7530 5.8.1.6 makes mode a plain attribute of every object, symbolic links included, and CREATE(NF4LNK) carries one; chimera reports 0755 for every symbolic link whatever the create asked for.  The mode of a symlink is never consulted for access (POSIX), so this is a reporting divergence -- but a GETATTR does read it back.",
+        "D4-20-access-root-execute": "RFC 8881 18.1.4: the server SHOULD NOT set ACCESS4_EXECUTE unless an execute bit is set.  chimera's root/AUTH_NONE DAC override grants it on a file with no execute bit anywhere in its mode, where the reference servers withhold it.  ACCESS is advisory (18.1: the operation itself is the authoritative check), so the coarser privileged override opens no hole, and `supported` and every other bit still match exactly.",
+        "D4-21-secinfo-consumes-fh": "RFC 8881 18.29.3 makes SECINFO consume the current filehandle, so the next operation that uses it answers NFS4ERR_NOFILEHANDLE; RFC 7530 17.31.3 leaves it in place on 4.0.  chimera zeroes req->fhlen for every minor version, so a 4.0 compound loses the handle too.",
+
+
+        "S4-compound-tag-unvalidated": "RFC 8881 2.2 (the compound tag is opaque UTF-8 the server need not police; the result count follows server processing).  The Linux server does not reject a malformed compound tag, so a compound the model predicts NFS4ERR_INVAL with an EMPTY result array is processed normally.  NFS-Ganesha was recorded here too and should not have been: measured across the 4.0 corpus, 8 malformed tags reached V6.5 and all 8 were refused with INVAL and an empty result array, which is what the model says with this OFF -- so it is enabled for knfsd alone.  With this on the model stops validating the tag at all, so the compound -- and everything downstream that depends on what it did -- stays in step.  Replaces KN-20-compound-tag-status and KN-21-compound-tag-results.  chimera DOES validate the tag (nfs4_proc_compound.c), and so does ganesha, which leaves the Linux server alone in not policing it.",
+
+        "G4-compound-tag-length-limit": "RFC 8881 2.2: the compound tag is opaque with no maximum length; the servers impose an implementation tag-length limit.  Both reference servers cap the compound tag below 256 bytes; the model treats it as opaque and accepts it.  ganesha returns NFS4ERR_INVAL for the whole compound, which is what this branch predicts.  (The Linux server rejects the same message at the RPC layer with GARBAGE_ARGS, which never becomes a COMPOUND status and so is not something the model can state -- that half stays in the harness's send path.)  Replaces GD-34-long-compound-tag.",
+
+
+        "S4-owner-seqid-gap-unpoliced": "RFC 7530 9.1.7 (the open-owner seqid must be exactly one greater; enforcement is the server's).  The model drives a deliberate +2 gap (nfs4_ops.qnt oseq = seqid + 2) expecting NFS4ERR_BAD_SEQID; neither reference server polices the gap -- both process the operation on its merits and record the seqid the client presented.  With this on the model does the same, so the owner state stays together where the harness registry this replaces could only abandon the trace.  Replaces GD-19-owner-seqid-gap-unpoliced, GD-32-open-seqid-vs-symlink (which was only the precedence between that gate and component resolution) and KN-9-owner-seqid-enforcement.  Recorded at OPEN, the operation whose seqid the generator gaps; the other sequenced operations share the relaxed gate.",
+
+        "S4-change-is-coarse-ctime": "RFC 7530 5.8.1.4 / RFC 8881 5.8.1.4 (change): must differ after any modification.  FSAL_VFS attrs: change = timespec_to_nsecs(ctime); ctime granularity is the kernel's coarse clock -- and knfsd change = ctime likewise.  So two mutations of one object inside a tick report the same change value, and a tick boundary moves it between two reads the model treats as unchanged.  Both directions violate the cited clause, but WHEN either bites is a race against a clock, so what the model states is that it no longer PREDICTS the value: every AttrSnap comes back changeOpaque and every change_info4 comes back opaque, and the harness drops its change-attribute invariant.  Like the xattr tolerance this could not use the <field>Accept convention -- what is dropped is an invariant across replies, not a value in one reply.  Replaces GD-1-change-is-coarse-ctime, GD-14-change-advanced-untracked and KN-15-change-coarse-ctime.  chimera keeps a per-object counter and is unaffected, which is what makes this a two-server divergence with one root cause.",
+
+
+        "G4-compound-shape-no-result": "RFC 8881 2.10.6.1 and 18.34.3: a COMPOUND refused for its SHAPE -- a first operation that is neither SEQUENCE nor session-exempt (NFS4ERR_OP_NOT_IN_SESSION), or a solo-only operation sent alongside others (BIND_CONN_TO_SESSION without SEQUENCE, NFS4ERR_NOT_ONLY_OP) -- is reported AGAINST the offending operation, so the reply carries one result.  ganesha agrees on the status and sends an EMPTY result array.  Nothing runs on either side, so nothing downstream parts.  Measured against V6.5 at 4.1 and 4.2 on both arms.  Replaces the ganesha registry's GD-28-compound-minorversion, which read the empty reply as NFS4ERR_INVAL and so recorded the status rather than the result count -- the half that actually failed replay.  A compound that fails at its first operation for any other reason DOES carry that operation's result: measured on DESTROY_CLIENTID (STALE_CLIENTID, CLIENTID_BUSY), DESTROY_SESSION (BADSESSION) and SEQUENCE (SEQ_MISORDERED), which is why this is about the compound's shape and not about where the failure sits.",
+
+        "G4-open-type-before-exist": "RFC 7530 16.16.4 / RFC 8881 18.16.4 list NFS4ERR_EXIST and the target object's own type error for a create that must not clobber, and order neither.  The model keeps the RFC-literal, POSIX O_EXCL reading: an existing name is EXIST whatever its type.  NFS-Ganesha V6.5 splits by DISPOSITION, and the split measured cleanly in both directions -- GUARDED answers EXIST (6 observations of 6) and EXCLUSIVE4 answers the type error (6 of 6) -- so this branch sits on the exclusive arm alone.  The OPEN fails either way, so nothing downstream parts.  Replaces GD-13-open-exist-precedence, which forgave ISDIR, SYMLINK and SHARE_DENIED on any OPEN and so said nothing about which disposition was in play; carrying that width into the model cost two rounds of over-prediction, once in each direction, before the disposition showed up in the data.",
+
+        "G4-verify-wide-trivial-match": "RFC 7530 16.15 / RFC 8881 18.31 (VERIFY/NVERIFY; an attrmask with fewer values than bits is unspecified).  opVerifyWide encodes the reference server's length-guard behaviour for an empty value blob and so predicts NFS4ERR_NOT_SAME for VERIFY and NFS4_OK for NVERIFY; ganesha reads the empty blob as 'no attributes to compare', which trivially matches, and answers the opposite (NFS4_OK / NFS4ERR_SAME).  Both are defensible readings of a deliberately under-specified request and neither changes state.  Replaces GD-4-verify-wide-empty-blob, which the registry recorded with verdict=MODEL: the model is the side that should eventually send a well-formed value blob.",
+
+        "G4-setattr-share-denied": "RFC 8881 9.1.4.3 (special stateid vs a conflicting OPEN) / 18.30 (SETATTR): the conflict is NFS4ERR_LOCKED.  ganesha reports the share-reservation conflict with NFS4ERR_SHARE_DENIED rather than the size op's NFS4ERR_LOCKED, for a size SETATTR and for ALLOCATE/DEALLOCATE through the anonymous stateid.  The object is unchanged either way.  Replaces GD-7-setattr-share-denied.",
+
+        "G4-exchange-id-no-confirmed-r": "RFC 8881 18.35.4 (EXGID4_FLAG_CONFIRMED_R is set for a repeat EXCHANGE_ID of a confirmed owner+verifier).  ganesha does not report CONFIRMED_R on a second EXCHANGE_ID for an already-confirmed client id; it returns the same client id, so the client stays confirmed and replay continues.  Replaces GD-12-exchange-id-confirmed-r.",
+
+
+        "G4-bindconn-direction-accepted": "RFC 8881 18.34 (BIND_CONN direction).  The four channel_dir_from_client4 values are FORE=1, BACK=2, FORE_OR_BOTH=3, BACK_OR_BOTH=7 and anything else is NFS4ERR_INVAL; ganesha accepts an out-of-range direction and answers NFS4_OK.  BIND_CONN_TO_SESSION changes no state the model tracks.  Replaces the BIND_CONN arms of GD-25-readdir-bindconn-residual and GD-26-bindconn-link-status.",
+
+        "G4-seek-at-eof-not-nxio": "RFC 7862 15.11.3: SEEK is NFS4ERR_NXIO when sa_offset is at or past the file size.  ganesha's FSAL SEEK does not return NXIO for an at/past-EOF starting offset -- it reports success with an offset, a hole it located earlier in the file, which the model has no way to predict, so the branch answers OK and carries the whole file as the accepted offset range.  A READ from any of them returns the same bytes, so the disagreement is confined to the SEEK reply.  Replaces GD-33-seek-hole-past-eof.  Its sibling GD-35-seek-offset (the boundary a successful SEEK reports) needs no deviation at all: it is already inside the existing T_HOLE_TRACKING tolerance, which the ganesha 4.2 cells enable.  It reaches further than the at-EOF branch it is named for.  Measured in both directions -- a SEEK_HOLE at byte 24576 and a SEEK_DATA at byte 8192, each answered 0 -- V6.5 does not treat sa_offset as a floor on the reply at all, which RFC 7862 15.11.3 requires of it.  So where T_HOLE_TRACKING is also on, SEEK accepts any offset within the file and the model pins nothing narrower.  Kept separate from the tolerance on purpose: T_HOLE_TRACKING alone is the CONFORMANT case, where block granularity moves the answer but never below sa_offset, and those cells keep the floor checked.",
+
+        "K4-exclusive-create-mode-zero": "RFC 7530 16.16.5 (OPEN with EXCLUSIVE4 carries a verifier INSTEAD of create attributes, and the client is told to follow with a SETATTR).  The model gives an exclusively-created file the mode the walk asked for (0600), which is what chimera and NFS-Ganesha report; the Linux server creates it mode 0 and leaves it there until the SETATTR arrives.  Field-only, and nothing in the model consults a regular file's mode, so nothing downstream parts.  The NFSv3 analogue is K3-exclusive-mode-zero in quint/nfs3, recorded against the same server for the same reason."
+      }
+    },
+    "HAZARDS": {
+      "kind": "hazard",
+      "key": "hazards",
+      "type": "devset",
+      "default": [],
+      "doc": "Input patterns the implementation under test cannot SURVIVE.  The fifth knob kind, and the only one that changes what the corpus CONTAINS rather than what it predicts: a feature says what the server offers, a policy which of several legal behaviours it chose, a tolerance which answers are all conformant, a deviation what it does wrong -- and every one of those still produces a reply the model can state.  A hazard is the case where there is no reply to state, because the server dies; the only thing a model can do with that is not send the pattern.  Gated by tools/devliveness.py exactly like DEVS, so a hazard the corpus never reaches is DEAD and fails the build rather than quietly narrowing the corpus forever, and CLEARED IN THE STRICT TWIN exactly like DEVS, so the extended tier goes on generating the pattern and the crash stays measured while the gating tier steers around it.",
+      "known": {
+        "G4-close-after-io-advise-segv": "NFS-Ganesha V6.5 (FSAL_VFS, NFSv4.2) takes a SIGSEGV in the NFSv4 CLOSE handler when the open stateid being closed has previously been named by an IO_ADVISE.  RFC 7862 15.5 makes IO_ADVISE a hint that changes no state and is permitted against an open stateid, and RFC 8881 18.2 makes CLOSE of that stateid unconditional, so nothing about the sequence is irregular.  Measured on two independent traces of the stepData42 flavour: ganesha42_stepData42_80_0x7_2 (IO_ADVISE, then a WRITE refused NFS4ERR_OPENMODE, then CLOSE) and _0x7_6 (IO_ADVISE, then READ, then CLOSE) -- the refused WRITE is NOT part of the trigger, which three traces that do refused-WRITE-then-CLOSE and replay clean confirm.  The last lines the server logs are `process_one_op: Request N: opcode 4 is OP_CLOSE` and `nfs4_op_close: Entering NFS v4 CLOSE handler`, and the fault is one frame below nfs4_op_close, on an ntirpc worker.  Deterministic: same compound, every run, and it still reproduces under NIV_DEBUG at a tenth the speed, so it is not a race.  The fence suppresses CLOSE of an advised stateid; the open simply outlives the trace, and every other CLOSE path stays exercised."
+      }
+    },
+    "T_HOLE_TRACKING": {
+      "kind": "tolerance",
+      "key": "tolerances.holeTracking",
+      "type": "bool",
+      "default": false,
+      "doc": "The corpus is replayed against a backend that tracks holes for real.  Not a deviation: RFC 7862 15.11 lets a server answer SEEK more precisely than the model's byte-granular view -- SEEK_HOLE may find a genuine hole anywhere between the queried offset and the model's answer, SEEK_DATA may skip a never-written range to a later offset or find nothing below EOF at all and answer NFS4ERR_NXIO (15.11.3).  With this on, SEEK's reply carries stAccept/offAccept/eofAccept sets and the harness membership-tests those fields instead of comparing for equality; with it off each set is the singleton of the exact answer."
+    },
+    "T_XATTR_CHANGE": {
+      "kind": "tolerance",
+      "key": "tolerances.xattrChange",
+      "type": "bool",
+      "default": false,
+      "doc": "The corpus is replayed against more than one VFS backend and reaches RFC 8276 extended attributes.  RFC 8276 does not say whether writing an extended attribute advances the object's change attribute, and chimera's backends answer differently: memfs and diskfs advance it, cairn does not.  With this on, the model stops PREDICTING an inode's change attribute once an extended attribute has been written to it (AttrSnap.changeOpaque), and the harness drops its change-attribute invariant for that inode.  This is the one tolerance the <field>Accept convention does not fit: what is tolerated is an invariant across replies, not a value in one reply, so there is no set of acceptable answers to enumerate."
+    },
+    "T_RENEW_LAPSED": {
+      "kind": "tolerance",
+      "key": "tolerances.renewLapsed",
+      "type": "bool",
+      "default": false,
+      "doc": "RFC 7530 16.30.4 lists BOTH NFS4ERR_EXPIRED and NFS4ERR_STALE_CLIENTID for RENEW, and 9.6.3 leaves it to the server how long a client id whose lease has lapsed survives -- so a late RENEW may be refused as a stale id, refused as an expired lease, or simply succeed and refresh it.  The model retires a client id the moment a superseding SETCLIENTID replaces its incarnation and answers STALE_CLIENTID.  With this on RENEW's reply carries all three conformant answers in stAccept and the harness membership-tests instead of comparing.  Replaces the ganesha registry's GD-10-renew-expired and the knfsd registry's KN-4-renew-expired and KN-12-renew-ok -- the two servers land on different members of the same permitted set, which is what makes this a tolerance and not two deviations.",
+      "note": "Slightly over-accepting: the model only ever RENEWs a client id it created, so the accept set cannot forgive a genuinely bogus one, but it does forgive an OK for an id the model believes is retired."
+    },
+    "T_RFLAGS_CONFIRM": {
+      "kind": "tolerance",
+      "key": "tolerances.rflagsConfirm",
+      "type": "bool",
+      "default": false,
+      "doc": "RFC 8881 18.16 makes OPEN4_RESULT_CONFIRM meaningful only for the 4.0 OPEN_CONFIRM handshake, so above 4.0 the flag is inert and a server may set it or not with no observable consequence.  The model predicts needConfirm = false there; ganesha sets the flag in cases it does not.  With this on OPEN's reply carries both values in needConfirmAccept.  The model auto-gates it to MINOR >= 1, where the flag drives nothing; below that it has to be exact.  Replaces GD-17-open-rflags-confirm."
+    },
+    "T_WIDE_ATTR_REFUSAL": {
+      "kind": "tolerance",
+      "key": "tolerances.wideAttrRefusal",
+      "type": "bool",
+      "default": false,
+      "doc": "RFC 8881 18.7.3 lets a server answer NFS4ERR_INVAL for an attribute request it cannot satisfy, and the wide GETATTR asks for the whole supported-attribute bitmap precisely to drive the marshaller rather than to read a value -- the model predicts only that the call happens, never what comes back.  With this on the reply carries stAccept: either the server marshals the lot (OK) or it refuses the combination (INVAL), and the compound ends there either way.  Replaces G4-getattr-wide-inval, which asserted the refusal outright; NFS-Ganesha V6.5 answers OK for every object this corpus reaches it with, so the deviation had become a claim the server no longer makes.",
+      "note": "Status-only by construction: there is no SGetattrWide comparator arm, so an accepted refusal costs no coverage of the values."
+    },
+    "MINOR": {
+      "kind": "policy",
+      "key": "policies.minor",
+      "type": "int",
+      "doc": "the NFSv4 minor version the traces speak. 0 brings SETCLIENTID, owner seqids and OPEN_CONFIRM; 1 and 2 bring sessions and the slot replay discipline; 2 additionally gates every RFC 7862 data operation. No default: a corpus that did not say which minor version it is would be meaningless."
+    },
+    "F_PNFS": {
+      "kind": "feature",
+      "key": "features.pnfs",
+      "type": "enum",
+      "values": {
+        "supported": "FeatMandatory",
+        "explore": "FeatIfAdvertised",
+        "unsupported": "FeatOff"
+      },
+      "default": "unsupported",
+      "doc": "the server is a pNFS metadata server (EXCHGID4_FLAG_USE_PNFS_MDS) and serves LAYOUTGET/LAYOUTCOMMIT/LAYOUTRETURN/GETDEVICEINFO."
+    },
+    "F_READ_DELEG": {
+      "kind": "feature",
+      "key": "features.readDelegation",
+      "type": "enum",
+      "values": {
+        "supported": "FeatMandatory",
+        "explore": "FeatIfAdvertised",
+        "unsupported": "FeatOff"
+      },
+      "default": "unsupported",
+      "doc": "read delegations are granted, recalled and returned. Off unless the replay harness runs a callback servicer, because the reference implementation only grants once a CB_NULL probe confirms the back channel."
+    },
+    "F_WRITE_DELEG": {
+      "kind": "feature",
+      "key": "features.writeDelegation",
+      "type": "enum",
+      "values": {
+        "supported": "FeatMandatory",
+        "explore": "FeatIfAdvertised",
+        "unsupported": "FeatOff"
+      },
+      "default": "unsupported",
+      "doc": "write delegations are granted, recalled and returned; same back-channel precondition as the read side."
+    },
+    "F_XATTR": {
+      "kind": "feature",
+      "key": "features.xattr",
+      "type": "enum",
+      "values": {
+        "supported": "FeatMandatory",
+        "explore": "FeatIfAdvertised",
+        "unsupported": "FeatOff"
+      },
+      "default": "unsupported",
+      "doc": "RFC 8276 extended attributes (GETXATTR/SETXATTR/LISTXATTRS/REMOVEXATTR). The model auto-gates it to MINOR >= 2."
+    },
+    "F_SPARSE": {
+      "kind": "feature",
+      "key": "features.sparse",
+      "type": "enum",
+      "values": {
+        "supported": "FeatMandatory",
+        "explore": "FeatIfAdvertised",
+        "unsupported": "FeatOff"
+      },
+      "default": "unsupported",
+      "doc": "ALLOCATE, DEALLOCATE and SEEK -- the hole-aware operations of RFC 7862."
+    },
+    "F_COPY": {
+      "kind": "feature",
+      "key": "features.copy",
+      "type": "enum",
+      "values": {
+        "supported": "FeatMandatory",
+        "explore": "FeatIfAdvertised",
+        "unsupported": "FeatOff"
+      },
+      "default": "unsupported",
+      "doc": "server-side COPY (CAP_COPY_RANGE at the VFS layer)."
+    },
+    "F_READ_PLUS": {
+      "kind": "feature",
+      "key": "features.readPlus",
+      "type": "enum",
+      "values": {
+        "supported": "FeatMandatory",
+        "explore": "FeatIfAdvertised",
+        "unsupported": "FeatOff"
+      },
+      "default": "unsupported",
+      "doc": "READ_PLUS, which may answer with hole segments rather than zeroes."
+    },
+    "F_IO_ADVISE": {
+      "kind": "feature",
+      "key": "features.ioAdvise",
+      "type": "enum",
+      "values": {
+        "supported": "FeatMandatory",
+        "explore": "FeatIfAdvertised",
+        "unsupported": "FeatOff"
+      },
+      "default": "unsupported",
+      "doc": "IO_ADVISE, whose reply says which hints the server actually took."
+    },
+    "F_WRITE_SAME": {
+      "kind": "feature",
+      "key": "features.writeSame",
+      "type": "enum",
+      "values": {
+        "supported": "FeatMandatory",
+        "explore": "FeatIfAdvertised",
+        "unsupported": "FeatOff"
+      },
+      "default": "unsupported",
+      "doc": "WRITE_SAME, the block-repeat write of RFC 7862."
+    },
+    "F_CLONE": {
+      "kind": "feature",
+      "key": "features.clone",
+      "type": "enum",
+      "values": {
+        "supported": "FeatMandatory",
+        "explore": "FeatIfAdvertised",
+        "unsupported": "FeatOff"
+      },
+      "default": "unsupported",
+      "doc": "CLONE, the reflink-style range copy."
+    },
+    "P_CONFLICT_DELAYS": {
+      "kind": "policy",
+      "key": "policies.conflictDelays",
+      "type": "bool",
+      "default": true,
+      "doc": "a conflicting request is answered NFS4ERR_DELAY rather than being blocked or refused outright."
+    },
+    "P_CLOSE_FREES_LOCKS": {
+      "kind": "policy",
+      "key": "policies.closeFreesLocks",
+      "type": "bool",
+      "default": true,
+      "doc": "CLOSE releases the byte-range locks held under the open it closes, instead of leaving them to a separate LOCKU/RELEASE_LOCKOWNER."
+    },
+    "P_ROOT_EXPORT": {
+      "kind": "policy",
+      "key": "policies.rootExport",
+      "type": "bool",
+      "default": false,
+      "doc": "where the cell's filesystem sits in the server's NFSv4 namespace -- a deployment choice, not a divergence. true: it IS the \"/\" export, so PUTROOTFH lands on its root, the model's ROOT is the root of the namespace served, and LOOKUPP there has no parent (NFS4ERR_NOENT, RFC 7530 16.14.4 / RFC 8881 18.14.4). false: it is a NAMED export, one entry in the server's pseudo-filesystem (RFC 7530 7.3), so ROOT has the pseudo-root above it and a LOOKUPP there walks onto it -- NOENT belongs one level higher. Both shapes are conformant and chimera serves both; the cell picks one and the corpus tests exactly that shape. The harness reads it back out of LInit.caps and mounts the trace's filesystem accordingly."
+    },
+
+    "P_LAYOUT_WHOLE_FILE": {
+      "kind": "policy",
+      "key": "policies.layoutWholeFile",
+      "type": "bool",
+      "default": true,
+      "doc": "LAYOUTGET always answers with a whole-file layout rather than the requested byte range."
+    }
+  }
+}

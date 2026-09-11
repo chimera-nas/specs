@@ -1,0 +1,204 @@
+{
+  "family": "posix",
+  "modelFile": "./posix",
+  "modelModule": "posix",
+
+  "prelude": [
+    "import posixops.* from \"./posix_ops\""
+  ],
+
+  "selfTests": [
+    { "name": "posixTestStd",  "module": "posixTestStd",  "file": "./posixTest", "maxSamples": 100 },
+    { "name": "posixTestRoot", "module": "posixTestRoot", "file": "./posixTest", "maxSamples": 100 }
+  ],
+
+  "consts": {
+
+    "DEVS": {
+      "kind": "deviation",
+      "key": "deviations",
+      "type": "devset",
+      "doc": "Known chimera divergences from POSIX.1-2024, per cell. The model takes the implementation's branch for each id a config enables, so the trace's expectation already IS what chimera does and replay is an exact match; the strict twin of the same cell binds this to the empty set and its failures are the live conformance debt.",
+      "known": {
+        "PD1": "POSIX.1-2024 fcntl() F_SETLK/F_SETLKW/F_GETLK and lockf(): record locks. chimera answers EOPNOTSUPP where a backend has no lock support. Root cause: the backend advertises no lock capability and the VFS has no generic fallback. Candidate fix: implement record locks in the backend, or a VFS-level lock manager.",
+
+        "PD2": "POSIX.1-2024 fcntl() F_DUPFD/F_GETFL/F_SETFL (System Interfaces). chimera_posix_fcntl implements only the record-lock commands; F_DUPFD, F_GETFL and F_SETFL fail EINVAL. Root cause: src/posix/posix_fcntl.c (switch on cmd, default EINVAL). Candidate fix: add F_DUPFD (fd table alloc-at-least), F_GETFL (return oflags) and F_SETFL (update O_APPEND) paths.",
+
+        "PD2b": "POSIX.1-2024 fcntl() F_SETFL (System Interfaces). F_SETFL fails EINVAL (same root cause as PD2); it also leaves the description's O_APPEND flag unchanged, which the model now mirrors so a later append-dependent write stays in sync. Root cause: src/posix/posix_fcntl.c. Candidate fix: see PD2.",
+
+        "PD4": "POSIX.1-2024 write() with O_APPEND: 'the file offset shall be set to the end of the file prior to each write'. O_APPEND is recorded at open but never honored: write() writes at the current offset instead of seeking to EOF. Root cause: src/posix/posix_write.c (no O_APPEND path; fd_entry offset used unconditionally). Candidate fix: resolve offset to EOF under O_APPEND atomically with the write (VFS write with append semantics).",
+
+        "PD5": "POSIX.1-2024 dup()/dup2(): 'shall refer to the same open file description' (shared file offset and status flags). Duplicated descriptors get their own offset: dup() allocates a fresh fd_entry with offset 0 and dup2() resets the target's offset to 0; the two descriptors then seek/read/write independently. Root cause: src/posix/posix_dup.c (chimera_posix_fd_alloc zeroes offset), posix_dup2.c (new_entry->offset = 0); offset lives per fd_entry, not per open file description. Candidate fix: introduce a shared description object (offset + status flags) referenced by fd entries.",
+
+        "PD6": "POSIX.1-2024 linkat() AT_SYMLINK_FOLLOW (System Interfaces). linkat ignores its flags argument, so AT_SYMLINK_FOLLOW links the symlink itself instead of its target (and real dirfds fail ENOSYS). Root cause: src/posix/posix_linkat.c ('flags ... not yet implemented', AT_FDCWD-only). Candidate fix: resolve oldpath with following when the flag is set.",
+
+        "PD7r": "POSIX.1-2024 read(): '[EBADF] ... not a valid file descriptor open for reading'. read/pread through a write-only descriptor succeeds -- the access mode is never enforced on the I/O path -- and the successful read advances the offset the model's failed read would not have moved. Root cause: src/posix/posix_read.c etc. never check fd_entry.oflags O_ACCMODE. Candidate fix: check O_ACCMODE in the fd I/O paths.",
+
+        "PD8": "POSIX.1-2024 read() on a directory (implementation-defined; Linux EISDIR). read on a directory descriptor returns fabricated zero-filled bytes; the model canonicalizes EISDIR. Root cause: memfs serves READ on a directory handle. Candidate fix: fail EISDIR in the client or memfs.",
+
+        "PD8w": "POSIX.1-2024 write() on a directory descriptor. write through a read-only directory descriptor fails EISDIR; the model reports EBADF first (descriptor not open for writing) -- an error-priority difference on a doubly-invalid call. Root cause: chimera checks the object type before the (never enforced, see PD7r) access mode. Candidate fix: fix PD7r; either order is then defensible.",
+
+        "PD11a": "POSIX.1-2024 XBD 4.5 / read(): access permission is determined at open(). A legitimate read through a valid descriptor fails EACCES because chimera re-runs the file-mode check per I/O (e.g. own file created mode 0222, opened O_RDWR). Root cause: per-request authorization in the VFS/memfs I/O path (server-style) with no open-time rights retention. Candidate fix: authorize at open; serve fd I/O under the open's granted rights.",
+
+        "PD11b": "POSIX.1-2024 read() [EBADF] vs per-op EACCES. read through a write-only descriptor is denied, but with EACCES from the per-op mode check instead of EBADF from the descriptor access mode. Root cause: see PD7r/PD11a. Candidate fix: see PD7r.",
+
+        "PD13": "POSIX.1-2024 open() of a FIFO with O_WRONLY blocks or fails ENXIO (O_NONBLOCK). Opening a FIFO succeeds instantly with no FIFO semantics (the model canonicalizes ENXIO, the honest NAS answer). Root cause: memfs treats FIFO inodes as plain files on OPEN. Candidate fix: fail ENXIO for FIFO/socket opens in the POSIX client.",
+
+        "PD14": "POSIX.1-2024 open(): '[EISDIR] The named file is a directory and oflag includes O_WRONLY or O_RDWR'. Directories open successfully for writing. Root cause: no EISDIR gate in the client open path; memfs serves writable opens of directories. Candidate fix: reject write-access opens of directories with EISDIR in chimera_posix_open/openat.",
+
+        "PD15": "POSIX.1-2024 XBD 4.16: a trailing slash requires the path to resolve to a directory (ENOTDIR otherwise). Trailing slashes on non-directories are ignored: stat('f/') succeeds, and mkdir over an existing non-dir with a trailing slash reports EEXIST instead of ENOTDIR. Root cause: the client passes the raw path down; no trailing-slash directory requirement anywhere in the stack. Candidate fix: enforce the trailing-slash rule during client path validation.",
+
+        "PD15b": "POSIX.1-2024 XBD 4.16: a trailing slash forces a final symlink to be followed (ELOOP for a self-loop). mkdir over a self-loop symlink named with a trailing slash reports EEXIST; the slash should force following and yield ELOOP. Root cause: see PD15 (trailing slashes ignored on the mutation paths). Candidate fix: see PD15.",
+
+        "PD15c": "POSIX.1-2024 XBD 4.16 vs mkdir(): a trailing slash on a DANGLING symlink. mkdir('dangling/') -- the model follows the link and creates the target directory (strict XBD 4.16); chimera (like Linux) reports the existing symlink name, and the model now mirrors that so the created directory does not desync the trace. Root cause: the client judges the slash-stripped name; creating through the link would need readlink+re-resolution. Candidate fix: acceptance (Linux agrees with chimera here). Shares PD15b's branch: both are the slash failing to force a final symlink to be followed.",
+
+        "PD17a": "POSIX.1-2024 unlink() EISDIR/EPERM vs EACCES priority (unspecified). unlink(directory) in a parent without write permission reports EACCES; the model reports the type error first. Root cause: chimera checks parent write access before victim type. Candidate fix: none required (priority unspecified); listed so the divergence stays visible.",
+
+
+
+        "PD18": "POSIX.1-2024 access()/faccessat(): checks use the process's real (or with AT_EACCESS, effective) credentials. faccessat evaluates permissions against the HOST process uid/gid (getuid()/getgid()) instead of the chimera credential, ignores supplementary groups and AT_EACCESS; running as root it grants nearly everything. Root cause: src/posix/posix_faccessat.c callback uses getuid()/getgid() over a stat result. Candidate fix: evaluate against chimera_posix_effective_cred (or issue a VFS ACCESS op with the request credential).",
+
+        "PD20": "POSIX.1-2024 open(): the access-mode permission check applies to existing files whether or not O_CREAT is given. open(existing, O_CREAT|O_WRONLY) succeeds on a file the caller has no write permission for; the same open without O_CREAT correctly fails EACCES. Root cause: the client/VFS create-path open skips the access-mode check when the file turns out to already exist. Candidate fix: apply the access check on the open-existing arm of the create path.",
+
+        "SD-SPECIAL": "POSIX.1-2024 open() of a FIFO or device special file: ENXIO with no reader / no backing device. Over the SMB loopback the server opens the NFS-reparse specfile node and reports EINVAL for the unsupported data open. Neither answer is what a Windows client would give (SMB has no POSIX device semantics); the divergence is a property of the specfile-over-reparse mapping. Root cause: src/vfs/smb maps a specfile to a reparse point whose data open is refused EINVAL. Candidate fix: translate the reparse-point refusal to ENXIO for FIFO/device nodes."
+      }
+    },
+
+    "T_STICKY_REMOVAL_EPERM": {
+      "kind": "tolerance",
+      "key": "tolerances.stickyRemovalEperm",
+      "type": "bool",
+      "default": false,
+      "doc": "A removal (or replacing rename) denied by the sticky-bit rule may answer EPERM as well as the errno policies.stickyEacces names. POSIX permits either (unlink() ERRORS names both EACCES and EPERM), and the choice is not the implementation's to pin once: this cell's corpus is replayed by cairn, whose answer is the policy's, AND by the host passthroughs, whose kernel answers EPERM. Set it and the model emits an eAccept set beside the errno it predicts, which the harness membership-tests; leave it and the cell demands the exact answer."
+    },
+    "F_COPY_RANGE": {
+      "kind": "feature",
+      "key": "features.copyRange",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "explore",
+      "doc": "copy_file_range"
+    },
+    "F_CLONE_RANGE": {
+      "kind": "feature",
+      "key": "features.cloneRange",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "explore",
+      "doc": "clone_file_range (reflink)"
+    },
+    "F_SEEK_HOLE": {
+      "kind": "feature",
+      "key": "features.seekHole",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "explore",
+      "doc": "lseek SEEK_HOLE / SEEK_DATA"
+    },
+    "F_ROOT": {
+      "kind": "feature",
+      "key": "features.root",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "explore",
+      "doc": "a process with euid 0 exists. The harness chooses the credentials it runs traces under, so both draws are real for every backend here."
+    },
+
+    "P_GID_FROM_PARENT": {
+      "kind": "policy",
+      "key": "policies.gidFromParent",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "explore",
+      "doc": "new-object gid = parent's"
+    },
+    "P_SGID_INHERIT": {
+      "kind": "policy",
+      "key": "policies.sgidInherit",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "explore",
+      "doc": "subdirs inherit S_ISGID"
+    },
+    "P_WRITE_CLEARS_SETIDS": {
+      "kind": "policy",
+      "key": "policies.writeClearsSetids",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "explore",
+      "doc": "write/trunc clears setids"
+    },
+    "P_PWRITE_APPENDS": {
+      "kind": "policy",
+      "key": "policies.pwriteAppends",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "explore",
+      "doc": "Linux-style pwrite+O_APPEND (the write lands at end-of-file rather than at the given offset)"
+    },
+    "P_RENAME_CTIME": {
+      "kind": "policy",
+      "key": "policies.renameCtime",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "explore",
+      "doc": "rename marks moved ctime"
+    },
+    "P_STRICT_ATIME": {
+      "kind": "policy",
+      "key": "policies.strictAtime",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "explore",
+      "doc": "harness enforces atime marks"
+    },
+    "P_STICKY_WRITE_ARM": {
+      "kind": "policy",
+      "key": "policies.stickyWriteArm",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "explore",
+      "doc": "sticky exempts write-perm"
+    },
+    "P_CHOWN_SUPP_GROUP": {
+      "kind": "policy",
+      "key": "policies.chownSuppGroup",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "explore",
+      "doc": "chgrp to a supplementary group"
+    },
+    "P_ERR_NOTEMPTY": {
+      "kind": "policy",
+      "key": "policies.rmdirEnotempty",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "explore",
+      "doc": "ENOTEMPTY (else EEXIST)"
+    },
+    "P_ERR_STICKY_ACCES": {
+      "kind": "policy",
+      "key": "policies.stickyEacces",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "explore",
+      "doc": "EACCES (else EPERM)"
+    },
+    "P_ERR_UNLINKDIR_ISDIR": {
+      "kind": "policy",
+      "key": "policies.unlinkDirIsdir",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "explore",
+      "doc": "EISDIR (else EPERM)"
+    },
+    "P_ERR_LOCK_AGAIN": {
+      "kind": "policy",
+      "key": "policies.lockEagain",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "explore",
+      "doc": "EAGAIN (else EACCES)"
+    }
+  }
+}

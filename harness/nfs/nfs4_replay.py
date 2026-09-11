@@ -42,11 +42,25 @@ the trace not applicable to this server and it is reported as a SKIP,
 never a failure: a third-party server owes the model nothing about which
 optional features it implements.
 
-Every other divergence is a Finding, looked up in the server's deviation
-registry (--server-kind picks ganesha_deviations / knfsd_deviations): a
-recorded, reconcilable deviation is tallied and replay continues; a
-recorded non-reconcilable one abandons the trace after the first hit; an
-unrecorded one is a MISMATCH and fails the run.
+Every other reply is compared EXACTLY against what the model predicted: what
+a server does differently is stated in the MODEL, switched on by the cell's
+config and declared with its citation in quint/nfs4/corpus.schema.json, so
+the trace's expectation is already the truth.  Two rules soften that, and
+only two:
+
+  * `<field>Accept` -- where the STANDARD permits several answers to one
+    call, the model emits a set beside the field and `accepts()` does a
+    membership test.  A field with no sibling accept set is equality.
+  * `changeOpaque` / a change_info4's `opaque` -- the model saying it can no
+    longer predict a change attribute at all, so the harness drops its
+    per-inode change INVARIANT.  Not a value, so it cannot be an accept set.
+
+A handful of divergences that could not be stated in the model are still
+looked up in the server's registry (--server-kind picks ganesha_deviations /
+knfsd_deviations; see their docstrings for which and why): a recorded,
+reconcilable deviation is tallied and replay continues; a recorded
+non-reconcilable one abandons the trace after the first hit; an unrecorded
+one is a MISMATCH and fails the run.
 """
 
 import argparse
@@ -192,6 +206,24 @@ def xattr_value(sym):
     return b"xattr-value-%d" % sym
 
 
+def accepts(v, field, actual, scale=1):
+    """The tolerance rule, and there is only one of it.
+
+    Where the STANDARD permits several answers to a single call, the model
+    emits a set named `<field>Accept` beside `<field>`; this is a membership
+    test over that set.  A field with no sibling accept set is compared for
+    equality, and a cell whose config leaves the tolerance off gets the
+    singleton of the exact answer -- which is equality said the long way.
+    Nothing here knows what the tolerance IS; that is stated once, in the
+    model, with its citation.  Mirrors v4_accept_i64/v4_accept_bool in
+    chimera's nfs4_mbt_replay.c and check_status in nfs3_mbt_replay.c.
+    """
+    acc = v.get(field + "Accept")
+    if acc is None:
+        return v[field] * scale == actual if scale != 1 else v[field] == actual
+    return any((x * scale if scale != 1 else x) == actual for x in acc)
+
+
 class Replayer:
     RETRY_DELAY_MAX = 40          # x 0.1s
     RETRY_GRACE_MAX = 60          # x 0.5s
@@ -223,6 +255,15 @@ class Replayer:
         self.unmatched = []           # (step, findings) in --keep-going mode
         self.history = []
         self.recall_log = []
+        # Replies whose status the MODEL named as one of several conformant
+        # answers (a `stAccept` membership hit).  Reported, never fatal.
+        self.status_dev = 0
+        # The same, counted for the compound being checked right now.  A
+        # compound whose status or result count differs BECAUSE one of its
+        # ops took a conformant answer the model did not predict is explained
+        # by that acceptance, exactly as it would be by a per-op status
+        # finding -- see reconcile().
+        self.tol_status = 0
         self.compounds = 0
         self.cur_open_client = None
         self.dry = False              # encode only, no server (--dry-run)
@@ -329,9 +370,16 @@ class Replayer:
         if req is not None and "sid" in req.get("value", {}):
             self.sid_seq[req["value"]["sid"]] = wire["stateid"][0]
 
-    def check_change(self, op, ino, abstract, wire, mism, what):
-        """Per-ino change-attribute consistency (never predict values)."""
-        if ino is None:
+    def check_change(self, op, ino, abstract, wire, mism, what, opaque=False):
+        """Per-ino change-attribute consistency (never predict values).
+
+        `opaque` is the model saying it can no longer predict this value at
+        all -- a server whose change attribute is a coarse ctime, or a backend
+        that does not advance it for an xattr write.  What is dropped then is
+        the INVARIANT (equal abstract <-> equal wire), not a value, which is
+        why it cannot use the `<field>Accept` convention above.
+        """
+        if ino is None or opaque:
             return
         m = self.chg.setdefault(ino, {})
         known = m.get(abstract)
@@ -355,9 +403,9 @@ class Replayer:
         # `before` is only meaningful when the server asserts atomicity.
         if wire["atomic"]:
             self.check_change(op, ino, exp["before"], wire["before"], mism,
-                              what + ".before")
+                              what + ".before", exp.get("opaque", False))
         self.check_change(op, ino, exp["after"], wire["after"], mism,
-                          what + ".after")
+                          what + ".after", exp.get("opaque", False))
 
     def caps_mismatch(self, feature, detail):
         raise CapsSkip(feature, detail)
@@ -374,8 +422,11 @@ class Replayer:
             # The model's ROOT is the export root.  Where the server puts a
             # pseudo-fs above it, PUTROOTFH would land elsewhere, so the
             # harness substitutes the export root handle it resolved at
-            # start.  (LOOKUPP at the root is then the one place the two
-            # namespaces differ; the model expects NOENT.)
+            # start.  Every cell here is a ROOT export (ganesha "Pseudo = /",
+            # knfsd "fsid=0"), so the two coincide and LOOKUPP at ROOT is
+            # NOENT -- which is what those cells declare with
+            # policies.rootExport.  A NAMED-export cell would answer the walk
+            # onto the pseudo-root instead; see P_ROOT_EXPORT.
             return c4.enc_putfh(self.fh[0])
         if tag == "RPutfh":
             return c4.enc_putfh(self.real_fh(v))
@@ -628,6 +679,14 @@ class Replayer:
         ast = wire["status"]
 
         if est != ast:
+            # A status the model itself said was one of several conformant
+            # answers.  It can still end the compound where the model ran on,
+            # so the OK-path checks below are skipped exactly as they are for
+            # a status that matched a non-OK expectation.
+            if "stAccept" in v and ast in v["stAccept"]:
+                self.status_dev += 1
+                self.tol_status += 1
+                return
             self.classify_status_mismatch(tag, v, est, ast, wire, mism, req)
             return
 
@@ -742,7 +801,7 @@ class Replayer:
                 self.sid_owner[v["sid"]] = (req["value"]["client"],
                                             req["value"]["owner"])
             need = bool(wire["rflags"] & c4.OPEN4_RESULT_CONFIRM)
-            if need != v["needConfirm"]:
+            if not accepts(v, "needConfirm", need):
                 self.fnd(mism, tag, "rflags_confirm", v["needConfirm"],
                          need)
             self.check_cinfo(tag, ctx["cur"], v["cinfo"], wire["cinfo"],
@@ -801,9 +860,9 @@ class Replayer:
                 self.fnd(mism, tag, "newsize",
                          v["newSizeBlocks"] * BLOCK_SIZE, wire["newsize"])
         elif tag == "SSeek":
-            if wire["eof"] != v["eof"]:
+            if not accepts(v, "eof", wire["eof"]):
                 self.fnd(mism, tag, "eof", v["eof"], wire["eof"])
-            if wire["offset"] != v["offset"] * BLOCK_SIZE:
+            if not accepts(v, "offset", wire["offset"], BLOCK_SIZE):
                 self.fnd(mism, tag, "offset", v["offset"] * BLOCK_SIZE,
                          wire["offset"])
         elif tag == "SCopy":
@@ -859,7 +918,8 @@ class Replayer:
                          wire.get(c4.FATTR4_SIZE))
         if c4.FATTR4_CHANGE in wire:
             self.check_change("SGetattr", ino, exp["change"],
-                              wire[c4.FATTR4_CHANGE], mism, "change")
+                              wire[c4.FATTR4_CHANGE], mism, "change",
+                              exp.get("changeOpaque", False))
 
     def check_deleg(self, exp, wire, mism):
         dt = wire["deleg_type"]
@@ -1063,6 +1123,7 @@ class Replayer:
             return rep
 
         ctx = {"cur": None, "saved": None}
+        self.tol_status = 0
         n = min(len(exp_results), len(rep["results"]))
         for i in range(n):
             eop = ops[i]["tag"] if i < len(ops) else "?"
@@ -1077,13 +1138,18 @@ class Replayer:
             self.check_result(exp_results[i], rep["results"][i], ctx,
                               mism, ops[i] if i < len(ops) else None)
 
-        if len(rep["results"]) != len(exp_results):
-            self.fnd(mism, "compound", "results", len(exp_results),
-                     len(rep["results"]),
-                     f"statuses {[r['status'] for r in rep['results']]}")
-        if rep["status"] != exp_status:
-            self.fnd(mism, "compound", "status", exp_status,
-                     rep["status"])
+        # The compound's status IS its last result's, and a compound ends at
+        # the first op that fails -- so when an op answered with a status the
+        # model itself listed as conformant, both the compound status and the
+        # result count follow from that one acceptance and say nothing new.
+        if not self.tol_status:
+            if len(rep["results"]) != len(exp_results):
+                self.fnd(mism, "compound", "results", len(exp_results),
+                         len(rep["results"]),
+                         f"statuses {[r['status'] for r in rep['results']]}")
+            if rep["status"] != exp_status:
+                self.fnd(mism, "compound", "status", exp_status,
+                         rep["status"])
 
         # Record the reply for future SEQUENCE replays of this slot.
         if seq_req is not None and rep["results"] \

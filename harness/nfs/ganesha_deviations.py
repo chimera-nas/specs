@@ -2,12 +2,48 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""Registry of known NFS-Ganesha divergences from the NFS models.
+"""What is LEFT of the NFS-Ganesha divergence registry.
 
-Retired (the model was corrected to the standard, so ganesha no longer
-diverges): the ACCESS type-masking (was GD-2/GN-1) and READLINK-on-a-directory
-returning INVAL (was GD-3) -- the models now predict exactly what ganesha,
-the Linux server and the RFCs all produce.
+Most of what this file used to hold now lives in the MODEL, switched on per
+cell by harness/nfs/configs/ganesha_*.json and declared with its citation in
+quint/nfs3/corpus.schema.json and quint/nfs4/corpus.schema.json.  A model that
+DESCRIBES what the server does produces a trace whose expectation already is
+the truth, so replay is an exact match and nothing here has to forgive
+anything.  Moved, with the id that replaced them:
+
+  GD-1, GD-14   -> S4-change-is-coarse-ctime   (shared with knfsd)
+  GD-4          -> G4-verify-wide-trivial-match
+  GD-5, GD-11   -> S4-no-wrong-type            (shared with knfsd)
+  GD-7          -> G4-setattr-share-denied
+  GD-9          -> T_LINK_REFUSAL tolerance    (shared with knfsd)
+  GD-10         -> T_RENEW_LAPSED tolerance    (shared with knfsd)
+  GD-12         -> G4-exchange-id-no-confirmed-r
+  GD-13 (type)  -> G4-open-type-before-exist
+  GD-17         -> T_RFLAGS_CONFIRM tolerance
+  GD-18         -> T_WIDE_ATTR_REFUSAL tolerance
+  GD-19, GD-32  -> nothing, and GD-19 came BACK: this ganesha polices the
+                   open-owner seqid gap only sometimes, in both directions,
+                   so neither a deviation nor a tolerance can state it.  (The
+                   knfsd cell still enables S4-owner-seqid-gap-unpoliced; the
+                   Linux server does not police it.)
+  GD-23, GD-24  -> S4-compound-tag-unvalidated  (shared with knfsd)
+  GD-33         -> G4-seek-at-eof-not-nxio
+  GD-34         -> G4-compound-tag-length-limit
+  GD-35         -> the existing T_HOLE_TRACKING tolerance
+  GD-25/26 (BIND_CONN) -> G4-bindconn-direction-accepted
+  GD-28         -> G4-op-outside-session-inval
+  GD-21 (DESTROY_CLIENTID) -> G4-destroy-clientid-busy-first
+  GN-2          -> G3-link-dir-badtype
+  GN-4          -> the existing T_ERROR_PRECEDENCE tolerance (shared with
+                   knfsd AND with chimera, which already had it)
+
+Retired without a replacement because the model was already corrected to the
+standard and ganesha no longer diverges: the ACCESS type-masking (was
+GD-2/GN-1), READLINK-on-a-directory returning INVAL (was GD-3), the
+directory nlink accounting (was GD-29 -- nfs4_fs.qnt's fsInv has counted
+subdirectories for some time), and DESTROY_CLIENTID against a busy client
+(was GD-31 -- opDestroyClientid already gates on clientBusy).  Both of the
+last two were live entries forgiving a divergence that no longer existed.
 
 See deviations.py for the contract.  Entries are recorded against the
 Ganesha in this repo's devcontainer (.devcontainer/Dockerfile pins the
@@ -23,86 +59,8 @@ from deviations import (Deviation, Registry, SERVER, MODEL, BOTH,  # noqa: F401
 from deviations import *  # noqa: F401,F403  -- the status constants
 
 
-# GD-1: the change attribute is the object's ctime.  FSAL_VFS derives
-# `change` (and therefore change_info4's before/after) from st_ctime in
-# nanoseconds.  ctime moves at the kernel's coarse clock tick (a few
-# milliseconds on a kernel without multigrain timestamps), so two mutations
-# of one directory inside a tick report the same value, and the model's
-# consistency check -- distinct abstract change values must observe distinct
-# wire values -- fires.  RFC 7530 5.8.1.4 / RFC 8881 5.8.1.4 require the
-# value to change on every modification.  Timing-dependent, so it is
-# recorded for whenever it fires; state stays in sync (the mutation itself
-# happened), so replay continues.
-GD_1_CHANGE_GRANULARITY = Deviation(
-    id="GD-1-change-is-coarse-ctime",
-    verdict=SERVER,
-    spec="RFC 7530 5.8.1.4 / RFC 8881 5.8.1.4 (change): must differ after "
-         "any modification",
-    summary="two mutations within one clock tick report the same change "
-            "value (FSAL_VFS change = ctime in ns)",
-    root_cause="FSAL_VFS attrs: change = timespec_to_nsecs(ctime); ctime "
-               "granularity is the kernel's coarse clock",
-    candidate_fix="a per-object modification counter, or multigrain "
-                  "timestamps (Linux >= 6.13 with an FS_MGTIME filesystem)",
-    ops=("SCreate", "SRemove", "SRename", "SLink", "SOpen", "SSetxattr",
-         "SRemovexattr", "SGetattr"),
-    field=("cinfo.after", "cinfo.before", "cinfoS.after", "cinfoS.before",
-           "cinfoT.after", "cinfoT.before", "change"),
-    context=lambda f, ctx: "unchanged on the wire" in f.detail,
-)
 
 
-
-# GD-4: the wide VERIFY / NVERIFY assert an implementation-specific status.
-# opVerifyWide sends the server's whole supported-attribute bitmap with an
-# EMPTY value blob to drive the attribute marshaller without predicting a
-# single value, and then relies on the reference implementation's length
-# guard (out_len == attr_vals.len is false) to decide the comparison "not
-# equal" -- so it predicts NFS4ERR_NOT_SAME for VERIFY and NFS4_OK for
-# NVERIFY.  Ganesha reads the empty value blob as "no attributes to compare",
-# which trivially matches, so it answers the opposite: NFS4_OK for VERIFY and
-# NFS4ERR_SAME for NVERIFY.  Both are defensible readings of a deliberately
-# under-specified request (RFC 7530 16.15 / RFC 8881 18.31 do not say what an
-# attrmask with fewer values than bits means), so the model is the one to
-# change -- send a well-formed value blob, or stop asserting the status of
-# the wide variant and only exercise the marshaller.  Recorded as MODEL,
-# reconcilable (VERIFY/NVERIFY change no state), pending that coordinated fix.
-GD_4_VERIFY_WIDE_EMPTY = Deviation(
-    id="GD-4-verify-wide-empty-blob",
-    verdict=MODEL,
-    spec="RFC 7530 16.15 / RFC 8881 18.31 (VERIFY/NVERIFY; an attrmask with "
-         "fewer values than bits is unspecified)",
-    summary="the wide VERIFY/NVERIFY predict NOT_SAME/OK from an empty value "
-            "blob; ganesha reads the empty blob as a trivial match (OK/SAME)",
-    root_cause="opVerifyWide encodes the reference server's length-guard "
-               "behaviour for an empty value blob",
-    candidate_fix="model: send a well-formed value blob for the wide "
-                  "VERIFY/NVERIFY, or drop the status assertion and keep only "
-                  "the marshaller exercise",
-    ops=("SVerify", "SNverify"),
-)
-
-# GD-5: OPEN of an existing non-regular, non-symlink target (a FIFO, socket
-# or device node) answers NFS4ERR_SYMLINK instead of NFS4ERR_WRONG_TYPE.
-# RFC 8881 18.16.4 gives NFS4ERR_SYMLINK its specific meaning -- the target is
-# a symbolic link -- and NFS4ERR_WRONG_TYPE for any other type mismatch, which
-# is what the model predicts on 4.1+.  Ganesha returns the older RFC 7530
-# generic NFS4ERR_SYMLINK for every non-directory special file, a FIFO
-# included.  Status-only, so replay continues.
-GD_5_OPEN_SPECIAL_SYMLINK = Deviation(
-    id="GD-5-open-special-as-symlink",
-    verdict=SERVER,
-    spec="RFC 8881 18.16.4 (a non-symlink type mismatch is NFS4ERR_WRONG_TYPE; "
-         "NFS4ERR_SYMLINK is specifically for a symbolic link)",
-    summary="OPEN of a FIFO/socket/device target returns NFS4ERR_SYMLINK "
-            "instead of NFS4ERR_WRONG_TYPE",
-    root_cause="ganesha uses the RFC 7530 generic SYMLINK for every "
-               "non-directory special open target",
-    candidate_fix="none required (RFC 8881's WRONG_TYPE is a SHOULD)",
-    ops=("SOpen",),
-    expected_status=NFS4ERR_WRONG_TYPE,
-    actual_status=NFS4ERR_SYMLINK,
-)
 
 # GD-6: component-name handling.  RFC 7530 12.7 / RFC 8881 12.6 make UTF-8
 # validation a server SHOULD, not a MUST, and 12.8 lets a server pick among
@@ -134,175 +92,12 @@ GD_6_NAME_HANDLING = Deviation(
                    NFS4ERR_NOENT, NFS4_OK, NFS4ERR_EXIST),
 )
 
-# GD-7: a SETATTR that changes size through the anonymous stateid, on a file
-# another owner holds open with a deny-write share reservation, answers
-# NFS4ERR_SHARE_DENIED instead of NFS4ERR_LOCKED.  RFC 8881 9.1.4.3 makes the
-# anonymous/special stateid usable for I/O and size changes only when no
-# conflicting OPEN exists; a conflict is reported as NFS4ERR_LOCKED (RFC 8881
-# 18.30, SETATTR).  NFS4ERR_SHARE_DENIED is defined for a conflicting OPEN,
-# not for a special-stateid size change, so the model's LOCKED is the RFC's
-# answer.  Ganesha reuses the share-reservation error.  Both leave the object
-# unchanged, so replay continues.
-GD_7_SETATTR_SHARE_DENIED = Deviation(
-    id="GD-7-setattr-share-denied",
-    verdict=SERVER,
-    spec="RFC 8881 9.1.4.3 (special stateid vs a conflicting OPEN) / 18.30 "
-         "(SETATTR): the conflict is NFS4ERR_LOCKED",
-    summary="a size SETATTR / ALLOCATE / DEALLOCATE through the anonymous "
-            "stateid against a deny-write share reservation returns "
-            "SHARE_DENIED instead of LOCKED",
-    root_cause="ganesha reports the share-reservation conflict with "
-               "NFS4ERR_SHARE_DENIED rather than the size op's NFS4ERR_LOCKED",
-    candidate_fix="ganesha: return NFS4ERR_LOCKED for a special-stateid size "
-                  "change that hits a share reservation",
-    ops=("SSetattr", "SAllocate", "SDeallocate"),
-    expected_status=NFS4ERR_LOCKED,
-    actual_status=NFS4ERR_SHARE_DENIED,
-)
 
 
-# GD-9: LINK whose saved (source) filehandle is a directory answers
-# NFS4ERR_NOTDIR, not the NFS4ERR_ISDIR the model predicts.  Hard-linking a
-# directory is refused by every server; RFC 7530 16.9.4 lists NFS4ERR_ISDIR
-# for LINK and the model (and its self-test) pick it, but both real servers
-# report NOTDIR -- a not-a-directory framing of the same refusal.  Recorded
-# against the model's pick; a candidate for switching the model to NOTDIR
-# since knfsd and ganesha agree.  Nothing is linked, so replay continues.
-GD_9_LINK_DIR_NOTDIR = Deviation(
-    id="GD-9-link-dir-notdir",
-    verdict=SERVER,
-    spec="RFC 7530 16.9.4 (LINK; ISDIR is listed, but the directory-source "
-         "status is effectively unspecified and servers differ)",
-    summary="LINK of a directory source: the name-vs-source-type precedence "
-            "and the source-type code (ISDIR/NOTDIR) both differ from the model",
-    root_cause="ganesha's LINK precedence is inconsistent across cases -- it "
-               "answers the name error or the source NOTDIR in an order the "
-               "model, which validates the name then reports ISDIR, cannot match",
-    candidate_fix="switch the model (and nfs4Test) to NOTDIR -- both servers "
-                  "agree on it -- or keep ISDIR and this record",
-    ops=("SLink",),
-    expected_status=(NFS4ERR_ISDIR, NFS4ERR_INVAL, NFS4ERR_BADNAME,
-                     NFS4ERR_BADCHAR),
-    actual_status=(NFS4ERR_NOTDIR, NFS4ERR_ISDIR, NFS4ERR_INVAL,
-                   NFS4ERR_BADNAME, NFS4ERR_BADCHAR),
-)
-
-# GD-10: RENEW of a lease that has lapsed answers NFS4ERR_EXPIRED where the
-# model predicts NFS4ERR_STALE_CLIENTID.  The model drops a client id the
-# moment a superseding SETCLIENTID retires its incarnation, so RENEW of the
-# retired id is STALE_CLIENTID; ganesha keeps the id past the lease and
-# reports the lease itself as EXPIRED (RFC 7530 16.30.4 lists both, and
-# 9.6.3 leaves how long an expired-lease client id survives to the server).
-# Timing-adjacent, like GD-1: recorded whenever it fires; the client
-# re-establishes state either way, so replay continues.
-GD_10_RENEW_EXPIRED = Deviation(
-    id="GD-10-renew-expired",
-    verdict=SERVER,
-    spec="RFC 7530 16.30.4 / 9.6.3 (RENEW; EXPIRED vs STALE_CLIENTID for a "
-         "lapsed lease is the server's to time)",
-    summary="RENEW of a lapsed lease returns NFS4ERR_EXPIRED where the model "
-            "predicts NFS4ERR_STALE_CLIENTID",
-    root_cause="ganesha retains the client id past the lease and reports "
-               "EXPIRED; the model retires it and reports STALE_CLIENTID",
-    candidate_fix="none required (defensible); the model could retain a "
-                  "lapsed client id briefly to match",
-    ops=("SRenew",),
-    expected_status=NFS4ERR_STALE_CLIENTID,
-    actual_status=NFS4ERR_EXPIRED,
-)
-
-# GD-11: a wrong-type operation on 4.1+ answers the POSIX-aligned status
-# (NFS4ERR_ISDIR / NFS4ERR_INVAL / NFS4ERR_SYMLINK) where the model predicts
-# NFS4ERR_WRONG_TYPE.  RFC 8881 makes WRONG_TYPE a SHOULD for a type mismatch
-# (e.g. 18.32.3 for the size attribute), and the model takes it on 4.1+ (4.0
-# has no such code); neither real server implements it, so a size SETATTR or a
-# WRITE on a non-regular object, an OPEN of a special file, and the like come
-# back as the file's natural error instead.  GD-5 recorded the OPEN case
-# specifically; this is the general form.  Status-only, so replay continues.
-GD_11_WRONG_TYPE = Deviation(
-    id="GD-11-wrong-type-posix-status",
-    verdict=SERVER,
-    spec="RFC 8881 (NFS4ERR_WRONG_TYPE is a SHOULD for a type mismatch; the "
-         "POSIX-aligned ISDIR/INVAL/SYMLINK are equally conformant)",
-    summary="a wrong-type op returns ISDIR/INVAL/SYMLINK where the model, "
-            "following the 4.1+ SHOULD, predicts NFS4ERR_WRONG_TYPE",
-    root_cause="ganesha reports the object's natural POSIX-aligned status, "
-               "never NFS4ERR_WRONG_TYPE",
-    candidate_fix="none required (both conformant); the model could drop "
-                  "WRONG_TYPE for the POSIX-aligned codes on all minors",
-    ops=("SSetattr", "SWrite", "SRead", "SOpen", "SLayoutget"),
-    expected_status=NFS4ERR_WRONG_TYPE,
-    actual_status=(NFS4ERR_ISDIR, NFS4ERR_INVAL, NFS4ERR_SYMLINK),
-)
-
-# GD-12: a repeat EXCHANGE_ID of an already-confirmed client (same co_ownerid
-# and verifier) returns the client id with EXGID4_FLAG_CONFIRMED_R clear.
-# RFC 8881 18.35.4 sets that flag when the server already holds a confirmed
-# record for the owner+verifier, which the model predicts; ganesha returns the
-# same client id (no client-id divergence) but leaves the flag false.  The
-# client stays confirmed either way, so replay continues.
-GD_12_CONFIRMED_R = Deviation(
-    id="GD-12-exchange-id-confirmed-r",
-    verdict=SERVER,
-    spec="RFC 8881 18.35.4 (EXGID4_FLAG_CONFIRMED_R is set for a repeat "
-         "EXCHANGE_ID of a confirmed owner+verifier)",
-    summary="a repeat EXCHANGE_ID of a confirmed client leaves confirmed_r "
-            "false where the model predicts true",
-    root_cause="ganesha does not report CONFIRMED_R on a second EXCHANGE_ID "
-               "for an already-confirmed client id",
-    candidate_fix="none required from the model's side; a ganesha behaviour",
-    ops=("SExchangeId",),
-    field="confirmed_r",
-    expected_value=True,
-    actual_value=False,
-)
-
-# GD-13: OPEN with GUARDED4 or EXCLUSIVE4 over an existing non-regular target,
-# or over a share-reservation conflict, reports the target's type error
-# (NFS4ERR_ISDIR / NFS4ERR_SYMLINK) or NFS4ERR_SHARE_DENIED where the model
-# reports NFS4ERR_EXIST.  The model keeps the fail-if-exists dispositions on
-# the RFC-literal / POSIX O_EXCL reading -- an existing name is EXIST whatever
-# its type -- and checks the share reservation only after resolve; ganesha
-# reports the type or the share conflict first.  RFC 7530 16.16.4 / RFC 8881
-# 18.16.4 list all of these without ordering them.  The OPEN fails either way,
-# so replay continues.
-GD_13_OPEN_EXIST_PRECEDENCE = Deviation(
-    id="GD-13-open-exist-precedence",
-    verdict=SERVER,
-    spec="RFC 7530 16.16.4 / RFC 8881 18.16.4 (OPEN; EXIST vs the target "
-         "type vs a share conflict are listed without a pinned order)",
-    summary="a GUARDED/EXCLUSIVE OPEN over an existing dir/symlink or a share "
-            "conflict returns ISDIR/SYMLINK/SHARE_DENIED, not the model's EXIST",
-    root_cause="ganesha checks the target type and the share reservation "
-               "before the create-exclusivity existence check",
-    candidate_fix="none required (defensible); the model keeps the RFC-literal "
-                  "EXIST for a fail-if-exists disposition",
-    ops=("SOpen",),
-    expected_status=NFS4ERR_EXIST,
-    actual_status=(NFS4ERR_ISDIR, NFS4ERR_SYMLINK, NFS4ERR_SHARE_DENIED),
-)
 
 
-# GD-14: extend GD-1's change-attribute reconciliation to its other facet.
-# check_change also fires "abstract change X reported two wire values" when the
-# wire change advances for an object the model did not mutate in that step
-# (coarse ctime crossing a tick boundary between two reads).  Same root cause
-# and RFC clause as GD-1; recorded here for the OPEN/GETATTR path.
-GD_14_CHANGE_ADVANCED = Deviation(
-    id="GD-14-change-advanced-untracked",
-    verdict=SERVER,
-    spec="RFC 7530 5.8.1.4 / RFC 8881 5.8.1.4 (change): coarse ctime makes the "
-         "value non-injective against the model's abstract change",
-    summary="the wire change advances where the model recorded no mutation "
-            "(the ctime-granularity dual of GD-1)",
-    root_cause="FSAL_VFS change = ctime in ns; a tick boundary moves it "
-               "between two reads the model treats as unchanged",
-    candidate_fix="a per-object modification counter (as GD-1)",
-    ops=("SOpen", "SGetattr", "SCreate", "SRemove", "SRename", "SLink"),
-    field=("cinfo.after", "cinfo.before", "cinfoS.before", "cinfoS.after",
-           "cinfoT.before", "cinfoT.after", "change"),
-    context=lambda f, ctx: "reported two wire values" in f.detail,
-)
+
+
 
 # GD-15: open-mode vs lock/IO enforcement.  RFC 8881 9.1.2 requires the stateid's
 # open to allow the access a READ/WRITE/LOCK needs (NFS4ERR_OPENMODE otherwise),
@@ -350,65 +145,7 @@ GD_16_EXCL_VERIFIER = Deviation(
     reconcilable=False,
 )
 
-# GD-17: OPEN's OPEN4_RESULT_CONFIRM flag.  On 4.1+ there is no OPEN_CONFIRM, so
-# the model predicts needConfirm=false; ganesha sets the flag in a case the
-# model does not (or vice versa).  The confirm handshake is 4.0-only, so the
-# flag on 4.1+ changes nothing observable -- field-only, reconcilable.
-GD_17_RFLAGS_CONFIRM = Deviation(
-    id="GD-17-open-rflags-confirm",
-    verdict=SERVER,
-    spec="RFC 8881 18.16 (OPEN4_RESULT_CONFIRM is meaningful only for the "
-         "4.0 OPEN_CONFIRM handshake)",
-    summary="OPEN's confirm flag differs from the model's needConfirm "
-            "prediction where it has no observable effect",
-    root_cause="ganesha's OPEN4_RESULT_CONFIRM bookkeeping differs from the "
-               "model's needConfirm",
-    candidate_fix="none required (no observable effect off 4.0)",
-    ops=("SOpen",),
-    field="rflags_confirm",
-)
 
-# GD-18: the wide GETATTR (every supported attribute at once) answers
-# NFS4ERR_INVAL.  ganesha rejects the whole-bitmap request that the model, which
-# asks only for the attributes it can predict, treats as OK.  RFC 8881 18.7
-# lets a server reject an attribute request it cannot satisfy; status-only.
-GD_18_GETATTR_WIDE_INVAL = Deviation(
-    id="GD-18-getattr-wide-inval",
-    verdict=SERVER,
-    spec="RFC 8881 18.7.3 (GETATTR may reject an unsupported attribute "
-         "combination)",
-    summary="the whole-bitmap wide GETATTR returns NFS4ERR_INVAL where the "
-            "model predicts OK",
-    root_cause="ganesha rejects the full supported-attribute bitmap request",
-    candidate_fix="model: narrow the wide GETATTR to attributes ganesha "
-                  "marshals without INVAL",
-    ops=("SGetattrWide",),
-    expected_status=NFS4_OK,
-    actual_status=NFS4ERR_INVAL,
-)
-
-# GD-19: the model deliberately drives NFS4ERR_BAD_SEQID by sending an OPEN
-# owner-seqid two past the last (nfs4_ops.qnt oseq: seqid + 2), but ganesha does
-# not fail the gap -- it processes the OPEN and answers on the name/existence
-# (NOENT, or the object status).  RFC 7530 9.1.7 makes strict +1 sequencing a
-# server enforcement point that this ganesha build does not police.
-# reconcilable=False: the owner seqid then parts, so the trace stops here.
-GD_19_OWNER_SEQID_GAP = Deviation(
-    id="GD-19-owner-seqid-gap-unpoliced",
-    verdict=SERVER,
-    spec="RFC 7530 9.1.7 (the open-owner seqid must be exactly one greater; "
-         "enforcement is the server's)",
-    summary="an OPEN owner-seqid gap the model predicts NFS4ERR_BAD_SEQID for "
-            "is processed by ganesha (NOENT / the object status)",
-    root_cause="this ganesha build does not police the +1 open-owner seqid gap",
-    candidate_fix="none from the model; drop the BAD_SEQID negative probe or "
-                  "record",
-    ops=("SOpen", "SClose", "SOpenDowngrade", "SLock"),
-    expected_status=(NFS4ERR_BAD_SEQID, NFS4_OK, NFS4ERR_INVAL),
-    actual_status=(NFS4ERR_NOENT, NFS4_OK, NFS4ERR_NOTDIR, NFS4ERR_EXIST,
-                   NFS4ERR_ISDIR, NFS4ERR_BAD_SEQID),
-    reconcilable=False,
-)
 
 
 # GD-20: object/stateid lifecycle -- the model references a stateid or
@@ -429,9 +166,17 @@ GD_20_LIFECYCLE = Deviation(
     root_cause="an upstream recorded deviation left the model and ganesha with "
                "different live stateids/objects",
     candidate_fix="none (downstream of the recorded upstream deviation)",
-    ops=("SSetattr", "SPutfh", "SSeek", "SLink"),
+    # Widened after the config migration let traces run past the point the
+    # registry used to abandon them: CREATE and LINK answer NFS4ERR_EXIST for
+    # a name ganesha still holds and the model has removed, VERIFY answers
+    # NFS4ERR_INVAL against attributes of an object the two no longer agree
+    # about.  A directory's nlink counting a child only one side has is the
+    # same cause on a FIELD, which the contract keeps in its own entry
+    # (GD-20b) because one Deviation matches either statuses or a field.
+    ops=("SSetattr", "SPutfh", "SSeek", "SLink", "SCreate", "SVerify"),
     expected_status=(NFS4ERR_BAD_STATEID, NFS4_OK, NFS4ERR_LOCKED),
-    actual_status=(NFS4_OK, NFS4ERR_STALE, NFS4ERR_NOENT),
+    actual_status=(NFS4_OK, NFS4ERR_STALE, NFS4ERR_NOENT, NFS4ERR_EXIST,
+                   NFS4ERR_INVAL),
     reconcilable=False,
 )
 
@@ -451,9 +196,12 @@ GD_21_RESIDUAL = Deviation(
     root_cause="ganesha orders the OPEN name/share checks and reports an "
                "in-use client id differently from the model",
     candidate_fix="triage per edge if any recurs at volume",
-    ops=("SOpen", "SDestroyClientid"),
-    expected_status=(NFS4ERR_BADCHAR, NFS4ERR_NOT_ONLY_OP),
-    actual_status=(NFS4ERR_SHARE_DENIED, NFS4ERR_CLIENTID_BUSY),
+    # NARROWED: the DESTROY_CLIENTID arm moved into the model as
+    # G4-destroy-clientid-busy-first.  What is left is the OPEN
+    # name-vs-share ordering, which is downstream of GD-6's name latitude.
+    ops=("SOpen",),
+    expected_status=(NFS4ERR_BADCHAR,),
+    actual_status=(NFS4ERR_SHARE_DENIED,),
 )
 
 # GD-22: LOCKU/ACCESS field divergences -- the LOCKU reply seqid the model and
@@ -474,42 +222,6 @@ GD_22_FIELD = Deviation(
 )
 
 
-# GD-23: compound-level structural divergences.  The model over-validates the
-# compound tag (a malformed-UTF-8 tag makes the whole compound NFS4ERR_INVAL
-# with no results), and predicts a result for a sole-op rule (BIND_CONN_TO_
-# SESSION NOT_ONLY_OP) that ganesha rejects at the connection level with zero
-# results.  RFC 8881 2.2 leaves compound-tag validation to the server, and the
-# reply's result count follows the server's processing.  Compound-level only.
-GD_23_COMPOUND = Deviation(
-    id="GD-23-compound-tag-and-shape",
-    verdict=SERVER,
-    spec="RFC 8881 2.2 (the compound tag is opaque UTF-8 the server need not "
-         "police; the result count follows server processing)",
-    summary="a compound's result count or status differs (tag validation / "
-            "BIND_CONN sole-op) with no per-op finding",
-    root_cause="ganesha does not reject a malformed tag and shapes the reply "
-               "differently on the BIND_CONN edge",
-    candidate_fix="model: relax compound-tag validation to match the servers",
-    ops=("compound",),
-    field="results",
-    expected_value=(0, 1),
-    actual_value=(0, 1),
-)
-
-# GD-24: the compound status the model predicts INVAL (malformed tag) that
-# ganesha answers OK, paired with GD-23's result-count row.
-GD_24_COMPOUND_STATUS = Deviation(
-    id="GD-24-compound-tag-status",
-    verdict=SERVER,
-    spec="RFC 8881 2.2 (compound-tag validation is the server's)",
-    summary="a malformed-tag compound the model calls NFS4ERR_INVAL is OK to "
-            "ganesha",
-    root_cause="ganesha does not reject a malformed compound tag",
-    candidate_fix="model: relax compound-tag validation",
-    ops=("compound",),
-    expected_status=NFS4ERR_INVAL,
-    actual_status=NFS4_OK,
-)
 
 
 # GD-25: residual field/status edges -- READDIR lists a leniently-accepted
@@ -525,7 +237,10 @@ GD_25_RESIDUAL2 = Deviation(
             "LINK name-error code differ from the model",
     root_cause="ganesha accepts a malformed name/direction the model rejects",
     candidate_fix="none (downstream of the recorded name/dir latitude)",
-    ops=("SReaddir", "SBindConnToSession", "SLink"),
+    # NARROWED: the BIND_CONN direction arm moved into the model as
+    # G4-bindconn-direction-accepted.  What is left is the READDIR name set,
+    # which is downstream of GD-6's malformed-name latitude.
+    ops=("SReaddir",),
     field=("names",),
     expected_value=None,
     actual_value=None,
@@ -543,9 +258,12 @@ GD_26_RESIDUAL2_STATUS = Deviation(
     root_cause="ganesha validates the BIND_CONN direction and the LINK name "
                "differently from the model",
     candidate_fix="none required (defensible)",
-    ops=("SBindConnToSession", "SLink"),
-    expected_status=(NFS4ERR_INVAL, 63),
-    actual_status=(NFS4_OK, NFS4ERR_ISDIR),
+    # NARROWED: the BIND_CONN direction arm moved into the model as
+    # G4-bindconn-direction-accepted; the LINK name-error code is left,
+    # downstream of GD-6.
+    ops=("SLink",),
+    expected_status=(63,),
+    actual_status=(NFS4ERR_ISDIR,),
 )
 
 
@@ -570,38 +288,8 @@ GD_27_FH_IDENTITY = Deviation(
     context=lambda f, ctx: f.kind == "fh_identity",
 )
 
-# GD-28: the compound-status companion of GD-27.
-GD_28_COMPOUND_MVM = Deviation(
-    id="GD-28-compound-minorversion",
-    verdict=SERVER,
-    spec="RFC 8881 2.2 (a bad minorversion vs a malformed compound is the "
-         "server's to distinguish)",
-    summary="a compound the model calls NFS4ERR_OP_NOT_IN_SESSION is "
-            "NFS4ERR_INVAL to ganesha",
-    root_cause="ganesha reports INVAL where the model predicts "
-               "OP_NOT_IN_SESSION for an op used outside a session",
-    candidate_fix="none required (defensible)",
-    ops=("compound",),
-    expected_status=NFS4ERR_OP_NOT_IN_SESSION,
-    actual_status=NFS4ERR_INVAL,
-)
 
 
-# GD-29: GETATTR nlink/mode on a directory whose subdirectory count the
-# backing ext4 export folds into nlink where the model keeps a flat 2 (the
-# ganesha analog of KN-16).  RFC 7530 5.8.1 leaves nlink to the filesystem.
-GD_29_DIR_NLINK = Deviation(
-    id="GD-29-dir-nlink-accounting",
-    verdict=SERVER,
-    spec="RFC 7530 5.8.1 (numlinks follows the backing filesystem)",
-    summary="GETATTR nlink/mode on a directory differs from the model's flat "
-            "accounting",
-    root_cause="ganesha's ext4 export counts subdirectories in a directory's "
-               "nlink",
-    candidate_fix="model: count subdirectories in a directory's nlink",
-    ops=("SGetattr",),
-    field=("nlink", "mode"),
-)
 
 # GD-30: a READ returns stale non-zero data for a block the model (and chimera's
 # memfs, which passes the same trace) reads as a hole.  Root-caused on
@@ -628,164 +316,196 @@ GD_30_READ_STALE_HOLE = Deviation(
     context=lambda f, ctx: "expected byte 0x0" in f.detail,
 )
 
-# GD-31: DESTROY_CLIENTID against a client that still owns sessions or state.
-# RFC 8881 18.50.3 makes NFS4ERR_CLIENTID_BUSY the required answer then; the
-# model destroys the clientid unconditionally.  ganesha enforces the RFC
-# precondition, so its CLIENTID_BUSY is the more-correct answer.
-GD_31_DESTROY_CLIENTID_BUSY = Deviation(
-    id="GD-31-destroy-clientid-busy",
+
+
+
+
+
+# GD-19: the open-owner sequence gap, and why it is here rather than in the
+# model.  The walk deliberately sends an OPEN whose owner seqid is two past
+# the last (nfs4_ops.qnt oseq: seqid + 2), which RFC 7530 9.1.7 makes
+# NFS4ERR_BAD_SEQID.  ganesha polices it SOMETIMES: measured across the 4.0
+# corpus, three OPENs answered on the name or the object (NOENT, or the
+# object's status) where the model with the deviation off predicts BAD_SEQID,
+# and in the run before this one -- with the model predicting the ordinary
+# answer instead -- three others came back BAD_SEQID.  Both directions occur,
+# which is why neither a deviation nor a tolerance fits: the two branches
+# leave DIFFERENT state (one OPEN creates an object and a stateid, the other
+# does not), so an accept set would keep replaying against a server the model
+# has already parted from.  reconcilable=False: the owner seqid parts here and
+# the trace stops.
+GD_19_OWNER_SEQID_GAP = Deviation(
+    id="GD-19-owner-seqid-gap",
     verdict=SERVER,
-    spec="RFC 8881 18.50.3: DESTROY_CLIENTID is NFS4ERR_CLIENTID_BUSY while the "
-         "client owns sessions or state",
-    summary="DESTROY_CLIENTID answers CLIENTID_BUSY where the model expects OK",
-    root_cause="ganesha enforces the RFC precondition that no sessions/state "
-               "remain; the model destroys the clientid unconditionally",
-    candidate_fix="model: gate DESTROY_CLIENTID on the client being quiescent",
+    spec="RFC 7530 9.1.7 (the open-owner seqid must be exactly one greater; "
+         "enforcement is the server's)",
+    summary="an OPEN with a two-past owner seqid is policed as BAD_SEQID only "
+            "sometimes; the other times it is answered on its merits",
+    root_cause="ganesha's open-owner sequence check does not fire uniformly",
+    candidate_fix="ganesha: police the gap on every OPEN, or on none",
+    # CLOSE, OPEN_CONFIRM and OPEN_DOWNGRADE ride the same owner sequence, so
+    # once it has parted they answer BAD_SEQID too; the guard below keeps the
+    # entry to exactly that -- a finding with BAD_SEQID on one side or the
+    # other, at 4.0, where the sequence exists at all.
+    ops=("SOpen", "SClose", "SOpenConfirm", "SOpenDowngrade"),
+    context=lambda f, ctx: ctx.get("minor") == 0 and f.kind == "status" and
+                           (f.expected == NFS4ERR_BAD_SEQID or
+                            f.actual == NFS4ERR_BAD_SEQID),
+    reconcilable=False,
+)
+
+
+# GD-36: the client id's lifecycle.  DESTROY_CLIENTID answers STALE_CLIENTID
+# for an id ganesha has already forgotten, or NFS4ERR_CLIENTID_BUSY for one it
+# still counts state against, where the model -- which has no lease clock and
+# retires an id the moment a superseding EXCHANGE_ID replaces it -- expects the
+# destroy to succeed; and once the model has destroyed an id ganesha kept, the
+# mirror image (the model predicting CLIENTID_BUSY where ganesha destroys it)
+# follows.  RFC 8881 18.50.3 makes both statuses the server's to decide from
+# state the model does not track.  reconcilable=False: one side has a client
+# the other does not.
+GD_36_CLIENTID_LIFECYCLE = Deviation(
+    id="GD-36-destroy-clientid-lifecycle",
+    verdict=SERVER,
+    spec="RFC 8881 18.50.3 (DESTROY_CLIENTID: STALE_CLIENTID and "
+         "CLIENTID_BUSY follow from server-side lease and state accounting)",
+    summary="DESTROY_CLIENTID answers STALE_CLIENTID or CLIENTID_BUSY where "
+            "the model expects success, and the mirror image after that",
+    root_cause="ganesha's lease clock and busy accounting differ from the "
+               "model's, which has neither",
+    candidate_fix="none within a trace (the model has no lease clock)",
     ops=("SDestroyClientid",),
-    expected_status=0,
-    actual_status=NFS4ERR_CLIENTID_BUSY,
+    expected_status=(NFS4_OK, NFS4ERR_CLIENTID_BUSY),
+    actual_status=(NFS4ERR_STALE_CLIENTID, NFS4ERR_CLIENTID_BUSY, NFS4_OK),
+    reconcilable=False,
 )
 
-# GD-32: OPEN(no-create) that both names a symlink and carries a stale owner
-# seqid.  RFC 7530 16.16 orders neither the owner-seqid check nor component
-# resolution, so either error is conformant: the model reports the seqid first
-# (NFS4ERR_BAD_SEQID), ganesha the resolution (NFS4ERR_SYMLINK).  Nothing opens
-# either way.
-GD_32_OPEN_SEQID_VS_SYMLINK = Deviation(
-    id="GD-32-open-seqid-vs-symlink",
+
+# GD-37: OPEN_DOWNGRADE answers NFS4ERR_SERVERFAULT.  RFC 8881 18.18.3 lists
+# NFS4ERR_INVAL for a downgrade whose share bits are not a subset of those
+# held; SERVERFAULT is the status a server sends when it has no better answer
+# (RFC 8881 15.1.14.2), so this is a ganesha defect rather than a latitude --
+# recorded here rather than modelled because the model would have to PREDICT a
+# server fault, which is not something a specification can state.  Measured on
+# access=3 deny=1 downgrades at 4.1 and 4.2.  Nothing is downgraded, so replay
+# continues.
+GD_37_DOWNGRADE_SERVERFAULT = Deviation(
+    id="GD-37-open-downgrade-serverfault",
     verdict=SERVER,
-    spec="RFC 7530 16.16.5 / 8.1.5: BAD_SEQID and SYMLINK both apply to this "
-         "OPEN and their precedence is unspecified",
-    summary="OPEN of a symlink with a stale owner seqid: model BAD_SEQID vs "
-            "ganesha SYMLINK",
-    root_cause="unordered error precedence between the owner-seqid check and "
-               "component resolution",
-    candidate_fix=None,
+    spec="RFC 8881 18.18.3 (OPEN_DOWNGRADE; a non-subset share request is "
+         "NFS4ERR_INVAL) / 15.1.14.2 (SERVERFAULT is the no-better-answer "
+         "status)",
+    summary="OPEN_DOWNGRADE answers NFS4ERR_SERVERFAULT",
+    root_cause="ganesha faults on a downgrade the model expects to succeed",
+    candidate_fix="ganesha: answer NFS4ERR_INVAL, or perform the downgrade",
+    ops=("SOpenDowngrade",),
+    actual_status=NFS4ERR_SERVERFAULT,
+)
+
+
+# GD-38: stateid and open-owner bookkeeping the model does not track.
+# FREE_STATEID answers BAD_STATEID for a stateid the model still holds with
+# locks (expecting LOCKS_HELD); an OPEN's stateid seqid runs one ahead of the
+# model's; a LOCK is refused NFS4ERR_RESOURCE; and a LOOKUP finds a name the
+# model has removed.  RFC 8881 8.2.2 makes the stateid generation and 15.1.4
+# makes RESOURCE the server's own accounting.  Field/status-only where the
+# state has not parted; the LOOKUP arm has, so the entry is not reconcilable.
+GD_38_STATEID_BOOKKEEPING = Deviation(
+    id="GD-38-stateid-bookkeeping",
+    verdict=SERVER,
+    spec="RFC 8881 8.2.2 (stateid generation) / 15.1.4 (NFS4ERR_RESOURCE) / "
+         "18.38.3 (FREE_STATEID)",
+    summary="FREE_STATEID BAD_STATEID, an OPEN stateid seqid one ahead, a "
+            "LOCK refused RESOURCE, and a LOOKUP finding a removed name",
+    root_cause="ganesha's stateid and resource accounting differ from the "
+               "model's",
+    candidate_fix="triage individually if any of them recurs at volume",
+    ops=("SFreeStateid", "SLock", "SLookup"),
+    context=lambda f, ctx: (
+        (f.op == "SFreeStateid" and f.actual == NFS4ERR_BAD_STATEID) or
+        (f.op == "SLock" and f.actual == NFS4ERR_RESOURCE) or
+        (f.op == "SLookup" and f.actual == NFS4_OK)),
+    reconcilable=False,
+)
+
+
+# GD-38b: the field twin of GD-38.  An OPEN's stateid seqid runs one ahead of
+# the model's (RFC 8881 8.2.2 makes the generation the server's), which the
+# contract cannot fold into the entry above: one Deviation matches either
+# statuses or a field, never both.
+GD_38B_OPEN_SEQID = Deviation(
+    id="GD-38b-open-stateid-seqid",
+    verdict=SERVER,
+    spec="RFC 8881 8.2.2 (the stateid's seqid is the server's generation "
+         "counter)",
+    summary="an OPEN's stateid seqid is one ahead of the model's",
+    root_cause="ganesha advances the open stateid's generation where the "
+               "model does not",
+    candidate_fix="triage if it recurs at volume",
     ops=("SOpen",),
-    expected_status=NFS4ERR_BAD_SEQID,
-    actual_status=NFS4ERR_SYMLINK,
+    field="seqid",
 )
 
-# GD-33: SEEK for the next hole at or past EOF.  RFC 7862 15.11.3 makes
-# NFS4ERR_NXIO the answer when sa_offset is at or beyond the file's size; the
-# model returns it, ganesha instead reports success with an offset (a hole it
-# located earlier in the file).  A read of that offset returns the same bytes
-# either way, so the disagreement is confined to the SEEK reply.
-GD_33_SEEK_HOLE_PAST_EOF = Deviation(
-    id="GD-33-seek-hole-past-eof",
+
+# GD-20b: the field twin of GD-20 -- a directory's link count carrying a child
+# only one side holds, after the object lifecycle parted.  Field-only.
+GD_20B_NLINK = Deviation(
+    id="GD-20b-nlink-after-lifecycle",
     verdict=SERVER,
-    spec="RFC 7862 15.11.3: SEEK is NFS4ERR_NXIO when sa_offset is at or past "
-         "the file size",
-    summary="SEEK(hole) at/past EOF answers OK where the model expects NXIO",
-    root_cause="ganesha's FSAL SEEK does not return NXIO for an at/past-EOF "
-               "starting offset",
-    candidate_fix=None,
-    ops=("SSeek",),
-    expected_status=NFS4ERR_NXIO,
-    actual_status=NFS4_OK,
+    spec="RFC 8881 5.8.1.5 (numlinks follows the backing filesystem)",
+    summary="a directory's nlink counts a child only ganesha holds",
+    root_cause="ganesha kept a name the model removed (GD-20's cause)",
+    candidate_fix="none (downstream of GD-20)",
+    ops=("SGetattr",),
+    field=("nlink",),
 )
 
-# GD-35: the offset facet of GD-33.  Where a SEEK does succeed, ganesha's FSAL
-# reports the next hole/data boundary at a different (often earlier) offset than
-# the model's block-granular sparse map -- RFC 7862 15.11.3 leaves the exact
-# boundary to the filesystem's allocation.  A read from the model's offset
-# returns the same bytes, so the disagreement is confined to the SEEK reply's
-# offset field.
-GD_35_SEEK_OFFSET = Deviation(
-    id="GD-35-seek-offset",
-    verdict=SERVER,
-    spec="RFC 7862 15.11.3: the SEEK result offset follows the filesystem's "
-         "own hole/data allocation",
-    summary="SEEK reports a different next-hole/data offset than the model",
-    root_cause="ganesha's FSAL sparse map differs from the model's block-granular "
-               "one",
-    candidate_fix=None,
-    ops=("SSeek",),
-    field=("offset", "eof"),
-)
 
-# GD-34: a 256-byte compound tag (the model's "NLONG" tag test).  RFC 8881 2.2
-# leaves the compound tag opaque with no maximum, so the model accepts it, but
-# both reference servers cap it below 256 bytes -- ganesha returns
-# NFS4ERR_INVAL for the whole compound, and knfsd rejects the message at the
-# RPC layer (GARBAGE_ARGS), which the harness handles at the send.  The
-# result-count difference is already GD-23; this covers the compound status.
-GD_34_LONG_TAG = Deviation(
-    id="GD-34-long-compound-tag",
+# GD-17b: the 4.0 half of the OPEN confirm flag.  Above 4.0 the flag is inert
+# and the T_RFLAGS_CONFIRM tolerance covers it; at 4.0 it drives the
+# OPEN_CONFIRM handshake, so a server that sets it where the model does not
+# expects a confirmation the trace never sends and the open stateid stays
+# unconfirmed.  RFC 7530 9.1.11 makes the decision the server's.
+# reconcilable=False: the handshake has parted.
+GD_17B_RFLAGS_CONFIRM_40 = Deviation(
+    id="GD-17b-rflags-confirm-40",
     verdict=SERVER,
-    spec="RFC 8881 2.2: the compound tag is opaque with no maximum length; the "
-         "servers impose an implementation tag-length limit",
-    summary="a 256-byte compound tag the model accepts is NFS4ERR_INVAL to "
-            "ganesha (GARBAGE_ARGS to knfsd)",
-    root_cause="both reference servers cap the compound tag below 256 bytes; "
-               "the model treats it as opaque and accepts it",
-    candidate_fix="model: cap the compound tag to the servers' limit",
-    ops=("compound",),
-    expected_status=NFS4_OK,
-    actual_status=NFS4ERR_INVAL,
-    context=lambda f, ctx: ctx["lab"].get("tagName") == "NLONG",
+    spec="RFC 7530 9.1.11 / 16.16 (OPEN4_RESULT_CONFIRM and the OPEN_CONFIRM "
+         "handshake are the server's to require)",
+    summary="OPEN sets OPEN4_RESULT_CONFIRM at 4.0 where the model's "
+            "needConfirm is false",
+    root_cause="ganesha requires a confirmation for an owner the model "
+               "considers already confirmed",
+    candidate_fix="none required (the RFC leaves it open); the model would "
+                  "need ganesha's own confirmed-owner accounting",
+    ops=("SOpen",),
+    field="rflags_confirm",
+    context=lambda f, ctx: ctx.get("minor") == 0,
+    reconcilable=False,
 )
 
 
 NFS4 = Registry("ganesha/nfs4", [
-    GD_1_CHANGE_GRANULARITY,
-    GD_4_VERIFY_WIDE_EMPTY,
-    GD_5_OPEN_SPECIAL_SYMLINK,
+    GD_17B_RFLAGS_CONFIRM_40,
+    GD_36_CLIENTID_LIFECYCLE,
+    GD_37_DOWNGRADE_SERVERFAULT,
+    GD_38_STATEID_BOOKKEEPING,
+    GD_38B_OPEN_SEQID,
+    GD_20B_NLINK,
+    GD_19_OWNER_SEQID_GAP,
     GD_6_NAME_HANDLING,
-    GD_7_SETATTR_SHARE_DENIED,
-    GD_9_LINK_DIR_NOTDIR,
-    GD_10_RENEW_EXPIRED,
-    GD_11_WRONG_TYPE,
-    GD_12_CONFIRMED_R,
-    GD_13_OPEN_EXIST_PRECEDENCE,
-    GD_14_CHANGE_ADVANCED,
     GD_15_OPENMODE,
     GD_16_EXCL_VERIFIER,
-    GD_17_RFLAGS_CONFIRM,
-    GD_18_GETATTR_WIDE_INVAL,
-    GD_19_OWNER_SEQID_GAP,
     GD_20_LIFECYCLE,
     GD_21_RESIDUAL,
     GD_22_FIELD,
-    GD_23_COMPOUND,
-    GD_24_COMPOUND_STATUS,
     GD_25_RESIDUAL2,
     GD_26_RESIDUAL2_STATUS,
     GD_27_FH_IDENTITY,
-    GD_28_COMPOUND_MVM,
-    GD_29_DIR_NLINK,
     GD_30_READ_STALE_HOLE,
-    GD_31_DESTROY_CLIENTID_BUSY,
-    GD_32_OPEN_SEQID_VS_SYMLINK,
-    GD_33_SEEK_HOLE_PAST_EOF,
-    GD_34_LONG_TAG,
-    GD_35_SEEK_OFFSET,
 ])
 
 
-# GN-2: LINK of a directory answers NFS3ERR_BADTYPE, not NFS3ERR_ISDIR.
-# Hard-linking a directory is refused by every server, but the status is not
-# pinned: RFC 1813 3.3.15 lists neither ISDIR nor a POSIX EPERM among LINK's
-# errors, so servers differ -- the reference implementation (and this model)
-# answer ISDIR, ganesha answers BADTYPE, and the Linux server answers yet
-# another.  Recorded as a ganesha divergence from the model's pick; once the
-# knfsd harness lands it becomes the tiebreaker for whether the model should
-# assert a *set* of acceptable statuses here rather than one.  Note the v4
-# LINK path is unaffected -- ganesha's NFSv4 LINK of a directory does return
-# NFS4ERR_ISDIR, matching the model.  Status-only, so replay continues.
-GN_2_LINK_DIR_BADTYPE = Deviation(
-    id="GN-2-link-dir-badtype",
-    verdict=SERVER,
-    spec="RFC 1813 3.3.15 (LINK; the directory-source status is unspecified)",
-    summary="LINK of a directory returns NFS3ERR_BADTYPE instead of "
-            "NFS3ERR_ISDIR",
-    root_cause="ganesha refuses a directory hard link with BADTYPE",
-    candidate_fix="none required (defensible); revisit whether the model "
-                  "should accept a status set once knfsd is the tiebreaker",
-    ops=("OLink",),
-    expected_status=NFS3ERR_ISDIR,
-    actual_status=NFS3ERR_BADTYPE,
-)
 
 # GN-3: CREATE disposition and precedence.  RFC 1813 3.3.8 leaves the order of
 # the existence, type and permission checks (and which of GUARDED's collisions
@@ -793,6 +513,15 @@ GN_2_LINK_DIR_BADTYPE = Deviation(
 # object type (BADTYPE), a permission failure (ACCES), or EXIST where the model
 # predicts EXIST or OK.  A create that one side made and the other did not parts
 # the state, so reconcilable=False.
+#
+# NOTDIR belongs to the same entry for a specific reason: the model treats a
+# name held by a symbolic link as taken (EXIST) and does not follow it, while
+# ganesha's FSAL_VFS creates with openat(O_CREAT), which follows a trailing
+# symlink as POSIX requires -- so the status it reports is whatever resolving
+# the link's TARGET lands on (NOTDIR for a target under a non-directory,
+# measured on d -> "a/b/target" with a as a FIFO).  Predicting that needs
+# multi-component path resolution the model does not have, which is why this
+# stays a recorded residual rather than moving into the model.
 GN_3_CREATE = Deviation(
     id="GN-3-create-disposition",
     verdict=SERVER,
@@ -806,27 +535,10 @@ GN_3_CREATE = Deviation(
     ops=("OCreate",),
     expected_status=(NFS3ERR_EXIST, NFS3_OK, NFS3ERR_ACCES, NFS3ERR_ISDIR),
     actual_status=(NFS3ERR_BADTYPE, NFS3ERR_ACCES, NFS3ERR_EXIST, NFS3_OK,
-                   NFS3ERR_NXIO),
+                   NFS3ERR_NXIO, NFS3ERR_NOTDIR),
     reconcilable=False,
 )
 
-# GN-4: RENAME of a non-empty directory target reports NFS3ERR_NOTEMPTY where
-# the model predicts NFS3ERR_ISDIR (both are conformant, RFC 1813 3.3.14 lists
-# neither order).  Nothing is renamed, so replay continues.
-GN_4_RENAME = Deviation(
-    id="GN-4-rename-notempty",
-    verdict=SERVER,
-    spec="RFC 1813 3.3.14 (RENAME; ISDIR vs NOTEMPTY for a directory target is "
-         "unordered)",
-    summary="RENAME onto a directory reports NFS3ERR_NOTEMPTY where the model "
-            "predicts NFS3ERR_ISDIR",
-    root_cause="ganesha reports the non-empty target before its type",
-    candidate_fix="none required (defensible)",
-    ops=("ORename",),
-    expected_status=(NFS3ERR_ISDIR, NFS3ERR_NOTEMPTY, NFS3ERR_INVAL, NFS3_OK),
-    actual_status=(NFS3ERR_NOTEMPTY, NFS3ERR_EXIST, NFS3_OK, NFS3ERR_IO),
-    reconcilable=False,
-)
 
 # GN-5: object attribute fields the FSAL reports differently -- a symlink's
 # size is its target length in the model but 0 from ganesha's FSAL_VFS, and a
@@ -846,9 +558,35 @@ GN_5_ATTR_FIELDS = Deviation(
            "wcc.after.nlink", "file_attributes.size", "readdirplus[b].size"),
 )
 
+# GN-6: an ACCESS on a socket or a FIFO answers NFS3ERR_INVAL instead of the
+# granted subset of the requested mask.  RFC 1813 3.3.4 lists no INVAL for
+# ACCESS at all, so ganesha is wrong -- but it is wrong only SOMETIMES, and
+# that is why this is recorded rather than modelled.  Measured across the
+# ganesha_nfs3 corpus: seven ACCESS calls on sockets and FIFOs, six answered
+# with the ordinary granted mask and one (a socket, full 0x3F mask) answered
+# INVAL, with no property of the call -- type, mask, mode -- separating them.
+# A model branch was tried and had to be reverted: it predicted INVAL for all
+# seven and failed six traces that had passed before.  Nothing is mutated, so
+# replay continues.
+GN_6_ACCESS_SPECIAL = Deviation(
+    id="GN-6-access-special-inval",
+    verdict=SERVER,
+    spec="RFC 1813 3.3.4 (ACCESS returns the granted subset of the mask; no "
+         "NFS3ERR_INVAL is listed for the procedure)",
+    summary="ACCESS on a socket or FIFO intermittently returns NFS3ERR_INVAL "
+            "where the model reports the type-applicable bits",
+    root_cause="ganesha's FSAL_VFS refuses the access check on a special file "
+               "under a condition this corpus has not isolated",
+    candidate_fix="ganesha: answer on the granted bits for a special file as "
+                  "for any other object",
+    ops=("OAccess",),
+    expected_status=NFS3_OK,
+    actual_status=NFS3ERR_INVAL,
+)
+
+
 NFS3 = Registry("ganesha/nfs3", [
-    GN_2_LINK_DIR_BADTYPE,
+    GN_6_ACCESS_SPECIAL,
     GN_3_CREATE,
-    GN_4_RENAME,
     GN_5_ATTR_FIELDS,
 ])
