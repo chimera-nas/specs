@@ -366,3 +366,37 @@ jobs:
               fi
               exit $rc
             '
+
+  # A single check for the ruleset to require.
+  #
+  # samba, ganesha and knfsd all hang off `build`, so requiring `build` alone
+  # goes green as soon as the corpus compiles -- while the three conformance
+  # replays that actually exercise it are still running.  A pull request could
+  # therefore be merged before its own pipeline had finished, which is what this
+  # exists to stop.
+  #
+  # Requiring each job by name instead would work until someone adds a fifth,
+  # which would then be unguarded until the ruleset was remembered.  One
+  # aggregate context that lists its dependencies here keeps that in the file
+  # people edit rather than in a setting they do not see.
+  ci-complete:
+    name: CI complete
+    needs: [build, samba, ganesha, knfsd]
+    if: always()
+    runs-on: ubuntu-latest
+    # It reads `needs` and nothing else -- no checkout, no API call -- so the
+    # token it runs with needs no permissions at all.
+    permissions: {}
+    steps:
+      - name: Verify every job succeeded
+        run: |
+          # Compare results rather than using success(): a job that was skipped
+          # never ran, and must not satisfy this for the wrong reason.
+          results='${{ join(needs.*.result, ' ') }}'
+          echo "dependency results: ${results}"
+          for r in ${results}; do
+            if [ "$r" != "success" ]; then
+              echo "a required job did not succeed"
+              exit 1
+            fi
+          done
