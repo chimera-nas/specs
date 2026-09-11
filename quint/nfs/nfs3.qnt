@@ -529,35 +529,14 @@ module nfs3 {
             // existence or type must not leak -- NFS3ERR_ACCES, taking
             // precedence over any EXIST/ISDIR outcome.
             //
-            // DEVIATION create-search-perm-1771.  chimera's mkfs backends
-            // (memfs/diskfs/cairn) omit the search check on the EXISTING-entry
-            // path and leak the type-based reply instead: EISDIR over a
-            // directory, EXIST over another non-regular object, or OK (with
-            // the existing regular file's handle) for an UNCHECKED create.
-            // The fresh-entry path still refuses, which is why this branch is
-            // conditioned on hasEnt.
-            //
-            // The accept set carries the RFC-correct ACCES because ONE corpus
-            // is replayed against every backend, and the passthrough backends
-            // (linux/io_uring) resolve the name through the host kernel, which
-            // enforces the search bit and answers ACCES.  It is not a
-            // tolerance -- the standard pins one answer here -- it is the
-            // price of a single cell serving backends that differ on this bug,
-            // and it retires with #1771 exactly as the branch does.
             fs' = fs,
             removed' = removed,
             nextFid' = nextFid,
-            devHits' =
-                if (dev("create-search-perm-1771") and hasEnt(d, n))
-                    Set("create-search-perm-1771")
-                else Set(),
+            devHits' = Set(),
             lastOp' =
-                if (dev("create-search-perm-1771") and hasEnt(d, n))
-                    createOnExisting(d, n, cm, m, c, Set(ERR_ACCES))
-                else
-                    OCreate({ dir: d, name: n, cmode: cm, mode: m, verf: -1,
-                              status: ERR_ACCES, obj: -1, cred: c,
-                              statusAccept: Set() }),
+                OCreate({ dir: d, name: n, cmode: cm, mode: m, verf: -1,
+                          status: ERR_ACCES, obj: -1, cred: c,
+                          statusAccept: Set() }),
         } else if (not(hasEnt(d, n)) and not(canWrite(fs.get(d), c))) all {
             // Creating a fresh entry additionally needs write on the parent
             // (XBD 4.6).  A new file is owned by its creator's credential.

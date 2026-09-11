@@ -3,9 +3,6 @@
   "description": "NFS-Ganesha 4.x (the build in this repo's devcontainer) exporting a loop-mounted ext4 image through FSAL_VFS, spoken to at NFSv3. The batch list is chimera's nfs3_ref list unchanged -- the corpus is protocol-level and backend-agnostic, so what distinguishes this cell from chimera's is only which divergences the model is told to predict.",
   "traceStem": "ganesha3",
 
-  // ganesha resolves every name through the host kernel, so the search-
-  // permission bug that chimera's in-engine backends carry
-  // (create-search-perm-1771) is NOT enabled here.
   "deviations": [
     "G3-link-dir-badtype"
   ],
