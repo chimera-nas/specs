@@ -284,15 +284,10 @@ module posixops {
             val last = rest1.length() == 0
             if (cnode.ftype != FDir)
                 w.with("done", true).with("out", rFail(ENOTDIR))
-            // PD25, half one: the VFS validates a component's length before
-            // it checks MAY_EXEC on the directory that holds it, so an
-            // over-long name in an unsearchable directory answers
-            // ENAMETOOLONG where left-to-right resolution (XBD 4.13) owes
-            // EACCES.  Only the two tests disagreeing is a divergence.
-            else if (dev(caps, "PD25") and c == NLONG and
-                     not(mayExec(cr, cnode)))
-                w.with("done", true)
-                 .with("out", rFail(ENAMETOOLONG).with("hits", Set("PD25")))
+            // XBD 4.13: search permission on a directory is what lets the
+            // NEXT component be examined at all, so an unsearchable directory
+            // answers EACCES ahead of anything the component itself is wrong
+            // about -- its length included.
             else if (not(mayExec(cr, cnode)))
                 w.with("done", true).with("out", rFail(EACCES))
             else if (c == NLONG)
@@ -379,18 +374,6 @@ module posixops {
             else out.with("hits", out.hits.union(slashHits))
         }
     }
-
-    // PD25, half two: on the ATTRIBUTE paths -- stat, chmod, chown, truncate
-    // -- the length check runs ahead of the WHOLE walk, not just ahead of the
-    // holding directory's MAY_EXEC, so an over-long final component answers
-    // ENAMETOOLONG even when the denial is higher in the prefix.  The
-    // NAMESPACE paths (mkdir, mknod, symlink, unlink, rmdir) stop at the
-    // higher denial -- measured on this corpus, /c/b/b/@nlong with /c/b
-    // unsearchable answers ENAMETOOLONG to stat and EACCES to rmdir, while
-    // /a/@nlong with /a unsearchable answers ENAMETOOLONG to both.
-    pure def pd25Hits(caps: Caps, r: RRes, pth: Path): bool =
-        dev(caps, "PD25") and r.err == EACCES and
-        pth.comps.foldl(false, (a, c) => a or c == NLONG)
 
     // Resolution for pure lookups: a missing final component is ENOENT.
     pure def resolveEx(fs: Fs, caps: Caps, cr: Cred, start: Ino, pth: Path,
@@ -801,20 +784,10 @@ module posixops {
                     else out(fs, psSetOffset(ps, p, fd, nd.size + off),
                              SOff({ e: OK, off: nd.size + off }))
                 | WData =>
-                    // SD-SEEK: with no sparse seek the answer is EINVAL, but
-                    // over the SMB loopback the generic fallback rejects a
-                    // NEGATIVE offset first and answers ENXIO.
-                    // PD22: where sparse seek IS present, chimera validates
-                    // the offset before dispatch and reports EINVAL for an
-                    // out-of-range one where Linux reports ENXIO.
-                    if (not(caps.seekHole) and dev(caps, "SD-SEEK") and off < 0)
-                        hit(out(fs, ps, SOff({ e: ENXIO, off: -1 })),
-                            Set("SD-SEEK"))
-                    else if (not(caps.seekHole))
+                    // [EINVAL] for a whence the implementation does not
+                    // support outranks [ENXIO] for an out-of-range offset.
+                    if (not(caps.seekHole))
                         out(fs, ps, SOff({ e: EINVAL, off: -1 }))
-                    else if ((off < 0 or off >= nd.size) and dev(caps, "PD22"))
-                        hit(out(fs, ps, SOff({ e: EINVAL, off: -1 })),
-                            Set("PD22"))
                     else if (off < 0 or off >= nd.size)
                         out(fs, ps, SOff({ e: ENXIO, off: -1 }))
                     else {
@@ -825,14 +798,8 @@ module posixops {
                                  SOff({ e: OK, off: s.off2 }))
                     }
                 | WHole =>
-                    if (not(caps.seekHole) and dev(caps, "SD-SEEK") and off < 0)
-                        hit(out(fs, ps, SOff({ e: ENXIO, off: -1 })),
-                            Set("SD-SEEK"))
-                    else if (not(caps.seekHole))
+                    if (not(caps.seekHole))
                         out(fs, ps, SOff({ e: EINVAL, off: -1 }))
-                    else if ((off < 0 or off >= nd.size) and dev(caps, "PD22"))
-                        hit(out(fs, ps, SOff({ e: EINVAL, off: -1 })),
-                            Set("PD22"))
                     else if (off < 0 or off >= nd.size)
                         out(fs, ps, SOff({ e: ENXIO, off: -1 }))
                     else {
@@ -986,9 +953,7 @@ module posixops {
                         len: int): Out = {
         val cr = psCred(ps, p)
         val r = resolveEx(fs, caps, cr, ROOT, pth, true)
-        if (pd25Hits(caps, r, pth))
-            hit(outErr(fs, ps, ENAMETOOLONG), Set("PD25"))
-        else if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
+        if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
         else {
             val nd = fs.inodes.get(r.ino)
             if (nd.ftype == FDir) outErr(fs, ps, EISDIR)
@@ -1042,16 +1007,10 @@ module posixops {
     pure def opStat(fs: Fs, ps: Pstate, caps: Caps, p: Pid, dfd: Fd,
                     pth: Path, follow: bool): Out = {
         val at = atStart(fs, ps, p, dfd, pth)
-        // PD3: fstatat accepts only AT_FDCWD; a real directory descriptor is
-        // refused before anything else is looked at.
-        if (dev(caps, "PD3") and dfd != -1)
-            hit(out(fs, ps, statFail(ENOSYS)), Set("PD3"))
-        else if (at.e != OK) out(fs, ps, statFail(at.e))
+        if (at.e != OK) out(fs, ps, statFail(at.e))
         else {
             val r = resolveEx(fs, caps, psCred(ps, p), at.start, pth, follow)
-            if (pd25Hits(caps, r, pth))
-                hit(out(fs, ps, statFail(ENAMETOOLONG)), Set("PD25"))
-            else if (r.err != OK) hit(out(fs, ps, statFail(r.err)), r.hits)
+            if (r.err != OK) hit(out(fs, ps, statFail(r.err)), r.hits)
             else out(fs, ps, statRes(fs.inodes.get(r.ino), r.ino))
         }
     }
@@ -1104,9 +1063,7 @@ module posixops {
         if (at.e != OK) outErr(fs, ps, at.e)
         else {
             val r = resolveEx(fs, caps, psCred(ps, p), at.start, pth, true)
-            if (pd25Hits(caps, r, pth))
-                hit(outErr(fs, ps, ENAMETOOLONG), Set("PD25"))
-            else if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
+            if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
             else chmodCommon(fs, ps, p, r.ino, m)
         }
     }
@@ -1161,9 +1118,7 @@ module posixops {
         if (at.e != OK) outErr(fs, ps, at.e)
         else {
             val r = resolveEx(fs, caps, psCred(ps, p), at.start, pth, follow)
-            if (pd25Hits(caps, r, pth))
-                hit(outErr(fs, ps, ENAMETOOLONG), Set("PD25"))
-            else if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
+            if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
             else chownCommon(fs, ps, caps, p, r.ino, u, g)
         }
     }
@@ -1237,10 +1192,7 @@ module posixops {
                  else { euid: cr0.ruid, egid: cr0.rgid, ruid: cr0.ruid,
                         rgid: cr0.rgid, groups: cr0.groups }
         val at = atStart(fs, ps, p, dfd, pth)
-        // PD3: faccessat accepts only AT_FDCWD, exactly as fstatat does.
-        if (dev(caps, "PD3") and dfd != -1)
-            hit(outErr(fs, ps, ENOSYS), Set("PD3"))
-        else if (at.e != OK) outErr(fs, ps, at.e)
+        if (at.e != OK) outErr(fs, ps, at.e)
         else {
             val r = resolveEx(fs, caps, cr, at.start, pth, true)
             if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
@@ -1351,28 +1303,20 @@ module posixops {
             val fo = followOld and not(dev(caps, "PD6"))
             val ro = resolveEx(fs, caps, cr, atO.start, pthOld, fo)
             val pd6 = if (followOld and dev(caps, "PD6")) Set("PD6") else Set()
-            // chimera judges the LINK TARGET before it has resolved the source
-            // or judged its type, so the target's answer wins on a call that is
-            // invalid both ways.  PD17f names the missing-source case, PD17e
-            // the directory-source case with an existing target, PD17c the
-            // directory-source case in an unwritable target parent.  POSIX
-            // orders none of them; the model states the source error.
-            val gEarly = if (dev(caps, "PD17c") or dev(caps, "PD17e") or
-                             dev(caps, "PD17f"))
-                             createGate(fs, ps, caps, p, dfdNew, pthNew, false)
-                         else { e: OK, par: -1, leaf: "", hits: Set() }
-            if (ro.err == ENOENT and dev(caps, "PD17f") and gEarly.e == EEXIST)
-                hit(outErr(fs, ps, EEXIST), pd6.union(Set("PD17f")))
-            else if (ro.err != OK) hit(outErr(fs, ps, ro.err),
-                                       ro.hits.union(pd6))
-            else if (fs.inodes.get(ro.ino).ftype == FDir and
-                     dev(caps, "PD17e") and gEarly.e == EEXIST)
-                hit(outErr(fs, ps, EEXIST), pd6.union(Set("PD17e")))
-            else if (fs.inodes.get(ro.ino).ftype == FDir and
-                     dev(caps, "PD17c") and gEarly.e == EACCES)
-                hit(outErr(fs, ps, EACCES), pd6.union(Set("PD17c")))
+            // A link() call that is invalid at BOTH ends -- an unusable source
+            // and a target that cannot be created -- has two conforming
+            // answers, and POSIX orders none of its [EPERM]/[ENOENT] source
+            // conditions against the target's [EEXIST]/[EACCES]/[ENOTDIR].
+            // An implementation that judges the target first (chimera does) is
+            // as correct as one that judges the source, so the model states
+            // the source error and ACCEPTS the target's unconditionally,
+            // rather than carrying a knob per ordering (was PD17c/PD17e/PD17f).
+            val gEarly = createGate(fs, ps, caps, p, dfdNew, pthNew, false)
+            val gAcc = if (gEarly.e == OK) Set() else Set(gEarly.e)
+            if (ro.err != OK)
+                hit(outErrA(fs, ps, ro.err, gAcc), ro.hits.union(pd6))
             else if (fs.inodes.get(ro.ino).ftype == FDir)
-                hit(outErr(fs, ps, EPERM), pd6)
+                hit(outErrA(fs, ps, EPERM, gAcc), pd6)
             else {
                 val g = createGate(fs, ps, caps, p, dfdNew, pthNew, false)
                 if (g.e != OK) hit(outErr(fs, ps, g.e), g.hits.union(pd6))

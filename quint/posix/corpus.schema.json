@@ -26,8 +26,6 @@
 
         "PD2b": "POSIX.1-2024 fcntl() F_SETFL (System Interfaces). F_SETFL fails EINVAL (same root cause as PD2); it also leaves the description's O_APPEND flag unchanged, which the model now mirrors so a later append-dependent write stays in sync. Root cause: src/posix/posix_fcntl.c. Candidate fix: see PD2.",
 
-        "PD3": "POSIX.1-2024 fstatat()/faccessat() dirfd argument (System Interfaces). fstatat and faccessat only accept AT_FDCWD; a real directory descriptor fails ENOSYS. Root cause: src/posix/posix_fstatat.c, posix_faccessat.c ('For now, only support AT_FDCWD'). Candidate fix: resolve through the descriptor's open handle as openat/mkdirat/unlinkat already do.",
-
         "PD4": "POSIX.1-2024 write() with O_APPEND: 'the file offset shall be set to the end of the file prior to each write'. O_APPEND is recorded at open but never honored: write() writes at the current offset instead of seeking to EOF. Root cause: src/posix/posix_write.c (no O_APPEND path; fd_entry offset used unconditionally). Candidate fix: resolve offset to EOF under O_APPEND atomically with the write (VFS write with append semantics).",
 
         "PD5": "POSIX.1-2024 dup()/dup2(): 'shall refer to the same open file description' (shared file offset and status flags). Duplicated descriptors get their own offset: dup() allocates a fresh fd_entry with offset 0 and dup2() resets the target's offset to 0; the two descriptors then seek/read/write independently. Root cause: src/posix/posix_dup.c (chimera_posix_fd_alloc zeroes offset), posix_dup2.c (new_entry->offset = 0); offset lives per fd_entry, not per open file description. Candidate fix: introduce a shared description object (offset + status flags) referenced by fd entries.",
@@ -57,25 +55,10 @@
         "PD17a": "POSIX.1-2024 unlink() EISDIR/EPERM vs EACCES priority (unspecified). unlink(directory) in a parent without write permission reports EACCES; the model reports the type error first. Root cause: chimera checks parent write access before victim type. Candidate fix: none required (priority unspecified); listed so the divergence stays visible.",
 
 
-        "PD17c": "POSIX.1-2024 link() EPERM (directory source) vs EACCES priority. link with a directory source in an unwritable target parent reports EACCES; the model reports EPERM (POSIX requires EPERM for directory sources specifically). Root cause: target-parent access checked before source type. Candidate fix: check the directory-source case first.",
-
-
-        "PD17e": "POSIX.1-2024 link(): EPERM (directory source) vs EEXIST (existing target) priority. link with a directory source and an existing target reports EEXIST; the model reports the source error. Root cause: target existence checked before source resolution. Candidate fix: none required; listed for visibility.",
-
-        "PD17f": "POSIX.1-2024 link(): ENOENT (missing source) vs EEXIST (existing target) priority. link with a missing source and an existing target reports EEXIST; the model reports the source error. Root cause: target existence checked before source resolution. Candidate fix: none required; listed for visibility.",
-
-
 
         "PD18": "POSIX.1-2024 access()/faccessat(): checks use the process's real (or with AT_EACCESS, effective) credentials. faccessat evaluates permissions against the HOST process uid/gid (getuid()/getgid()) instead of the chimera credential, ignores supplementary groups and AT_EACCESS; running as root it grants nearly everything. Root cause: src/posix/posix_faccessat.c callback uses getuid()/getgid() over a stat result. Candidate fix: evaluate against chimera_posix_effective_cred (or issue a VFS ACCESS op with the request credential).",
 
         "PD20": "POSIX.1-2024 open(): the access-mode permission check applies to existing files whether or not O_CREAT is given. open(existing, O_CREAT|O_WRONLY) succeeds on a file the caller has no write permission for; the same open without O_CREAT correctly fails EACCES. Root cause: the client/VFS create-path open skips the access-mode check when the file turns out to already exist. Candidate fix: apply the access check on the open-existing arm of the create path.",
-
-        "PD22": "POSIX.1-2024 lseek() SEEK_DATA/SEEK_HOLE: ENXIO for offsets at or past EOF (and for negative offsets). chimera returns EINVAL where the model (and Linux) return ENXIO for out-of-range SEEK_DATA/SEEK_HOLE offsets. Root cause: src/posix/posix_lseek.c validates the offset before dispatch and reports EINVAL. Candidate fix: return ENXIO for out-of-range data/hole seeks.",
-
-        "PD25": "POSIX.1-2024 XBD 4.13 Pathname Resolution -- search permission on each prefix directory is required to examine the next component, so an over-long component behind an unsearchable directory owes EACCES and not ENAMETOOLONG. Verified against Linux: EACCES when the prefix is unsearchable, ENAMETOOLONG only when it is searchable. Found by the ENAMETOOLONG generator (genTooLong). chimera gets it wrong in two places, and the model states both: the VFS validates a component's length before it checks MAY_EXEC on the directory that HOLDS it (every op), and the attribute paths -- stat, chmod, chown, truncate -- validate ahead of the whole walk, so they answer ENAMETOOLONG even when the denial is higher in the prefix. Measured on this corpus: /c/b/b/@nlong with /c/b unsearchable answers ENAMETOOLONG to stat and EACCES to rmdir, while /a/@nlong with /a unsearchable answers ENAMETOOLONG to both. Root cause: the VFS NAME_MAX check runs before the holding directory's MAY_EXEC search-permission check, and the attribute paths validate the path string up front. Candidate fix: check search permission on each prefix component before validating the next component's length.",
-
-
-        "SD-SEEK": "POSIX.1-2024 lseek() SEEK_DATA/SEEK_HOLE [EINVAL] for a whence the implementation does not support, vs [ENXIO] for an out-of-range offset. Over the SMB loopback a NEGATIVE offset draws ENXIO where the no-sparse-seek profile's EINVAL is owed: the SMB proxy has no seek operation and the VFS generic fallback rejects the offset before the unsupported-whence answer is formed. A real CIFS mount has no sparse map here either. Root cause: offset validation precedes the capability answer in the generic seek fallback. Candidate fix: report the unsupported whence before validating the offset.",
 
         "SD-SPECIAL": "POSIX.1-2024 open() of a FIFO or device special file: ENXIO with no reader / no backing device. Over the SMB loopback the server opens the NFS-reparse specfile node and reports EINVAL for the unsupported data open. Neither answer is what a Windows client would give (SMB has no POSIX device semantics); the divergence is a property of the specfile-over-reparse mapping. Root cause: src/vfs/smb maps a specfile to a reparse point whose data open is refused EINVAL. Candidate fix: translate the reparse-point refusal to ENXIO for FIFO/device nodes."
       }
