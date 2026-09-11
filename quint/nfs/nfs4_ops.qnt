@@ -2230,17 +2230,29 @@ module nfs4ops {
             // zero on the success side -- so the ids it reports are folded
             // onto whatever Acc the arms below produce, once, at the end.
             val outAcc = if (res.st != OK) {
-                // A symlink handed in as the parent is the Table 7 latitude
-                // every other directory-requiring op has (DIR_SYM_ACCEPT);
-                // OPEN carries it here because openResolve's record has no
-                // acceptance field of its own.
+                // Two latitudes ride on this reply, because openResolve's
+                // record has no acceptance field of its own to carry them.
+                //
+                // A symlink handed in as the PARENT is the Table 7 latitude
+                // every other directory-requiring op has (DIR_SYM_ACCEPT).
+                //
+                // A special-file TARGET is the WRONG_TYPE latitude: RFC 8881
+                // 15.1.2.9 makes NFS4ERR_WRONG_TYPE a SHOULD and the more
+                // specific successor of the 4.0-era answer, which for OPEN is
+                // SYMLINK -- openResolve picks between them on the minor
+                // version four lines above.  The model predicts the specific
+                // one and accepts the older one, exactly as the LOOKUP and
+                // data-path sites do; this was the site that decision missed,
+                // and NFS-Ganesha answers SYMLINK at 4.2.
+                val typeAcc =
+                    if (res.st == E_SYMLINK and cfhLive(a) and
+                        cfhNode(a).ftype == FLnk) DIR_SYM_ACCEPT
+                    else if (res.st == E_WRONG_TYPE)
+                        wrongTypeAccept(E_WRONG_TYPE, E_SYMLINK)
+                    else Set()
                 val a1 = emit(a, SOpen(nores.with("st", res.st)
                                             .with("stAccept",
-                                                  if (res.st == E_SYMLINK and
-                                                      cfhLive(a) and
-                                                      cfhNode(a).ftype == FLnk)
-                                                      stAcc.union(DIR_SYM_ACCEPT)
-                                                  else stAcc)))
+                                                  stAcc.union(typeAcc))))
                 if (a.minor == 0)
                     a1.with("sdb", ooSettle(a1.sdb, ar.client, ar.owner,
                                             ar.oseq, res.st, false))
