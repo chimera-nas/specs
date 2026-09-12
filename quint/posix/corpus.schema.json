@@ -52,8 +52,6 @@
 
         "PD15c": "POSIX.1-2024 XBD 4.16 vs mkdir(): a trailing slash on a DANGLING symlink. mkdir('dangling/') -- the model follows the link and creates the target directory (strict XBD 4.16); chimera (like Linux) reports the existing symlink name, and the model now mirrors that so the created directory does not desync the trace. Root cause: the client judges the slash-stripped name; creating through the link would need readlink+re-resolution. Candidate fix: acceptance (Linux agrees with chimera here). Shares PD15b's branch: both are the slash failing to force a final symlink to be followed.",
 
-        "PD17a": "POSIX.1-2024 unlink() EISDIR/EPERM vs EACCES priority (unspecified). unlink(directory) in a parent without write permission reports EACCES; the model reports the type error first. Root cause: chimera checks parent write access before victim type. Candidate fix: none required (priority unspecified); listed so the divergence stays visible.",
-
 
 
         "PD18": "POSIX.1-2024 access()/faccessat(): checks use the process's real (or with AT_EACCESS, effective) credentials. faccessat evaluates permissions against the HOST process uid/gid (getuid()/getgid()) instead of the chimera credential, ignores supplementary groups and AT_EACCESS; running as root it grants nearly everything. Root cause: src/posix/posix_faccessat.c callback uses getuid()/getgid() over a stat result. Candidate fix: evaluate against chimera_posix_effective_cred (or issue a VFS ACCESS op with the request credential).",

@@ -494,8 +494,9 @@ module posix {
 
     action genOpenFile = all {
         entryPairsOf(fs, FReg).union(entryPairsOf(fs, FLnk)).size() > 0,
+        fdRoomProcs(ps, PROCS).size() > 0,
         {
-            nondet p = oneOf(PROCS)
+            nondet p = oneOf(fdRoomProcs(ps, PROCS))
             nondet pr = oneOf(entryPairsOf(fs, FReg)
                                   .union(entryPairsOf(fs, FLnk)))
             nondet acc = oneOf(Set(AccR, AccW, AccRW))
@@ -514,8 +515,9 @@ module posix {
 
     action genOpenCreat = all {
         roomFor(fs),
+        fdRoomProcs(ps, PROCS).size() > 0,
         {
-            nondet p = oneOf(PROCS)
+            nondet p = oneOf(fdRoomProcs(ps, PROCS))
             nondet d = oneOf(reachableDirs(fs))
             nondet n = oneOf(NAMES)
             nondet m = oneOf(MODES)
@@ -530,14 +532,18 @@ module posix {
     }
 
     // Open a directory read-only (usable as a dirfd for *at calls).
-    action genOpenDir = {
-        nondet p = oneOf(PROCS)
-        nondet d = oneOf(reachableDirs(fs))
-        nondet od = oneOf(Set(true, false))
-        runOp(p, ROpen({ dfd: -1, pth: dirPath(fs, d),
-                         fl: { acc: AccR, creat: false, excl: false,
-                               trunc: false, appendF: false,
-                               directory: od, nofollow: false, mode: 0 } }))
+    action genOpenDir = all {
+        fdRoomProcs(ps, PROCS).size() > 0,
+        {
+            nondet p = oneOf(fdRoomProcs(ps, PROCS))
+            nondet d = oneOf(reachableDirs(fs))
+            nondet od = oneOf(Set(true, false))
+            runOp(p, ROpen({ dfd: -1, pth: dirPath(fs, d),
+                             fl: { acc: AccR, creat: false, excl: false,
+                                   trunc: false, appendF: false,
+                                   directory: od, nofollow: false,
+                                   mode: 0 } }))
+        }
     }
 
     // A path-taking call routed through a directory descriptor.
@@ -576,7 +582,9 @@ module posix {
             nondet k = oneOf(pfds(ps))
             nondet two = oneOf(Set(true, false))
             nondet nfd = oneOf(Set(0, 1, 2, 3))
-            if (two) runOp(k._1, RDup2({ fd: k._2, nfd: nfd }))
+            // dup2 names its own target, so it needs no free slot; dup does.
+            if (two or fdLowest(ps, k._1, 0, MAX_FDS) < 0)
+                runOp(k._1, RDup2({ fd: k._2, nfd: nfd }))
             else runOp(k._1, RDup({ fd: k._2 }))
         }
     }
@@ -738,10 +746,11 @@ module posix {
             nondet which = oneOf(Set(0, 1, 2))
             nondet ap = oneOf(Set(true, false))
             nondet base = oneOf(Set(0, 2, 5))
-            if (which == 0) runOp(k._1, RFcntlGetfl({ fd: k._2 }))
-            else if (which == 1)
+            if (which == 1)
                 runOp(k._1, RFcntlSetfl({ fd: k._2, appendF: ap }))
-            else runOp(k._1, RFcntlDupfd({ fd: k._2, atLeast: base }))
+            else if (which == 2 and fdLowest(ps, k._1, base, MAX_FDS) >= 0)
+                runOp(k._1, RFcntlDupfd({ fd: k._2, atLeast: base }))
+            else runOp(k._1, RFcntlGetfl({ fd: k._2 }))
         }
     }
 
@@ -1060,9 +1069,7 @@ module posix {
     // holes back.  Concentrated so the allocate path is not starved by the
     // broad data mix (pjd covers this via posix_fallocate; the coverage diff
     // flagged it as entirely unmodeled).  genClose recycles descriptors so the
-    // process never piles up to MAX_FDS: a spurious EMFILE (PD24) on an
-    // O_TRUNC open would otherwise skip a truncation the live 1024-slot table
-    // still performs, an irreconcilable state divergence.
+    // mix keeps reaching the open arms rather than stalling on a full table.
     action stepFallocate = any {
         genOpenCreat, genOpenFile, genClose, genWrite, genFallocate,
         genTruncate, genRead, genFstat

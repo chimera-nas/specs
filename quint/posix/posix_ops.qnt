@@ -386,9 +386,19 @@ module posixops {
     // Requests and results
     // ------------------------------------------------------------------
 
-    // Descriptor-table capacity (bounds lowest-fd searches; universes keep
-    // well below it, so EMFILE is never exercised).
+    // Descriptor-table capacity (bounds lowest-fd searches).
     pure val MAX_FDS = 16
+
+    // The processes that still have a free descriptor slot.  Every generator
+    // that mints a descriptor draws its process from here, so a trace never
+    // asks for one the table cannot supply.  EMFILE is a property of MAX_FDS,
+    // not of the implementation under test: a real fd table is far wider, so
+    // the implementation hands back a descriptor the model never learned of,
+    // and the harness has to close it again -- which under POSIX drops every
+    // byte-range lock the process held on that file, silently deleting state
+    // the model still believes in.  Cheaper to never ask.
+    pure def fdRoomProcs(ps: Pstate, procs: Set[Pid]): Set[Pid] =
+        procs.filter(p => fdLowest(ps, p, 0, MAX_FDS) >= 0)
 
     // Whole-file lock ranges (l_len = 0) cover [0, LOCK_SPAN) of the
     // abstract byte universe; the harness maps that span to an unbounded
@@ -1099,11 +1109,18 @@ module posixops {
             // set*id bits untouched.
             out(fsChown(fs, i, -1, -1, false), ps, sOk(OK))
         else {
+            // A field set to the value it already holds is not a change, so
+            // it needs no privilege -- Linux's setattr_prepare tests
+            // !uid_eq(inode->uid, ia_uid) and !gid_eq(inode->gid, ia_gid), so
+            // a restate carries no requirement at all.  That was already true
+            // of the uid arm here; the gid arm demanded membership even of a
+            // caller naming the group the object already has, which is a
+            // permission POSIX never asks for.
             val allowed =
                 isPriv(cr) or
                 (cr.euid == nd.uid and
                  (u == -1 or u == nd.uid) and
-                 (g == -1 or
+                 (g == -1 or g == nd.gid or
                   (if (caps.chownSuppGroup) inGroup(cr, g)
                    else cr.egid == g)))
             if (not(allowed)) outErr(fs, ps, EPERM)
@@ -1345,20 +1362,22 @@ module posixops {
             else {
                 val dnode = fs.inodes.get(r.par)
                 val vnode = fs.inodes.get(r.ino)
-                // PD17a: chimera's delete gate judges the PARENT -- write
-                // permission and the sticky rule both -- before the victim is
-                // examined, so unlink(directory) in a parent that denies the
-                // removal answers that denial where the model names the type
-                // error.  POSIX orders neither; the model states the type
-                // error, which is what every other stack reports.
-                if (dev(caps, "PD17a") and vnode.ftype == FDir and
-                        not(mayWrite(cr, dnode)))
-                    hit(outErr(fs, ps, EACCES), Set("PD17a"))
-                else if (dev(caps, "PD17a") and vnode.ftype == FDir and
-                         not(stickyOk(caps, cr, dnode, vnode)))
-                    hit(outErrA(fs, ps, errSticky(caps), stickyAccept(caps)),
-                        Set("PD17a"))
-                else if (vnode.ftype == FDir) outErr(fs, ps, errUnlinkDir(caps))
+                // Which error wins when BOTH the victim and the parent would
+                // refuse -- a DIRECTORY victim in a parent that denies the
+                // removal -- is left unspecified by POSIX, exactly as it is
+                // for rmdir below.  An implementation whose delete gate judges
+                // the parent first answers EACCES (or the sticky error); the
+                // model names the victim's type error and accepts the
+                // parent's.  UNCONDITIONAL: this was PD17a, a knob for a
+                // priority no standard states, and the FUSE kernel stand-in
+                // is one of the implementations that judges the parent first.
+                val delGate =
+                    (if (not(mayWrite(cr, dnode))) Set(EACCES) else Set())
+                    .union(if (not(stickyOk(caps, cr, dnode, vnode)))
+                               stickyAccept(caps).union(Set(errSticky(caps)))
+                           else Set())
+                if (vnode.ftype == FDir)
+                    outErrA(fs, ps, errUnlinkDir(caps), delGate)
                 else if (not(mayWrite(cr, dnode))) outErr(fs, ps, EACCES)
                 else if (not(stickyOk(caps, cr, dnode, vnode)))
                     outErrA(fs, ps, errSticky(caps), stickyAccept(caps))
