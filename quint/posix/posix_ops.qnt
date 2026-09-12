@@ -386,9 +386,19 @@ module posixops {
     // Requests and results
     // ------------------------------------------------------------------
 
-    // Descriptor-table capacity (bounds lowest-fd searches; universes keep
-    // well below it, so EMFILE is never exercised).
+    // Descriptor-table capacity (bounds lowest-fd searches).
     pure val MAX_FDS = 16
+
+    // The processes that still have a free descriptor slot.  Every generator
+    // that mints a descriptor draws its process from here, so a trace never
+    // asks for one the table cannot supply.  EMFILE is a property of MAX_FDS,
+    // not of the implementation under test: a real fd table is far wider, so
+    // the implementation hands back a descriptor the model never learned of,
+    // and the harness has to close it again -- which under POSIX drops every
+    // byte-range lock the process held on that file, silently deleting state
+    // the model still believes in.  Cheaper to never ask.
+    pure def fdRoomProcs(ps: Pstate, procs: Set[Pid]): Set[Pid] =
+        procs.filter(p => fdLowest(ps, p, 0, MAX_FDS) >= 0)
 
     // Whole-file lock ranges (l_len = 0) cover [0, LOCK_SPAN) of the
     // abstract byte universe; the harness maps that span to an unbounded
