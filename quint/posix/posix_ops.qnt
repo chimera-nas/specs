@@ -1464,6 +1464,19 @@ module posixops {
                              not(stickyOk(caps, cr, tdnode,
                                           fs.inodes.get(rt.ino))))
                         outErrA(fs, ps, errSticky(caps), stickyAccept(caps))
+                    // Moving a DIRECTORY to a different parent rewrites its
+                    // ".." entry, so it needs write permission on the
+                    // directory being moved -- not merely on the two parents.
+                    // rename() names it: "write permission is required and is
+                    // denied for a directory pointed to by the old or new
+                    // arguments".  Only across parents; a rename within one
+                    // parent leaves ".." alone and asks nothing of the
+                    // subject.  (Verified against ext4: a 0000 directory
+                    // moved out of its parent by its own owner is EACCES, the
+                    // same move at 0700 succeeds.)
+                    else if (srcNode.ftype == FDir and rs.par != rt.par and
+                             not(mayWrite(cr, srcNode)))
+                        outErr(fs, ps, EACCES)
                     else {
                         val rn = fsRename(fs, rs.par, rs.leaf, rt.par,
                                           rt.leaf, psPinned(ps))
