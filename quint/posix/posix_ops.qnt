@@ -1920,14 +1920,21 @@ module posixops {
                 out(fs, ps, rwErr(EINVAL))
             else if (offIn < 0 or offOut < 0)
                 out(fs, ps, rwErr(EINVAL))
-            else if (oi.ino == oo.ino and offIn < offOut + len and
-                     offOut < offIn + len)
-                // Overlapping ranges within one file.
-                out(fs, ps, rwErr(EINVAL))
             else {
+                // generic_copy_file_checks() shortens the copy to the source's
+                // EOF BEFORE it judges overlap, and the overlap test is
+                // written against the shortened count -- so a request whose
+                // source offset is already at or past EOF copies zero bytes
+                // and cannot overlap anything.  Testing the REQUESTED length
+                // instead called that EINVAL, twice in one run against ext4,
+                // where the answer is a 0-byte success.
                 val srcSz = fs.inodes.get(oi.ino).size
                 val n = imax(0, imin(len, srcSz - offIn))
-                if (n == 0)
+                if (oi.ino == oo.ino and offIn < offOut + n and
+                        offOut < offIn + n)
+                    // Overlapping ranges within one file.
+                    out(fs, ps, rwErr(EINVAL))
+                else if (n == 0)
                     out(fs, ps, rwOk(0, oo.ino, offOut))
                 else {
                     val fs1 = fsCopyRange(fs, oi.ino, offIn, oo.ino,
