@@ -29,7 +29,8 @@
     // strength of an "expected 11, got 13" that was a permission failure
     // rather than a lock conflict; the next run answered "expected 13, got 11"
     // on both lockf and fcntl, which is the conflict case saying EAGAIN.
-    "lockEagain": "supported"
+    "lockEagain": "supported",
+    "dirSeekDomain": "supported"
   },
 
   // NONE, and the two attempts to enable some are worth recording because the

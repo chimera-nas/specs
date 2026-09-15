@@ -195,6 +195,16 @@
       "default": "explore",
       "doc": "EISDIR (else EPERM)"
     },
+    "P_DIR_SEEK_DOMAIN": {
+      "kind": "policy",
+      "key": "policies.dirSeekDomain",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "unsupported",
+      "doc": "directory fds seek over a cookie domain, not their size",
+      "citation": "POSIX.1-2024 XSH lseek: the file offset lseek() sets on a directory is unspecified -- the clause constrains it only for regular files, where SEEK_DATA/SEEK_HOLE are defined against the file size.  Linux ext4 reads the silence as licence: ext4_dir_llseek() (fs/ext4/dir.c) passes htree_max = 0x7fffffffffffffff to generic_file_llseek_size() as both the eof and the maxsize of a hashed directory, since a htree offset is a hash value rather than a byte position.  SEEK_DATA then reports every offset below 2^63-1 as data, SEEK_HOLE reports the hole at 2^63-1, SEEK_END counts from it, and an offset past it is EINVAL by way of vfs_setpos().  A directory whose offsets are byte positions -- the second road, taken by implementations that store a directory as a plain extent -- answers all four against its size instead.  Both conform; the clause distinguishes neither, so this is a policy rather than a deviation, and the strict twin keeps it.  Defaults to unsupported so that a cell says the ext4 shape out loud rather than inheriting it.",
+      "note": "ext4 applies the cookie domain only to a hashed directory (is_dx_dir(): dir_index on the superblock, plus either EXT4_INODE_INDEX or a single-block directory).  Every directory the corpus builds is a single block, so the distinction does not arise here; a corpus that grew one past a block on a dir_index-less filesystem would need the byte-extent answer for it."
+    },
     "P_ERR_LOCK_AGAIN": {
       "kind": "policy",
       "key": "policies.lockEagain",

@@ -101,6 +101,16 @@ module posixops {
         errStickyAcces: bool,   // EACCES (else EPERM) for sticky violations
         errUnlinkDirIsdir: bool, // EISDIR (else EPERM) for unlink(directory)
         errLockAgain: bool,     // EAGAIN (else EACCES) for lock conflicts
+        // Directory seek domain.  POSIX leaves the offsets lseek() reports for
+        // a directory fd unspecified, and implementations split: a directory
+        // may be a byte extent like any other file, or its offsets may be
+        // opaque cookies over a domain unrelated to its size.  ext4 takes the
+        // second road -- ext4_dir_llseek() hands generic_file_llseek_size() a
+        // htree_max of 2^63-1 as BOTH the eof and the maxsize for a hashed
+        // directory, because a htree offset is a hash value, not a position.
+        // true: directories seek over [0, DIR_SEEK_MAX); false: over their
+        // size, as a regular file does.
+        dirSeekDomain: bool,
         // Known divergences from POSIX.1-2024 that the implementation under
         // test still carries, by id.  A deviation is DESCRIBED here rather
         // than forgiven by the replay harness afterwards: the model takes the
@@ -785,34 +795,53 @@ module posixops {
                      SFd({ e: OK, fd: nfd }))
         }
 
+    // Directory offsets are cookies over a domain of their own where
+    // caps.dirSeekDomain holds; the value is ext4's htree_max, 2^63-1.
+    pure val DIR_SEEK_MAX: int = 9223372036854775807
+
     pure def opLseek(fs: Fs, ps: Pstate, caps: Caps, p: Pid, fd: Fd,
                      off: int, wh: Whence): Out =
         if (not(fdLive(ps, p, fd))) out(fs, ps, SOff({ e: EBADF, off: -1 }))
         else {
             val o = fdOfd(ps, p, fd)
             val nd = fs.inodes.get(o.ino)
+            // A directory with a domain of its own seeks over [0, eof] and
+            // rejects anything past it; a regular file seeks over its size and
+            // the model imposes no upper bound (s_maxbytes is out of reach of
+            // the generated offsets).
+            val cookieDir = nd.ftype == FDir and caps.dirSeekDomain
+            val eof = if (cookieDir) DIR_SEEK_MAX else nd.size
+            // vfs_setpos(): past the maxsize is EINVAL, and the overflow a
+            // huge eof provokes lands negative, which is EINVAL on the same
+            // line.  Only the cookie domain has a maxsize the model can reach.
             match wh {
                 | WSet =>
-                    if (off < 0) out(fs, ps, SOff({ e: EINVAL, off: -1 }))
+                    if (off < 0 or (cookieDir and off > DIR_SEEK_MAX))
+                        out(fs, ps, SOff({ e: EINVAL, off: -1 }))
                     else out(fs, psSetOffset(ps, p, fd, off),
                              SOff({ e: OK, off: off }))
                 | WCur =>
-                    if (o.offset + off < 0)
+                    if (o.offset + off < 0 or
+                        (cookieDir and o.offset + off > DIR_SEEK_MAX))
                         out(fs, ps, SOff({ e: EINVAL, off: -1 }))
                     else out(fs, psSetOffset(ps, p, fd, o.offset + off),
                              SOff({ e: OK, off: o.offset + off }))
                 | WEnd =>
-                    if (nd.size + off < 0)
+                    if (eof + off < 0 or
+                        (cookieDir and eof + off > DIR_SEEK_MAX))
                         out(fs, ps, SOff({ e: EINVAL, off: -1 }))
-                    else out(fs, psSetOffset(ps, p, fd, nd.size + off),
-                             SOff({ e: OK, off: nd.size + off }))
+                    else out(fs, psSetOffset(ps, p, fd, eof + off),
+                             SOff({ e: OK, off: eof + off }))
                 | WData =>
                     // [EINVAL] for a whence the implementation does not
                     // support outranks [ENXIO] for an out-of-range offset.
                     if (not(caps.seekHole))
                         out(fs, ps, SOff({ e: EINVAL, off: -1 }))
-                    else if (off < 0 or off >= nd.size)
+                    else if (off < 0 or off >= eof)
                         out(fs, ps, SOff({ e: ENXIO, off: -1 }))
+                    else if (cookieDir)
+                        out(fs, psSetOffset(ps, p, fd, off),
+                            SOff({ e: OK, off: off }))
                     else {
                         val s = seekScan(nd, off, true)
                         if (not(s.found))
@@ -823,8 +852,11 @@ module posixops {
                 | WHole =>
                     if (not(caps.seekHole))
                         out(fs, ps, SOff({ e: EINVAL, off: -1 }))
-                    else if (off < 0 or off >= nd.size)
+                    else if (off < 0 or off >= eof)
                         out(fs, ps, SOff({ e: ENXIO, off: -1 }))
+                    else if (cookieDir)
+                        out(fs, psSetOffset(ps, p, fd, eof),
+                            SOff({ e: OK, off: eof }))
                     else {
                         val s = seekScan(nd, off, false)
                         out(fs, psSetOffset(ps, p, fd, s.off2),
