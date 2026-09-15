@@ -1179,7 +1179,7 @@ module posixops {
     //    privilege, else EACCES
     //  - any explicit value: owner or privilege only, else EPERM (write
     //    access never helps)
-    pure def utimensCommon(fs: Fs, ps: Pstate, p: Pid, i: Ino,
+    pure def utimensCommon(fs: Fs, ps: Pstate, caps: Caps, p: Pid, i: Ino,
                            ta: TimeSpec, tm: TimeSpec): Out = {
         val cr = psCred(ps, p)
         val nd = fs.inodes.get(i)
@@ -1187,8 +1187,26 @@ module posixops {
         else {
             val explicit = tsExplicit(ta) or tsExplicit(tm)
             val owner = isPriv(cr) or cr.euid == nd.uid
-            if (explicit and not(owner)) outErr(fs, ps, EPERM)
-            else if (not(explicit) and not(owner) and not(mayWrite(cr, nd)))
+            // A MIXED pair -- one UTIME_NOW, one UTIME_OMIT -- satisfies
+            // neither tier's stated condition: XSH utimensat names EACCES for
+            // "a null pointer, or BOTH tv_nsec values are UTIME_NOW" and EPERM
+            // for "neither field is UTIME_NOW, neither is UTIME_OMIT".  Linux
+            // resolves the gap by taking the ownership tier for anything that
+            // is not both-UTIME_NOW: vfs_utimes() sets ATTR_TIMES_SET and
+            // setattr_prepare() then demands ownership.
+            val mixedNowOmit = not(explicit) and not(ta == TsNow and tm == TsNow)
+            val ownerTier =
+                explicit or (dev(caps, "S-utimens-mixed-owner") and mixedNowOmit)
+            // Recorded only where it changed the answer: a non-owner reaching
+            // the ownership tier gets EPERM where the write tier would have
+            // allowed the call or refused it with EACCES.  An owner passes
+            // either tier, so nothing is recorded for one.
+            val utHits = if (dev(caps, "S-utimens-mixed-owner") and
+                             mixedNowOmit and not(owner))
+                             Set("S-utimens-mixed-owner")
+                         else Set()
+            if (ownerTier and not(owner)) hit(outErr(fs, ps, EPERM), utHits)
+            else if (not(ownerTier) and not(owner) and not(mayWrite(cr, nd)))
                 outErr(fs, ps, EACCES)
             else out(fsSetTimes(fs, i, ta != TsOmit, tsVal(ta),
                                 tm != TsOmit, tsVal(tm)),
@@ -1203,14 +1221,14 @@ module posixops {
         else {
             val r = resolveEx(fs, caps, psCred(ps, p), at.start, pth, true)
             if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
-            else utimensCommon(fs, ps, p, r.ino, ta, tm)
+            else utimensCommon(fs, ps, caps, p, r.ino, ta, tm)
         }
     }
 
-    pure def opFutimens(fs: Fs, ps: Pstate, p: Pid, fd: Fd, ta: TimeSpec,
-                        tm: TimeSpec): Out =
+    pure def opFutimens(fs: Fs, ps: Pstate, caps: Caps, p: Pid, fd: Fd,
+                        ta: TimeSpec, tm: TimeSpec): Out =
         if (not(fdLive(ps, p, fd))) outErr(fs, ps, EBADF)
-        else utimensCommon(fs, ps, p, fdOfd(ps, p, fd).ino, ta, tm)
+        else utimensCommon(fs, ps, caps, p, fdOfd(ps, p, fd).ino, ta, tm)
 
     // access/faccessat: the whole check -- path search included -- runs
     // with the real ids unless AT_EACCESS.
@@ -1976,7 +1994,7 @@ module posixops {
             | RFchown(a) => opFchown(fs, ps, caps, p, a.fd, a.u, a.g)
             | RUtimens(a) => opUtimens(fs, ps, caps, p, a.dfd, a.pth, a.ta,
                                        a.tm)
-            | RFutimens(a) => opFutimens(fs, ps, p, a.fd, a.ta, a.tm)
+            | RFutimens(a) => opFutimens(fs, ps, caps, p, a.fd, a.ta, a.tm)
             | RAccess(a) => opAccess(fs, ps, caps, p, a.dfd, a.pth, a.r,
                                      a.w, a.x, a.eff)
             | RUmask(a) => opUmask(fs, ps, p, a.mask)

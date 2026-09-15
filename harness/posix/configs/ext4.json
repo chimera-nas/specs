@@ -51,7 +51,8 @@
   // failing until then, because an id that makes a cell report MORE
   // disagreements than it has is worse than no id.
   "deviations": [
-    "S-slash-create-eexist"
+    "S-slash-create-eexist",
+    "S-utimens-mixed-owner"
   ],
 
   "batches": [
