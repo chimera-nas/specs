@@ -1258,12 +1258,37 @@ module posixops {
             { e: int, par: Ino, leaf: Name, hits: Set[str] } = {
         val cr = psCred(ps, p)
         val at = atStart(fs, ps, p, dfd, pth)
+        // A trailing slash on a CREATING call: the name already exists, and
+        // what it happens to be is the slash rule's business on a resolving
+        // call but not here.  With the deviation on, the slash is dropped
+        // before resolution, so an existing final component answers EEXIST --
+        // ahead of the ENOTDIR resolve() would have raised for a
+        // non-directory, and ahead of the ELOOP it would have raised for a
+        // looping symlink the slash forced it to follow.
+        //
+        // Only createGate's resolution changes.  stat("f/") still gets the
+        // rule, which is what separates this from PD15: that one clears the
+        // rule inside resolve() itself, for every op that resolves a path.
+        val rpth = if (dev(caps, "S-slash-create-eexist"))
+                       pth.with("slash", false)
+                   else pth
         if (at.e != OK) { e: at.e, par: -1, leaf: "", hits: Set() }
         else {
-            val r = resolve(fs, caps, cr, at.start, pth, false)
+            val r = resolve(fs, caps, cr, at.start, rpth, false)
             if (r.err != OK) { e: r.err, par: -1, leaf: "", hits: r.hits }
-            else if (r.ino != -1) { e: EEXIST, par: -1, leaf: "",
-                                    hits: r.hits }
+            else if (r.ino != -1)
+                // The deviation is TAKEN only where dropping the slash changed
+                // the answer: the final component exists and is not a
+                // directory, so the rule would have raised ENOTDIR for it (or
+                // ELOOP for a symlink it forced resolution through) instead of
+                // the EEXIST this reports.  Over a directory the slash is
+                // immaterial and nothing is recorded, which is what keeps the
+                // liveness gate measuring the case the id actually names.
+                { e: EEXIST, par: -1, leaf: "",
+                  hits: if (dev(caps, "S-slash-create-eexist") and pth.slash and
+                            fs.inodes.get(r.ino).ftype != FDir)
+                            r.hits.union(Set("S-slash-create-eexist"))
+                        else r.hits }
             else if (pth.slash and not(slashOk))
                 { e: ENOENT, par: -1, leaf: "", hits: r.hits }
             else if (not(mayWrite(cr, fs.inodes.get(r.par))))

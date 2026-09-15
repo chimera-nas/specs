@@ -50,7 +50,9 @@
   // too, since it would then say which half it has.  Left unenabled and
   // failing until then, because an id that makes a cell report MORE
   // disagreements than it has is worse than no id.
-  "deviations": [],
+  "deviations": [
+    "S-slash-create-eexist"
+  ],
 
   "batches": [
     { "flavor": "step",            "steps": 128, "traces": 10, "seed": "0x1"   },
