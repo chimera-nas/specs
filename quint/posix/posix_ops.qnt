@@ -1556,6 +1556,18 @@ module posixops {
                     if (not(noop) and srcNode.ftype == FDir and
                         fsDescOf(fs, rs.ino).contains(rt.par))
                         outErr(fs, ps, EINVAL)
+                    // The mirror image: new names an ANCESTOR of old.  Such a
+                    // target is necessarily non-empty -- old lives under it --
+                    // so ENOTEMPTY is the answer XSH rename gives for it, and
+                    // it outranks the [EISDIR] a non-directory old would
+                    // otherwise earn.  Linux settles both directions at the
+                    // same place, off lock_rename()'s trap dentry: old == trap
+                    // is the EINVAL above, new == trap is this, and both
+                    // precede every may_delete/may_create judgement.
+                    else if (not(noop) and rt.ino != -1 and
+                             fs.inodes.get(rt.ino).ftype == FDir and
+                             fsDescOf(fs, rt.ino).contains(rs.par))
+                        outErr(fs, ps, errNonempty(caps))
                     else if (not(mayWrite(cr, sdnode)) or
                             not(mayWrite(cr, tdnode)))
                         outErr(fs, ps, EACCES)
