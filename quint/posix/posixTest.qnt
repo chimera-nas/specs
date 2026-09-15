@@ -813,9 +813,15 @@ module posixTestStd {
 
     run gidSgidTest =
         init
-        .then(runOp(0, RMkdir({ dfd: -1, pth: ap(["d"]), mode: 1517 })))
+        // mkdir cannot confer S_ISGID -- the mode argument's set-id bits are
+        // masked off (see newDirMode), measured against ext4 -- so the bit is
+        // set afterwards, which is the only way a directory that does not
+        // inherit it from ITS parent can come to have it.
+        .then(runOp(0, RMkdir({ dfd: -1, pth: ap(["d"]), mode: 493 })))
         .expect(lastE == OK and fsGet(fs, 1).gid == 10 and
-                bitOn(fsGet(fs, 1).mode, MB_SGID))
+                not(bitOn(fsGet(fs, 1).mode, MB_SGID)))
+        .then(runOp(0, RChmod({ dfd: -1, pth: ap(["d"]), mode: 1517 })))
+        .expect(lastE == OK and bitOn(fsGet(fs, 1).mode, MB_SGID))
         .then(runOp(0, RChown({ dfd: -1, pth: ap(["d"]), u: -1, g: 30,
                                 follow: true })))
         .expect(lastE == OK and fsGet(fs, 1).gid == 30 and

@@ -25,9 +25,31 @@
     "rmdirEnotempty": "supported",
     "stickyEacces": "unsupported",
     "unlinkDirIsdir": "supported",
+    // EAGAIN.  An earlier reading of the corpus flipped this to EACCES on the
+    // strength of an "expected 11, got 13" that was a permission failure
+    // rather than a lock conflict; the next run answered "expected 13, got 11"
+    // on both lockf and fcntl, which is the conflict case saying EAGAIN.
     "lockEagain": "supported"
   },
 
+  // NONE, and the two attempts to enable some are worth recording because the
+  // measurement refuted both.
+  //
+  // PD15/PD15b/PD15c looked like exact matches: ext4 answers EEXIST where the
+  // model wants ENOTDIR or ELOOP for mkdir over an existing name with a
+  // trailing slash, which is what those ids describe.  Enabling them made the
+  // cell WORSE -- seven stat calls started failing that had passed -- because
+  // the ids do not gate the creating call.  They clear slashIsDir/slashFollows
+  // inside resolve(), which every path-taking op runs, so they say "ignore the
+  // trailing slash everywhere".  That is chimera's behaviour.  ext4 ignores it
+  // only where the name is being CREATED: stat("f/") on a non-directory is
+  // still ENOTDIR here, and a final symlink is still followed.
+  //
+  // So the id is too coarse to describe this kernel, and splitting the
+  // creating-call half out of it is the fix -- one a chimera cell would want
+  // too, since it would then say which half it has.  Left unenabled and
+  // failing until then, because an id that makes a cell report MORE
+  // disagreements than it has is worse than no id.
   "deviations": [],
 
   "batches": [

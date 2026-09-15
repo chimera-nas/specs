@@ -204,17 +204,23 @@ module posixops {
 
     // Mode of a newly created directory: umask-filtered, plus inherited
     // S_ISGID when the policy says so.
-    // mkdir cannot set the set-user-ID bit.  XSH mkdir initializes "the file
-    // permission bits" from mode and gives S_ISUID no meaning on a directory,
-    // and the implementations mask it off before the filesystem is reached:
-    // Linux in vfs_mkdir() (mode &= S_IRWXUGO|S_ISVTX) and FreeBSD in
-    // ufs_mkdir() (va_mode & 0777).  Measured against ext4: mkdir("/b/d",
-    // 04755) under a set-group-ID parent lands 02755, not 06755.
+    // mkdir takes NEITHER set-id bit from its mode argument.  XSH mkdir
+    // initializes "the file permission bits" from mode, and the
+    // implementations mask both off before the filesystem is reached: Linux in
+    // vfs_mkdir() (mode &= S_IRWXUGO|S_ISVTX) and FreeBSD in ufs_mkdir()
+    // (va_mode & 0777).  The filesystem then puts S_ISGID back if the PARENT
+    // carries it, which is the only way a new directory gets the bit.
+    //
+    // Both halves are measured against ext4, not inferred: mkdir("/b/d",
+    // 04755) under a set-group-ID parent lands 02755 rather than 06755, and
+    // mkdir("/b", 02755) in a parent WITHOUT the bit lands 0755 rather than
+    // 02755.  The second case is why asking for S_ISGID does nothing -- a
+    // directory's group-inheritance is the parent's property to confer.
     pure def newDirMode(caps: Caps, m: int, mask: int, dnode: Inode): int = {
-        val asked = applyUmask(m, mask)
-        val base  = if (bitOn(asked, MB_SUID)) asked - MB_SUID else asked
-        if (caps.sgidInherit and bitOn(dnode.mode, MB_SGID) and
-                not(bitOn(base, MB_SGID)))
+        val asked  = applyUmask(m, mask)
+        val noSuid = if (bitOn(asked, MB_SUID)) asked - MB_SUID else asked
+        val base   = if (bitOn(noSuid, MB_SGID)) noSuid - MB_SGID else noSuid
+        if (caps.sgidInherit and bitOn(dnode.mode, MB_SGID))
             base + MB_SGID
         else base
     }
