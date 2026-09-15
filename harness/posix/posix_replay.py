@@ -101,8 +101,9 @@ def check_config_profile(cell, measured):
             if got is None:
                 continue
             if bool(got) != (want == "supported"):
+                have = "supported" if got else "unsupported"
                 drift.append(f"{group}.{key}: config says {want}, "
-                             f"measured {'supported' if got else 'unsupported'}")
+                             f"measured {have}")
     return drift
 
 
@@ -327,7 +328,8 @@ class Replayer:
         self.verbose = verbose
         self.fdmap = {}       # (pid, model fd) -> real fd
         self.sidmap = {}      # model sid -> driver stream id
-        self.strays = []      # (pid, real fd) deferred to cleanup(); see op_open
+        # (pid, real fd) deferred to cleanup(); see op_open
+        self.strays = []
         self.inomap = {}      # model ino -> (st_dev, st_ino)
         self.shadow = {}      # model ino -> bytearray
         self.timemap = {}     # (model ino, field) -> (abstract, (sec, ns))
@@ -473,13 +475,13 @@ class Replayer:
         The model may name more than one acceptable errno: where POSIX gives
         a condition two spellings -- rmdir on a non-empty directory is
         {ENOTEMPTY, EEXIST}, a sticky refusal is {EPERM, EACCES} -- the trace
-        carries the alternates alongside the canonical answer and any of them
-        conforms.  An implementation that picks a permitted alternate is not
-        deviating from anything, so this is not a deviation-registry matter
-        and no entry is written for it."""
+        carries the alternates alongside the canonical answer, as the result's
+        eAccept set, and any of them conforms.  An implementation that picks a
+        permitted alternate is not deviating from anything, so this is not a
+        deviation-registry matter and no entry is written for it."""
         if actual == expected:
             return True
-        if actual in self._ctx.get("alt", ()):
+        if actual in self._ctx.get("eaccept", ()):
             self.alts_taken[(self._ctx.get("tag"), expected, actual)] += 1
             return False
         # An absent interface refuses every call, whatever the model
@@ -1270,7 +1272,14 @@ class Replayer:
             self._ctx = {"tag": tag, "req": req["value"], "res": res["value"],
                          "pid": pid, "fs": state["fs"], "ps": state.get("ps"),
                          "caps": self.caps, "step": idx,
-                         "alt": set(label["value"].get("alt", []))}
+                         # Every result carries the set of errnos the model
+                         # will accept for the condition that step hit.  It
+                         # lives on the RESULT and is called eAccept; an
+                         # earlier scheme put an `alt` on the label, and
+                         # reading that name here meant the set was silently
+                         # always empty and every permitted alternate was
+                         # reported as a divergence.
+                         "eaccept": set(res["value"].get("eAccept", []) or [])}
             signal.alarm(120)
             r = handler(self, pid, req["value"], res["value"], state["fs"])
             signal.alarm(0)
