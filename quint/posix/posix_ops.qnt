@@ -1493,7 +1493,20 @@ module posixops {
                     val srcNode = fs.inodes.get(rs.ino)
                     val noop = (rs.par == rt.par and rs.leaf == rt.leaf) or
                                (rt.ino != -1 and rt.ino == rs.ino)
-                    if (not(mayWrite(cr, sdnode)) or
+                    // "The new directory pathname names a descendant of the
+                    // old directory" is EINVAL (XSH rename), and it is settled
+                    // BEFORE the permission checks.  fsRename already detects
+                    // it, but only once the gates below have passed, so a
+                    // caller who also lacked write permission was told EACCES
+                    // for a rename no permission could have made legal.
+                    // Linux resolves the descendant case during lookup, well
+                    // before may_delete/may_create judge anything; ext4
+                    // answers EINVAL for rename("/d", "/d/d") where the model
+                    // answered EACCES, 11 times in one run.
+                    if (not(noop) and srcNode.ftype == FDir and
+                        fsDescOf(fs, rs.ino).contains(rt.par))
+                        outErr(fs, ps, EINVAL)
+                    else if (not(mayWrite(cr, sdnode)) or
                             not(mayWrite(cr, tdnode)))
                         outErr(fs, ps, EACCES)
                     else if (not(stickyOk(caps, cr, sdnode, srcNode)))
