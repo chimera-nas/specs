@@ -1851,7 +1851,21 @@ module posixops {
         else {
             val o = fdOfd(ps, p, fd)
             val i = o.ino
-            if (not(accWrites(o.acc))) outErr(fs, ps, EBADF)
+            // XSH lockf scopes the write requirement to the two commands
+            // that take a lock: "[EBADF] ... or function is F_LOCK or F_TLOCK
+            // and fildes is not a valid file descriptor open for writing".
+            // F_TEST and F_ULOCK ask only for a valid descriptor, and glibc's
+            // lockf() lands on exactly that split -- F_LOCK/F_TLOCK become
+            // fcntl F_WRLCK, which fcntl refuses EBADF on a read-only fd,
+            // while F_TEST is F_GETLK and F_ULOCK is F_UNLCK and neither
+            // consults the access mode.
+            val needsWrite = match cmd {
+                | LfLock  => true
+                | LfTlock => true
+                | LfTst   => false
+                | LfUlock => false
+            }
+            if (needsWrite and not(accWrites(o.acc))) outErr(fs, ps, EBADF)
             else if (fs.inodes.get(i).ftype != FReg) outErr(fs, ps, EINVAL)
             else if (len < 0) outErr(fs, ps, EINVAL)
             else {
