@@ -896,6 +896,14 @@ module posixops {
             else if (readModeDenied(caps, cr, nd))
                 hit(out(fs, ps, rwErr(EACCES)),
                     if (badAcc) Set("PD11b") else Set("PD11a"))
+            // rw_verify_area() runs inside vfs_read(), BEFORE the file's own
+            // read op -- so an offset whose sum with the count overflows off_t
+            // is EINVAL and never reaches the EISDIR generic_read_dir() would
+            // have answered.  Only a descriptor with a cookie seek domain can
+            // carry an offset that large, so this is reachable exactly where
+            // policies.dirSeekDomain put it.
+            else if (o.offset >= 0 and o.offset + len > DIR_SEEK_MAX)
+                out(fs, ps, rwErr(EINVAL))
             else if (nd.ftype == FDir and dev(caps, "PD8"))
                 // PD8: the directory handle serves READ, answering `len`
                 // fabricated zero bytes and advancing the offset.
