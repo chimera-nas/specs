@@ -642,7 +642,9 @@ module posixTestStd {
         .then(runOp(0, RLockf({ fd: 0, cmd: LfTlock, len: 2 })))
         .expect(lastE == OK)
         .then(runOp(1, RLockf({ fd: 0, cmd: LfTst, len: 2 })))
-        .expect(lastE == EAGAIN)
+        // glibc's lockf() names EACCES for a F_TEST conflict itself, rather
+        // than passing on the kernel's EAGAIN as F_LOCK/F_TLOCK do.
+        .expect(lastE == EACCES)
         .then(runOp(1, RLseek({ fd: 0, off: 4, wh: WSet })))
         .expect(lastOff == 4)
         .then(runOp(1, RLockf({ fd: 0, cmd: LfTlock, len: 2 })))
@@ -657,6 +659,25 @@ module posixTestStd {
         .expect(lastFd == 1)
         .then(runOp(0, RLockf({ fd: 1, cmd: LfTlock, len: 1 })))
         .expect(lastE == EBADF)
+        // ... but F_TEST and F_ULOCK do not ask for write access at all: XSH
+        // lockf binds that EBADF to F_LOCK and F_TLOCK by name, and the same
+        // read-only descriptor serves both of these.
+        .then(runOp(0, RLockf({ fd: 1, cmd: LfTst, len: 1 })))
+        .expect(lastE == OK)
+        .then(runOp(0, RLockf({ fd: 1, cmd: LfUlock, len: 1 })))
+        .expect(lastE == OK)
+        // F_TEST asks whether a READER would conflict (glibc tests with
+        // F_RDLCK), so another process's read lock is no conflict -- though a
+        // writer still collides with it.
+        .then(runOp(1, RFcntlLock({ fd: 0, cmd: CSetlk, lk: LkRd, lo: 8,
+                                    hi: 9 })))
+        .expect(lastE == OK)
+        .then(runOp(0, RLseek({ fd: 0, off: 8, wh: WSet })))
+        .expect(lastOff == 8)
+        .then(runOp(0, RLockf({ fd: 0, cmd: LfTst, len: 1 })))
+        .expect(lastE == OK)
+        .then(runOp(0, RLockf({ fd: 0, cmd: LfTlock, len: 1 })))
+        .expect(lastE == EAGAIN)
 
     // ---------------- directory streams ----------------
 

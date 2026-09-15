@@ -1888,8 +1888,22 @@ module posixops {
                     | LfUlock =>
                         out(fs, lockUnset(ps, p, i, lo, hi), sOk(OK))
                     | LfTst =>
-                        if (lockConflict(ps, p, i, lo, hi, LWrite))
-                            outErr(fs, ps, errLockBusy(caps))
+                        // The harness reaches lockf() through libc, and glibc
+                        // implements F_TEST as fcntl F_GETLK with l_type =
+                        // F_RDLCK, reporting a conflict as EACCES outright:
+                        //   if (fl.l_type == F_UNLCK || fl.l_pid == getpid ())
+                        //     return 0;
+                        //   __set_errno (EACCES);
+                        // Two consequences the model had wrong.  It asks
+                        // whether a READER would conflict, so another process
+                        // holding a read lock is no conflict at all -- only a
+                        // write lock is -- where the model asked as a writer
+                        // and reported conflicts that are not there.  And the
+                        // errno is glibc's own EACCES, not the EAGAIN/EACCES
+                        // choice policies.lockEagain makes for the commands
+                        // that take a lock, where the answer is the kernel's.
+                        if (lockConflict(ps, p, i, lo, hi, LRead))
+                            outErr(fs, ps, EACCES)
                         else outErr(fs, ps, OK)
                     | LfLock =>
                         // Blocking variant; generators keep it
