@@ -36,6 +36,7 @@ module posixTestStd {
         P_DIR_SEEK_DOMAIN = FeatOff,
         P_ORPHAN_CTIME = FeatOff,
         P_SYMLINK_ATIME = FeatOff,
+        P_RENAME_TRAP_FIRST = FeatOff,
         // DEVS = Set(): the self-tests check the STANDARD, so no
         // implementation deviation is switched on here.  That is the point of
         // keeping them separate from the generated corpus -- a config may
@@ -1000,6 +1001,7 @@ module posixTestRoot {
         P_DIR_SEEK_DOMAIN = FeatOff,
         P_ORPHAN_CTIME = FeatOff,
         P_SYMLINK_ATIME = FeatOff,
+        P_RENAME_TRAP_FIRST = FeatOff,
         // DEVS = Set(): the self-tests check the STANDARD, so no
         // implementation deviation is switched on here.  That is the point of
         // keeping them separate from the generated corpus -- a config may
@@ -1107,6 +1109,7 @@ module posixTestLinux {
         P_DIR_SEEK_DOMAIN = FeatMandatory,
         P_ORPHAN_CTIME = FeatMandatory,
         P_SYMLINK_ATIME = FeatMandatory,
+        P_RENAME_TRAP_FIRST = FeatMandatory,
         DEVS = Set(),
         T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"

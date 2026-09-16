@@ -32,7 +32,8 @@
     "lockEagain": "supported",
     "dirSeekDomain": "supported",
     "orphanCtime": "supported",
-    "symlinkAtime": "supported"
+    "symlinkAtime": "supported",
+    "renameTrapFirst": "supported"
   },
 
   // NONE, and the two attempts to enable some are worth recording because the

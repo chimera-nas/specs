@@ -121,6 +121,12 @@ module posixops {
         // link's atime?  Linux does it in get_link() (fs/namei.c), off the
         // non-RCU path: touch_atime(&last->link).
         symlinkAtime: bool,
+        // Does rename report the SHAPE of the tree -- new naming a descendant
+        // or an ancestor of old -- before the caller's permission to make the
+        // change?  Linux does (lock_rename()'s trap precedes may_delete); an
+        // engine that resolves both parents by handle and runs its own gates
+        // reports the permission failure first.  XSH orders neither.
+        renameTrapFirst: bool,
         // Known divergences from POSIX.1-2024 that the implementation under
         // test still carries, by id.  A deviation is DESCRIBED here rather
         // than forgiven by the replay harness afterwards: the model takes the
@@ -1661,22 +1667,41 @@ module posixops {
                     // it, so a sticky source directory could deny a rename
                     // that does nothing, and the parent's timestamps marked
                     // for a rename that moved no name.
+                    // The two STRUCTURAL verdicts, which depend on the
+                    // shape of the tree rather than on the caller:
+                    //
+                    //   * new names a descendant of old -- [EINVAL], named by
+                    //     XSH rename ("The new directory pathname contains a
+                    //     path prefix that names the old directory").
+                    //   * new names an ANCESTOR of old -- such a target is
+                    //     necessarily non-empty, since old lives under it, so
+                    //     it earns the [ENOTEMPTY] a non-empty target gets,
+                    //     and that outranks the [EISDIR] a non-directory old
+                    //     would otherwise draw.
+                    //
+                    // Linux settles both off lock_rename()'s trap dentry --
+                    // old == trap is the first, new == trap the second -- and
+                    // both precede every may_delete/may_create judgement.
+                    val structErr =
+                        if (noop) OK
+                        else if (srcNode.ftype == FDir and
+                                 fsDescOf(fs, rs.ino).contains(rt.par))
+                            EINVAL
+                        else if (rt.ino != -1 and
+                                 fs.inodes.get(rt.ino).ftype == FDir and
+                                 fsDescOf(fs, rt.ino).contains(rs.par))
+                            errNonempty(caps)
+                        else OK
+                    // Where they land is policy.  Both errnos are mandated,
+                    // but XSH orders none of its rename conditions against
+                    // another, so an implementation that reports the caller's
+                    // permission failure first is as conformant as one that
+                    // reports the shape of the tree first.  Linux takes the
+                    // trap before may_delete; an engine that resolves both
+                    // parents by handle and gates them itself reports EACCES.
                     if (noop) outErr(fs, ps, OK)
-                    else if (srcNode.ftype == FDir and
-                        fsDescOf(fs, rs.ino).contains(rt.par))
-                        outErr(fs, ps, EINVAL)
-                    // The mirror image: new names an ANCESTOR of old.  Such a
-                    // target is necessarily non-empty -- old lives under it --
-                    // so ENOTEMPTY is the answer XSH rename gives for it, and
-                    // it outranks the [EISDIR] a non-directory old would
-                    // otherwise earn.  Linux settles both directions at the
-                    // same place, off lock_rename()'s trap dentry: old == trap
-                    // is the EINVAL above, new == trap is this, and both
-                    // precede every may_delete/may_create judgement.
-                    else if (rt.ino != -1 and
-                             fs.inodes.get(rt.ino).ftype == FDir and
-                             fsDescOf(fs, rt.ino).contains(rs.par))
-                        outErr(fs, ps, errNonempty(caps))
+                    else if (caps.renameTrapFirst and structErr != OK)
+                        outErr(fs, ps, structErr)
                     // vfs_rename() judges the source COMPLETELY before it
                     // looks at the new directory at all:
                     //     error = may_delete(old_dir, old_dentry, is_dir);
@@ -1709,6 +1734,8 @@ module posixops {
                     // subject.  (Verified against ext4: a 0000 directory
                     // moved out of its parent by its own owner is EACCES, the
                     // same move at 0700 succeeds.)
+                    // The cell that gates first reports the shape here.
+                    else if (structErr != OK) outErr(fs, ps, structErr)
                     else if (srcNode.ftype == FDir and rs.par != rt.par and
                              not(mayWrite(cr, srcNode)))
                         outErr(fs, ps, EACCES)

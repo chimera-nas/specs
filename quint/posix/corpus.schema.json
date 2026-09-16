@@ -226,6 +226,16 @@
       "citation": "POSIX.1-2024 XBD 4.15 (Pathname Resolution) describes expanding a symbolic link without requiring any timestamp of the link to be marked, and XSH does not name path resolution among the things that update a symbolic link's last data access timestamp.  Reading the link's contents is nonetheless an access of it, and implementations differ on whether it shows.  Linux marks: get_link() in fs/namei.c calls touch_atime(&last->link) on the non-RCU path, so every traversal of a symlink refreshes it, including one that goes on to fail ELOOP.  Both readings conform, so this is a policy and the strict twin keeps it.  Defaults to unsupported, the model's prior behaviour, so no cell moves unless it asks.",
       "note": "Only observable where atime updates are not being suppressed: under the relatime default a traversal refreshes the link at most once a day unless its atime already trails its mtime or ctime.  The ext4 cell mounts the scratch filesystem strictatime for exactly this reason, so every traversal shows."
     },
+    "P_RENAME_TRAP_FIRST": {
+      "kind": "policy",
+      "key": "policies.renameTrapFirst",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "unsupported",
+      "doc": "rename reports the tree's shape before the caller's permission",
+      "citation": "POSIX.1-2024 XSH rename mandates [EINVAL] when \"the new directory pathname contains a path prefix that names the old directory\", and [ENOTEMPTY] for a non-empty target -- which an ancestor of old necessarily is, since old lives under it.  It orders neither against the [EACCES] a caller without write permission on a parent earns, and XSH ERRORS is explicit that when several conditions hold the implementation may report any of them.  Linux reports the shape: do_renameat2() takes lock_rename()'s trap dentry and answers EINVAL (old == trap) or ENOTEMPTY (new == trap) before vfs_rename() reaches may_delete().  An engine that resolves both parents by handle, so that no kernel path-resolution check runs, and then gates them itself, reports the permission failure instead -- which is what chimera does deliberately, to keep its DELEGATES_DAC passthroughs and its own backends answering alike.  Both conform, so this is a policy and the strict twin keeps it.  Defaults to unsupported, the reading that reports permission first.",
+      "note": "Covers both directions at once because Linux settles both at the same place.  A cell that wants them split would need two knobs; nothing has yet."
+    },
     "P_ERR_LOCK_AGAIN": {
       "kind": "policy",
       "key": "policies.lockEagain",
