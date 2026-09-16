@@ -36,6 +36,10 @@ module posixDefault {
         P_ERR_STICKY_ACCES = FeatIfAdvertised,
         P_ERR_UNLINKDIR_ISDIR = FeatIfAdvertised,
         P_ERR_LOCK_AGAIN = FeatIfAdvertised,
+        P_DIR_SEEK_DOMAIN = FeatOff,
+        P_ORPHAN_CTIME = FeatOff,
+        P_SYMLINK_ATIME = FeatOff,
+        P_RENAME_KERNEL_ORDER = FeatOff,
         DEVS = Set(),
         T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
@@ -67,6 +71,10 @@ module posixMemfs {
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
         P_ERR_LOCK_AGAIN = FeatMandatory,
+        P_DIR_SEEK_DOMAIN = FeatOff,
+        P_ORPHAN_CTIME = FeatOff,
+        P_SYMLINK_ATIME = FeatOff,
+        P_RENAME_KERNEL_ORDER = FeatOff,
         DEVS = Set(),
         T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
@@ -95,6 +103,10 @@ module posixDisk {
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
         P_ERR_LOCK_AGAIN = FeatMandatory,
+        P_DIR_SEEK_DOMAIN = FeatOff,
+        P_ORPHAN_CTIME = FeatOff,
+        P_SYMLINK_ATIME = FeatOff,
+        P_RENAME_KERNEL_ORDER = FeatOff,
         DEVS = Set(),
         T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
@@ -125,6 +137,10 @@ module posixNfs3 {
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
         P_ERR_LOCK_AGAIN = FeatMandatory,
+        P_DIR_SEEK_DOMAIN = FeatOff,
+        P_ORPHAN_CTIME = FeatOff,
+        P_SYMLINK_ATIME = FeatOff,
+        P_RENAME_KERNEL_ORDER = FeatOff,
         DEVS = Set(),
         T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
@@ -156,6 +172,10 @@ module posixNfs4 {
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
         P_ERR_LOCK_AGAIN = FeatMandatory,
+        P_DIR_SEEK_DOMAIN = FeatOff,
+        P_ORPHAN_CTIME = FeatOff,
+        P_SYMLINK_ATIME = FeatOff,
+        P_RENAME_KERNEL_ORDER = FeatOff,
         DEVS = Set(),
         T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
@@ -195,6 +215,10 @@ module posixFuse {
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
         P_ERR_LOCK_AGAIN = FeatMandatory,
+        P_DIR_SEEK_DOMAIN = FeatOff,
+        P_ORPHAN_CTIME = FeatOff,
+        P_SYMLINK_ATIME = FeatOff,
+        P_RENAME_KERNEL_ORDER = FeatOff,
         DEVS = Set(),
         T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
@@ -235,6 +259,10 @@ module posixSmb {
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
         P_ERR_LOCK_AGAIN = FeatMandatory,
+        P_DIR_SEEK_DOMAIN = FeatOff,
+        P_ORPHAN_CTIME = FeatOff,
+        P_SYMLINK_ATIME = FeatOff,
+        P_RENAME_KERNEL_ORDER = FeatOff,
         DEVS = Set(),
         T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
@@ -259,6 +287,10 @@ module posixStrict {
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatOff,
         P_ERR_LOCK_AGAIN = FeatMandatory,
+        P_DIR_SEEK_DOMAIN = FeatOff,
+        P_ORPHAN_CTIME = FeatOff,
+        P_SYMLINK_ATIME = FeatOff,
+        P_RENAME_KERNEL_ORDER = FeatOff,
         DEVS = Set(),
         T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
@@ -283,6 +315,10 @@ module posixLinuxish {
         P_ERR_STICKY_ACCES = FeatOff,
         P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
         P_ERR_LOCK_AGAIN = FeatMandatory,
+        P_DIR_SEEK_DOMAIN = FeatOff,
+        P_ORPHAN_CTIME = FeatOff,
+        P_SYMLINK_ATIME = FeatOff,
+        P_RENAME_KERNEL_ORDER = FeatOff,
         DEVS = Set(),
         T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"

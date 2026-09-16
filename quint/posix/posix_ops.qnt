@@ -101,6 +101,39 @@ module posixops {
         errStickyAcces: bool,   // EACCES (else EPERM) for sticky violations
         errUnlinkDirIsdir: bool, // EISDIR (else EPERM) for unlink(directory)
         errLockAgain: bool,     // EAGAIN (else EACCES) for lock conflicts
+        // Directory seek domain.  POSIX leaves the offsets lseek() reports for
+        // a directory fd unspecified, and implementations split: a directory
+        // may be a byte extent like any other file, or its offsets may be
+        // opaque cookies over a domain unrelated to its size.  ext4 takes the
+        // second road -- ext4_dir_llseek() hands generic_file_llseek_size() a
+        // htree_max of 2^63-1 as BOTH the eof and the maxsize for a hashed
+        // directory, because a htree offset is a hash value, not a position.
+        // true: directories seek over [0, DIR_SEEK_MAX); false: over their
+        // size, as a regular file does.
+        dirSeekDomain: bool,
+        // Does removing an object's LAST link mark its ctime?  unlink() asks
+        // for the mark "if the file's link count is not 0" and leaves the
+        // other case unsaid -- yet an open descriptor keeps the orphan
+        // observable, so the choice shows.  Linux marks unconditionally
+        // (ext4_unlink(): drop_nlink(), then inode_set_ctime_current()).
+        orphanCtime: bool,
+        // Does expanding a symbolic link during path resolution mark that
+        // link's atime?  Linux does it in get_link() (fs/namei.c), off the
+        // non-RCU path: touch_atime(&last->link).
+        symlinkAtime: bool,
+        // Does rename judge in vfs_rename()'s order?  Two things follow from
+        // it, and an implementation takes both or neither:
+        //   * the SHAPE of the tree -- new naming a descendant or an ancestor
+        //     of old -- is reported before the caller's permission, because
+        //     lock_rename()'s trap precedes may_delete();
+        //   * the TARGET's type is reported before the subject's own
+        //     writability, because may_delete(new_dir) precedes the
+        //     inode_permission(old_dentry) a cross-parent directory move
+        //     needs.
+        // An engine that resolves both parents by handle and runs its own
+        // gates reports the permission failures first, on both counts.  XSH
+        // orders none of these conditions against another.
+        renameKernelOrder: bool,
         // Known divergences from POSIX.1-2024 that the implementation under
         // test still carries, by id.  A deviation is DESCRIBED here rather
         // than forgiven by the replay harness afterwards: the model takes the
@@ -204,10 +237,23 @@ module posixops {
 
     // Mode of a newly created directory: umask-filtered, plus inherited
     // S_ISGID when the policy says so.
+    // mkdir takes NEITHER set-id bit from its mode argument.  XSH mkdir
+    // initializes "the file permission bits" from mode, and the
+    // implementations mask both off before the filesystem is reached: Linux in
+    // vfs_mkdir() (mode &= S_IRWXUGO|S_ISVTX) and FreeBSD in ufs_mkdir()
+    // (va_mode & 0777).  The filesystem then puts S_ISGID back if the PARENT
+    // carries it, which is the only way a new directory gets the bit.
+    //
+    // Both halves are measured against ext4, not inferred: mkdir("/b/d",
+    // 04755) under a set-group-ID parent lands 02755 rather than 06755, and
+    // mkdir("/b", 02755) in a parent WITHOUT the bit lands 0755 rather than
+    // 02755.  The second case is why asking for S_ISGID does nothing -- a
+    // directory's group-inheritance is the parent's property to confer.
     pure def newDirMode(caps: Caps, m: int, mask: int, dnode: Inode): int = {
-        val base = applyUmask(m, mask)
-        if (caps.sgidInherit and bitOn(dnode.mode, MB_SGID) and
-                not(bitOn(base, MB_SGID)))
+        val asked  = applyUmask(m, mask)
+        val noSuid = if (bitOn(asked, MB_SUID)) asked - MB_SUID else asked
+        val base   = if (bitOn(noSuid, MB_SGID)) noSuid - MB_SGID else noSuid
+        if (caps.sgidInherit and bitOn(dnode.mode, MB_SGID))
             base + MB_SGID
         else base
     }
@@ -257,21 +303,26 @@ module posixops {
     // `hits` names the deviations that shaped this resolution (empty for a
     // conformant one); handlers union it into their outcome so the trace
     // records which claims the step exercised.
-    type RRes = { err: int, ino: Ino, par: Ino, leaf: Name, hits: Set[str] }
+    type RRes = { err: int, ino: Ino, par: Ino, leaf: Name, hits: Set[str],
+                  // The symbolic links this resolution expanded.  Reading a
+                  // link is an access of it, and where the cell says so that
+                  // marks its atime -- see withLinkAtimes.
+                  links: Set[Ino] }
 
     type RWalk = {
         cur: Ino,          // directory being walked
         rest: List[Name],  // remaining components
         hops: int,         // symlink expansions so far
+        links: Set[Ino],   // the links those expansions read
         done: bool,
         out: RRes
     }
 
     pure def rFail(e: int): RRes = { err: e, ino: -1, par: -1, leaf: "",
-                                     hits: Set() }
+                                     hits: Set(), links: Set() }
 
     pure def rOk(i: Ino, par: Ino, leaf: Name): RRes =
-        { err: OK, ino: i, par: par, leaf: leaf, hits: Set() }
+        { err: OK, ino: i, par: par, leaf: leaf, hits: Set(), links: Set() }
 
     // One resolution step: consume the head component of w.rest.
     pure def rStep(fs: Fs, caps: Caps, cr: Cred, followFinal: bool,
@@ -318,6 +369,7 @@ module posixops {
                         w.with("done", true).with("out", rFail(ELOOP))
                     else
                         w.with("hops", w.hops + 1)
+                         .with("links", w.links.union(Set(child)))
                          .with("cur", if (chnode.target.abs) ROOT else w.cur)
                          .with("rest", chnode.target.comps.concat(rest1))
                 else if (last)
@@ -357,8 +409,8 @@ module posixops {
             // the slash names the directory the link resolves to), which
             // is why the ENOTDIR check below sees the followed object.
             val ff = followFinal or (pth.slash and slashFollows)
-            val w0 = { cur: begin, rest: pth.comps, hops: 0, done: false,
-                       out: rFail(EIO) }
+            val w0 = { cur: begin, rest: pth.comps, hops: 0, links: Set(),
+                       done: false, out: rFail(EIO) }
             val wN = range(0, RESOLVE_FUEL).foldl(w0, (w, _) =>
                 rStep(fs, caps, cr, ff, w))
             val out = if (wN.done) wN.out else rFail(ELOOP)
@@ -366,12 +418,16 @@ module posixops {
                 if (pth.slash and not(slashFollows))
                     Set("PD15b", "PD15c").intersect(caps.devs)
                 else Set()
-            if (out.err == OK and out.ino >= 0 and pth.slash and
-                    fs.inodes.get(out.ino).ftype != FDir)
-                if (slashIsDir) rFail(ENOTDIR).with("hits", slashHits)
-                else out.with("hits", out.hits.union(slashHits)
-                                             .union(Set("PD15")))
-            else out.with("hits", out.hits.union(slashHits))
+            val fin =
+                if (out.err == OK and out.ino >= 0 and pth.slash and
+                        fs.inodes.get(out.ino).ftype != FDir)
+                    if (slashIsDir) rFail(ENOTDIR).with("hits", slashHits)
+                    else out.with("hits", out.hits.union(slashHits)
+                                                 .union(Set("PD15")))
+                else out.with("hits", out.hits.union(slashHits))
+            // A resolution that ended in ELOOP still read every link it got
+            // through, so the marks ride on the failure as well.
+            fin.with("links", wN.links)
         }
     }
 
@@ -379,7 +435,12 @@ module posixops {
     pure def resolveEx(fs: Fs, caps: Caps, cr: Cred, start: Ino, pth: Path,
                        followFinal: bool): RRes = {
         val r = resolve(fs, caps, cr, start, pth, followFinal)
-        if (r.err == OK and r.ino == -1) rFail(ENOENT) else r
+        // The links the walk read survive the rewrite: a dangling symbolic
+        // link was still READ to discover that its target is missing, so a
+        // fresh rFail() here would drop the very marks that case earns.
+        if (r.err == OK and r.ino == -1)
+            rFail(ENOENT).with("links", r.links)
+        else r
     }
 
     // ------------------------------------------------------------------
@@ -547,6 +608,19 @@ module posixops {
     pure def out(fs: Fs, ps: Pstate, r: OpRes): Out =
         { fs2: fs, ps2: ps, res: r, hits: Set() }
 
+    // Path resolution READS every symbolic link it expands, and where the
+    // cell says that marks the link's atime, the marks belong on the outcome
+    // whatever it turned out to be: a walk that ended in ELOOP, or an op that
+    // went on to fail, still read the links it got through.  Applied to the
+    // finished Out so that a handler's own timestamp work is untouched, and
+    // skipping a link the op itself removed, which no longer has an inode to
+    // mark.
+    pure def withLinkAtimes(o: Out, links: Set[Ino], caps: Caps): Out =
+        if (not(caps.symlinkAtime) or links.size() == 0) o
+        else o.with("fs2", links.fold(o.fs2, (f, i) =>
+            if (f.inodes.keys().contains(i)) fsMark(f, i, true, false, false)
+            else f))
+
     // Tag an outcome with the deviation(s) that produced it.
     pure def hit(o: Out, ids: Set[str]): Out =
         o.with("hits", o.hits.union(ids))
@@ -634,6 +708,7 @@ module posixops {
                         resolve(fs, caps, cr, at.start, pth, false)
                     else
                         resolve(fs, caps, cr, at.start, pth, not(fl.nofollow))
+            withLinkAtimes({
             if (r.err != OK)
                 hit(out(fs, ps, SFd({ e: r.err, fd: -1 })), r.hits)
             else if (r.ino == -1)
@@ -725,6 +800,7 @@ module posixops {
                     }
                 }
             }
+            }, r.links, caps)
         }
     }
 
@@ -772,34 +848,60 @@ module posixops {
                      SFd({ e: OK, fd: nfd }))
         }
 
+    // Directory offsets are cookies over a domain of their own where
+    // caps.dirSeekDomain holds; the value is ext4's htree_max, 2^63-1.
+    pure val DIR_SEEK_MAX: int = 9223372036854775807
+
     pure def opLseek(fs: Fs, ps: Pstate, caps: Caps, p: Pid, fd: Fd,
                      off: int, wh: Whence): Out =
         if (not(fdLive(ps, p, fd))) out(fs, ps, SOff({ e: EBADF, off: -1 }))
         else {
             val o = fdOfd(ps, p, fd)
             val nd = fs.inodes.get(o.ino)
+            // A directory with a domain of its own seeks over [0, eof] and
+            // rejects anything past it; a regular file seeks over its size and
+            // the model imposes no upper bound (s_maxbytes is out of reach of
+            // the generated offsets).
+            val cookieDir = nd.ftype == FDir and caps.dirSeekDomain
+            val eof = if (cookieDir) DIR_SEEK_MAX else nd.size
+            // vfs_setpos(): past the maxsize is EINVAL, and the overflow a
+            // huge eof provokes lands negative, which is EINVAL on the same
+            // line.  Only the cookie domain has a maxsize the model can reach.
             match wh {
                 | WSet =>
-                    if (off < 0) out(fs, ps, SOff({ e: EINVAL, off: -1 }))
+                    if (off < 0 or (cookieDir and off > DIR_SEEK_MAX))
+                        out(fs, ps, SOff({ e: EINVAL, off: -1 }))
                     else out(fs, psSetOffset(ps, p, fd, off),
                              SOff({ e: OK, off: off }))
+                // The sums below are tested for range BEFORE they are
+                // formed.  A cookie domain's end is the largest off_t there
+                // is, and a descriptor may already be sitting on it, so
+                // forming base + off to find out whether it fits overflows
+                // the very type the answer is about.
                 | WCur =>
-                    if (o.offset + off < 0)
+                    if (off > 0 and off > DIR_SEEK_MAX - o.offset)
+                        out(fs, ps, SOff({ e: EINVAL, off: -1 }))
+                    else if (off < 0 - o.offset)
                         out(fs, ps, SOff({ e: EINVAL, off: -1 }))
                     else out(fs, psSetOffset(ps, p, fd, o.offset + off),
                              SOff({ e: OK, off: o.offset + off }))
                 | WEnd =>
-                    if (nd.size + off < 0)
+                    if (off > 0 and off > DIR_SEEK_MAX - eof)
                         out(fs, ps, SOff({ e: EINVAL, off: -1 }))
-                    else out(fs, psSetOffset(ps, p, fd, nd.size + off),
-                             SOff({ e: OK, off: nd.size + off }))
+                    else if (off < 0 - eof)
+                        out(fs, ps, SOff({ e: EINVAL, off: -1 }))
+                    else out(fs, psSetOffset(ps, p, fd, eof + off),
+                             SOff({ e: OK, off: eof + off }))
                 | WData =>
                     // [EINVAL] for a whence the implementation does not
                     // support outranks [ENXIO] for an out-of-range offset.
                     if (not(caps.seekHole))
                         out(fs, ps, SOff({ e: EINVAL, off: -1 }))
-                    else if (off < 0 or off >= nd.size)
+                    else if (off < 0 or off >= eof)
                         out(fs, ps, SOff({ e: ENXIO, off: -1 }))
+                    else if (cookieDir)
+                        out(fs, psSetOffset(ps, p, fd, off),
+                            SOff({ e: OK, off: off }))
                     else {
                         val s = seekScan(nd, off, true)
                         if (not(s.found))
@@ -810,8 +912,11 @@ module posixops {
                 | WHole =>
                     if (not(caps.seekHole))
                         out(fs, ps, SOff({ e: EINVAL, off: -1 }))
-                    else if (off < 0 or off >= nd.size)
+                    else if (off < 0 or off >= eof)
                         out(fs, ps, SOff({ e: ENXIO, off: -1 }))
+                    else if (cookieDir)
+                        out(fs, psSetOffset(ps, p, fd, eof),
+                            SOff({ e: OK, off: eof }))
                     else {
                         val s = seekScan(nd, off, false)
                         out(fs, psSetOffset(ps, p, fd, s.off2),
@@ -851,6 +956,14 @@ module posixops {
             else if (readModeDenied(caps, cr, nd))
                 hit(out(fs, ps, rwErr(EACCES)),
                     if (badAcc) Set("PD11b") else Set("PD11a"))
+            // rw_verify_area() runs inside vfs_read(), BEFORE the file's own
+            // read op -- so an offset whose sum with the count overflows off_t
+            // is EINVAL and never reaches the EISDIR generic_read_dir() would
+            // have answered.  Only a descriptor with a cookie seek domain can
+            // carry an offset that large, so this is reachable exactly where
+            // policies.dirSeekDomain put it.
+            else if (o.offset >= 0 and len > DIR_SEEK_MAX - o.offset)
+                out(fs, ps, rwErr(EINVAL))
             else if (nd.ftype == FDir and dev(caps, "PD8"))
                 // PD8: the directory handle serves READ, answering `len`
                 // fabricated zero bytes and advancing the offset.
@@ -963,6 +1076,7 @@ module posixops {
                         len: int): Out = {
         val cr = psCred(ps, p)
         val r = resolveEx(fs, caps, cr, ROOT, pth, true)
+        withLinkAtimes({
         if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
         else {
             val nd = fs.inodes.get(r.ino)
@@ -974,6 +1088,7 @@ module posixops {
                          caps.writeClearsSets and not(isPriv(cr))),
                      ps, sOk(OK))
         }
+        }, r.links, caps)
     }
 
     pure def opFtruncate(fs: Fs, ps: Pstate, caps: Caps, p: Pid, fd: Fd,
@@ -1020,8 +1135,10 @@ module posixops {
         if (at.e != OK) out(fs, ps, statFail(at.e))
         else {
             val r = resolveEx(fs, caps, psCred(ps, p), at.start, pth, follow)
+            withLinkAtimes({
             if (r.err != OK) hit(out(fs, ps, statFail(r.err)), r.hits)
             else out(fs, ps, statRes(fs.inodes.get(r.ino), r.ino))
+            }, r.links, caps)
         }
     }
 
@@ -1041,8 +1158,10 @@ module posixops {
         if (at.e != OK) outErr(fs, ps, at.e)
         else {
             val r = resolveEx(fs, caps, psCred(ps, p), at.start, pth, true)
+            withLinkAtimes({
             if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
             else outErr(fs, ps, OK)
+            }, r.links, caps)
         }
     }
 
@@ -1073,8 +1192,10 @@ module posixops {
         if (at.e != OK) outErr(fs, ps, at.e)
         else {
             val r = resolveEx(fs, caps, psCred(ps, p), at.start, pth, true)
+            withLinkAtimes({
             if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
             else chmodCommon(fs, ps, p, r.ino, m)
+            }, r.links, caps)
         }
     }
 
@@ -1105,9 +1226,17 @@ module posixops {
         // with no ownership check; pjd chown/00 "chown(-1,-1) succeeds even for
         // a non-owner").  No uid/gid and no set*id bit change.
         if (u == -1 and g == -1)
-            // Bumps ctime (Linux sets ATTR_CTIME) but leaves uid/gid and the
-            // set*id bits untouched.
-            out(fsChown(fs, i, -1, -1, false), ps, sOk(OK))
+            // Bumps ctime (Linux sets ATTR_CTIME) and leaves uid/gid alone --
+            // but the setid bits still go.  XSH chown conditions that on the
+            // file being regular, an execute bit being set, the caller being
+            // unprivileged and the call returning successfully; it does NOT
+            // ask whether an id actually changed, and chown(-1, -1) returns
+            // successfully.  chown_common() reads it the same way, adding
+            // ATTR_KILL_SUID|ATTR_KILL_SGID for any non-directory OUTSIDE the
+            // two tests that look at user and group.  The model kept the bits
+            // here and an audit caught /d holding 04755 against ext4's 0755.
+            out(fsChown(fs, i, -1, -1,
+                        nd.ftype == FReg and anyExec(nd.mode)), ps, sOk(OK))
         else {
             // A field set to the value it already holds is not a change, so
             // it needs no privilege -- Linux's setattr_prepare tests
@@ -1135,8 +1264,10 @@ module posixops {
         if (at.e != OK) outErr(fs, ps, at.e)
         else {
             val r = resolveEx(fs, caps, psCred(ps, p), at.start, pth, follow)
+            withLinkAtimes({
             if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
             else chownCommon(fs, ps, caps, p, r.ino, u, g)
+            }, r.links, caps)
         }
     }
 
@@ -1166,7 +1297,7 @@ module posixops {
     //    privilege, else EACCES
     //  - any explicit value: owner or privilege only, else EPERM (write
     //    access never helps)
-    pure def utimensCommon(fs: Fs, ps: Pstate, p: Pid, i: Ino,
+    pure def utimensCommon(fs: Fs, ps: Pstate, caps: Caps, p: Pid, i: Ino,
                            ta: TimeSpec, tm: TimeSpec): Out = {
         val cr = psCred(ps, p)
         val nd = fs.inodes.get(i)
@@ -1174,8 +1305,26 @@ module posixops {
         else {
             val explicit = tsExplicit(ta) or tsExplicit(tm)
             val owner = isPriv(cr) or cr.euid == nd.uid
-            if (explicit and not(owner)) outErr(fs, ps, EPERM)
-            else if (not(explicit) and not(owner) and not(mayWrite(cr, nd)))
+            // A MIXED pair -- one UTIME_NOW, one UTIME_OMIT -- satisfies
+            // neither tier's stated condition: XSH utimensat names EACCES for
+            // "a null pointer, or BOTH tv_nsec values are UTIME_NOW" and EPERM
+            // for "neither field is UTIME_NOW, neither is UTIME_OMIT".  Linux
+            // resolves the gap by taking the ownership tier for anything that
+            // is not both-UTIME_NOW: vfs_utimes() sets ATTR_TIMES_SET and
+            // setattr_prepare() then demands ownership.
+            val mixedNowOmit = not(explicit) and not(ta == TsNow and tm == TsNow)
+            val ownerTier =
+                explicit or (dev(caps, "S-utimens-mixed-owner") and mixedNowOmit)
+            // Recorded only where it changed the answer: a non-owner reaching
+            // the ownership tier gets EPERM where the write tier would have
+            // allowed the call or refused it with EACCES.  An owner passes
+            // either tier, so nothing is recorded for one.
+            val utHits = if (dev(caps, "S-utimens-mixed-owner") and
+                             mixedNowOmit and not(owner))
+                             Set("S-utimens-mixed-owner")
+                         else Set()
+            if (ownerTier and not(owner)) hit(outErr(fs, ps, EPERM), utHits)
+            else if (not(ownerTier) and not(owner) and not(mayWrite(cr, nd)))
                 outErr(fs, ps, EACCES)
             else out(fsSetTimes(fs, i, ta != TsOmit, tsVal(ta),
                                 tm != TsOmit, tsVal(tm)),
@@ -1189,15 +1338,17 @@ module posixops {
         if (at.e != OK) outErr(fs, ps, at.e)
         else {
             val r = resolveEx(fs, caps, psCred(ps, p), at.start, pth, true)
+            withLinkAtimes({
             if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
-            else utimensCommon(fs, ps, p, r.ino, ta, tm)
+            else utimensCommon(fs, ps, caps, p, r.ino, ta, tm)
+            }, r.links, caps)
         }
     }
 
-    pure def opFutimens(fs: Fs, ps: Pstate, p: Pid, fd: Fd, ta: TimeSpec,
-                        tm: TimeSpec): Out =
+    pure def opFutimens(fs: Fs, ps: Pstate, caps: Caps, p: Pid, fd: Fd,
+                        ta: TimeSpec, tm: TimeSpec): Out =
         if (not(fdLive(ps, p, fd))) outErr(fs, ps, EBADF)
-        else utimensCommon(fs, ps, p, fdOfd(ps, p, fd).ino, ta, tm)
+        else utimensCommon(fs, ps, caps, p, fdOfd(ps, p, fd).ino, ta, tm)
 
     // access/faccessat: the whole check -- path search included -- runs
     // with the real ids unless AT_EACCESS.
@@ -1212,6 +1363,7 @@ module posixops {
         if (at.e != OK) outErr(fs, ps, at.e)
         else {
             val r = resolveEx(fs, caps, cr, at.start, pth, true)
+            withLinkAtimes({
             if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
             else {
                 val nd = fs.inodes.get(r.ino)
@@ -1226,6 +1378,7 @@ module posixops {
                     hit(outErr(fs, ps, EACCES), r.hits)
                 else hit(outErr(fs, ps, OK), r.hits)
             }
+            }, r.links, caps)
         }
     }
 
@@ -1242,20 +1395,58 @@ module posixops {
     // included -- is EEXIST), then require write on the parent.
     pure def createGate(fs: Fs, ps: Pstate, caps: Caps, p: Pid, dfd: Fd,
                         pth: Path, slashOk: bool):
-            { e: int, par: Ino, leaf: Name, hits: Set[str] } = {
+            { e: int, par: Ino, leaf: Name, hits: Set[str],
+              links: Set[Ino],
+              // Set where the gate answered for the FINAL component -- it
+              // exists -- while the parent would have denied the write
+              // anyway.  Both conditions hold, XSH orders neither, so a
+              // caller that reports the parent's objection first is as
+              // correct as one that reports the name's.
+              alsoDenies: bool } = {
         val cr = psCred(ps, p)
         val at = atStart(fs, ps, p, dfd, pth)
-        if (at.e != OK) { e: at.e, par: -1, leaf: "", hits: Set() }
+        // A trailing slash on a CREATING call: the name already exists, and
+        // what it happens to be is the slash rule's business on a resolving
+        // call but not here.  With the deviation on, the slash is dropped
+        // before resolution, so an existing final component answers EEXIST --
+        // ahead of the ENOTDIR resolve() would have raised for a
+        // non-directory, and ahead of the ELOOP it would have raised for a
+        // looping symlink the slash forced it to follow.
+        //
+        // Only createGate's resolution changes.  stat("f/") still gets the
+        // rule, which is what separates this from PD15: that one clears the
+        // rule inside resolve() itself, for every op that resolves a path.
+        val rpth = if (dev(caps, "S-slash-create-eexist"))
+                       pth.with("slash", false)
+                   else pth
+        if (at.e != OK) { e: at.e, par: -1, leaf: "", hits: Set(),
+                          links: Set(), alsoDenies: false }
         else {
-            val r = resolve(fs, caps, cr, at.start, pth, false)
-            if (r.err != OK) { e: r.err, par: -1, leaf: "", hits: r.hits }
-            else if (r.ino != -1) { e: EEXIST, par: -1, leaf: "",
-                                    hits: r.hits }
+            val r = resolve(fs, caps, cr, at.start, rpth, false)
+            if (r.err != OK) { e: r.err, par: -1, leaf: "", hits: r.hits,
+                               links: r.links, alsoDenies: false }
+            else if (r.ino != -1)
+                // The deviation is TAKEN only where dropping the slash changed
+                // the answer: the final component exists and is not a
+                // directory, so the rule would have raised ENOTDIR for it (or
+                // ELOOP for a symlink it forced resolution through) instead of
+                // the EEXIST this reports.  Over a directory the slash is
+                // immaterial and nothing is recorded, which is what keeps the
+                // liveness gate measuring the case the id actually names.
+                { e: EEXIST, par: -1, leaf: "", links: r.links,
+                  alsoDenies: not(mayWrite(cr, fs.inodes.get(r.par))),
+                  hits: if (dev(caps, "S-slash-create-eexist") and pth.slash and
+                            fs.inodes.get(r.ino).ftype != FDir)
+                            r.hits.union(Set("S-slash-create-eexist"))
+                        else r.hits }
             else if (pth.slash and not(slashOk))
-                { e: ENOENT, par: -1, leaf: "", hits: r.hits }
+                { e: ENOENT, par: -1, leaf: "", hits: r.hits, links: r.links,
+                  alsoDenies: false }
             else if (not(mayWrite(cr, fs.inodes.get(r.par))))
-                { e: EACCES, par: -1, leaf: "", hits: r.hits }
-            else { e: OK, par: r.par, leaf: r.leaf, hits: r.hits }
+                { e: EACCES, par: -1, leaf: "", hits: r.hits, links: r.links,
+                  alsoDenies: false }
+            else { e: OK, par: r.par, leaf: r.leaf, hits: r.hits,
+                   links: r.links, alsoDenies: false }
         }
     }
 
@@ -1263,6 +1454,7 @@ module posixops {
                      pth: Path, m: int): Out = {
         val cr = psCred(ps, p)
         val g = createGate(fs, ps, caps, p, dfd, pth, true)
+        withLinkAtimes({
         if (g.e != OK) hit(outErr(fs, ps, g.e), g.hits)
         else {
             val dnode = fs.inodes.get(g.par)
@@ -1271,12 +1463,14 @@ module posixops {
             val mk = fsMknode(fs, g.par, g.leaf, node)
             hit(outErr(mk.fs2, ps, OK), g.hits)
         }
+        }, g.links, caps)
     }
 
     pure def opMknod(fs: Fs, ps: Pstate, caps: Caps, p: Pid, pth: Path,
                      ft: Ftype, m: int): Out = {
         val cr = psCred(ps, p)
         val g = createGate(fs, ps, caps, p, -1, pth, false)
+        withLinkAtimes({
         if (g.e != OK) hit(outErr(fs, ps, g.e), g.hits)
         else if (ft == FDir or ft == FLnk) outErr(fs, ps, EINVAL)
         else if ((ft == FBlk or ft == FChr) and not(isPriv(cr)))
@@ -1290,6 +1484,7 @@ module posixops {
                                       newGid(caps, cr, dnode))
             hit(outErr(fsMknode(fs, g.par, g.leaf, node).fs2, ps, OK), g.hits)
         }
+        }, g.links, caps)
     }
 
     // symlink: the target is not validated (dangling is fine).  The link's
@@ -1300,12 +1495,14 @@ module posixops {
                        tgt: SymTarget, dfd: Fd, pth: Path): Out = {
         val cr = psCred(ps, p)
         val g = createGate(fs, ps, caps, p, dfd, pth, false)
+        withLinkAtimes({
         if (g.e != OK) hit(outErr(fs, ps, g.e), g.hits)
         else {
             val dnode = fs.inodes.get(g.par)
             val node = mkSymlink(tgt, 511, cr.euid, newGid(caps, cr, dnode))
             hit(outErr(fsMknode(fs, g.par, g.leaf, node).fs2, ps, OK), g.hits)
         }
+        }, g.links, caps)
     }
 
     pure def opLink(fs: Fs, ps: Pstate, caps: Caps, p: Pid, dfdOld: Fd,
@@ -1329,7 +1526,11 @@ module posixops {
             // the source error and ACCEPTS the target's unconditionally,
             // rather than carrying a knob per ordering (was PD17c/PD17e/PD17f).
             val gEarly = createGate(fs, ps, caps, p, dfdNew, pthNew, false)
-            val gAcc = if (gEarly.e == OK) Set() else Set(gEarly.e)
+            withLinkAtimes({
+            val gAcc = if (gEarly.e == OK) Set()
+                       else if (gEarly.alsoDenies)
+                           Set(gEarly.e, EACCES)
+                       else Set(gEarly.e)
             if (ro.err != OK)
                 hit(outErrA(fs, ps, ro.err, gAcc), ro.hits.union(pd6))
             else if (fs.inodes.get(ro.ino).ftype == FDir)
@@ -1346,6 +1547,7 @@ module posixops {
                         else ENOTDIR), g.hits.union(pd6))
                 }
             }
+            }, ro.links.union(gEarly.links), caps)
         }
     }
 
@@ -1356,6 +1558,7 @@ module posixops {
         if (at.e != OK) outErr(fs, ps, at.e)
         else {
             val r = resolve(fs, caps, cr, at.start, pth, false)
+            withLinkAtimes({
             if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
             else if (r.ino == -1) outErr(fs, ps, ENOENT)
             else if (r.par == -1) outErr(fs, ps, EBUSY)   // "/"
@@ -1382,10 +1585,12 @@ module posixops {
                 else if (not(stickyOk(caps, cr, dnode, vnode)))
                     outErrA(fs, ps, errSticky(caps), stickyAccept(caps))
                 else {
-                    val rm = fsRemove(fs, r.par, r.leaf, psPinned(ps))
+                    val rm = fsRemove(fs, r.par, r.leaf, psPinned(ps),
+                                      caps.orphanCtime)
                     outErr(rm.fs2, ps, if (rm.st == FsOk) OK else ENOENT)
                 }
             }
+            }, r.links, caps)
         }
     }
 
@@ -1396,6 +1601,7 @@ module posixops {
         if (at.e != OK) outErr(fs, ps, at.e)
         else {
             val r = resolve(fs, caps, cr, at.start, pth, false)
+            withLinkAtimes({
             if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
             else if (r.ino == -1) outErr(fs, ps, ENOENT)
             else if (r.leaf == ".") outErr(fs, ps, EINVAL)
@@ -1424,10 +1630,12 @@ module posixops {
                 else if (not(stickyOk(caps, cr, dnode, vnode)))
                     outErrA(fs, ps, errSticky(caps), stickyAccept(caps))
                 else {
-                    val rm = fsRemove(fs, r.par, r.leaf, psPinned(ps))
+                    val rm = fsRemove(fs, r.par, r.leaf, psPinned(ps),
+                                      caps.orphanCtime)
                     outErr(rm.fs2, ps, if (rm.st == FsOk) OK else ENOENT)
                 }
             }
+            }, r.links, caps)
         }
     }
 
@@ -1440,12 +1648,14 @@ module posixops {
         else if (atN.e != OK) outErr(fs, ps, atN.e)
         else {
             val rs = resolve(fs, caps, cr, atO.start, pthOld, false)
+            withLinkAtimes({
             if (rs.err != OK) hit(outErr(fs, ps, rs.err), rs.hits)
             else if (rs.ino == -1) outErr(fs, ps, ENOENT)
             else if (rs.leaf == "." or rs.leaf == ".." or rs.par == -1)
                 outErr(fs, ps, EINVAL)
             else {
                 val rt = resolve(fs, caps, cr, atN.start, pthNew, false)
+                withLinkAtimes({
                 if (rt.err != OK) hit(outErr(fs, ps, rt.err), rt.hits)
                 else if (rt.leaf == "." or rt.leaf == ".." or rt.par == -1)
                     outErr(fs, ps, EINVAL)
@@ -1455,12 +1665,88 @@ module posixops {
                     val srcNode = fs.inodes.get(rs.ino)
                     val noop = (rs.par == rt.par and rs.leaf == rt.leaf) or
                                (rt.ino != -1 and rt.ino == rs.ino)
-                    if (not(mayWrite(cr, sdnode)) or
-                            not(mayWrite(cr, tdnode)))
+                    // "The new directory pathname names a descendant of the
+                    // old directory" is EINVAL (XSH rename), and it is settled
+                    // BEFORE the permission checks.  fsRename already detects
+                    // it, but only once the gates below have passed, so a
+                    // caller who also lacked write permission was told EACCES
+                    // for a rename no permission could have made legal.
+                    // Linux resolves the descendant case during lookup, well
+                    // before may_delete/may_create judge anything; ext4
+                    // answers EINVAL for rename("/d", "/d/d") where the model
+                    // answered EACCES, 11 times in one run.
+                    // "If the old argument and the new argument resolve to
+                    // either the same existing directory entry or different
+                    // directory entries for the same existing file, rename()
+                    // shall return successfully and perform no other action"
+                    // (XSH rename).  Unconditionally -- the call asks nothing
+                    // of the caller's permissions, and vfs_rename() agrees,
+                    // returning 0 on source == target before may_delete() is
+                    // reached.  The model computed the case but never acted on
+                    // it, so a sticky source directory could deny a rename
+                    // that does nothing, and the parent's timestamps marked
+                    // for a rename that moved no name.
+                    // The two STRUCTURAL verdicts, which depend on the
+                    // shape of the tree rather than on the caller:
+                    //
+                    //   * new names a descendant of old -- [EINVAL], named by
+                    //     XSH rename ("The new directory pathname contains a
+                    //     path prefix that names the old directory").
+                    //   * new names an ANCESTOR of old -- such a target is
+                    //     necessarily non-empty, since old lives under it, so
+                    //     it earns the [ENOTEMPTY] a non-empty target gets,
+                    //     and that outranks the [EISDIR] a non-directory old
+                    //     would otherwise draw.
+                    //
+                    // Linux settles both off lock_rename()'s trap dentry --
+                    // old == trap is the first, new == trap the second -- and
+                    // both precede every may_delete/may_create judgement.
+                    val structErr =
+                        if (noop) OK
+                        else if (srcNode.ftype == FDir and
+                                 fsDescOf(fs, rs.ino).contains(rt.par))
+                            EINVAL
+                        // The ancestor verdict is the TRAP's doing, not a
+                        // rule of its own: a cell without the trap has no
+                        // reason to treat an ancestor target differently from
+                        // any other non-empty directory, and answers by the
+                        // ordinary rules below -- [EISDIR] where old is not a
+                        // directory, [ENOTEMPTY] where it is.  Only a cell
+                        // that reports the shape first reports this.
+                        else if (caps.renameKernelOrder and rt.ino != -1 and
+                                 fs.inodes.get(rt.ino).ftype == FDir and
+                                 fsDescOf(fs, rt.ino).contains(rs.par))
+                            errNonempty(caps)
+                        else OK
+                    // Where they land is policy.  Both errnos are mandated,
+                    // but XSH orders none of its rename conditions against
+                    // another, so an implementation that reports the caller's
+                    // permission failure first is as conformant as one that
+                    // reports the shape of the tree first.  Linux takes the
+                    // trap before may_delete; an engine that resolves both
+                    // parents by handle and gates them itself reports EACCES.
+                    if (noop) outErr(fs, ps, OK)
+                    else if (caps.renameKernelOrder and structErr != OK)
+                        outErr(fs, ps, structErr)
+                    // vfs_rename() judges the source COMPLETELY before it
+                    // looks at the new directory at all:
+                    //     error = may_delete(old_dir, old_dentry, is_dir);
+                    //     if (error) return error;
+                    //     if (!target) error = may_create(new_dir, ...);
+                    //     else         error = may_delete(new_dir, ...);
+                    // and may_delete tests write permission first, then the
+                    // sticky rule.  So a source the sticky rule forbids
+                    // answers for itself even when the target's parent is
+                    // unwritable too.  Checking write on BOTH parents up
+                    // front, as the model did, let the target's EACCES speak
+                    // over the source's sticky EPERM.
+                    else if (not(mayWrite(cr, sdnode)))
                         outErr(fs, ps, EACCES)
                     else if (not(stickyOk(caps, cr, sdnode, srcNode)))
                         outErrA(fs, ps, errSticky(caps), stickyAccept(caps))
-                    else if (rt.ino != -1 and not(noop) and
+                    else if (not(mayWrite(cr, tdnode)))
+                        outErr(fs, ps, EACCES)
+                    else if (rt.ino != -1 and
                              not(stickyOk(caps, cr, tdnode,
                                           fs.inodes.get(rt.ino))))
                         outErrA(fs, ps, errSticky(caps), stickyAccept(caps))
@@ -1474,12 +1760,33 @@ module posixops {
                     // subject.  (Verified against ext4: a 0000 directory
                     // moved out of its parent by its own owner is EACCES, the
                     // same move at 0700 succeeds.)
+                    // The cell that gates first reports the shape here.
+                    else if (structErr != OK) outErr(fs, ps, structErr)
+                    // The TARGET's type is judged before the subject's own
+                    // write permission.  vfs_rename() runs may_delete() on the
+                    // new directory -- which is where "renaming a directory
+                    // onto a non-directory" becomes -ENOTDIR, and the mirror
+                    // -EISDIR -- and only then, further down, asks whether the
+                    // directory being moved across parents is writable:
+                    //     if (is_dir && ... && old_dir != new_dir)
+                    //             error = inode_permission(old_dentry->d_inode, MAY_WRITE);
+                    // Checking the subject first reported EACCES for a rename
+                    // whose target could never have accepted it.
+                    else if (caps.renameKernelOrder and rt.ino != -1 and
+                             not(noop) and srcNode.ftype == FDir and
+                             fs.inodes.get(rt.ino).ftype != FDir)
+                        outErr(fs, ps, ENOTDIR)
+                    else if (caps.renameKernelOrder and rt.ino != -1 and
+                             not(noop) and srcNode.ftype != FDir and
+                             fs.inodes.get(rt.ino).ftype == FDir)
+                        outErr(fs, ps, EISDIR)
                     else if (srcNode.ftype == FDir and rs.par != rt.par and
                              not(mayWrite(cr, srcNode)))
                         outErr(fs, ps, EACCES)
                     else {
                         val rn = fsRename(fs, rs.par, rs.leaf, rt.par,
-                                          rt.leaf, psPinned(ps))
+                                          rt.leaf, caps.orphanCtime,
+                                          psPinned(ps))
                         val e = if (rn.st == FsOk) OK
                                 else if (rn.st == FsNoent) ENOENT
                                 else if (rn.st == FsInval) EINVAL
@@ -1494,7 +1801,9 @@ module posixops {
                         outErr(fsC, ps, e)
                     }
                 }
+                }, rt.links, caps)
             }
+            }, rs.links, caps)
         }
     }
 
@@ -1504,6 +1813,7 @@ module posixops {
         if (at.e != OK) out(fs, ps, SReadlinkR({ e: at.e, tgt: NO_TARGET }))
         else {
             val r = resolveEx(fs, caps, psCred(ps, p), at.start, pth, false)
+            withLinkAtimes({
             if (r.err != OK)
                 hit(out(fs, ps, SReadlinkR({ e: r.err, tgt: NO_TARGET })),
                     r.hits)
@@ -1517,6 +1827,7 @@ module posixops {
                     out(fsMark(fs, r.ino, true, false, false), ps,
                         SReadlinkR({ e: OK, tgt: nd.target }))
             }
+            }, r.links, caps)
         }
     }
 
@@ -1530,6 +1841,7 @@ module posixops {
                        pth: Path): Out = {
         val cr = psCred(ps, p)
         val r = resolveEx(fs, caps, cr, ROOT, pth, true)
+        withLinkAtimes({
         if (r.err != OK) hit(out(fs, ps, SDirR({ e: r.err, sid: -1 })), r.hits)
         else {
             val nd = fs.inodes.get(r.ino)
@@ -1541,6 +1853,7 @@ module posixops {
                 out(fs, od.ps2, SDirR({ e: OK, sid: od.sid }))
             }
         }
+        }, r.links, caps)
     }
 
     // readdir modeled as one atomic full sweep (see DESIGN-POSIX.md): the
@@ -1750,7 +2063,21 @@ module posixops {
         else {
             val o = fdOfd(ps, p, fd)
             val i = o.ino
-            if (not(accWrites(o.acc))) outErr(fs, ps, EBADF)
+            // XSH lockf scopes the write requirement to the two commands
+            // that take a lock: "[EBADF] ... or function is F_LOCK or F_TLOCK
+            // and fildes is not a valid file descriptor open for writing".
+            // F_TEST and F_ULOCK ask only for a valid descriptor, and glibc's
+            // lockf() lands on exactly that split -- F_LOCK/F_TLOCK become
+            // fcntl F_WRLCK, which fcntl refuses EBADF on a read-only fd,
+            // while F_TEST is F_GETLK and F_ULOCK is F_UNLCK and neither
+            // consults the access mode.
+            val needsWrite = match cmd {
+                | LfLock  => true
+                | LfTlock => true
+                | LfTst   => false
+                | LfUlock => false
+            }
+            if (needsWrite and not(accWrites(o.acc))) outErr(fs, ps, EBADF)
             else if (fs.inodes.get(i).ftype != FReg) outErr(fs, ps, EINVAL)
             else if (len < 0) outErr(fs, ps, EINVAL)
             else {
@@ -1761,8 +2088,22 @@ module posixops {
                     | LfUlock =>
                         out(fs, lockUnset(ps, p, i, lo, hi), sOk(OK))
                     | LfTst =>
-                        if (lockConflict(ps, p, i, lo, hi, LWrite))
-                            outErr(fs, ps, errLockBusy(caps))
+                        // The harness reaches lockf() through libc, and glibc
+                        // implements F_TEST as fcntl F_GETLK with l_type =
+                        // F_RDLCK, reporting a conflict as EACCES outright:
+                        //   if (fl.l_type == F_UNLCK || fl.l_pid == getpid ())
+                        //     return 0;
+                        //   __set_errno (EACCES);
+                        // Two consequences the model had wrong.  It asks
+                        // whether a READER would conflict, so another process
+                        // holding a read lock is no conflict at all -- only a
+                        // write lock is -- where the model asked as a writer
+                        // and reported conflicts that are not there.  And the
+                        // errno is glibc's own EACCES, not the EAGAIN/EACCES
+                        // choice policies.lockEagain makes for the commands
+                        // that take a lock, where the answer is the kernel's.
+                        if (lockConflict(ps, p, i, lo, hi, LRead))
+                            outErr(fs, ps, EACCES)
                         else outErr(fs, ps, OK)
                     | LfLock =>
                         // Blocking variant; generators keep it
@@ -1805,14 +2146,21 @@ module posixops {
                 out(fs, ps, rwErr(EINVAL))
             else if (offIn < 0 or offOut < 0)
                 out(fs, ps, rwErr(EINVAL))
-            else if (oi.ino == oo.ino and offIn < offOut + len and
-                     offOut < offIn + len)
-                // Overlapping ranges within one file.
-                out(fs, ps, rwErr(EINVAL))
             else {
+                // generic_copy_file_checks() shortens the copy to the source's
+                // EOF BEFORE it judges overlap, and the overlap test is
+                // written against the shortened count -- so a request whose
+                // source offset is already at or past EOF copies zero bytes
+                // and cannot overlap anything.  Testing the REQUESTED length
+                // instead called that EINVAL, twice in one run against ext4,
+                // where the answer is a 0-byte success.
                 val srcSz = fs.inodes.get(oi.ino).size
                 val n = imax(0, imin(len, srcSz - offIn))
-                if (n == 0)
+                if (oi.ino == oo.ino and offIn < offOut + n and
+                        offOut < offIn + n)
+                    // Overlapping ranges within one file.
+                    out(fs, ps, rwErr(EINVAL))
+                else if (n == 0)
                     out(fs, ps, rwOk(0, oo.ino, offOut))
                 else {
                     val fs1 = fsCopyRange(fs, oi.ino, offIn, oo.ino,
@@ -1876,16 +2224,21 @@ module posixops {
     // (fallocate uses EBADF here, not the EINVAL ftruncate returns).  Both
     // modes mark mtime/ctime and neither clears the set-user/group-ID bits
     // (the allocate path bumps times only, never the mode).
-    pure def opFallocate(fs: Fs, ps: Pstate, p: Pid, fd: Fd, mode: int,
-                         off: int, len: int): Out =
+    pure def opFallocate(fs: Fs, ps: Pstate, caps: Caps, p: Pid, fd: Fd,
+                         mode: int, off: int, len: int): Out =
         if (off < 0 or len <= 0) outErr(fs, ps, EINVAL)
         else if (not(fdLive(ps, p, fd))) outErr(fs, ps, EBADF)
         else {
             val o = fdOfd(ps, p, fd)
+            // fallocate changes the file, so it sheds the setid bits on the
+            // same rule a write does: every ext4_fallocate() path runs
+            // file_modified(), which calls file_remove_privs().  The model
+            // treated it as a pure allocation and kept them.
+            val drop = caps.writeClearsSets and not(isPriv(psCred(ps, p)))
             if (not(accWrites(o.acc))) outErr(fs, ps, EBADF)
             else if (mode == 0)
-                out(fsAllocate(fs, o.ino, off, len), ps, sOk(OK))
-            else out(fsPunch(fs, o.ino, off, len), ps, sOk(OK))
+                out(fsAllocate(fs, o.ino, off, len, drop), ps, sOk(OK))
+            else out(fsPunch(fs, o.ino, off, len, drop), ps, sOk(OK))
         }
 
     // ------------------------------------------------------------------
@@ -1925,7 +2278,7 @@ module posixops {
             | RFchown(a) => opFchown(fs, ps, caps, p, a.fd, a.u, a.g)
             | RUtimens(a) => opUtimens(fs, ps, caps, p, a.dfd, a.pth, a.ta,
                                        a.tm)
-            | RFutimens(a) => opFutimens(fs, ps, p, a.fd, a.ta, a.tm)
+            | RFutimens(a) => opFutimens(fs, ps, caps, p, a.fd, a.ta, a.tm)
             | RAccess(a) => opAccess(fs, ps, caps, p, a.dfd, a.pth, a.r,
                                      a.w, a.x, a.eff)
             | RUmask(a) => opUmask(fs, ps, p, a.mask)
@@ -1957,7 +2310,7 @@ module posixops {
             | RCloneRange(a) => opCloneRange(fs, ps, caps, p, a.fdDst,
                                              a.offDst, a.fdSrc, a.offSrc,
                                              a.len)
-            | RFallocate(a) => opFallocate(fs, ps, p, a.fd, a.mode, a.off,
+            | RFallocate(a) => opFallocate(fs, ps, caps, p, a.fd, a.mode, a.off,
                                            a.len)
         }
 }

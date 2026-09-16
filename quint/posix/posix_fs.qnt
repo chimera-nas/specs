@@ -307,7 +307,8 @@ module posixfs {
     //    remaining gets its ctime marked (unlink page: "if the file's link
     //    count is not 0").  An orphan's ctime is deliberately not marked;
     //    the harness treats orphan ctime as unobservable-by-path anyway.
-    pure def fsRemove(fs: Fs, d: Ino, n: Name, pinned: Set[Ino]):
+    pure def fsRemove(fs: Fs, d: Ino, n: Name, pinned: Set[Ino],
+                      orphanCtime: bool):
             { fs2: Fs, st: FsStatus, gone: Ino, orphaned: Ino } = {
         val dnode = fs.inodes.get(d)
         val same = { fs2: fs, st: FsOk, gone: -1, orphaned: -1 }
@@ -334,9 +335,15 @@ module posixfs {
                            .with("removed", fsA.removed.union(Set(victim)))
                     else if (orphans)
                         // Orphaned: nlink drops to 0 (a removed directory
-                        // sheds both "." and its parent entry).
+                        // sheds both "." and its parent entry).  Whether the
+                        // ctime marks here is policy: unlink() requires it
+                        // "if the file's link count is not 0" and says nothing
+                        // about the case where it is, which an open descriptor
+                        // nonetheless keeps observable.
                         fsA.with("inodes", fsA.inodes.setBy(victim, vn => vn
-                            .with("nlink", 0)))
+                            .with("nlink", 0)
+                            .with("ctime", if (orphanCtime) fs.clk
+                                           else vn.ctime)))
                     else
                         // Other links remain: ctime of the object marks.
                         fsA.with("inodes", fsA.inodes.setBy(victim, vn => vn
@@ -372,6 +379,7 @@ module posixfs {
     //    whether the moved object's ctime marks is left to implementations
     //    (acceptance: harness tolerates either).
     pure def fsRename(fs: Fs, sd: Ino, sn: Name, td: Ino, tn: Name,
+                      orphanCtime: bool,
                       pinned: Set[Ino]):
             { fs2: Fs, st: FsStatus, gone: Ino, orphaned: Ino } = {
         val sdnode = fs.inodes.get(sd)
@@ -412,8 +420,12 @@ module posixfs {
                             fs.with("inodes", mapDrop(fs.inodes, tgt))
                               .with("removed", fs.removed.union(Set(tgt)))
                         else if (tgtOrphans)
+                            // As in fsRemove: the replaced target's ctime
+                            // marks only where the cell says it does.
                             fs.with("inodes", fs.inodes.setBy(tgt, x => x
-                                .with("nlink", 0)))
+                                .with("nlink", 0)
+                                .with("ctime", if (orphanCtime) fs.clk
+                                               else x.ctime)))
                         else if (tgtExists)
                             fs.with("inodes", fs.inodes.setBy(tgt, x => x
                                 .with("nlink", x.nlink - 1)
@@ -536,10 +548,12 @@ module posixfs {
     // SEEK_HOLE/SEEK_DATA must see it as data, not a hole (RFC 7862 §11.1;
     // memfs_allocate materializes for exactly this reason).  Presence changes,
     // content does not.  Marks mtime/ctime.
-    pure def fsAllocate(fs: Fs, f: Ino, off: int, len: int): Fs = {
+    pure def fsAllocate(fs: Fs, f: Ino, off: int, len: int,
+                        dropSets: bool): Fs = {
         fs.with("inodes", fs.inodes.setBy(f, x => x
               .with("dataBlocks", addBlocks(x.dataBlocks, off, len))
               .with("size", imax(x.size, off + len))
+              .with("mode", if (dropSets) modeWithoutSetids(x.mode) else x.mode)
               .with("mtime", fs.clk)
               .with("ctime", fs.clk)))
           .with("clk", fs.clk + 1)
@@ -550,11 +564,13 @@ module posixfs {
     // floor((off+len)/BS)) -- which revert to holes; a partially-covered edge
     // block stays present (memfs zeroes the sub-range but keeps the block).
     // Size is unchanged.  Marks mtime/ctime unconditionally.
-    pure def fsPunch(fs: Fs, f: Ino, off: int, len: int): Fs = {
+    pure def fsPunch(fs: Fs, f: Ino, off: int, len: int,
+                     dropSets: bool): Fs = {
         val lo = ceilDiv(off, BS)
         val hi = blkOf(off + len)
         fs.with("inodes", fs.inodes.setBy(f, x => x
               .with("dataBlocks", x.dataBlocks.filter(i => i < lo or i >= hi))
+              .with("mode", if (dropSets) modeWithoutSetids(x.mode) else x.mode)
               .with("mtime", fs.clk)
               .with("ctime", fs.clk)))
           .with("clk", fs.clk + 1)

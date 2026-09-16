@@ -9,7 +9,8 @@
 
   "selfTests": [
     { "name": "posixTestStd",  "module": "posixTestStd",  "file": "./posixTest", "maxSamples": 100 },
-    { "name": "posixTestRoot", "module": "posixTestRoot", "file": "./posixTest", "maxSamples": 100 }
+    { "name": "posixTestRoot", "module": "posixTestRoot", "file": "./posixTest", "maxSamples": 100 },
+    { "name": "posixTestLinux", "module": "posixTestLinux", "file": "./posixTest", "maxSamples": 100 }
   ],
 
   "consts": {
@@ -46,11 +47,16 @@
 
         "PD14": "POSIX.1-2024 open(): '[EISDIR] The named file is a directory and oflag includes O_WRONLY or O_RDWR'. Directories open successfully for writing. Root cause: no EISDIR gate in the client open path; memfs serves writable opens of directories. Candidate fix: reject write-access opens of directories with EISDIR in chimera_posix_open/openat.",
 
-        "PD15": "POSIX.1-2024 XBD 4.16: a trailing slash requires the path to resolve to a directory (ENOTDIR otherwise). Trailing slashes on non-directories are ignored: stat('f/') succeeds, and mkdir over an existing non-dir with a trailing slash reports EEXIST instead of ENOTDIR. Root cause: the client passes the raw path down; no trailing-slash directory requirement anywhere in the stack. Candidate fix: enforce the trailing-slash rule during client path validation.",
+        "S-utimens-mixed-owner": "POSIX.1-2024 utimensat() permission tiers. A MIXED times array -- one UTIME_NOW, one UTIME_OMIT -- satisfies neither tier XSH states: EACCES is named for \"a null pointer, or both tv_nsec values are UTIME_NOW\", EPERM for \"neither field is UTIME_NOW, neither is UTIME_OMIT\". Linux closes the gap by taking the ownership tier for anything that is not both-UTIME_NOW -- vfs_utimes() sets ATTR_TIMES_SET and setattr_prepare() then demands ownership -- so a non-owner with write permission gets EPERM where the model's write tier would have let the call through. Measured on ext4. S-, not a target-specific id, because it is a property of the clause being silent rather than of one implementation: any server whose permission check follows Linux's will show it.",
 
-        "PD15b": "POSIX.1-2024 XBD 4.16: a trailing slash forces a final symlink to be followed (ELOOP for a self-loop). mkdir over a self-loop symlink named with a trailing slash reports EEXIST; the slash should force following and yield ELOOP. Root cause: see PD15 (trailing slashes ignored on the mutation paths). Candidate fix: see PD15.",
+        "S-slash-create-eexist": "POSIX.1-2024 XBD 4.16 vs the creating calls. A trailing slash on a name that ALREADY EXISTS answers EEXIST from mkdir/mknod, ahead of the ENOTDIR the slash rule raises for a non-directory and the ELOOP it raises for a self-looping symlink the slash forced it to follow. Measured on ext4: mkdir over an existing regular file named with a trailing slash is EEXIST, and so is mkdir over a self-loop symlink; stat(\"f/\") on the same file is still ENOTDIR, which is what makes this separable. S-, not PD-, because it is not one implementation's: chimera does this too, as part of the broader PD15 (which clears the rule inside resolve() and so covers the resolving calls as well). A cell that ignores the slash only where a name is being created enables THIS; one that ignores it everywhere enables PD15. Splitting them is what let the ext4 cell say which half it has -- enabling PD15 there made seven passing stat calls fail.",
+
+        "PD15": "POSIX.1-2024 XBD 4.16: a trailing slash requires the path to resolve to a directory (ENOTDIR otherwise). Trailing slashes on non-directories are ignored: stat('f/') succeeds, and mkdir over an existing non-dir with a trailing slash reports EEXIST instead of ENOTDIR. ext4 answers EEXIST for the mkdir half too, but NOT for the rest: stat('f/') on a non-directory is ENOTDIR there. This id does not separate the two -- it clears the rule inside resolve(), for every path-taking op -- so it describes chimera and overstates ext4. Splitting the creating-call half out would let each cell say which half it has. Root cause: the client passes the raw path down; no trailing-slash directory requirement anywhere in the stack. Candidate fix: enforce the trailing-slash rule during client path validation.",
+
+        "PD15b": "POSIX.1-2024 XBD 4.16: a trailing slash forces a final symlink to be followed (ELOOP for a self-loop). mkdir over a self-loop symlink named with a trailing slash reports EEXIST; the slash should force following and yield ELOOP. On ext4 the slash does not force the final symlink to be followed on a CREATING call, but does everywhere else; as with PD15, this id does not separate the two. Root cause: see PD15 (trailing slashes ignored on the mutation paths). Candidate fix: see PD15.",
 
         "PD15c": "POSIX.1-2024 XBD 4.16 vs mkdir(): a trailing slash on a DANGLING symlink. mkdir('dangling/') -- the model follows the link and creates the target directory (strict XBD 4.16); chimera (like Linux) reports the existing symlink name, and the model now mirrors that so the created directory does not desync the trace. Root cause: the client judges the slash-stripped name; creating through the link would need readlink+re-resolution. Candidate fix: acceptance (Linux agrees with chimera here). Shares PD15b's branch: both are the slash failing to force a final symlink to be followed.",
+
 
 
 
@@ -189,6 +195,46 @@
       "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
       "default": "explore",
       "doc": "EISDIR (else EPERM)"
+    },
+    "P_DIR_SEEK_DOMAIN": {
+      "kind": "policy",
+      "key": "policies.dirSeekDomain",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "unsupported",
+      "doc": "directory fds seek over a cookie domain, not their size",
+      "citation": "POSIX.1-2024 XSH lseek: the file offset lseek() sets on a directory is unspecified -- the clause constrains it only for regular files, where SEEK_DATA/SEEK_HOLE are defined against the file size.  Linux ext4 reads the silence as licence: ext4_dir_llseek() (fs/ext4/dir.c) passes htree_max = 0x7fffffffffffffff to generic_file_llseek_size() as both the eof and the maxsize of a hashed directory, since a htree offset is a hash value rather than a byte position.  SEEK_DATA then reports every offset below 2^63-1 as data, SEEK_HOLE reports the hole at 2^63-1, SEEK_END counts from it, and an offset past it is EINVAL by way of vfs_setpos().  A directory whose offsets are byte positions -- the second road, taken by implementations that store a directory as a plain extent -- answers all four against its size instead.  Both conform; the clause distinguishes neither, so this is a policy rather than a deviation, and the strict twin keeps it.  Defaults to unsupported so that a cell says the ext4 shape out loud rather than inheriting it.",
+      "note": "ext4 applies the cookie domain only to a hashed directory (is_dx_dir(): dir_index on the superblock, plus either EXT4_INODE_INDEX or a single-block directory).  Every directory the corpus builds is a single block, so the distinction does not arise here; a corpus that grew one past a block on a dir_index-less filesystem would need the byte-extent answer for it."
+    },
+    "P_ORPHAN_CTIME": {
+      "kind": "policy",
+      "key": "policies.orphanCtime",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "unsupported",
+      "doc": "removing an object's last link marks its ctime",
+      "citation": "POSIX.1-2024 XSH unlink: 'Upon successful completion, unlink() shall mark for update the last data modification and last file status change timestamps of the parent directory. Also, if the file's link count is not 0, the last file status change timestamp of the file shall be marked for update.'  The mark is required only while links remain, and the clause says nothing about the link count reaching 0 -- reasonably, since the object is then unreachable by name.  An open descriptor makes it reachable anyway, and fstat() through it shows whichever choice the implementation made.  Linux marks unconditionally: ext4_unlink() runs drop_nlink() and then inode_set_ctime_current() with no test on the result, and ext4_rename() does the same to a replaced target.  Both answers conform, so this is a policy and the strict twin keeps it.  Defaults to unsupported, which is the model's reading of the clause as written.",
+      "note": "Covers the replaced target of a rename as well as unlink()/rmdir(), because the two share the orphaning path: a target that loses its last link while a descriptor holds it open is orphaned rather than reaped, and the same question arises about its ctime."
+    },
+    "P_SYMLINK_ATIME": {
+      "kind": "policy",
+      "key": "policies.symlinkAtime",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "unsupported",
+      "doc": "expanding a symlink during resolution marks the link's atime",
+      "citation": "POSIX.1-2024 XBD 4.15 (Pathname Resolution) describes expanding a symbolic link without requiring any timestamp of the link to be marked, and XSH does not name path resolution among the things that update a symbolic link's last data access timestamp.  Reading the link's contents is nonetheless an access of it, and implementations differ on whether it shows.  Linux marks: get_link() in fs/namei.c calls touch_atime(&last->link) on the non-RCU path, so every traversal of a symlink refreshes it, including one that goes on to fail ELOOP.  Both readings conform, so this is a policy and the strict twin keeps it.  Defaults to unsupported, the model's prior behaviour, so no cell moves unless it asks.",
+      "note": "Only observable where atime updates are not being suppressed: under the relatime default a traversal refreshes the link at most once a day unless its atime already trails its mtime or ctime.  The ext4 cell mounts the scratch filesystem strictatime for exactly this reason, so every traversal shows."
+    },
+    "P_RENAME_KERNEL_ORDER": {
+      "kind": "policy",
+      "key": "policies.renameKernelOrder",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "unsupported",
+      "doc": "rename judges in vfs_rename's order: shape and target type before permission",
+      "citation": "POSIX.1-2024 XSH rename mandates [EINVAL] when \"the new directory pathname contains a path prefix that names the old directory\", and [ENOTEMPTY] for a non-empty target -- which an ancestor of old necessarily is, since old lives under it.  It orders neither against the [EACCES] a caller without write permission on a parent earns, and XSH ERRORS is explicit that when several conditions hold the implementation may report any of them.  Linux reports the shape: do_renameat2() takes lock_rename()'s trap dentry and answers EINVAL (old == trap) or ENOTEMPTY (new == trap) before vfs_rename() reaches may_delete().  An engine that resolves both parents by handle, so that no kernel path-resolution check runs, and then gates them itself, reports the permission failure instead -- which is what chimera does deliberately, to keep its DELEGATES_DAC passthroughs and its own backends answering alike.  Both conform, so this is a policy and the strict twin keeps it.  Defaults to unsupported, the reading that reports permission first.",
+      "note": "Covers three orderings at once -- descendant, ancestor, and the target's type against the subject's writability -- because vfs_rename() settles them all in one sequence, and an implementation that follows it for one follows it for all.  A cell needing them split would want separate knobs; none does yet."
     },
     "P_ERR_LOCK_AGAIN": {
       "kind": "policy",
