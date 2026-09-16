@@ -1755,6 +1755,24 @@ module posixops {
                     // same move at 0700 succeeds.)
                     // The cell that gates first reports the shape here.
                     else if (structErr != OK) outErr(fs, ps, structErr)
+                    // The TARGET's type is judged before the subject's own
+                    // write permission.  vfs_rename() runs may_delete() on the
+                    // new directory -- which is where "renaming a directory
+                    // onto a non-directory" becomes -ENOTDIR, and the mirror
+                    // -EISDIR -- and only then, further down, asks whether the
+                    // directory being moved across parents is writable:
+                    //     if (is_dir && ... && old_dir != new_dir)
+                    //             error = inode_permission(old_dentry->d_inode, MAY_WRITE);
+                    // Checking the subject first reported EACCES for a rename
+                    // whose target could never have accepted it.
+                    else if (rt.ino != -1 and not(noop) and
+                             srcNode.ftype == FDir and
+                             fs.inodes.get(rt.ino).ftype != FDir)
+                        outErr(fs, ps, ENOTDIR)
+                    else if (rt.ino != -1 and not(noop) and
+                             srcNode.ftype != FDir and
+                             fs.inodes.get(rt.ino).ftype == FDir)
+                        outErr(fs, ps, EISDIR)
                     else if (srcNode.ftype == FDir and rs.par != rt.par and
                              not(mayWrite(cr, srcNode)))
                         outErr(fs, ps, EACCES)
