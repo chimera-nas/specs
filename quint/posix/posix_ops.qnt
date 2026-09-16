@@ -860,15 +860,22 @@ module posixops {
                         out(fs, ps, SOff({ e: EINVAL, off: -1 }))
                     else out(fs, psSetOffset(ps, p, fd, off),
                              SOff({ e: OK, off: off }))
+                // The sums below are tested for range BEFORE they are
+                // formed.  A cookie domain's end is the largest off_t there
+                // is, and a descriptor may already be sitting on it, so
+                // forming base + off to find out whether it fits overflows
+                // the very type the answer is about.
                 | WCur =>
-                    if (o.offset + off < 0 or
-                        (cookieDir and o.offset + off > DIR_SEEK_MAX))
+                    if (off > 0 and off > DIR_SEEK_MAX - o.offset)
+                        out(fs, ps, SOff({ e: EINVAL, off: -1 }))
+                    else if (off < 0 - o.offset)
                         out(fs, ps, SOff({ e: EINVAL, off: -1 }))
                     else out(fs, psSetOffset(ps, p, fd, o.offset + off),
                              SOff({ e: OK, off: o.offset + off }))
                 | WEnd =>
-                    if (eof + off < 0 or
-                        (cookieDir and eof + off > DIR_SEEK_MAX))
+                    if (off > 0 and off > DIR_SEEK_MAX - eof)
+                        out(fs, ps, SOff({ e: EINVAL, off: -1 }))
+                    else if (off < 0 - eof)
                         out(fs, ps, SOff({ e: EINVAL, off: -1 }))
                     else out(fs, psSetOffset(ps, p, fd, eof + off),
                              SOff({ e: OK, off: eof + off }))
@@ -942,7 +949,7 @@ module posixops {
             // have answered.  Only a descriptor with a cookie seek domain can
             // carry an offset that large, so this is reachable exactly where
             // policies.dirSeekDomain put it.
-            else if (o.offset >= 0 and o.offset + len > DIR_SEEK_MAX)
+            else if (o.offset >= 0 and len > DIR_SEEK_MAX - o.offset)
                 out(fs, ps, rwErr(EINVAL))
             else if (nd.ftype == FDir and dev(caps, "PD8"))
                 // PD8: the directory handle serves READ, answering `len`

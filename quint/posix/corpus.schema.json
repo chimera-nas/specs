@@ -9,7 +9,8 @@
 
   "selfTests": [
     { "name": "posixTestStd",  "module": "posixTestStd",  "file": "./posixTest", "maxSamples": 100 },
-    { "name": "posixTestRoot", "module": "posixTestRoot", "file": "./posixTest", "maxSamples": 100 }
+    { "name": "posixTestRoot", "module": "posixTestRoot", "file": "./posixTest", "maxSamples": 100 },
+    { "name": "posixTestLinux", "module": "posixTestLinux", "file": "./posixTest", "maxSamples": 100 }
   ],
 
   "consts": {
