@@ -1389,7 +1389,13 @@ module posixops {
     pure def createGate(fs: Fs, ps: Pstate, caps: Caps, p: Pid, dfd: Fd,
                         pth: Path, slashOk: bool):
             { e: int, par: Ino, leaf: Name, hits: Set[str],
-              links: Set[Ino] } = {
+              links: Set[Ino],
+              // Set where the gate answered for the FINAL component -- it
+              // exists -- while the parent would have denied the write
+              // anyway.  Both conditions hold, XSH orders neither, so a
+              // caller that reports the parent's objection first is as
+              // correct as one that reports the name's.
+              alsoDenies: bool } = {
         val cr = psCred(ps, p)
         val at = atStart(fs, ps, p, dfd, pth)
         // A trailing slash on a CREATING call: the name already exists, and
@@ -1407,11 +1413,11 @@ module posixops {
                        pth.with("slash", false)
                    else pth
         if (at.e != OK) { e: at.e, par: -1, leaf: "", hits: Set(),
-                          links: Set() }
+                          links: Set(), alsoDenies: false }
         else {
             val r = resolve(fs, caps, cr, at.start, rpth, false)
             if (r.err != OK) { e: r.err, par: -1, leaf: "", hits: r.hits,
-                               links: r.links }
+                               links: r.links, alsoDenies: false }
             else if (r.ino != -1)
                 // The deviation is TAKEN only where dropping the slash changed
                 // the answer: the final component exists and is not a
@@ -1421,16 +1427,19 @@ module posixops {
                 // immaterial and nothing is recorded, which is what keeps the
                 // liveness gate measuring the case the id actually names.
                 { e: EEXIST, par: -1, leaf: "", links: r.links,
+                  alsoDenies: not(mayWrite(cr, fs.inodes.get(r.par))),
                   hits: if (dev(caps, "S-slash-create-eexist") and pth.slash and
                             fs.inodes.get(r.ino).ftype != FDir)
                             r.hits.union(Set("S-slash-create-eexist"))
                         else r.hits }
             else if (pth.slash and not(slashOk))
-                { e: ENOENT, par: -1, leaf: "", hits: r.hits, links: r.links }
+                { e: ENOENT, par: -1, leaf: "", hits: r.hits, links: r.links,
+                  alsoDenies: false }
             else if (not(mayWrite(cr, fs.inodes.get(r.par))))
-                { e: EACCES, par: -1, leaf: "", hits: r.hits, links: r.links }
+                { e: EACCES, par: -1, leaf: "", hits: r.hits, links: r.links,
+                  alsoDenies: false }
             else { e: OK, par: r.par, leaf: r.leaf, hits: r.hits,
-                   links: r.links }
+                   links: r.links, alsoDenies: false }
         }
     }
 
@@ -1511,7 +1520,10 @@ module posixops {
             // rather than carrying a knob per ordering (was PD17c/PD17e/PD17f).
             val gEarly = createGate(fs, ps, caps, p, dfdNew, pthNew, false)
             withLinkAtimes({
-            val gAcc = if (gEarly.e == OK) Set() else Set(gEarly.e)
+            val gAcc = if (gEarly.e == OK) Set()
+                       else if (gEarly.alsoDenies)
+                           Set(gEarly.e, EACCES)
+                       else Set(gEarly.e)
             if (ro.err != OK)
                 hit(outErrA(fs, ps, ro.err, gAcc), ro.hits.union(pd6))
             else if (fs.inodes.get(ro.ino).ftype == FDir)
