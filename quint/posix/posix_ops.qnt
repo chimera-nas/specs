@@ -1630,7 +1630,19 @@ module posixops {
                     // before may_delete/may_create judge anything; ext4
                     // answers EINVAL for rename("/d", "/d/d") where the model
                     // answered EACCES, 11 times in one run.
-                    if (not(noop) and srcNode.ftype == FDir and
+                    // "If the old argument and the new argument resolve to
+                    // either the same existing directory entry or different
+                    // directory entries for the same existing file, rename()
+                    // shall return successfully and perform no other action"
+                    // (XSH rename).  Unconditionally -- the call asks nothing
+                    // of the caller's permissions, and vfs_rename() agrees,
+                    // returning 0 on source == target before may_delete() is
+                    // reached.  The model computed the case but never acted on
+                    // it, so a sticky source directory could deny a rename
+                    // that does nothing, and the parent's timestamps marked
+                    // for a rename that moved no name.
+                    if (noop) outErr(fs, ps, OK)
+                    else if (srcNode.ftype == FDir and
                         fsDescOf(fs, rs.ino).contains(rt.par))
                         outErr(fs, ps, EINVAL)
                     // The mirror image: new names an ANCESTOR of old.  Such a
@@ -1641,7 +1653,7 @@ module posixops {
                     // same place, off lock_rename()'s trap dentry: old == trap
                     // is the EINVAL above, new == trap is this, and both
                     // precede every may_delete/may_create judgement.
-                    else if (not(noop) and rt.ino != -1 and
+                    else if (rt.ino != -1 and
                              fs.inodes.get(rt.ino).ftype == FDir and
                              fsDescOf(fs, rt.ino).contains(rs.par))
                         outErr(fs, ps, errNonempty(caps))
@@ -1663,7 +1675,7 @@ module posixops {
                         outErrA(fs, ps, errSticky(caps), stickyAccept(caps))
                     else if (not(mayWrite(cr, tdnode)))
                         outErr(fs, ps, EACCES)
-                    else if (rt.ino != -1 and not(noop) and
+                    else if (rt.ino != -1 and
                              not(stickyOk(caps, cr, tdnode,
                                           fs.inodes.get(rt.ino))))
                         outErrA(fs, ps, errSticky(caps), stickyAccept(caps))
@@ -2121,16 +2133,21 @@ module posixops {
     // (fallocate uses EBADF here, not the EINVAL ftruncate returns).  Both
     // modes mark mtime/ctime and neither clears the set-user/group-ID bits
     // (the allocate path bumps times only, never the mode).
-    pure def opFallocate(fs: Fs, ps: Pstate, p: Pid, fd: Fd, mode: int,
-                         off: int, len: int): Out =
+    pure def opFallocate(fs: Fs, ps: Pstate, caps: Caps, p: Pid, fd: Fd,
+                         mode: int, off: int, len: int): Out =
         if (off < 0 or len <= 0) outErr(fs, ps, EINVAL)
         else if (not(fdLive(ps, p, fd))) outErr(fs, ps, EBADF)
         else {
             val o = fdOfd(ps, p, fd)
+            // fallocate changes the file, so it sheds the setid bits on the
+            // same rule a write does: every ext4_fallocate() path runs
+            // file_modified(), which calls file_remove_privs().  The model
+            // treated it as a pure allocation and kept them.
+            val drop = caps.writeClearsSets and not(isPriv(psCred(ps, p)))
             if (not(accWrites(o.acc))) outErr(fs, ps, EBADF)
             else if (mode == 0)
-                out(fsAllocate(fs, o.ino, off, len), ps, sOk(OK))
-            else out(fsPunch(fs, o.ino, off, len), ps, sOk(OK))
+                out(fsAllocate(fs, o.ino, off, len, drop), ps, sOk(OK))
+            else out(fsPunch(fs, o.ino, off, len, drop), ps, sOk(OK))
         }
 
     // ------------------------------------------------------------------
@@ -2202,7 +2219,7 @@ module posixops {
             | RCloneRange(a) => opCloneRange(fs, ps, caps, p, a.fdDst,
                                              a.offDst, a.fdSrc, a.offSrc,
                                              a.len)
-            | RFallocate(a) => opFallocate(fs, ps, p, a.fd, a.mode, a.off,
+            | RFallocate(a) => opFallocate(fs, ps, caps, p, a.fd, a.mode, a.off,
                                            a.len)
         }
 }

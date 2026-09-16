@@ -548,10 +548,12 @@ module posixfs {
     // SEEK_HOLE/SEEK_DATA must see it as data, not a hole (RFC 7862 §11.1;
     // memfs_allocate materializes for exactly this reason).  Presence changes,
     // content does not.  Marks mtime/ctime.
-    pure def fsAllocate(fs: Fs, f: Ino, off: int, len: int): Fs = {
+    pure def fsAllocate(fs: Fs, f: Ino, off: int, len: int,
+                        dropSets: bool): Fs = {
         fs.with("inodes", fs.inodes.setBy(f, x => x
               .with("dataBlocks", addBlocks(x.dataBlocks, off, len))
               .with("size", imax(x.size, off + len))
+              .with("mode", if (dropSets) modeWithoutSetids(x.mode) else x.mode)
               .with("mtime", fs.clk)
               .with("ctime", fs.clk)))
           .with("clk", fs.clk + 1)
@@ -562,11 +564,13 @@ module posixfs {
     // floor((off+len)/BS)) -- which revert to holes; a partially-covered edge
     // block stays present (memfs zeroes the sub-range but keeps the block).
     // Size is unchanged.  Marks mtime/ctime unconditionally.
-    pure def fsPunch(fs: Fs, f: Ino, off: int, len: int): Fs = {
+    pure def fsPunch(fs: Fs, f: Ino, off: int, len: int,
+                     dropSets: bool): Fs = {
         val lo = ceilDiv(off, BS)
         val hi = blkOf(off + len)
         fs.with("inodes", fs.inodes.setBy(f, x => x
               .with("dataBlocks", x.dataBlocks.filter(i => i < lo or i >= hi))
+              .with("mode", if (dropSets) modeWithoutSetids(x.mode) else x.mode)
               .with("mtime", fs.clk)
               .with("ctime", fs.clk)))
           .with("clk", fs.clk + 1)
