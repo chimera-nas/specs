@@ -46,6 +46,7 @@ module posix {
     const P_ERR_UNLINKDIR_ISDIR: FeatureMode // EISDIR (else EPERM)
     const P_ERR_LOCK_AGAIN: FeatureMode    // EAGAIN (else EACCES)
     const P_DIR_SEEK_DOMAIN: FeatureMode   // directories have a seek domain
+    const P_ORPHAN_CTIME: FeatureMode      // losing the last link marks ctime
 
     // Known divergences from POSIX.1-2024 that the implementation under test
     // still carries.  A deviation is DESCRIBED by the model, gated on the
@@ -234,6 +235,7 @@ module posix {
         nondet eUd = oneOf(capChoices(P_ERR_UNLINKDIR_ISDIR))
         nondet eLk = oneOf(capChoices(P_ERR_LOCK_AGAIN))
         nondet dSk = oneOf(capChoices(P_DIR_SEEK_DOMAIN))
+        nondet oCt = oneOf(capChoices(P_ORPHAN_CTIME))
         val c: Caps = {
             copyRange: copyR, cloneRange: cloneR, seekHole: seekH,
             withRoot: rootP, gidFromParent: gidPar, sgidInherit: sgidInh,
@@ -242,7 +244,7 @@ module posix {
             chownSuppGroup: chSup,
             errNotempty: eNe, errStickyAcces: eSt,
             errUnlinkDirIsdir: eUd, errLockAgain: eLk,
-            dirSeekDomain: dSk,
+            dirSeekDomain: dSk, orphanCtime: oCt,
             devs: DEVS, stickyRemovalEperm: T_STICKY_REMOVAL_EPERM
         }
         all {
@@ -1136,7 +1138,8 @@ module posix {
         capChoices(P_ERR_STICKY_ACCES).contains(caps.errStickyAcces),
         capChoices(P_ERR_UNLINKDIR_ISDIR).contains(caps.errUnlinkDirIsdir),
         capChoices(P_ERR_LOCK_AGAIN).contains(caps.errLockAgain),
-        capChoices(P_DIR_SEEK_DOMAIN).contains(caps.dirSeekDomain)
+        capChoices(P_DIR_SEEK_DOMAIN).contains(caps.dirSeekDomain),
+        capChoices(P_ORPHAN_CTIME).contains(caps.orphanCtime)
     }
 
     val inv = all {

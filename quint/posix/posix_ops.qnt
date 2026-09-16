@@ -111,6 +111,12 @@ module posixops {
         // true: directories seek over [0, DIR_SEEK_MAX); false: over their
         // size, as a regular file does.
         dirSeekDomain: bool,
+        // Does removing an object's LAST link mark its ctime?  unlink() asks
+        // for the mark "if the file's link count is not 0" and leaves the
+        // other case unsaid -- yet an open descriptor keeps the orphan
+        // observable, so the choice shows.  Linux marks unconditionally
+        // (ext4_unlink(): drop_nlink(), then inode_set_ctime_current()).
+        orphanCtime: bool,
         // Known divergences from POSIX.1-2024 that the implementation under
         // test still carries, by id.  A deviation is DESCRIBED here rather
         // than forgiven by the replay harness afterwards: the model takes the
@@ -1478,7 +1484,8 @@ module posixops {
                 else if (not(stickyOk(caps, cr, dnode, vnode)))
                     outErrA(fs, ps, errSticky(caps), stickyAccept(caps))
                 else {
-                    val rm = fsRemove(fs, r.par, r.leaf, psPinned(ps))
+                    val rm = fsRemove(fs, r.par, r.leaf, psPinned(ps),
+                                      caps.orphanCtime)
                     outErr(rm.fs2, ps, if (rm.st == FsOk) OK else ENOENT)
                 }
             }
@@ -1520,7 +1527,8 @@ module posixops {
                 else if (not(stickyOk(caps, cr, dnode, vnode)))
                     outErrA(fs, ps, errSticky(caps), stickyAccept(caps))
                 else {
-                    val rm = fsRemove(fs, r.par, r.leaf, psPinned(ps))
+                    val rm = fsRemove(fs, r.par, r.leaf, psPinned(ps),
+                                      caps.orphanCtime)
                     outErr(rm.fs2, ps, if (rm.st == FsOk) OK else ENOENT)
                 }
             }
@@ -1600,7 +1608,8 @@ module posixops {
                         outErr(fs, ps, EACCES)
                     else {
                         val rn = fsRename(fs, rs.par, rs.leaf, rt.par,
-                                          rt.leaf, psPinned(ps))
+                                          rt.leaf, caps.orphanCtime,
+                                          psPinned(ps))
                         val e = if (rn.st == FsOk) OK
                                 else if (rn.st == FsNoent) ENOENT
                                 else if (rn.st == FsInval) EINVAL

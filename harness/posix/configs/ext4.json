@@ -30,7 +30,8 @@
     // rather than a lock conflict; the next run answered "expected 13, got 11"
     // on both lockf and fcntl, which is the conflict case saying EAGAIN.
     "lockEagain": "supported",
-    "dirSeekDomain": "supported"
+    "dirSeekDomain": "supported",
+    "orphanCtime": "supported"
   },
 
   // NONE, and the two attempts to enable some are worth recording because the
