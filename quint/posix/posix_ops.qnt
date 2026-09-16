@@ -1584,11 +1584,24 @@ module posixops {
                              fs.inodes.get(rt.ino).ftype == FDir and
                              fsDescOf(fs, rt.ino).contains(rs.par))
                         outErr(fs, ps, errNonempty(caps))
-                    else if (not(mayWrite(cr, sdnode)) or
-                            not(mayWrite(cr, tdnode)))
+                    // vfs_rename() judges the source COMPLETELY before it
+                    // looks at the new directory at all:
+                    //     error = may_delete(old_dir, old_dentry, is_dir);
+                    //     if (error) return error;
+                    //     if (!target) error = may_create(new_dir, ...);
+                    //     else         error = may_delete(new_dir, ...);
+                    // and may_delete tests write permission first, then the
+                    // sticky rule.  So a source the sticky rule forbids
+                    // answers for itself even when the target's parent is
+                    // unwritable too.  Checking write on BOTH parents up
+                    // front, as the model did, let the target's EACCES speak
+                    // over the source's sticky EPERM.
+                    else if (not(mayWrite(cr, sdnode)))
                         outErr(fs, ps, EACCES)
                     else if (not(stickyOk(caps, cr, sdnode, srcNode)))
                         outErrA(fs, ps, errSticky(caps), stickyAccept(caps))
+                    else if (not(mayWrite(cr, tdnode)))
+                        outErr(fs, ps, EACCES)
                     else if (rt.ino != -1 and not(noop) and
                              not(stickyOk(caps, cr, tdnode,
                                           fs.inodes.get(rt.ino))))
