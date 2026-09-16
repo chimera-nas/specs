@@ -422,7 +422,12 @@ module posixops {
     pure def resolveEx(fs: Fs, caps: Caps, cr: Cred, start: Ino, pth: Path,
                        followFinal: bool): RRes = {
         val r = resolve(fs, caps, cr, start, pth, followFinal)
-        if (r.err == OK and r.ino == -1) rFail(ENOENT) else r
+        // The links the walk read survive the rewrite: a dangling symbolic
+        // link was still READ to discover that its target is missing, so a
+        // fresh rFail() here would drop the very marks that case earns.
+        if (r.err == OK and r.ino == -1)
+            rFail(ENOENT).with("links", r.links)
+        else r
     }
 
     // ------------------------------------------------------------------
@@ -1201,9 +1206,17 @@ module posixops {
         // with no ownership check; pjd chown/00 "chown(-1,-1) succeeds even for
         // a non-owner").  No uid/gid and no set*id bit change.
         if (u == -1 and g == -1)
-            // Bumps ctime (Linux sets ATTR_CTIME) but leaves uid/gid and the
-            // set*id bits untouched.
-            out(fsChown(fs, i, -1, -1, false), ps, sOk(OK))
+            // Bumps ctime (Linux sets ATTR_CTIME) and leaves uid/gid alone --
+            // but the setid bits still go.  XSH chown conditions that on the
+            // file being regular, an execute bit being set, the caller being
+            // unprivileged and the call returning successfully; it does NOT
+            // ask whether an id actually changed, and chown(-1, -1) returns
+            // successfully.  chown_common() reads it the same way, adding
+            // ATTR_KILL_SUID|ATTR_KILL_SGID for any non-directory OUTSIDE the
+            // two tests that look at user and group.  The model kept the bits
+            // here and an audit caught /d holding 04755 against ext4's 0755.
+            out(fsChown(fs, i, -1, -1,
+                        nd.ftype == FReg and anyExec(nd.mode)), ps, sOk(OK))
         else {
             // A field set to the value it already holds is not a change, so
             // it needs no privilege -- Linux's setattr_prepare tests
