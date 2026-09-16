@@ -1687,7 +1687,14 @@ module posixops {
                         else if (srcNode.ftype == FDir and
                                  fsDescOf(fs, rs.ino).contains(rt.par))
                             EINVAL
-                        else if (rt.ino != -1 and
+                        // The ancestor verdict is the TRAP's doing, not a
+                        // rule of its own: a cell without the trap has no
+                        // reason to treat an ancestor target differently from
+                        // any other non-empty directory, and answers by the
+                        // ordinary rules below -- [EISDIR] where old is not a
+                        // directory, [ENOTEMPTY] where it is.  Only a cell
+                        // that reports the shape first reports this.
+                        else if (caps.renameTrapFirst and rt.ino != -1 and
                                  fs.inodes.get(rt.ino).ftype == FDir and
                                  fsDescOf(fs, rt.ino).contains(rs.par))
                             errNonempty(caps)
