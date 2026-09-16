@@ -33,7 +33,7 @@
     "dirSeekDomain": "supported",
     "orphanCtime": "supported",
     "symlinkAtime": "supported",
-    "renameTrapFirst": "supported"
+    "renameKernelOrder": "supported"
   },
 
   // NONE, and the two attempts to enable some are worth recording because the

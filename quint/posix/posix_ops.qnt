@@ -121,12 +121,19 @@ module posixops {
         // link's atime?  Linux does it in get_link() (fs/namei.c), off the
         // non-RCU path: touch_atime(&last->link).
         symlinkAtime: bool,
-        // Does rename report the SHAPE of the tree -- new naming a descendant
-        // or an ancestor of old -- before the caller's permission to make the
-        // change?  Linux does (lock_rename()'s trap precedes may_delete); an
-        // engine that resolves both parents by handle and runs its own gates
-        // reports the permission failure first.  XSH orders neither.
-        renameTrapFirst: bool,
+        // Does rename judge in vfs_rename()'s order?  Two things follow from
+        // it, and an implementation takes both or neither:
+        //   * the SHAPE of the tree -- new naming a descendant or an ancestor
+        //     of old -- is reported before the caller's permission, because
+        //     lock_rename()'s trap precedes may_delete();
+        //   * the TARGET's type is reported before the subject's own
+        //     writability, because may_delete(new_dir) precedes the
+        //     inode_permission(old_dentry) a cross-parent directory move
+        //     needs.
+        // An engine that resolves both parents by handle and runs its own
+        // gates reports the permission failures first, on both counts.  XSH
+        // orders none of these conditions against another.
+        renameKernelOrder: bool,
         // Known divergences from POSIX.1-2024 that the implementation under
         // test still carries, by id.  A deviation is DESCRIBED here rather
         // than forgiven by the replay harness afterwards: the model takes the
@@ -1706,7 +1713,7 @@ module posixops {
                         // ordinary rules below -- [EISDIR] where old is not a
                         // directory, [ENOTEMPTY] where it is.  Only a cell
                         // that reports the shape first reports this.
-                        else if (caps.renameTrapFirst and rt.ino != -1 and
+                        else if (caps.renameKernelOrder and rt.ino != -1 and
                                  fs.inodes.get(rt.ino).ftype == FDir and
                                  fsDescOf(fs, rt.ino).contains(rs.par))
                             errNonempty(caps)
@@ -1719,7 +1726,7 @@ module posixops {
                     // trap before may_delete; an engine that resolves both
                     // parents by handle and gates them itself reports EACCES.
                     if (noop) outErr(fs, ps, OK)
-                    else if (caps.renameTrapFirst and structErr != OK)
+                    else if (caps.renameKernelOrder and structErr != OK)
                         outErr(fs, ps, structErr)
                     // vfs_rename() judges the source COMPLETELY before it
                     // looks at the new directory at all:
@@ -1765,12 +1772,12 @@ module posixops {
                     //             error = inode_permission(old_dentry->d_inode, MAY_WRITE);
                     // Checking the subject first reported EACCES for a rename
                     // whose target could never have accepted it.
-                    else if (rt.ino != -1 and not(noop) and
-                             srcNode.ftype == FDir and
+                    else if (caps.renameKernelOrder and rt.ino != -1 and
+                             not(noop) and srcNode.ftype == FDir and
                              fs.inodes.get(rt.ino).ftype != FDir)
                         outErr(fs, ps, ENOTDIR)
-                    else if (rt.ino != -1 and not(noop) and
-                             srcNode.ftype != FDir and
+                    else if (caps.renameKernelOrder and rt.ino != -1 and
+                             not(noop) and srcNode.ftype != FDir and
                              fs.inodes.get(rt.ino).ftype == FDir)
                         outErr(fs, ps, EISDIR)
                     else if (srcNode.ftype == FDir and rs.par != rt.par and

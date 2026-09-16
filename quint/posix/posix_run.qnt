@@ -39,7 +39,7 @@ module posixDefault {
         P_DIR_SEEK_DOMAIN = FeatOff,
         P_ORPHAN_CTIME = FeatOff,
         P_SYMLINK_ATIME = FeatOff,
-        P_RENAME_TRAP_FIRST = FeatOff,
+        P_RENAME_KERNEL_ORDER = FeatOff,
         DEVS = Set(),
         T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
@@ -74,7 +74,7 @@ module posixMemfs {
         P_DIR_SEEK_DOMAIN = FeatOff,
         P_ORPHAN_CTIME = FeatOff,
         P_SYMLINK_ATIME = FeatOff,
-        P_RENAME_TRAP_FIRST = FeatOff,
+        P_RENAME_KERNEL_ORDER = FeatOff,
         DEVS = Set(),
         T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
@@ -106,7 +106,7 @@ module posixDisk {
         P_DIR_SEEK_DOMAIN = FeatOff,
         P_ORPHAN_CTIME = FeatOff,
         P_SYMLINK_ATIME = FeatOff,
-        P_RENAME_TRAP_FIRST = FeatOff,
+        P_RENAME_KERNEL_ORDER = FeatOff,
         DEVS = Set(),
         T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
@@ -140,7 +140,7 @@ module posixNfs3 {
         P_DIR_SEEK_DOMAIN = FeatOff,
         P_ORPHAN_CTIME = FeatOff,
         P_SYMLINK_ATIME = FeatOff,
-        P_RENAME_TRAP_FIRST = FeatOff,
+        P_RENAME_KERNEL_ORDER = FeatOff,
         DEVS = Set(),
         T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
@@ -175,7 +175,7 @@ module posixNfs4 {
         P_DIR_SEEK_DOMAIN = FeatOff,
         P_ORPHAN_CTIME = FeatOff,
         P_SYMLINK_ATIME = FeatOff,
-        P_RENAME_TRAP_FIRST = FeatOff,
+        P_RENAME_KERNEL_ORDER = FeatOff,
         DEVS = Set(),
         T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
@@ -218,7 +218,7 @@ module posixFuse {
         P_DIR_SEEK_DOMAIN = FeatOff,
         P_ORPHAN_CTIME = FeatOff,
         P_SYMLINK_ATIME = FeatOff,
-        P_RENAME_TRAP_FIRST = FeatOff,
+        P_RENAME_KERNEL_ORDER = FeatOff,
         DEVS = Set(),
         T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
@@ -262,7 +262,7 @@ module posixSmb {
         P_DIR_SEEK_DOMAIN = FeatOff,
         P_ORPHAN_CTIME = FeatOff,
         P_SYMLINK_ATIME = FeatOff,
-        P_RENAME_TRAP_FIRST = FeatOff,
+        P_RENAME_KERNEL_ORDER = FeatOff,
         DEVS = Set(),
         T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
@@ -290,7 +290,7 @@ module posixStrict {
         P_DIR_SEEK_DOMAIN = FeatOff,
         P_ORPHAN_CTIME = FeatOff,
         P_SYMLINK_ATIME = FeatOff,
-        P_RENAME_TRAP_FIRST = FeatOff,
+        P_RENAME_KERNEL_ORDER = FeatOff,
         DEVS = Set(),
         T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
@@ -318,7 +318,7 @@ module posixLinuxish {
         P_DIR_SEEK_DOMAIN = FeatOff,
         P_ORPHAN_CTIME = FeatOff,
         P_SYMLINK_ATIME = FeatOff,
-        P_RENAME_TRAP_FIRST = FeatOff,
+        P_RENAME_KERNEL_ORDER = FeatOff,
         DEVS = Set(),
         T_STICKY_REMOVAL_EPERM = false
     ).* from "./posix"
