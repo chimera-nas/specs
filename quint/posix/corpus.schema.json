@@ -215,6 +215,16 @@
       "citation": "POSIX.1-2024 XSH unlink: 'Upon successful completion, unlink() shall mark for update the last data modification and last file status change timestamps of the parent directory. Also, if the file's link count is not 0, the last file status change timestamp of the file shall be marked for update.'  The mark is required only while links remain, and the clause says nothing about the link count reaching 0 -- reasonably, since the object is then unreachable by name.  An open descriptor makes it reachable anyway, and fstat() through it shows whichever choice the implementation made.  Linux marks unconditionally: ext4_unlink() runs drop_nlink() and then inode_set_ctime_current() with no test on the result, and ext4_rename() does the same to a replaced target.  Both answers conform, so this is a policy and the strict twin keeps it.  Defaults to unsupported, which is the model's reading of the clause as written.",
       "note": "Covers the replaced target of a rename as well as unlink()/rmdir(), because the two share the orphaning path: a target that loses its last link while a descriptor holds it open is orphaned rather than reaped, and the same question arises about its ctime."
     },
+    "P_SYMLINK_ATIME": {
+      "kind": "policy",
+      "key": "policies.symlinkAtime",
+      "type": "enum",
+      "values": { "supported": "FeatMandatory", "explore": "FeatIfAdvertised", "unsupported": "FeatOff" },
+      "default": "unsupported",
+      "doc": "expanding a symlink during resolution marks the link's atime",
+      "citation": "POSIX.1-2024 XBD 4.15 (Pathname Resolution) describes expanding a symbolic link without requiring any timestamp of the link to be marked, and XSH does not name path resolution among the things that update a symbolic link's last data access timestamp.  Reading the link's contents is nonetheless an access of it, and implementations differ on whether it shows.  Linux marks: get_link() in fs/namei.c calls touch_atime(&last->link) on the non-RCU path, so every traversal of a symlink refreshes it, including one that goes on to fail ELOOP.  Both readings conform, so this is a policy and the strict twin keeps it.  Defaults to unsupported, the model's prior behaviour, so no cell moves unless it asks.",
+      "note": "Only observable where atime updates are not being suppressed: under the relatime default a traversal refreshes the link at most once a day unless its atime already trails its mtime or ctime.  The ext4 cell mounts the scratch filesystem strictatime for exactly this reason, so every traversal shows."
+    },
     "P_ERR_LOCK_AGAIN": {
       "kind": "policy",
       "key": "policies.lockEagain",

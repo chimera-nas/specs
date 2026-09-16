@@ -35,6 +35,7 @@ module posixTestStd {
         P_ERR_LOCK_AGAIN = FeatMandatory,
         P_DIR_SEEK_DOMAIN = FeatOff,
         P_ORPHAN_CTIME = FeatOff,
+        P_SYMLINK_ATIME = FeatOff,
         // DEVS = Set(): the self-tests check the STANDARD, so no
         // implementation deviation is switched on here.  That is the point of
         // keeping them separate from the generated corpus -- a config may
@@ -959,6 +960,7 @@ module posixTestRoot {
         P_ERR_LOCK_AGAIN = FeatMandatory,
         P_DIR_SEEK_DOMAIN = FeatOff,
         P_ORPHAN_CTIME = FeatOff,
+        P_SYMLINK_ATIME = FeatOff,
         // DEVS = Set(): the self-tests check the STANDARD, so no
         // implementation deviation is switched on here.  That is the point of
         // keeping them separate from the generated corpus -- a config may

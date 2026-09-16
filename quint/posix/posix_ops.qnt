@@ -117,6 +117,10 @@ module posixops {
         // observable, so the choice shows.  Linux marks unconditionally
         // (ext4_unlink(): drop_nlink(), then inode_set_ctime_current()).
         orphanCtime: bool,
+        // Does expanding a symbolic link during path resolution mark that
+        // link's atime?  Linux does it in get_link() (fs/namei.c), off the
+        // non-RCU path: touch_atime(&last->link).
+        symlinkAtime: bool,
         // Known divergences from POSIX.1-2024 that the implementation under
         // test still carries, by id.  A deviation is DESCRIBED here rather
         // than forgiven by the replay harness afterwards: the model takes the
@@ -286,21 +290,26 @@ module posixops {
     // `hits` names the deviations that shaped this resolution (empty for a
     // conformant one); handlers union it into their outcome so the trace
     // records which claims the step exercised.
-    type RRes = { err: int, ino: Ino, par: Ino, leaf: Name, hits: Set[str] }
+    type RRes = { err: int, ino: Ino, par: Ino, leaf: Name, hits: Set[str],
+                  // The symbolic links this resolution expanded.  Reading a
+                  // link is an access of it, and where the cell says so that
+                  // marks its atime -- see withLinkAtimes.
+                  links: Set[Ino] }
 
     type RWalk = {
         cur: Ino,          // directory being walked
         rest: List[Name],  // remaining components
         hops: int,         // symlink expansions so far
+        links: Set[Ino],   // the links those expansions read
         done: bool,
         out: RRes
     }
 
     pure def rFail(e: int): RRes = { err: e, ino: -1, par: -1, leaf: "",
-                                     hits: Set() }
+                                     hits: Set(), links: Set() }
 
     pure def rOk(i: Ino, par: Ino, leaf: Name): RRes =
-        { err: OK, ino: i, par: par, leaf: leaf, hits: Set() }
+        { err: OK, ino: i, par: par, leaf: leaf, hits: Set(), links: Set() }
 
     // One resolution step: consume the head component of w.rest.
     pure def rStep(fs: Fs, caps: Caps, cr: Cred, followFinal: bool,
@@ -347,6 +356,7 @@ module posixops {
                         w.with("done", true).with("out", rFail(ELOOP))
                     else
                         w.with("hops", w.hops + 1)
+                         .with("links", w.links.union(Set(child)))
                          .with("cur", if (chnode.target.abs) ROOT else w.cur)
                          .with("rest", chnode.target.comps.concat(rest1))
                 else if (last)
@@ -386,8 +396,8 @@ module posixops {
             // the slash names the directory the link resolves to), which
             // is why the ENOTDIR check below sees the followed object.
             val ff = followFinal or (pth.slash and slashFollows)
-            val w0 = { cur: begin, rest: pth.comps, hops: 0, done: false,
-                       out: rFail(EIO) }
+            val w0 = { cur: begin, rest: pth.comps, hops: 0, links: Set(),
+                       done: false, out: rFail(EIO) }
             val wN = range(0, RESOLVE_FUEL).foldl(w0, (w, _) =>
                 rStep(fs, caps, cr, ff, w))
             val out = if (wN.done) wN.out else rFail(ELOOP)
@@ -395,12 +405,16 @@ module posixops {
                 if (pth.slash and not(slashFollows))
                     Set("PD15b", "PD15c").intersect(caps.devs)
                 else Set()
-            if (out.err == OK and out.ino >= 0 and pth.slash and
-                    fs.inodes.get(out.ino).ftype != FDir)
-                if (slashIsDir) rFail(ENOTDIR).with("hits", slashHits)
-                else out.with("hits", out.hits.union(slashHits)
-                                             .union(Set("PD15")))
-            else out.with("hits", out.hits.union(slashHits))
+            val fin =
+                if (out.err == OK and out.ino >= 0 and pth.slash and
+                        fs.inodes.get(out.ino).ftype != FDir)
+                    if (slashIsDir) rFail(ENOTDIR).with("hits", slashHits)
+                    else out.with("hits", out.hits.union(slashHits)
+                                                 .union(Set("PD15")))
+                else out.with("hits", out.hits.union(slashHits))
+            // A resolution that ended in ELOOP still read every link it got
+            // through, so the marks ride on the failure as well.
+            fin.with("links", wN.links)
         }
     }
 
@@ -576,6 +590,19 @@ module posixops {
     pure def out(fs: Fs, ps: Pstate, r: OpRes): Out =
         { fs2: fs, ps2: ps, res: r, hits: Set() }
 
+    // Path resolution READS every symbolic link it expands, and where the
+    // cell says that marks the link's atime, the marks belong on the outcome
+    // whatever it turned out to be: a walk that ended in ELOOP, or an op that
+    // went on to fail, still read the links it got through.  Applied to the
+    // finished Out so that a handler's own timestamp work is untouched, and
+    // skipping a link the op itself removed, which no longer has an inode to
+    // mark.
+    pure def withLinkAtimes(o: Out, links: Set[Ino], caps: Caps): Out =
+        if (not(caps.symlinkAtime) or links.size() == 0) o
+        else o.with("fs2", links.fold(o.fs2, (f, i) =>
+            if (f.inodes.keys().contains(i)) fsMark(f, i, true, false, false)
+            else f))
+
     // Tag an outcome with the deviation(s) that produced it.
     pure def hit(o: Out, ids: Set[str]): Out =
         o.with("hits", o.hits.union(ids))
@@ -663,6 +690,7 @@ module posixops {
                         resolve(fs, caps, cr, at.start, pth, false)
                     else
                         resolve(fs, caps, cr, at.start, pth, not(fl.nofollow))
+            withLinkAtimes({
             if (r.err != OK)
                 hit(out(fs, ps, SFd({ e: r.err, fd: -1 })), r.hits)
             else if (r.ino == -1)
@@ -754,6 +782,7 @@ module posixops {
                     }
                 }
             }
+            }, r.links, caps)
         }
     }
 
@@ -1022,6 +1051,7 @@ module posixops {
                         len: int): Out = {
         val cr = psCred(ps, p)
         val r = resolveEx(fs, caps, cr, ROOT, pth, true)
+        withLinkAtimes({
         if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
         else {
             val nd = fs.inodes.get(r.ino)
@@ -1033,6 +1063,7 @@ module posixops {
                          caps.writeClearsSets and not(isPriv(cr))),
                      ps, sOk(OK))
         }
+        }, r.links, caps)
     }
 
     pure def opFtruncate(fs: Fs, ps: Pstate, caps: Caps, p: Pid, fd: Fd,
@@ -1079,8 +1110,10 @@ module posixops {
         if (at.e != OK) out(fs, ps, statFail(at.e))
         else {
             val r = resolveEx(fs, caps, psCred(ps, p), at.start, pth, follow)
+            withLinkAtimes({
             if (r.err != OK) hit(out(fs, ps, statFail(r.err)), r.hits)
             else out(fs, ps, statRes(fs.inodes.get(r.ino), r.ino))
+            }, r.links, caps)
         }
     }
 
@@ -1100,8 +1133,10 @@ module posixops {
         if (at.e != OK) outErr(fs, ps, at.e)
         else {
             val r = resolveEx(fs, caps, psCred(ps, p), at.start, pth, true)
+            withLinkAtimes({
             if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
             else outErr(fs, ps, OK)
+            }, r.links, caps)
         }
     }
 
@@ -1132,8 +1167,10 @@ module posixops {
         if (at.e != OK) outErr(fs, ps, at.e)
         else {
             val r = resolveEx(fs, caps, psCred(ps, p), at.start, pth, true)
+            withLinkAtimes({
             if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
             else chmodCommon(fs, ps, p, r.ino, m)
+            }, r.links, caps)
         }
     }
 
@@ -1194,8 +1231,10 @@ module posixops {
         if (at.e != OK) outErr(fs, ps, at.e)
         else {
             val r = resolveEx(fs, caps, psCred(ps, p), at.start, pth, follow)
+            withLinkAtimes({
             if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
             else chownCommon(fs, ps, caps, p, r.ino, u, g)
+            }, r.links, caps)
         }
     }
 
@@ -1266,8 +1305,10 @@ module posixops {
         if (at.e != OK) outErr(fs, ps, at.e)
         else {
             val r = resolveEx(fs, caps, psCred(ps, p), at.start, pth, true)
+            withLinkAtimes({
             if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
             else utimensCommon(fs, ps, caps, p, r.ino, ta, tm)
+            }, r.links, caps)
         }
     }
 
@@ -1289,6 +1330,7 @@ module posixops {
         if (at.e != OK) outErr(fs, ps, at.e)
         else {
             val r = resolveEx(fs, caps, cr, at.start, pth, true)
+            withLinkAtimes({
             if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
             else {
                 val nd = fs.inodes.get(r.ino)
@@ -1303,6 +1345,7 @@ module posixops {
                     hit(outErr(fs, ps, EACCES), r.hits)
                 else hit(outErr(fs, ps, OK), r.hits)
             }
+            }, r.links, caps)
         }
     }
 
@@ -1319,7 +1362,8 @@ module posixops {
     // included -- is EEXIST), then require write on the parent.
     pure def createGate(fs: Fs, ps: Pstate, caps: Caps, p: Pid, dfd: Fd,
                         pth: Path, slashOk: bool):
-            { e: int, par: Ino, leaf: Name, hits: Set[str] } = {
+            { e: int, par: Ino, leaf: Name, hits: Set[str],
+              links: Set[Ino] } = {
         val cr = psCred(ps, p)
         val at = atStart(fs, ps, p, dfd, pth)
         // A trailing slash on a CREATING call: the name already exists, and
@@ -1336,10 +1380,12 @@ module posixops {
         val rpth = if (dev(caps, "S-slash-create-eexist"))
                        pth.with("slash", false)
                    else pth
-        if (at.e != OK) { e: at.e, par: -1, leaf: "", hits: Set() }
+        if (at.e != OK) { e: at.e, par: -1, leaf: "", hits: Set(),
+                          links: Set() }
         else {
             val r = resolve(fs, caps, cr, at.start, rpth, false)
-            if (r.err != OK) { e: r.err, par: -1, leaf: "", hits: r.hits }
+            if (r.err != OK) { e: r.err, par: -1, leaf: "", hits: r.hits,
+                               links: r.links }
             else if (r.ino != -1)
                 // The deviation is TAKEN only where dropping the slash changed
                 // the answer: the final component exists and is not a
@@ -1348,16 +1394,17 @@ module posixops {
                 // the EEXIST this reports.  Over a directory the slash is
                 // immaterial and nothing is recorded, which is what keeps the
                 // liveness gate measuring the case the id actually names.
-                { e: EEXIST, par: -1, leaf: "",
+                { e: EEXIST, par: -1, leaf: "", links: r.links,
                   hits: if (dev(caps, "S-slash-create-eexist") and pth.slash and
                             fs.inodes.get(r.ino).ftype != FDir)
                             r.hits.union(Set("S-slash-create-eexist"))
                         else r.hits }
             else if (pth.slash and not(slashOk))
-                { e: ENOENT, par: -1, leaf: "", hits: r.hits }
+                { e: ENOENT, par: -1, leaf: "", hits: r.hits, links: r.links }
             else if (not(mayWrite(cr, fs.inodes.get(r.par))))
-                { e: EACCES, par: -1, leaf: "", hits: r.hits }
-            else { e: OK, par: r.par, leaf: r.leaf, hits: r.hits }
+                { e: EACCES, par: -1, leaf: "", hits: r.hits, links: r.links }
+            else { e: OK, par: r.par, leaf: r.leaf, hits: r.hits,
+                   links: r.links }
         }
     }
 
@@ -1365,6 +1412,7 @@ module posixops {
                      pth: Path, m: int): Out = {
         val cr = psCred(ps, p)
         val g = createGate(fs, ps, caps, p, dfd, pth, true)
+        withLinkAtimes({
         if (g.e != OK) hit(outErr(fs, ps, g.e), g.hits)
         else {
             val dnode = fs.inodes.get(g.par)
@@ -1373,12 +1421,14 @@ module posixops {
             val mk = fsMknode(fs, g.par, g.leaf, node)
             hit(outErr(mk.fs2, ps, OK), g.hits)
         }
+        }, g.links, caps)
     }
 
     pure def opMknod(fs: Fs, ps: Pstate, caps: Caps, p: Pid, pth: Path,
                      ft: Ftype, m: int): Out = {
         val cr = psCred(ps, p)
         val g = createGate(fs, ps, caps, p, -1, pth, false)
+        withLinkAtimes({
         if (g.e != OK) hit(outErr(fs, ps, g.e), g.hits)
         else if (ft == FDir or ft == FLnk) outErr(fs, ps, EINVAL)
         else if ((ft == FBlk or ft == FChr) and not(isPriv(cr)))
@@ -1392,6 +1442,7 @@ module posixops {
                                       newGid(caps, cr, dnode))
             hit(outErr(fsMknode(fs, g.par, g.leaf, node).fs2, ps, OK), g.hits)
         }
+        }, g.links, caps)
     }
 
     // symlink: the target is not validated (dangling is fine).  The link's
@@ -1402,12 +1453,14 @@ module posixops {
                        tgt: SymTarget, dfd: Fd, pth: Path): Out = {
         val cr = psCred(ps, p)
         val g = createGate(fs, ps, caps, p, dfd, pth, false)
+        withLinkAtimes({
         if (g.e != OK) hit(outErr(fs, ps, g.e), g.hits)
         else {
             val dnode = fs.inodes.get(g.par)
             val node = mkSymlink(tgt, 511, cr.euid, newGid(caps, cr, dnode))
             hit(outErr(fsMknode(fs, g.par, g.leaf, node).fs2, ps, OK), g.hits)
         }
+        }, g.links, caps)
     }
 
     pure def opLink(fs: Fs, ps: Pstate, caps: Caps, p: Pid, dfdOld: Fd,
@@ -1431,6 +1484,7 @@ module posixops {
             // the source error and ACCEPTS the target's unconditionally,
             // rather than carrying a knob per ordering (was PD17c/PD17e/PD17f).
             val gEarly = createGate(fs, ps, caps, p, dfdNew, pthNew, false)
+            withLinkAtimes({
             val gAcc = if (gEarly.e == OK) Set() else Set(gEarly.e)
             if (ro.err != OK)
                 hit(outErrA(fs, ps, ro.err, gAcc), ro.hits.union(pd6))
@@ -1448,6 +1502,7 @@ module posixops {
                         else ENOTDIR), g.hits.union(pd6))
                 }
             }
+            }, ro.links.union(gEarly.links), caps)
         }
     }
 
@@ -1458,6 +1513,7 @@ module posixops {
         if (at.e != OK) outErr(fs, ps, at.e)
         else {
             val r = resolve(fs, caps, cr, at.start, pth, false)
+            withLinkAtimes({
             if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
             else if (r.ino == -1) outErr(fs, ps, ENOENT)
             else if (r.par == -1) outErr(fs, ps, EBUSY)   // "/"
@@ -1489,6 +1545,7 @@ module posixops {
                     outErr(rm.fs2, ps, if (rm.st == FsOk) OK else ENOENT)
                 }
             }
+            }, r.links, caps)
         }
     }
 
@@ -1499,6 +1556,7 @@ module posixops {
         if (at.e != OK) outErr(fs, ps, at.e)
         else {
             val r = resolve(fs, caps, cr, at.start, pth, false)
+            withLinkAtimes({
             if (r.err != OK) hit(outErr(fs, ps, r.err), r.hits)
             else if (r.ino == -1) outErr(fs, ps, ENOENT)
             else if (r.leaf == ".") outErr(fs, ps, EINVAL)
@@ -1532,6 +1590,7 @@ module posixops {
                     outErr(rm.fs2, ps, if (rm.st == FsOk) OK else ENOENT)
                 }
             }
+            }, r.links, caps)
         }
     }
 
@@ -1544,12 +1603,14 @@ module posixops {
         else if (atN.e != OK) outErr(fs, ps, atN.e)
         else {
             val rs = resolve(fs, caps, cr, atO.start, pthOld, false)
+            withLinkAtimes({
             if (rs.err != OK) hit(outErr(fs, ps, rs.err), rs.hits)
             else if (rs.ino == -1) outErr(fs, ps, ENOENT)
             else if (rs.leaf == "." or rs.leaf == ".." or rs.par == -1)
                 outErr(fs, ps, EINVAL)
             else {
                 val rt = resolve(fs, caps, cr, atN.start, pthNew, false)
+                withLinkAtimes({
                 if (rt.err != OK) hit(outErr(fs, ps, rt.err), rt.hits)
                 else if (rt.leaf == "." or rt.leaf == ".." or rt.par == -1)
                     outErr(fs, ps, EINVAL)
@@ -1637,7 +1698,9 @@ module posixops {
                         outErr(fsC, ps, e)
                     }
                 }
+                }, rt.links, caps)
             }
+            }, rs.links, caps)
         }
     }
 
@@ -1647,6 +1710,7 @@ module posixops {
         if (at.e != OK) out(fs, ps, SReadlinkR({ e: at.e, tgt: NO_TARGET }))
         else {
             val r = resolveEx(fs, caps, psCred(ps, p), at.start, pth, false)
+            withLinkAtimes({
             if (r.err != OK)
                 hit(out(fs, ps, SReadlinkR({ e: r.err, tgt: NO_TARGET })),
                     r.hits)
@@ -1660,6 +1724,7 @@ module posixops {
                     out(fsMark(fs, r.ino, true, false, false), ps,
                         SReadlinkR({ e: OK, tgt: nd.target }))
             }
+            }, r.links, caps)
         }
     }
 
@@ -1673,6 +1738,7 @@ module posixops {
                        pth: Path): Out = {
         val cr = psCred(ps, p)
         val r = resolveEx(fs, caps, cr, ROOT, pth, true)
+        withLinkAtimes({
         if (r.err != OK) hit(out(fs, ps, SDirR({ e: r.err, sid: -1 })), r.hits)
         else {
             val nd = fs.inodes.get(r.ino)
@@ -1684,6 +1750,7 @@ module posixops {
                 out(fs, od.ps2, SDirR({ e: OK, sid: od.sid }))
             }
         }
+        }, r.links, caps)
     }
 
     // readdir modeled as one atomic full sweep (see DESIGN-POSIX.md): the
