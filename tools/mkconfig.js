@@ -300,7 +300,10 @@ function stageSources(specsRoot, stage) {
       try { current = fs.readlinkSync(link) } catch (err) { /* absent */ }
       if (current === target) continue
       try { fs.unlinkSync(link) } catch (err) { /* absent */ }
-      fs.symlinkSync(target, link)
+      // Native Windows checkouts need no Developer Mode or symlink privilege.
+      // Refresh the copy at configure time just as Unix refreshes the link.
+      if (process.platform === 'win32') fs.copyFileSync(target, link)
+      else fs.symlinkSync(target, link)
     }
   }
 }

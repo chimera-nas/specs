@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: 2026 The Quint Specs Authors
+# SPDX-License-Identifier: MIT
+name: Native corpus generation
+on:
+  push:
+    branches: [main, windows-node]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  corpus:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-14, windows-2022, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install pinned Quint
+        shell: pwsh
+        run: |
+          $version = (Get-Content .quint-version).Trim()
+          npm install -g "@informalsystems/quint@$version"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Configure a corpus consumer
+        run: cmake -S tests/native -B build
+      - name: Generate and self-test the model
+        run: cmake --build build --parallel 2
+      - uses: actions/upload-artifact@v6
+        with:
+          name: corpus-${{ matrix.runner }}
+          path: build/specs-corpus/**/*.itf.json
+          if-no-files-found: error

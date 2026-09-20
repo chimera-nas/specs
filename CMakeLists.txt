@@ -25,7 +25,7 @@ cmake_minimum_required(VERSION 3.20)
 project(specs NONE)
 enable_testing()
 
-find_program(QUINT_BIN quint REQUIRED)
+find_program(QUINT_BIN NAMES quint.cmd quint REQUIRED)
 # tools/gen.js drives quint's staged API directly; see the specs_gen comment.
 find_program(NODE_BIN NAMES node nodejs REQUIRED)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
