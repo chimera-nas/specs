@@ -2234,11 +2234,26 @@ module posixops {
             // same rule a write does: every ext4_fallocate() path runs
             // file_modified(), which calls file_remove_privs().  The model
             // treated it as a pure allocation and kept them.
-            val drop = caps.writeClearsSets and not(isPriv(psCred(ps, p)))
+            // PD21: a punch that reaches past EOF writes nothing, and a
+            // proxy that emulates DEALLOCATE with zero-writes therefore sends
+            // nothing -- so the set-id bits keep standing where the call
+            // itself would have cleared them.  Recorded only where it is
+            // observable: the punch must actually be empty.
+            val emptyPunch = mode != 0 and off >= fs.inodes.get(o.ino).size
+            val proxyKeeps = dev(caps, "PD21") and emptyPunch
+            val drop = caps.writeClearsSets and
+                       not(isPriv(psCred(ps, p))) and not(proxyKeeps)
+            val pdHits = if (proxyKeeps and caps.writeClearsSets and
+                              not(isPriv(psCred(ps, p))) and
+                              (bitOn(fs.inodes.get(o.ino).mode, MB_SUID) or
+                               bitOn(fs.inodes.get(o.ino).mode, MB_SGID)))
+                             Set("PD21")
+                         else Set()
             if (not(accWrites(o.acc))) outErr(fs, ps, EBADF)
             else if (mode == 0)
                 out(fsAllocate(fs, o.ino, off, len, drop), ps, sOk(OK))
-            else out(fsPunch(fs, o.ino, off, len, drop), ps, sOk(OK))
+            else hit(out(fsPunch(fs, o.ino, off, len, drop), ps, sOk(OK)),
+                     pdHits)
         }
 
     // ------------------------------------------------------------------
