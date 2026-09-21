@@ -706,6 +706,114 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# ext4 conformance (harness/posix)
+#
+# The POSIX model encodes POSIX.1-2024 and the behaviour Linux actually ships
+# where the standard leaves a choice.  This cell is what makes that claim
+# falsifiable, and its value runs the opposite way to the other conformance
+# suites here: ext4 IS the implementation the model was written against, so
+# where THIS cell needs a deviation the suspicion falls on the model first.
+#
+# The traces are replayed by real syscalls, in a KVM guest, by a driver that
+# forks one chrooted process per model pid and permanently drops credentials
+# into it (harness/posix/posix_driver.py).  A guest is needed for three
+# reasons the host cannot give: a scratch ext4 to mkfs per batch, root to
+# become arbitrary uids, and Linux's fs.protected_* sysctls turned off -- they
+# are a hardening policy layered over POSIX and would otherwise read as
+# divergences.
+#
+# The same guest image the knfsd suite boots (KVM_IMAGE_DIR).
+# ---------------------------------------------------------------------------
+option(SPECS_EXT4_TESTS "Replay the POSIX corpus against a real ext4 filesystem"
+       ${_conformance_default})
+
+if(SPECS_EXT4_TESTS)
+    set(POSIX_HARNESS ${CMAKE_CURRENT_SOURCE_DIR}/harness/posix)
+    find_program(QEMU_BIN NAMES qemu-system-x86_64 qemu-system-aarch64
+                 qemu-system-riscv64)
+    set(EXT4_CAN_RUN TRUE)
+    if(NOT KVM_IMAGE_DIR OR NOT EXISTS "${KVM_IMAGE_DIR}/vmlinuz"
+       OR NOT EXISTS "${KVM_IMAGE_DIR}/rootfs.qcow2")
+        set(EXT4_CAN_RUN FALSE)
+        message(STATUS
+            "ext4 MBT tests: corpus registered, tests disabled (no KVM guest "
+            "image; set KVM_IMAGE_DIR to a directory with vmlinuz + "
+            "rootfs.qcow2)")
+    elseif(NOT QEMU_BIN)
+        set(EXT4_CAN_RUN FALSE)
+        message(STATUS
+            "ext4 MBT tests: corpus registered, tests disabled (qemu-system "
+            "not found)")
+    else()
+        message(STATUS "ext4 MBT tests: enabled (guest ${KVM_IMAGE_DIR}, "
+                "${QEMU_BIN})")
+    endif()
+
+    # cell config | trace stem | batch names
+    set(EXT4_CELLS
+        "ext4|ext4|step_128,step_256,step_512,stepNamespace_128,stepNamespace_256,stepDescriptors_128,stepMetadata_128,stepDirs_128,stepData_128,stepLocks_128,stepLocks_256,stepPerms_128,stepLinks_128,stepFds_128,stepTooLong_128,stepPrefix_128,stepFallocate_128,stepVectored_128,stepLockOps_128,stepDevice_128")
+
+    foreach(c ${EXT4_CELLS})
+        string(REPLACE "|" ";" parts "${c}")
+        list(GET parts 0 cfgname)
+        list(GET parts 1 stem)
+        list(GET parts 2 bnames)
+        string(REPLACE "," ";" bnames "${bnames}")
+        set(ecfg ${POSIX_HARNESS}/configs/${cfgname}.json)
+
+        specs_corpus(NAME    ext4/${cfgname}
+                     FAMILY  posix
+                     CONFIG  ${ecfg}
+                     OUT_DIR EXT4_TRACES
+                     STRICT_OUT_DIR EXT4_STRICT)
+
+        # The gate that stops a recorded deviation outliving its fix: a
+        # deviation this cell enables that no trace in its own corpus ever
+        # records having taken fails here.  It needs no guest -- it reads the
+        # config and the generated traces -- so it runs everywhere the corpus
+        # is built, which is the point, because that is most machines.
+        set(SPECS_DEVLIVENESS ${CMAKE_CURRENT_SOURCE_DIR}/tools/devliveness.py)
+        add_test(NAME ext4/posix/${cfgname}/devliveness
+                 COMMAND ${Python3_EXECUTABLE} ${SPECS_DEVLIVENESS}
+                         ${ecfg} ${EXT4_TRACES})
+        set_tests_properties(ext4/posix/${cfgname}/devliveness PROPERTIES
+            LABELS "ext4;posix;devliveness"
+            TIMEOUT 120)
+
+        foreach(bname ${bnames})
+            if(NOT EXT4_CAN_RUN)
+                continue()
+            endif()
+            set(tname ext4/posix/${cfgname}/${bname})
+            add_test(NAME ${tname}
+                     COMMAND ${POSIX_HARNESS}/run_posix_mbt.sh
+                             ${EXT4_TRACES} ${stem}_${bname}_*.itf.json)
+            # One guest boot plus a mkfs per batch: minutes.  SKIP_RETURN_CODE
+            # 77 lets the runner report "no /dev/kvm here" as a ctest SKIP.
+            set_tests_properties(${tname} PROPERTIES
+                LABELS "ext4;posix;mbt"
+                TIMEOUT 1800
+                SKIP_RETURN_CODE 77
+                ENVIRONMENT "KVM_VMLINUZ=${KVM_IMAGE_DIR}/vmlinuz;KVM_ROOTFS=${KVM_IMAGE_DIR}/rootfs.qcow2")
+
+            # The STRICT twin: the same cell with every deviation forced off,
+            # so the corpus states POSIX and nothing else.  Its failures ARE
+            # ext4's conformance debt, re-measured every run rather than
+            # remembered in a registry.  Extended tier: reporting, not gating.
+            add_test(NAME ${tname}-strict
+                     CONFIGURATIONS extended
+                     COMMAND ${POSIX_HARNESS}/run_posix_mbt.sh
+                             ${EXT4_STRICT} ${stem}_${bname}_*.itf.json)
+            set_tests_properties(${tname}-strict PROPERTIES
+                LABELS "ext4;posix;mbt;strict"
+                TIMEOUT 1800
+                SKIP_RETURN_CODE 77
+                ENVIRONMENT "KVM_VMLINUZ=${KVM_IMAGE_DIR}/vmlinuz;KVM_ROOTFS=${KVM_IMAGE_DIR}/rootfs.qcow2")
+        endforeach()
+    endforeach()
+endif()
+
+# ---------------------------------------------------------------------------
 # Emit the build edges for every cell registered above (cmake/SpecsCorpus.cmake).
 #
 # A CONSUMER calls this itself, after its own specs_corpus() registrations; this
