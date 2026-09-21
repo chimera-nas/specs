@@ -40,6 +40,7 @@ module posix {
     const P_RENAME_CTIME: FeatureMode      // rename marks moved ctime
     const P_STRICT_ATIME: FeatureMode      // harness enforces atime marks
     const P_STICKY_WRITE_ARM: FeatureMode  // sticky exempts write-perm
+    const P_STATELESS_IO_DAC: bool         // stateless transport rechecks I/O
     const P_CHOWN_SUPP_GROUP: FeatureMode  // chgrp to a supplementary group
     const P_ERR_NOTEMPTY: FeatureMode      // ENOTEMPTY (else EEXIST)
     const P_ERR_STICKY_ACCES: FeatureMode  // EACCES (else EPERM)
@@ -245,7 +246,7 @@ module posix {
             withRoot: rootP, gidFromParent: gidPar, sgidInherit: sgidInh,
             writeClearsSets: wClear, pwriteAppends: pwApp,
             renameCtime: rnCt, strictAtime: sAtime, stickyWriteArm: stArm,
-            chownSuppGroup: chSup,
+            chownSuppGroup: chSup, statelessIoDac: P_STATELESS_IO_DAC,
             errNotempty: eNe, errStickyAcces: eSt,
             errUnlinkDirIsdir: eUd, errLockAgain: eLk,
             dirSeekDomain: dSk, orphanCtime: oCt, symlinkAtime: sAt,
@@ -1139,6 +1140,7 @@ module posix {
         capChoices(P_STRICT_ATIME).contains(caps.strictAtime),
         capChoices(P_STICKY_WRITE_ARM).contains(caps.stickyWriteArm),
         capChoices(P_CHOWN_SUPP_GROUP).contains(caps.chownSuppGroup),
+        caps.statelessIoDac == P_STATELESS_IO_DAC,
         capChoices(P_ERR_NOTEMPTY).contains(caps.errNotempty),
         capChoices(P_ERR_STICKY_ACCES).contains(caps.errStickyAcces),
         capChoices(P_ERR_UNLINKDIR_ISDIR).contains(caps.errUnlinkDirIsdir),

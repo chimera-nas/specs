@@ -97,6 +97,10 @@ module posixfs {
     type Inode = {
         ftype: Ftype,
         mode: int,            // 12 file mode bits
+        // A no-op punch may preserve the old set-id bits (Linux 6.8) or
+        // clear them (newer kernels). Only these two complete modes are
+        // accepted; chmod or a privilege-clearing mutation resolves it.
+        optionalSetids: int,
         uid: int,
         gid: int,
         nlink: int,
@@ -156,25 +160,25 @@ module posixfs {
     // ------------------------------------------------------------------
 
     pure def mkDir(m: int, u: int, g: int): Inode = {
-        ftype: FDir, mode: m, uid: u, gid: g, nlink: 2,
+        ftype: FDir, mode: m, optionalSetids: 0, uid: u, gid: g, nlink: 2,
         dataBlocks: Set(), size: 0, ents: Map(), parent: ROOT,
         target: NO_TARGET, atime: 0, mtime: 0, ctime: 0
     }
 
     pure def mkFile(m: int, u: int, g: int): Inode = {
-        ftype: FReg, mode: m, uid: u, gid: g, nlink: 1,
+        ftype: FReg, mode: m, optionalSetids: 0, uid: u, gid: g, nlink: 1,
         dataBlocks: Set(), size: 0, ents: Map(), parent: ROOT,
         target: NO_TARGET, atime: 0, mtime: 0, ctime: 0
     }
 
     pure def mkSymlink(tgt: SymTarget, m: int, u: int, g: int): Inode = {
-        ftype: FLnk, mode: m, uid: u, gid: g, nlink: 1,
+        ftype: FLnk, mode: m, optionalSetids: 0, uid: u, gid: g, nlink: 1,
         dataBlocks: Set(), size: 0, ents: Map(), parent: ROOT,
         target: tgt, atime: 0, mtime: 0, ctime: 0
     }
 
     pure def mkSpecial(ft: Ftype, m: int, u: int, g: int): Inode = {
-        ftype: ft, mode: m, uid: u, gid: g, nlink: 1,
+        ftype: ft, mode: m, optionalSetids: 0, uid: u, gid: g, nlink: 1,
         dataBlocks: Set(), size: 0, ents: Map(), parent: ROOT,
         target: NO_TARGET, atime: 0, mtime: 0, ctime: 0
     }
@@ -509,6 +513,7 @@ module posixfs {
               .with("dataBlocks", addBlocks(x.dataBlocks, off, len))
               .with("size", nsz)
               .with("mode", if (dropSets) modeWithoutSetids(x.mode) else x.mode)
+              .with("optionalSetids", if (dropSets) 0 else x.optionalSetids)
               .with("mtime", fs.clk)
               .with("ctime", fs.clk)))
           .with("clk", fs.clk + 1),
@@ -537,6 +542,7 @@ module posixfs {
               .with("dataBlocks", kept)
               .with("size", n)
               .with("mode", if (dropSets) modeWithoutSetids(x.mode) else x.mode)
+              .with("optionalSetids", if (dropSets) 0 else x.optionalSetids)
               .with("mtime", fs.clk)
               .with("ctime", fs.clk)))
           .with("clk", fs.clk + 1)
@@ -554,6 +560,7 @@ module posixfs {
               .with("dataBlocks", addBlocks(x.dataBlocks, off, len))
               .with("size", imax(x.size, off + len))
               .with("mode", if (dropSets) modeWithoutSetids(x.mode) else x.mode)
+              .with("optionalSetids", if (dropSets) 0 else x.optionalSetids)
               .with("mtime", fs.clk)
               .with("ctime", fs.clk)))
           .with("clk", fs.clk + 1)
@@ -571,6 +578,9 @@ module posixfs {
         fs.with("inodes", fs.inodes.setBy(f, x => x
               .with("dataBlocks", x.dataBlocks.filter(i => i < lo or i >= hi))
               .with("mode", if (dropSets) modeWithoutSetids(x.mode) else x.mode)
+              .with("optionalSetids", if (dropSets and off >= x.size)
+                    x.mode - modeWithoutSetids(x.mode) + x.optionalSetids
+                  else if (dropSets) 0 else x.optionalSetids)
               .with("mtime", fs.clk)
               .with("ctime", fs.clk)))
           .with("clk", fs.clk + 1)
@@ -580,6 +590,7 @@ module posixfs {
     pure def fsChmod(fs: Fs, f: Ino, m: int): Fs =
         fs.with("inodes", fs.inodes.setBy(f, x => x
               .with("mode", m)
+              .with("optionalSetids", 0)
               .with("ctime", fs.clk)))
           .with("clk", fs.clk + 1)
 
@@ -591,6 +602,7 @@ module posixfs {
               .with("uid", if (u == -1) x.uid else u)
               .with("gid", if (g == -1) x.gid else g)
               .with("mode", if (clearSets) modeWithoutSetids(x.mode) else x.mode)
+              .with("optionalSetids", if (clearSets) 0 else x.optionalSetids)
               .with("ctime", fs.clk)))
           .with("clk", fs.clk + 1)
 

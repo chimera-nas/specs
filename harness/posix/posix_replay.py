@@ -554,7 +554,7 @@ class Replayer:
             # POSIX leaves a symlink's permission bits unspecified and no
             # call consults them; deliberately not asserted.
             pass
-        elif res.get("mode") != rv["mode"]:
+        elif res.get("mode") not in (rv["mode"], rv["mode"] + rv.get("optionalSetids", 0)):
             self.note("mode", oct(rv["mode"]), oct(res.get("mode", 0)))
         if res.get("uid") != rv["uid"]:
             self.note("uid", rv["uid"], res.get("uid"))
@@ -1357,7 +1357,8 @@ class Replayer:
                     self.note("audit", FTYPE_MAP[ftag], st.get("ftype"),
                               f"{cpath} ftype")
                     continue
-                if ftag != "FLnk" and st.get("mode") != cnode["mode"]:
+                if ftag != "FLnk" and st.get("mode") not in (
+                        cnode["mode"], cnode["mode"] + cnode.get("optionalSetids", 0)):
                     self.note("audit", oct(cnode["mode"]),
                               oct(st.get("mode", 0)), f"{cpath} mode")
                 if st.get("uid") != cnode["uid"] or \

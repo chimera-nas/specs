@@ -87,6 +87,7 @@ module posixops {
         gidFromParent: bool, // new object gid = parent dir's gid (else egid)
         sgidInherit: bool,   // new subdir inherits parent's S_ISGID
         // Setid clearing / divergence policies:
+        statelessIoDac: bool,   // NFSv3 rechecks read/write DAC on every RPC
         writeClearsSets: bool,  // write/truncate by unprivileged clears setids
         pwriteAppends: bool,    // pwrite honors O_APPEND (Linux divergence;
                                 // POSIX: writes at the given offset)
@@ -570,7 +571,7 @@ module posixops {
         // landing byte offset so the replay can verify/update its byte shadow.
         // Exact content bytes are NOT modeled (they live in the shadow).
         | SRw({ e: int, n: int, ino: Ino, off: int })
-        | SStatR({ e: int, ftype: Ftype, mode: int, uid: int, gid: int,
+        | SStatR({ e: int, ftype: Ftype, mode: int, optionalSetids: int, uid: int, gid: int,
                    nlink: int, sizeB: int, ino: Ino,
                    atime: int, mtime: int, ctime: int })
         | SReadlinkR({ e: int, tgt: SymTarget })
@@ -942,6 +943,16 @@ module posixops {
     pure def readModeDenied(caps: Caps, cr: Cred, nd: Inode): bool =
         (dev(caps, "PD11a") or dev(caps, "PD11b")) and not(mayRead(cr, nd))
 
+    // NFSv3 has no OPEN stateid. A descriptor retains the opening identity,
+    // but a non-owner must still pass server DAC for each data RPC. Linux's
+    // owner override preserves the owner's access after chmod. Credentials
+    // are fixed for each model process and descriptors never cross processes.
+    pure def rpcReadDenied(caps: Caps, cr: Cred, nd: Inode): bool =
+        caps.statelessIoDac and cr.euid != nd.uid and not(mayRead(cr, nd))
+
+    pure def rpcWriteDenied(caps: Caps, cr: Cred, nd: Inode): bool =
+        caps.statelessIoDac and cr.euid != nd.uid and not(mayWrite(cr, nd))
+
     pure def opRead(fs: Fs, ps: Pstate, caps: Caps, p: Pid, fd: Fd,
                     len: int): Out =
         if (not(fdLive(ps, p, fd)))
@@ -953,6 +964,8 @@ module posixops {
             val badAcc = not(accReads(o.acc))
             if (badAcc and readAccEnforced(caps))
                 out(fs, ps, rwErr(EBADF))
+            else if (nd.ftype == FReg and rpcReadDenied(caps, cr, nd))
+                out(fs, ps, rwErr(EACCES))
             else if (readModeDenied(caps, cr, nd))
                 hit(out(fs, ps, rwErr(EACCES)),
                     if (badAcc) Set("PD11b") else Set("PD11a"))
@@ -1000,6 +1013,8 @@ module posixops {
                 hit(out(fs, ps, rwErr(EISDIR)), Set("PD8w"))
             else if (not(accWrites(o.acc)))
                 out(fs, ps, rwErr(EBADF))
+            else if (rpcWriteDenied(caps, cr, fs.inodes.get(o.ino)))
+                out(fs, ps, rwErr(EACCES))
             else {
                 // O_APPEND: the offset is set to the size immediately
                 // before each write, atomically with it.  PD4: chimera
@@ -1028,6 +1043,8 @@ module posixops {
             val badAcc = not(accReads(o.acc))
             if (badAcc and readAccEnforced(caps))
                 out(fs, ps, rwErr(EBADF))
+            else if (nd.ftype == FReg and rpcReadDenied(caps, cr, nd))
+                out(fs, ps, rwErr(EACCES))
             else if (readModeDenied(caps, cr, nd))
                 hit(out(fs, ps, rwErr(EACCES)),
                     if (badAcc) Set("PD11b") else Set("PD11a"))
@@ -1058,6 +1075,8 @@ module posixops {
             val o = fdOfd(ps, p, fd)
             if (not(accWrites(o.acc)))
                 out(fs, ps, rwErr(EBADF))
+            else if (rpcWriteDenied(caps, cr, fs.inodes.get(o.ino)))
+                out(fs, ps, rwErr(EACCES))
             else if (off < 0)
                 out(fs, ps, rwErr(EINVAL))
             else {
@@ -1101,6 +1120,8 @@ module posixops {
             else if (len < 0) outErr(fs, ps, EINVAL)
             else if (fs.inodes.get(o.ino).ftype != FReg)
                 outErr(fs, ps, EINVAL)
+            else if (rpcWriteDenied(caps, cr, fs.inodes.get(o.ino)))
+                outErr(fs, ps, EACCES)
             else out(fsResize(fs, o.ino, len,
                          caps.writeClearsSets and not(isPriv(cr))),
                      ps, sOk(OK))
@@ -1117,12 +1138,12 @@ module posixops {
     // ------------------------------------------------------------------
 
     pure def statRes(nd: Inode, i: Ino): OpRes =
-        SStatR({ e: OK, ftype: nd.ftype, mode: nd.mode, uid: nd.uid,
+        SStatR({ e: OK, ftype: nd.ftype, mode: nd.mode, optionalSetids: nd.optionalSetids, uid: nd.uid,
                  gid: nd.gid, nlink: nd.nlink, sizeB: nd.size,
                  ino: i, atime: nd.atime, mtime: nd.mtime, ctime: nd.ctime })
 
     pure def statFail(e: int): OpRes =
-        SStatR({ e: e, ftype: FReg, mode: 0, uid: -1, gid: -1, nlink: 0,
+        SStatR({ e: e, ftype: FReg, mode: 0, optionalSetids: 0, uid: -1, gid: -1, nlink: 0,
                  sizeB: 0, ino: -1, atime: 0, mtime: 0, ctime: 0 })
 
     // stat/lstat/fstatat: no permission is needed on the object itself,
@@ -2221,39 +2242,29 @@ module posixops {
     // the
     // libc-style wrapper BEFORE acquiring the descriptor, so EINVAL (off < 0
     // or len <= 0) precedes EBADF; a descriptor not open for writing is EBADF
-    // (fallocate uses EBADF here, not the EINVAL ftruncate returns).  Both
-    // modes mark mtime/ctime and neither clears the set-user/group-ID bits
-    // (the allocate path bumps times only, never the mode).
+    // (fallocate uses EBADF here, not the EINVAL ftruncate returns).
     pure def opFallocate(fs: Fs, ps: Pstate, caps: Caps, p: Pid, fd: Fd,
                          mode: int, off: int, len: int): Out =
         if (off < 0 or len <= 0) outErr(fs, ps, EINVAL)
         else if (not(fdLive(ps, p, fd))) outErr(fs, ps, EBADF)
         else {
             val o = fdOfd(ps, p, fd)
-            // fallocate changes the file, so it sheds the setid bits on the
-            // same rule a write does: every ext4_fallocate() path runs
-            // file_modified(), which calls file_remove_privs().  The model
-            // treated it as a pure allocation and kept them.
-            // PD21: a punch that reaches past EOF writes nothing, and a
-            // proxy that emulates DEALLOCATE with zero-writes therefore sends
-            // nothing -- so the set-id bits keep standing where the call
-            // itself would have cleared them.  Recorded only where it is
-            // observable: the punch must actually be empty.
-            val emptyPunch = mode != 0 and off >= fs.inodes.get(o.ino).size
-            val proxyKeeps = dev(caps, "PD21") and emptyPunch
-            val drop = caps.writeClearsSets and
-                       not(isPriv(psCred(ps, p))) and not(proxyKeeps)
-            val pdHits = if (proxyKeeps and caps.writeClearsSets and
-                              not(isPriv(psCred(ps, p))) and
-                              (bitOn(fs.inodes.get(o.ino).mode, MB_SUID) or
-                               bitOn(fs.inodes.get(o.ino).mode, MB_SGID)))
-                             Set("PD21")
-                         else Set()
+            // A modifying allocation drops privilege bits like a write.
+            // For a punch wholly beyond EOF, fsPunch retains both permitted
+            // outcomes: ext4 in Linux 6.8 returns before file_modified(),
+            // whereas newer kernels call it before the punch dispatch.
+            val drop = caps.writeClearsSets and not(isPriv(psCred(ps, p)))
             if (not(accWrites(o.acc))) outErr(fs, ps, EBADF)
+            // NFSv3 emulates allocation with SETATTR when extending and
+            // punching with WRITE within EOF. Only those RPCs require DAC;
+            // an already allocated range or a punch past EOF does no I/O.
+            else if (rpcWriteDenied(caps, psCred(ps, p), fs.inodes.get(o.ino)) and
+                     (if (mode == 0) off + len > fs.inodes.get(o.ino).size
+                      else off < fs.inodes.get(o.ino).size))
+                outErr(fs, ps, EACCES)
             else if (mode == 0)
                 out(fsAllocate(fs, o.ino, off, len, drop), ps, sOk(OK))
-            else hit(out(fsPunch(fs, o.ino, off, len, drop), ps, sOk(OK)),
-                     pdHits)
+            else out(fsPunch(fs, o.ino, off, len, drop), ps, sOk(OK))
         }
 
     // ------------------------------------------------------------------

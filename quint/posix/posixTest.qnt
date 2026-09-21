@@ -28,6 +28,7 @@ module posixTestStd {
         P_RENAME_CTIME = FeatOff,
         P_STRICT_ATIME = FeatMandatory,
         P_STICKY_WRITE_ARM = FeatOff,
+        P_STATELESS_IO_DAC = false,
         P_CHOWN_SUPP_GROUP = FeatMandatory,
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
@@ -68,7 +69,7 @@ module posixTestStd {
         | LInit(x) => -1
     }
 
-    val noStatR = { e: -999, ftype: FReg, mode: 0, uid: -1, gid: -1,
+    val noStatR = { e: -999, ftype: FReg, mode: 0, optionalSetids: 0, uid: -1, gid: -1,
                     nlink: 0, sizeB: 0, ino: -1, atime: 0, mtime: 0,
                     ctime: 0 }
 
@@ -682,10 +683,8 @@ module posixTestStd {
         .then(runOp(0, RLockf({ fd: 0, cmd: LfTlock, len: 1 })))
         .expect(lastE == EAGAIN)
 
-    // fallocate changes the file, so it sheds the setid bits exactly as a
-    // write does -- every ext4_fallocate() path runs file_modified(), which
-    // calls file_remove_privs().  The model once treated it as a pure
-    // allocation and kept them.
+    // Allocating data or punching within EOF sheds set-id bits like a write.
+    // A punch wholly beyond EOF permits preservation as well as clearing.
     run fallocateSetidTest =
         init
         .then(runOp(0, RMknod({ pth: ap(["f"]), ft: FReg, mode: 1517 })))
@@ -699,6 +698,54 @@ module posixTestStd {
         .expect(lastE == OK and fsGet(fs, 1).mode == 1517)
         .then(runOp(0, RFallocate({ fd: 0, mode: 1, off: 0, len: 4096 })))
         .expect(lastE == OK and fsGet(fs, 1).mode == 493)
+
+    run emptyPunchSetidTest =
+        init
+        .then(runOp(0, ROpen({ dfd: -1, pth: ap(["f"]), fl: FLRW.with("creat", true).with("mode", 1517) })))
+        .then(runOp(0, RFchmod({ fd: 0, mode: 1517 })))
+        .then(runOp(0, RFallocate({ fd: 0, mode: 1, off: 4096, len: 4096 })))
+        .expect(lastE == OK and fsGet(fs, 1).mode == 493 and
+                fsGet(fs, 1).optionalSetids == 1024)
+        // Repeating a no-op must keep the same two outcomes.
+        .then(runOp(0, RFallocate({ fd: 0, mode: 1, off: 0, len: 4096 })))
+        .expect(fsGet(fs, 1).optionalSetids == 1024)
+        .then(runOp(0, RWrite({ fd: 0, len: 1, pat: 1 })))
+        .expect(lastE == OK and fsGet(fs, 1).mode == 493 and
+                fsGet(fs, 1).optionalSetids == 0)
+        .then(runOp(0, RFchmod({ fd: 0, mode: 1517 })))
+        .expect(fsGet(fs, 1).mode == 1517 and fsGet(fs, 1).optionalSetids == 0)
+
+    run statelessIoDacTest =
+        init
+        .then(runOp(0, ROpen({ dfd: -1, pth: ap(["f"]),
+                              fl: FLRW.with("creat", true).with("mode", 511) })))
+        .then(runOp(0, RWrite({ fd: 0, len: 4096, pat: 1 })))
+        .then(runOp(1, ROpen({ dfd: -1, pth: ap(["f"]), fl: FLRW })))
+        .expect(lastE == OK)
+        .then(runOp(0, RFchmod({ fd: 0, mode: 0 })))
+        .expect(errOf(opRead(fs, ps, caps.with("statelessIoDac", true),
+                            1, 0, 1).res) == EACCES)
+        .expect(opRead(fs, ps, caps.with("statelessIoDac", true),
+                       1, 0, 1).ps2 == ps)
+        .expect(errOf(opWrite(fs, ps, caps.with("statelessIoDac", true),
+                             1, 0, 1, 2).res) == EACCES)
+        .expect(opWrite(fs, ps, caps.with("statelessIoDac", true),
+                        1, 0, 1, 2).fs2 == fs)
+        .expect(errOf(opFtruncate(fs, ps, caps.with("statelessIoDac", true),
+                                 1, 0, 4096).res) == EACCES)
+        .expect(errOf(opFallocate(fs, ps, caps.with("statelessIoDac", true),
+                                 1, 0, 0, 4096, 4096).res) == EACCES)
+        .expect(errOf(opFallocate(fs, ps, caps.with("statelessIoDac", true),
+                                 1, 0, 1, 0, 4096).res) == EACCES)
+        .expect(errOf(opFallocate(fs, ps, caps.with("statelessIoDac", true),
+                                 1, 0, 0, 0, 4096).res) == OK)
+        .expect(errOf(opFallocate(fs, ps, caps.with("statelessIoDac", true),
+                                 1, 0, 1, 4096, 4096).res) == OK)
+        // Owners retain access; stateful non-owner descriptors do too.
+        .expect(errOf(opRead(fs, ps, caps.with("statelessIoDac", true),
+                            0, 0, 1).res) == OK)
+        .then(runOp(1, RRead({ fd: 0, len: 1 })))
+        .expect(lastE == OK and lastN == 1)
 
     // chown(-1, -1) names neither id and moves neither, but XSH chown asks
     // for the setid bits of an executable regular file to be cleared "upon
@@ -993,6 +1040,7 @@ module posixTestRoot {
         P_RENAME_CTIME = FeatOff,
         P_STRICT_ATIME = FeatMandatory,
         P_STICKY_WRITE_ARM = FeatOff,
+        P_STATELESS_IO_DAC = false,
         P_CHOWN_SUPP_GROUP = FeatMandatory,
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
@@ -1100,6 +1148,7 @@ module posixTestLinux {
         P_RENAME_CTIME = FeatOff,
         P_STRICT_ATIME = FeatMandatory,
         P_STICKY_WRITE_ARM = FeatOff,
+        P_STATELESS_IO_DAC = false,
         P_CHOWN_SUPP_GROUP = FeatMandatory,
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
@@ -1129,7 +1178,7 @@ module posixTestLinux {
         | LInit(x) => -1
     }
 
-    val noStatR = { e: -999, ftype: FReg, mode: 0, uid: -1, gid: -1,
+    val noStatR = { e: -999, ftype: FReg, mode: 0, optionalSetids: 0, uid: -1, gid: -1,
                     nlink: 0, sizeB: 0, ino: -1, atime: 0, mtime: 0,
                     ctime: 0 }
 
