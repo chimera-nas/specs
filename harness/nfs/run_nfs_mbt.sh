@@ -168,6 +168,17 @@ if [ "$USE_NETNS" = "1" ]; then
         exit 77
     fi
     ip netns exec "${NETNS_NAME}" ip link set lo up
+    if [ "$SERVER" = "ganesha" ]; then
+        # Reserve every rotating listener port before rpcbind or a replay
+        # client opens an outgoing connection. NLM's range overlaps Linux's
+        # ephemeral range: an earlier trace can otherwise leave a future
+        # listener port occupied by a client connection (or TIME_WAIT).
+        # Only change our private namespace, preserving inherited reservations.
+        reserved=$(run_in_ns cat /proc/sys/net/ipv4/ip_local_reserved_ports) || exit 1
+        ports="${NFS_BASE_PORT}-$((NFS_BASE_PORT + 49)),${MNT_BASE_PORT}-$((MNT_BASE_PORT + 49)),${NLM_BASE_PORT}-$((NLM_BASE_PORT + 49))"
+        run_in_ns sh -c 'printf "%s\n" "$1" > /proc/sys/net/ipv4/ip_local_reserved_ports' \
+            sh "${reserved:+${reserved},}${ports}" || exit 1
+    fi
 fi
 
 wait_port() {
