@@ -67,7 +67,18 @@ const spec = JSON.parse(fs.readFileSync(specPath, 'utf8'))
 let cliCommands
 try {
   const cli = fs.realpathSync(spec.quintCli)
-  cliCommands = require(path.join(path.dirname(cli), 'cliCommands'))
+  // npm's Windows launcher is a .cmd file alongside node_modules, rather
+  // than a symlink into the package. Resolve that standard installation
+  // layout without changing the pinned package or relying on NODE_PATH.
+  const directory = path.dirname(cli)
+  const candidates = [
+    path.join(directory, 'cliCommands'),
+    path.join(directory, 'node_modules', '@informalsystems', 'quint', 'dist', 'src', 'cliCommands'),
+    path.join(directory, '..', '@informalsystems', 'quint', 'dist', 'src', 'cliCommands'),
+  ]
+  const commands = candidates.find(candidate => fs.existsSync(candidate + '.js'))
+  if (!commands) throw new Error('cannot locate the Quint package beside its launcher')
+  cliCommands = require(commands)
 } catch (err) {
   die(`could not load quint's cliCommands from ${spec.quintCli}: ${err.message}\n` +
       `        this file depends on quint internals; see the caveat at the top`)

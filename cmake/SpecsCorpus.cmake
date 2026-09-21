@@ -35,7 +35,7 @@
 # elaborates once and simulates every batch against the same typechecked stage.
 # Adding a cell costs simulation, not elaboration.
 
-find_program(QUINT_BIN quint)
+find_program(QUINT_BIN NAMES quint.cmd quint)
 find_program(NODE_BIN NAMES node nodejs)
 
 set(SPECS_CORPUS_ROOT "${CMAKE_BINARY_DIR}/specs-corpus" CACHE PATH
