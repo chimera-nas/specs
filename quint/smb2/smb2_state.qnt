@@ -203,6 +203,8 @@ module smb2state {
     // SMB-only bits (H caching, delete share, delete-on-close, the caching
     // grant this handle holds and its break progress).
     type Open = {
+        // Original ClientGuid survives a non-lease reconnect by another client.
+        clientTag: int,
         session: SessionId,
         tree: TreeId,
         file: Ino,
@@ -507,6 +509,7 @@ module smb2state {
         val fid = sdb.nextFile
         { sdb2: sdb
               .with("opens", sdb.opens.put(fid, {
+                  clientTag: sdb.sessions.get(sess).clientTag,
                   session: sess, tree: tree, file: f, dir: dir, name: name,
                   granted: granted, denied: deny, caching: CNone,
                   breaking: false, breakTo: CNone,
@@ -778,8 +781,16 @@ module smb2state {
         sdb.with("opens", sdb.opens.setBy(fid, o => o.with("modified", true)))
 
     // Set (or replace) the caching grant on a handle.
-    pure def doSetCaching(sdb: StateDB, fid: FileId, c: Caching): StateDB =
-        sdb.with("opens", sdb.opens.setBy(fid, o => o.with("caching", c)))
+    pure def doSetCaching(sdb: StateDB, fid: FileId, c: Caching): StateDB = {
+        val o = sdb.opens.get(fid)
+        val members = if (isLeaseGrant(c)) sdb.opens.keys().filter(f => {
+            val peer = sdb.opens.get(f)
+            peer.file == o.file and peer.clientTag == o.clientTag and
+            isLeaseGrant(peer.caching) and leaseKeyOf(peer.caching) == leaseKeyOf(c)
+        }).union(Set(fid)) else Set(fid)
+        members.fold(sdb, (a, f) =>
+            a.with("opens", a.opens.setBy(f, p => p.with("caching", c))))
+    }
 
     pure def cachingLevelNone(c: Caching): bool = bitsEmpty(cachBits(c))
 
@@ -839,7 +850,7 @@ module smb2state {
     pure def sameGrant(a: Open, b: Open): bool =
         isLeaseGrant(a.caching) and isLeaseGrant(b.caching) and
         leaseKeyOf(a.caching) == leaseKeyOf(b.caching) and
-        a.session == b.session
+        a.clientTag == b.clientTag
 
     // The lowest-numbered member of a coalesced grant: the one open whose
     // notification represents the whole grant, so a break of a two-open
@@ -883,7 +894,7 @@ module smb2state {
             not(bitsEq(bitsAnd(cur, retain), cur)) and
             not(spareLeases and isLeaseGrant(o.caching)) and
             not(selfKey >= 0 and leaseKeyOf(o.caching) == selfKey and
-                o.session == selfSess)
+                o.clientTag == sdb.sessions.get(selfSess).clientTag)
         })
 
     // The notification set a break over `holders` puts on the wire (one per
@@ -1024,7 +1035,7 @@ module smb2state {
                     v2: o.durable.v2,
                     guid: o.durable.guid,
                     persistent: o.durable.persistent,
-                    owner: tag,
+                    owner: o.clientTag,
                     hadLease: isLeaseGrant(o.caching),
                     leaseKey: leaseKeyOf(o.caching),
                     dir: o.dir,
@@ -1109,7 +1120,7 @@ module smb2state {
         sdb.opens.keys().exists(f => {
             val o = sdb.opens.get(f)
             o.durable.on and o.durable.v2 and o.durable.guid == g and
-            sdb.sessions.get(o.session).clientTag == tag and
+            o.clientTag == tag and
             (not(isReplay) or o.session != sess)
         }) or
         sdb.parked.keys().exists(k => {

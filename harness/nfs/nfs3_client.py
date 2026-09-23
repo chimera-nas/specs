@@ -348,14 +348,14 @@ class Nfs3Client:
         u.done()
         return res
 
-    def create(self, dir_fh, name, createmode=UNCHECKED, mode=None, verf=None):
+    def create(self, dir_fh, name, createmode=UNCHECKED, mode=None, verf=None, size=None):
         p = Packer()
         _pack_diropargs3(p, dir_fh, name)
         p.uint32(createmode)
         if createmode == EXCLUSIVE:
             p.opaque_fixed(verf)
         else:
-            _pack_sattr3(p, mode=mode)
+            _pack_sattr3(p, mode=mode, size=size)
         return self._create_reply(self.rpc.call(NFSPROC3_CREATE, bytes(p.buf)))
 
     def mkdir(self, dir_fh, name, mode=None):

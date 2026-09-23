@@ -265,6 +265,22 @@ class Replayer:
             self.check_attrs(op["obj"], res["obj_attrs"], post_fs, mism)
         return res
 
+    def op_create_truncate(self, op, post_fs, mism):
+        res = self.call(self.client.create, self.real_fh(op["dir"]),
+                        op["name"], size=op["sizeBlocks"] * BLOCK_SIZE)
+        if self.check_status(op["status"], res["status"], mism):
+            if op["status"] == NFS3_OK:
+                self.learn_fh(op["obj"], res["obj_fh"], mism)
+                if res["obj_attrs"] is not None:
+                    self.check_attrs(op["obj"], res["obj_attrs"], post_fs, mism)
+            attrs = self.client.getattr(self.real_fh(op["obj"]))
+            if attrs["status"] != NFS3_OK:
+                self.fnd(mism, "GETATTR after CREATE", NFS3_OK, attrs["status"])
+            else:
+                self.check_attrs(op["obj"], attrs["attrs"], post_fs, mism)
+
+        return res
+
     def op_setattr(self, op, post_fs, mism):
         fh = self.real_fh(op["obj"])
         guard = None
@@ -285,10 +301,16 @@ class Replayer:
             size=None if op["sizeBlocks"] < 0
                  else op["sizeBlocks"] * BLOCK_SIZE,
             guard_ctime=guard)
-        if self.check_status(op["status"], res["status"], mism) \
-                and op["status"] == NFS3_OK:
-            self.check_attrs(op["obj"], res["wcc"]["after"], post_fs, mism,
-                             what="wcc.after")
+        if self.check_status(op["status"], res["status"], mism):
+            if res["status"] == NFS3_OK and res["wcc"]["after"] is not None:
+                self.check_attrs(op["obj"], res["wcc"]["after"], post_fs, mism,
+                                 what="wcc.after")
+            attrs = self.client.getattr(fh)
+            if attrs["status"] != NFS3_OK:
+                self.fnd(mism, "GETATTR after SETATTR", NFS3_OK, attrs["status"])
+            else:
+                self.check_attrs(op["obj"], attrs["attrs"], post_fs, mism)
+
         return res
 
     def op_access(self, op, post_fs, mism):
@@ -518,6 +540,7 @@ class Replayer:
         "OSetattr": op_setattr,
         "OAccess": op_access,
         "OCreate": op_create,
+        "OCreateTruncate": op_create_truncate,
         "OMkdir": op_mkdir,
         "OSymlink": op_symlink,
         "OReadlink": op_readlink,

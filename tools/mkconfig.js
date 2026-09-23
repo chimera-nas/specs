@@ -415,6 +415,7 @@ function cmakePath(value) {
 }
 const cmakeLines = []
 const genBatches = []
+const directories = []
 let allDeps = new Set([schemaPath, path.resolve(__filename)])
 
 for (const cell of spec.cells) {
@@ -466,6 +467,21 @@ for (const cell of spec.cells) {
       naming,
     })
   }
+  // Named runs are exported through the same ITF replay interface as random
+  // traces. By default they run in the configured cell, preserving its
+  // capability bindings. An explicit module must be a declared self-test.
+  for (const scenario of cfg.scenarios || []) {
+    if ((scenario.module && !(schema.selfTests || []).some(t => t.module === scenario.module)) ||
+        !/^[A-Za-z][A-Za-z0-9_]*$/.test(scenario.run || '') ||
+        !/^[A-Za-z][A-Za-z0-9]*$/.test(scenario.flavor || '')) {
+      die(`${cell.name}: scenario needs a declared test module, run and flavor`)
+    }
+    const naming = `${stem}_${scenario.flavor}_scenario_${scenario.run}_{seq}`
+    traces.push(path.join(outdir, naming.replace('{seq}', '0') + '.itf.json'))
+    genBatches.push({ outdir, main: scenario.module || modName, run: scenario.run,
+      maxSamples: 1, nTraces: 1, seed: '0x1', naming })
+  }
+  directories.push({ path: outdir, traces: traces.map(t => path.basename(t)) })
   const varName = cell.name.replace(/[^A-Za-z0-9]+/g, '_')
   cmakeLines.push(`set(SPECS_CELL_${varName}_DIR "${cmakePath(outdir)}")`)
   cmakeLines.push(`set(SPECS_CELL_${varName}_TRACES "${traces.map(cmakePath).join(';')}")`)
@@ -488,6 +504,7 @@ const genSpec = {
     maxSamples: t.maxSamples || 200,
   })),
   batches: genBatches,
+  directories,
 }
 writeIfDifferent(path.join(spec.stage, `${spec.family}.gen.json`),
                  JSON.stringify(genSpec, null, 2) + '\n')

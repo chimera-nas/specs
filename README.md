@@ -56,9 +56,10 @@ harness owns the record for the server it drives:
 * Samba's divergences live here, in
   [`harness/samba/samba_deviations.py`](harness/samba/samba_deviations.py) --
   the server is not this project's, but the harness that drives it is.
-* A consuming project's divergences live in that project, next to the code that
-  has to change. Chimera keeps its own registry in
-  `src/server/smb/tests/quint/smb2_mbt_deviations.h`.
+* A consuming project's divergences live in that project's test documentation,
+  next to the code that has to change. Chimera executes each SMB family
+  separately and reports durable/lease/replay failures instead of excluding
+  those families from a passing batch.
 
 A harness that cannot drive part of the corpus says so per batch and reports a
 SKIP, which keeps the gap visible and attributable to the harness rather than
