@@ -33,6 +33,7 @@ module smb2Test {
     def lastResults: List[Res] =
         match lastOp {
             | LMsg(l) => l.results
+            | LCreateComplete(l) => l.results
             | LInit(_) => []
         }
 
@@ -93,6 +94,7 @@ module smb2Test {
     def lastNotes: Set[NotifyNote] =
         match lastOp {
             | LMsg(l) => l.notes
+            | LCreateComplete(l) => l.notes
             | LInit(_) => Set()
         }
 
@@ -2756,6 +2758,15 @@ module smb2Test {
             .expect(noteOf(0).recs == [ { act: FA_MODIFIED, name: "a" } ])
 
 
+    // The generated scenarios also guard the model's pending/completion rules.
+    run pendingAckTest = leasePendingAckRegression
+    run pendingCloseTest = leasePendingCloseRegression
+    run cacheAckTest = leaseCacheAckRegression
+    run cacheCloseTest = leaseCacheCloseRegression
+    run leaseKeyCreationTest = leaseKeyCreationRegression
+    run leaseUpgradeSizeTest = leaseUpgradeSizeRegression
+    run duplicateGuidTest = duplicateNondurableGuidRegression
+
 }
 
 // A SECOND instance of the same model with durable handles NOT advertised.
@@ -2786,6 +2797,7 @@ module smb2TestNoDurable {
     def lastResults: List[Res] =
         match lastOp {
             | LMsg(l) => l.results
+            | LCreateComplete(l) => l.results
             | LInit(_) => []
         }
 
@@ -2860,6 +2872,7 @@ module smb2TestNoLease {
     def lastResults: List[Res] =
         match lastOp {
             | LMsg(l) => l.results
+            | LCreateComplete(l) => l.results
             | LInit(_) => []
         }
 
@@ -2911,4 +2924,5 @@ module smb2TestNoLease {
     // The whole request-matrix walk with caching off: no grant may appear.
     run noLeaseWalkTest =
         init.then(60.reps(_ => all { inv, stepReq }))
+
 }

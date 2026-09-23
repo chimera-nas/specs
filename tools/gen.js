@@ -153,7 +153,8 @@ async function main() {
     stage.args = argsFor(tc)
     const res = await cliCommands.runTests(stage)
     if (res.isLeft() || (res.value.status && res.value.status !== 'passed')) {
-      die(`self-test ${tc.name} (${tc.main}) failed for ${spec.model}`)
+      die(`self-test ${tc.name} (${tc.main}) failed for ${spec.model}: ` +
+          JSON.stringify(res.value.failed ?? res.value.errors ?? res.value.status))
     }
   }
 

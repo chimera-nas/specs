@@ -309,7 +309,7 @@ module smb2ops {
         | RWrite({ st: int, count: int, breaks: Set[BreakNote] })
         | RFlush({ st: int })
         | RLock({ st: int })
-        | RSetEof({ st: int })
+        | RSetEof({ st: int, breaks: Set[BreakNote] })
         | RSetDisposition({ st: int })
         | RSetRename({ st: int, breaks: Set[BreakNote] })
         | RQueryBasic({ st: int, attrs: AttrSnap })
@@ -554,7 +554,7 @@ module smb2ops {
         val members = opensOfFile(sdb, f).exclude(Set(self)).filter(fid =>
             isLeaseGrantEstablished(sdb.opens.get(fid).caching) and
             leaseKeyOf(sdb.opens.get(fid).caching) == k and
-            sdb.opens.get(fid).session == sess)
+            sdb.opens.get(fid).clientTag == sdb.sessions.get(sess).clientTag)
         if (members.size() == 0) CNone
         else sdb.opens.get(members.fold(-1, (acc, x) =>
                  if (acc < 0 or x < acc) x else acc)).caching
@@ -642,13 +642,12 @@ module smb2ops {
         //
         // The parked arm compares CLIENT TAGS, because a parked handle records
         // its owner as one (there is no session left to compare).  The live arm
-        // deliberately still compares SESSIONS: whether the model's lease-owner
-        // identity should drop the session term is the open question Q-6, and
-        // it is not settled by this trace, so it is not quietly changed here.
+        // compares the original CLIENT TAG too: reconnecting establishes a new
+        // session, but does not create a new lease owner.
         val myTag = sdb.sessions.get(sess).clientTag
         val ownHandleLease = others.exists(g => {
             val o = sdb.opens.get(g)
-            o.session == sess and isLeaseGrant(o.caching) and cachBits(o.caching).h
+            o.clientTag == myTag and isLeaseGrant(o.caching) and cachBits(o.caching).h
         }) or survivors.exists(k => {
             val p = sdb.parked.get(k)
             p.owner == myTag and isLeaseGrant(p.open.caching) and
@@ -680,10 +679,15 @@ module smb2ops {
                 val req = if (not(caps.leases) or not(x.r)) BITS_NONE
                           else capForceLevel2(caps, { r: x.r, w: x.w,
                                                       h: x.h })
-                // W caching only to a sole opener (MS-FSA 2.1.5.18.1, the
-                // mandate above); H caching only when no non-lease peer
-                // open owns the handle (probe O12, discretion).
-                val st = { r: req.r, w: req.w and sole,
+                // Same-client/key opens share one SMB lease; they do not cap
+                // its upgrade. Other opens retain the sole-owner restriction.
+                // H caching is capped by a non-lease peer (server discretion).
+                val leaseSole = others.forall(g => {
+                    val o = sdb.opens.get(g)
+                    o.clientTag == myTag and isLeaseGrant(o.caching) and
+                        leaseKeyOf(o.caching) == x.key
+                }) and survivors.size() == 0
+                val st = { r: req.r, w: req.w and leaseSole,
                            h: req.h and not(capsHandle) }
                 if (not(isLeaseGrant(joined))) {
                     // A fresh lease.  MS-SMB2 3.3.5.9.8 identifies a lease by
@@ -695,8 +699,8 @@ module smb2ops {
                     // its grant on the lease key alone until CD-5 was fixed,
                     // and answered a v2 request as v1 at epoch 0 when it met
                     // another client's v1 lease.  Settles the model's open
-                    // question Q-6 -- whether lease-owner identity should drop
-                    // the session term -- against dropping it.)
+                    // question Q-6: client identity distinguishes leases, while
+                    // several sessions of one client share the same lease.)
                     CLease({ key: x.key,
                              st: st,
                              // A v2 lease is granted at the client's epoch + 1
@@ -729,20 +733,14 @@ module smb2ops {
                     // superset, only when grantable without breaking another
                     // owner) and what the epoch exists to version
                     // (3.3.5.9.11: the epoch tracks changes to the lease
-                    // STATE).  The union with `st` gives both halves at once:
-                    // it can only add bits, and only ones this open would have
-                    // been granted anyway.
-                    //
-                    // The upgrade matters most exactly where the join does: a
-                    // lease broken to NONE that is still bound to its key.
-                    // Re-opening under that key returns the lease to the
-                    // caching it can now hold rather than leaving it dead.
+                    // STATE). Chimera's discretionary upgrade policy accepts
+                    // the requested superset in full or keeps the old grant;
+                    // it does not negotiate a partial upgrade.
                     match joined {
                         | CLease(j) => {
-                            val up = { r: j.st.r or st.r,
-                                       w: j.st.w or st.w,
-                                       h: j.st.h or st.h }
-                            if (bitsEq(up, j.st)) joined
+                            val up = req
+                            if (not(bitsEq(req, st)) or
+                                not(bitsSubset(j.st, req)) or bitsEq(req, j.st)) joined
                             else CLease({ key: j.key, st: up,
                                           // The lease keeps the version it was
                                           // established with -- the response
@@ -766,6 +764,7 @@ module smb2ops {
         sdb: StateDB,
         caps: Caps,
         related: bool,
+        asyncCreate: bool,
         sess: SessionId,
         tree: TreeId,
         cfid: FileId,        // current related fid (last CREATE), -1 if none
@@ -1350,6 +1349,12 @@ module smb2ops {
     // after a single all-or-nothing break, and no result is ST_PENDING: the
     // reply carries the real status, with `parked` recording whether the server
     // had to emit an async interim first.
+    pure def createPending(acc: Acc, sdb: StateDB, notes: Set[BreakNote]): Acc =
+        emit(acc.with("sdb", sdb),
+             RCreate({ st: ST_PENDING, fid: -1, act: 0, ino: -1,
+                       caching: CNone, breaks: notes, parked: true,
+                       durable: false }), ST_PENDING).with("done", true)
+
     pure def doCmdCreate(acc, x) =
         if (not(sessOk(acc))) createErr(acc, ST_USER_SESSION_DELETED)
         else if (not(treeOk(acc))) createErr(acc, ST_NETWORK_NAME_DELETED)
@@ -1427,6 +1432,13 @@ module smb2ops {
                      ST_SUCCESS)
             }
         }
+        // An eligible DH2Q open retains its replay identity even if the
+        // requested durability was not granted (MS-SMB2 3.3.5.9.10).
+        else if (not(acc.replay) and durIsReq(x.durable) and
+                 durReqV2(x.durable) and acc.caps.durable and
+                 replayLiveMatch(acc.sdb, acc.tree,
+                                 durReqGuid(x.durable)).size() > 0)
+            createErr(acc, ST_DUPLICATE_OBJECTID)
         // MS-SMB2 3.3.5.9.10: a CreateGuid identifies ONE durable open per
         // client.  A non-replay CREATE carrying a DH2Q whose CreateGuid already
         // names a durable open of this ClientGuid -- live on any connection, or
@@ -1564,9 +1576,10 @@ module smb2ops {
                 // A truncating open then ALSO runs break_on_write, so a legacy
                 // oplock broken here is broken a second time -- and settles
                 // without an ack (see breakNotesEx).
-                val n1 = breakNotesEx(sdb1, dec.ino, h1, r1, trunc)
+                val n1 = breakNotesEx(sdb1, dec.ino, h1, r1,
+                                      trunc and not(acc.asyncCreate))
                 val sdb2a = h1.fold(sdb1, (a, fid) => doBreakOne(a, fid, r1))
-                val sdb2 = if (not(trunc)) sdb2a
+                val sdb2 = if (not(trunc) or acc.asyncCreate) sdb2a
                            else h1.fold(sdb2a, (a, fid) =>
                                if (isLeaseGrant(a.opens.get(fid).caching)) a
                                else doAckBreak(a, fid, BITS_NONE))
@@ -1580,7 +1593,15 @@ module smb2ops {
                 // that write was exactly the case that never arbitrated.  The
                 // model's own statOpen() already draws the line in the right
                 // place (samba conformance suite, SD-3).
-                if (not(stat) and
+                val blockers = opensOfFile(sdb1, dec.ino).filter(f => {
+                    val o = sdb1.opens.get(f)
+                    accItsc(want, o.denied) or accItsc(denyCheck, grantedAcc(o))
+                })
+                val canWait = blockers.forall(f => cachBits(sdb1.opens.get(f).caching).h)
+                if (acc.asyncCreate and canWait and
+                    breakInProgress(sdb2, dec.ino, -1))
+                    createPending(acc, sdb2, n1)
+                else if (not(stat) and
                     shareConflict(sdb2, dec.ino, want, denyCheck)) {
                     val h2 = breakHolders(sdb2, dec.ino, -1, BITS_H, BITS_RW,
                                           false, selfKey, acc.sess)
@@ -1592,7 +1613,10 @@ module smb2ops {
                     // as it found it -- decideCreate's filesystem effect
                     // (dec.fs2) is committed on the success path only, and
                     // nowhere else (SD-7).
-                    emit(acc.with("sdb", sdb3),
+                    if (acc.asyncCreate and canWait and
+                        breakInProgress(sdb3, dec.ino, -1))
+                        createPending(acc, sdb3, n1.union(n2))
+                    else emit(acc.with("sdb", sdb3),
                          RCreate({ st: ST_SHARING_VIOLATION, fid: -1, act: 0,
                                    ino: -1, caching: CNone,
                                    breaks: n1.union(n2), parked: false,
@@ -1617,7 +1641,10 @@ module smb2ops {
                     // every cached holder (break_on_write); a plain
                     // conflicting open only recalls the exclusive WRITE cache.
                     val t2 = if (trunc) BITS_RWH else BITS_W
-                    val h2 = if (stat or not(acc.caps.leaseOpenBreak)) Set()
+                    // A stat open does not invalidate data by opening it,
+                    // but requesting a lease still needs a coherent read cache.
+                    val statNoCache = stat and not(reqIsLease(x.oplock))
+                    val h2 = if (statNoCache or not(acc.caps.leaseOpenBreak)) Set()
                              else breakHolders(ins.sdb2, dec.ino, ins.fid, t2,
                                                r2, false, selfKey, acc.sess)
                     val n2 = breakNotes(ins.sdb2, dec.ino, h2, r2)
@@ -1669,7 +1696,13 @@ module smb2ops {
                     val sdb7 = stEmitEv(sdb6, x.dir,
                                         createNotifyCls(dec.act, x.isDir),
                                         x.name, "")
-                    emit(acc.with("sdb", sdb7).with("cfid", ins.fid),
+                    if (acc.asyncCreate and breakInProgress(sdb3, dec.ino, ins.fid))
+                        // Only the break is visible while the request waits.
+                        // Re-evaluate the open after an ACK or holder CLOSE.
+                        createPending(acc,
+                            h2.fold(sdb2, (a, f) => doBreakOne(a, f, r2)),
+                            n1.union(n2))
+                    else emit(acc.with("sdb", sdb7).with("cfid", ins.fid),
                          RCreate({ st: ST_SUCCESS, fid: ins.fid,
                                    act: dec.act, ino: dec.ino,
                                    caching: gr, breaks: n1.union(n2),
@@ -1975,30 +2008,43 @@ module smb2ops {
     pure def doCmdSetEof(acc, x) = {
         val fid = resolveFid(acc, x.fid)
         if (not(acc.sdb.opens.keys().contains(fid)))
-            emit(acc, RSetEof({ st: ST_FILE_CLOSED }), ST_FILE_CLOSED)
+            emit(acc, RSetEof({ st: ST_FILE_CLOSED, breaks: Set() }), ST_FILE_CLOSED)
         else if (csRefuse(acc, fid))
-            emit(acc, RSetEof({ st: ST_FILE_NOT_AVAILABLE }),
+            emit(acc, RSetEof({ st: ST_FILE_NOT_AVAILABLE, breaks: Set() }),
                  ST_FILE_NOT_AVAILABLE)
         else {
             val a1 = csAccept(acc, fid)
             val o = a1.sdb.opens.get(fid)
             if (not(o.granted.w))
-                emit(a1, RSetEof({ st: ST_ACCESS_DENIED }), ST_ACCESS_DENIED)
-            else
+                emit(a1, RSetEof({ st: ST_ACCESS_DENIED, breaks: Set() }), ST_ACCESS_DENIED)
+            else {
+                // Resizing invalidates peers' cached data, just like WRITE.
+                val peers = breakHolders(a1.sdb, o.file, fid, BITS_RWH,
+                                         BITS_NONE, false,
+                                         leaseKeyOf(o.caching), o.session)
+                val selfII = match o.caching {
+                    | COplock(l) => l == OpLevelII
+                    | _ => false
+                }
+                val holders = if (selfII) peers.union(Set(fid)) else peers
+                val notes = breakNotes(a1.sdb, o.file, holders, BITS_NONE)
+                val sdb1 = holders.fold(a1.sdb, (a, h) =>
+                               doBreakOne(a, h, BITS_NONE))
                 // MS-FSA 2.1.5.14.5 (SetFileEndOfFileInformation): a length
                 // change is a SIZE change and, because it changes the file's
                 // data extent, a LAST_WRITE one -- which is why the model
                 // raises FILE_MODIFIED alongside SIZE rather than treating the
                 // two filters as alternatives.
                 emit(a1.with("sdb",
-                         stEmitEv(a1.sdb.with("fs",
-                                      fsResize(a1.sdb.fs, o.file,
+                         stEmitEv(sdb1.with("fs",
+                                      fsResize(sdb1.fs, o.file,
                                                x.sizeBlocks)),
                                   o.dir,
                                   Set(EV_SIZE, EV_FILE_MODIFIED,
                                       EV_STREAM_SIZE),
                                   o.name, "")),
-                     RSetEof({ st: ST_SUCCESS }), ST_SUCCESS)
+                     RSetEof({ st: ST_SUCCESS, breaks: notes }), ST_SUCCESS)
+            }
         }
     }
 
@@ -2346,10 +2392,20 @@ module smb2ops {
     type MsgOutcome = { sdb2: StateDB, results: List[Res],
                         notes: Set[NotifyNote], devHits: Set[str] }
 
+    // Atomic evaluation is useful for isolated transition tests. Live traces
+    // use evalMsgAsync so a CREATE can yield before an acknowledgment.
     pure def evalMsg(sdb: StateDB, caps: Caps, devs: Set[str],
-                     msg: Msg): MsgOutcome = {
+                     msg: Msg): MsgOutcome =
+        evalMsgMode(sdb, caps, devs, msg, false)
+
+    pure def evalMsgAsync(sdb: StateDB, caps: Caps, devs: Set[str],
+                          msg: Msg): MsgOutcome =
+        evalMsgMode(sdb, caps, devs, msg, true)
+
+    pure def evalMsgMode(sdb: StateDB, caps: Caps, devs: Set[str],
+                         msg: Msg, asyncCreate: bool): MsgOutcome = {
         val a0: Acc = {
-            sdb: sdb, caps: caps, related: msg.related,
+            sdb: sdb, caps: caps, related: msg.related, asyncCreate: asyncCreate,
             sess: msg.sess, tree: msg.tree, cfid: -1,
             cs: msg.cs, replay: msg.replay,
             done: false, results: [],

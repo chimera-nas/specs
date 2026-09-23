@@ -150,6 +150,12 @@ module smb2 {
         | LMsg({ tag: int, msg: Msg, results: List[Res],
                  notes: Set[NotifyNote] })
 
+        | LCreateComplete({ request: int, msg: Msg, results: List[Res],
+                            notes: Set[NotifyNote] })
+
+    // One in-flight CREATE is enough to explore ACK vs CLOSE scheduling.
+    // The bound is explicit; the server is never implicitly acknowledged.
+    var pendingCreates: int -> Msg
     var sdb: StateDB
     var caps: Caps
     var tag: int
@@ -177,6 +183,7 @@ module smb2 {
         all {
             // ref: in-memory share roots are 0777; the root mode is not
             // asserted by the harness (backend-specific).
+            pendingCreates' = Map(),
             sdb' = stInit(511),
             caps' = c,
             tag' = 1,
@@ -186,9 +193,29 @@ module smb2 {
     }
 
     // The one transition shape: evaluate a message, record the label.
-    action runM(msg: Msg): bool = {
-        val out = evalMsg(sdb, caps, DEVS, msg)
+    pure def createIsPending(results: List[Res]): bool =
+        results.length() > 0 and match results[0] {
+            | RCreate(x) => x.st == ST_PENDING
+            | _ => false
+        }
+
+    action runM(msg: Msg): bool = recordMsg(msg, evalMsg(sdb, caps, DEVS, msg))
+
+    action runAsyncM(msg: Msg): bool =
+        recordMsg(msg, evalMsgAsync(sdb, caps, DEVS, msg))
+
+    action recordMsg(msg: Msg, out: MsgOutcome): bool = {
         all {
+            pendingCreates.keys().size() == 0 or
+                (breakingOpens.size() > 0 and msg.cmds.length() == 1 and
+                 match msg.cmds[0] {
+                    | CBreakAck(_) => true
+                    | CClose(_) => true
+                    | _ => false
+                 }),
+            pendingCreates' = if (createIsPending(out.results))
+                                  pendingCreates.put(tag, msg)
+                              else pendingCreates,
             sdb' = out.sdb2,
             caps' = caps,
             tag' = tag + 1,
@@ -196,6 +223,26 @@ module smb2 {
                              notes: out.notes }),
             devHits' = out.devHits,
         }
+    }
+
+    action smbCompleteCreate = all {
+        pendingCreates.keys().size() > 0,
+        breakingOpens.size() == 0,
+        {
+            nondet request = oneOf(pendingCreates.keys())
+            val msg = pendingCreates.get(request)
+            val out = evalMsgAsync(sdb, caps, DEVS, msg)
+            all {
+                pendingCreates' = if (createIsPending(out.results)) pendingCreates
+                                  else smapDrop(pendingCreates, request),
+                sdb' = out.sdb2,
+                caps' = caps,
+                tag' = tag + 1,
+                lastOp' = LCreateComplete({ request: request, msg: msg,
+                            results: out.results, notes: out.notes }),
+                devHits' = out.devHits,
+            }
+        },
     }
 
     // A singleton (non-compound) message on session/tree.
@@ -311,7 +358,7 @@ module smb2 {
             peers.exists(f => {
                 val o = sdb.opens.get(f)
                 openVisibleToGrant(o) and
-                (reqIsLease(opl) or o.session != sess)
+                (reqIsLease(opl) or o.clientTag != sdb.sessions.get(sess).clientTag)
             })
         }
     }
@@ -749,7 +796,7 @@ module smb2 {
     // acknowledgment is deferred by the server until the holder acks (C-11),
     // and the acknowledgment is a separate step the DURABLE flavor does not
     // draw -- servicing the caching break lifecycle is stepLease's job, and
-    // stepLease is blocked on Q-4/Q-5/Q-6.  Generating that shape here would
+    // stepLease models that wait explicitly. Generating that shape here would
     // wedge the replayer on a CREATE with no reply (measured: the first
     // stepDurable corpus wedged for exactly this reason), which is a harness
     // dead end, not a finding.
@@ -1403,7 +1450,10 @@ module smb2 {
     // ordering (the model adjudicates DELETE_PENDING before the share check,
     // the server the other way round), so it is excluded here exactly as it is
     // from `stepCore` -- the caching lifecycle is what this flavor is for.
-    action smbCreateCache = all {
+    action smbCreateCache = smbCreateCacheMode(false)
+    action smbCreateCacheAsync = smbCreateCacheMode(true)
+
+    action smbCreateCacheMode(asyncCreate: bool): bool = all {
         trees.size() > 0,
         liveInos.size() < MAX_OBJECTS,
         opens.size() < MAX_OPENS,
@@ -1426,10 +1476,11 @@ module smb2 {
                           epoch: 1 })))
             val opl = if (grantAgreed(n, oplWant, treeSess(t))) oplWant
                       else OrNone
-            runM(one(treeSess(t), t,
+            val msg = one(treeSess(t), t,
                 CCreate({ dir: ROOT, name: n, disp: disp, access: acc,
                           share: sh, isDir: false, delOnClose: false,
-                          oplock: opl, durable: DurNone })))
+                          oplock: opl, durable: DurNone }))
+            if (asyncCreate) runAsyncM(msg) else runM(msg)
         },
     }
 
@@ -1437,14 +1488,17 @@ module smb2 {
     // arm, and the I/O that drives break-on-write.  Every command here is one
     // the in-process replayer builds on the wire, so this flavor is
     // generatable as well as self-testable.
-    action stepLease = any {
+    action stepLease = if (pendingCreates.keys().size() > 0) any {
+        smbCompleteCreate, smbBreakAck, smbBreakAckNone,
+        smbBreakAckKeepRead, smbClose,
+    } else any {
         smbSessionSetup, smbTreeConnect,
-        smbCreateCache, smbCreateCache, smbCreateCache, smbCreateCache,
+        smbCreateCacheAsync, smbCreateCacheAsync, smbCreateCacheAsync, smbCreateCacheAsync,
         smbClose, smbClose,
         smbRead, smbWrite, smbWrite,
         smbBreakAck, smbBreakAck, smbBreakAckNone,
         smbBreakAckKeepRead, smbBreakAckStale,
-        smbCompoundCreateWriteClose,
+        smbCompoundQuiet,
     }
 
     // Data / lock heavy.
@@ -1975,6 +2029,119 @@ module smb2 {
             .then(runM(one(0, 0, CSetRename({ fid: FidRef(0), newdir: ROOT, newname: "b" }))))
             .expect(fsHasEnt(sdb.fs, ROOT, "b") and not(fsHasEnt(sdb.fs, ROOT, "a")))
             .then(runM(one(0, 0, CRead({ fid: FidRef(0), off: 0, len: 1 }))))
+            .then(runM(one(0, 0, CClose(FidRef(0)))))
+
+
+    run leasePendingBoot =
+        init
+            .then(runM(one(-1, -1, CSessionSetup({ clientSym: 1 }))))
+            .then(runM(one(0, -1, CTreeConnect({ share: 1 }))))
+            .then(runM(one(-1, -1, CSessionSetup({ clientSym: 2 }))))
+            .then(runM(one(1, -1, CTreeConnect({ share: 1 }))))
+            .then(runAsyncM(one(0, 0, CCreate({ dir: ROOT, name: "a", disp: DispOpenIf,
+                access: ACCESS_RW, share: SHARE_NONE, isDir: false,
+                delOnClose: false, oplock: OrLease({ key: 1, r: true, w: true,
+                    h: true, v2: true, epoch: 1 }), durable: DurNone }))))
+            .then(runAsyncM(one(1, 1, CCreate({ dir: ROOT, name: "a", disp: DispOpen,
+                access: ACCESS_RW, share: SHARE_RWD, isDir: false,
+                delOnClose: false, oplock: OrNone, durable: DurNone }))))
+            .expect(pendingCreates.keys().size() == 1 and opens.size() == 1)
+
+    run leaseCachePendingBoot =
+        init
+            .then(runM(one(-1, -1, CSessionSetup({ clientSym: 1 }))))
+            .then(runM(one(0, -1, CTreeConnect({ share: 1 }))))
+            .then(runM(one(-1, -1, CSessionSetup({ clientSym: 2 }))))
+            .then(runM(one(1, -1, CTreeConnect({ share: 1 }))))
+            .then(runAsyncM(one(0, 0, CCreate({ dir: ROOT, name: "a", disp: DispOpenIf,
+                access: ACCESS_RW, share: SHARE_RWD, isDir: false,
+                delOnClose: false, oplock: OrLease({ key: 1, r: true, w: true,
+                    h: true, v2: true, epoch: 1 }), durable: DurNone }))))
+            .then(runAsyncM(one(1, 1, CCreate({ dir: ROOT, name: "a", disp: DispOpen,
+                access: ACCESS_R, share: SHARE_RWD, isDir: false,
+                delOnClose: false, oplock: OrExclusive, durable: DurNone }))))
+            .expect(pendingCreates.keys().size() == 1 and opens.size() == 1)
+
+    run leasePendingAckRegression =
+        leasePendingBoot
+            .then(smbBreakAck)
+            .then(smbCompleteCreate)
+            .expect(pendingCreates.keys().size() == 0 and opens.size() == 1)
+            .then(runM(one(0, 0, CClose(FidRef(0)))))
+
+    run leasePendingCloseRegression =
+        leasePendingBoot
+            .then(runM(one(0, 0, CClose(FidRef(0)))))
+            .then(smbCompleteCreate)
+            .expect(pendingCreates.keys().size() == 0 and opens.size() == 1)
+            .then(runM(one(1, 1, CWrite({ fid: FidRef(1), off: 0, len: 1, pat: 2 }))))
+            .then(runM(one(1, 1, CRead({ fid: FidRef(1), off: 0, len: 1 }))))
+            .then(runM(one(1, 1, CClose(FidRef(1)))))
+
+    run leaseCacheCloseRegression =
+        leaseCachePendingBoot
+            .then(runM(one(0, 0, CClose(FidRef(0)))))
+            .then(smbCompleteCreate)
+            .expect(pendingCreates.keys().size() == 0 and opens.size() == 1)
+            .then(runM(one(1, 1, CRead({ fid: FidRef(1), off: 0, len: 1 }))))
+            .then(runM(one(1, 1, CClose(FidRef(1)))))
+
+    run leaseCacheAckRegression =
+        leaseCachePendingBoot
+            .then(smbBreakAck)
+            .then(smbCompleteCreate)
+            .expect(pendingCreates.keys().size() == 0 and opens.size() == 2)
+            .then(runM(one(0, 0, CClose(FidRef(0)))))
+            .then(runM(one(1, 1, CClose(FidRef(1)))))
+
+    run leaseKeyCreationRegression =
+        init
+            .then(runM(one(-1, -1, CSessionSetup({ clientSym: 1 }))))
+            .then(runM(one(0, -1, CTreeConnect({ share: 1 }))))
+            .then(runAsyncM(one(0, 0, CCreate({ dir: ROOT, name: "a", disp: DispOpenIf,
+                access: ACCESS_RW, share: SHARE_RWD, isDir: false,
+                delOnClose: false, oplock: OrLease({ key: 1, r: true, w: true, h: true, v2: true, epoch: 1 }), durable: DurNone }))))
+            .then(runAsyncM(one(0, 0, CCreate({ dir: ROOT, name: "b", disp: DispOpenIf,
+                access: ACCESS_RW, share: SHARE_RWD, isDir: false,
+                delOnClose: false, oplock: OrLease({ key: 1, r: true, w: true, h: true, v2: true, epoch: 1 }), durable: DurNone }))))
+            .expect(not(fsHasEnt(sdb.fs, ROOT, "b")))
+            .then(runAsyncM(one(0, 0, CCreate({ dir: ROOT, name: "b", disp: DispCreate,
+                access: ACCESS_RW, share: SHARE_RWD, isDir: false,
+                delOnClose: false, oplock: OrNone, durable: DurNone }))))
+            .expect(fsHasEnt(sdb.fs, ROOT, "b") and opens.size() == 2)
+            .then(runM(one(0, 0, CClose(FidRef(0)))))
+            .then(runM(one(0, 0, CClose(FidRef(1)))))
+
+    run leaseUpgradeSizeRegression =
+        init
+            .then(runM(one(-1, -1, CSessionSetup({ clientSym: 1 }))))
+            .then(runM(one(0, -1, CTreeConnect({ share: 1 }))))
+            .then(runAsyncM(one(0, 0, CCreate({ dir: ROOT, name: "a", disp: DispOpenIf,
+                access: ACCESS_RW, share: SHARE_RWD, isDir: false,
+                delOnClose: false, oplock: OrLease({ key: 1, r: true, w: false, h: true, v2: true, epoch: 1 }), durable: DurNone }))))
+            .then(runM(one(-1, -1, CReconnect({ prev: 0 }))))
+            .then(runM(one(1, -1, CTreeConnect({ share: 1 }))))
+            .then(runAsyncM(one(1, 1, CCreate({ dir: ROOT, name: "a", disp: DispOpenIf,
+                access: ACCESS_RW, share: SHARE_RWD, isDir: false,
+                delOnClose: false, oplock: OrLease({ key: 1, r: true, w: true, h: true, v2: true, epoch: 1 }), durable: DurNone }))))
+            .expect(cachBits(sdb.opens.get(0).caching).w and
+                    cachBits(sdb.opens.get(1).caching).w)
+            .then(runM(one(0, 0, CClose(FidRef(0)))))
+            .then(runM(one(1, 1, CSetEof({ fid: FidRef(1), sizeBlocks: 2 }))))
+            .then(runM(one(1, 1, CRead({ fid: FidRef(1), off: 0, len: 2 }))))
+            .then(runM(one(1, 1, CClose(FidRef(1)))))
+
+    run duplicateNondurableGuidRegression =
+        init
+            .then(runM(one(-1, -1, CSessionSetup({ clientSym: 1 }))))
+            .then(runM(one(0, -1, CTreeConnect({ share: 1 }))))
+            .then(runAsyncM(one(0, 0, CCreate({ dir: ROOT, name: "a", disp: DispOpenIf,
+                access: ACCESS_RW, share: SHARE_RWD, isDir: false,
+                delOnClose: false, oplock: OrNone, durable: DurQ({ v2: true, guid: 1, persistent: false }) }))))
+            .then(runAsyncM(one(0, 0, CCreate({ dir: ROOT, name: "b", disp: DispOpenIf,
+                access: ACCESS_RW, share: SHARE_RWD, isDir: false,
+                delOnClose: false, oplock: OrNone, durable: DurQ({ v2: true, guid: 1, persistent: false }) }))))
+            .expect(opens.size() == 1 and not(fsHasEnt(sdb.fs, ROOT, "b")))
             .then(runM(one(0, 0, CClose(FidRef(0)))))
 
 }
