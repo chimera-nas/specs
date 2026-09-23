@@ -69,7 +69,7 @@ def load_trace(path):
         raise TraceFormatError(f"{path}: not an ITF trace")
     states = []
     for st in raw["states"]:
-        states.append({k: itf_decode(v) for k, v in st.items()
+        states.append({k.rsplit("::", 1)[-1]: itf_decode(v) for k, v in st.items()
                        if k != "#meta" and not k.startswith("mbt::")})
     for st in states:
         if "lastOp" not in st or "fs" not in st:
@@ -87,6 +87,9 @@ ALL_BUCKETS = [
     # SETATTR
     "setattr:mode", "setattr:truncate", "setattr:extend", "setattr:size-same",
     "setattr:guard-match", "setattr:guard-stale",
+    "setattr:denied-mode", "setattr:denied-size", "setattr:denied-unchanged",
+    "create-size:denied", "create-size:denied-unchanged", "create-size:truncate",
+    "create-size:extend", "create-size:same",
     # ACCESS
     "access:read", "access:execute", "access:all",
     # CREATE
@@ -170,8 +173,22 @@ def classify_step(pre, post, op_tag, op, buckets):
         hit({OK: "lookup:ok", 2: "lookup:noent", 20: "lookup:notdir"}[st])
     elif op_tag == "OGetattr":
         hit("getattr:" + FTYPE_BUCKET[ftype(post[op["obj"]])])
+    elif op_tag == "OCreateTruncate":
+        if st != OK:
+            hit("create-size:denied")
+            if pre == post:
+                hit("create-size:denied-unchanged")
+        else:
+            old = len(pre[op["obj"]]["data"])
+            new = len(post[op["obj"]]["data"])
+            hit("create-size:truncate" if new < old else
+                "create-size:extend" if new > old else "create-size:same")
     elif op_tag == "OSetattr":
-        if st == 10002:
+        if st in (1, 13):
+            hit("setattr:denied-mode" if st == 1 else "setattr:denied-size")
+            if pre == post:
+                hit("setattr:denied-unchanged")
+        elif st == 10002:
             hit("setattr:guard-stale")
         else:
             if op["guard"] == 1:

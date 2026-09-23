@@ -1963,4 +1963,18 @@ module smb2 {
 
     val inv = invFs and invSt and capsRespected and capsWellFormed and
               durableRespected
+    // A required namespace regression, replayed under the cell's own caps.
+    run renameRegression =
+        init
+            .then(runM(one(-1, -1, CSessionSetup({ clientSym: 1 }))))
+            .then(runM(one(0, -1, CTreeConnect({ share: 1 }))))
+            .then(runM(one(0, 0, CCreate({ dir: ROOT, name: "a", disp: DispCreate,
+                access: ACCESS_RWD, share: SHARE_RWD, isDir: false,
+                delOnClose: false, oplock: OrNone, durable: DurNone }))))
+            .then(runM(one(0, 0, CWrite({ fid: FidRef(0), off: 0, len: 1, pat: 1 }))))
+            .then(runM(one(0, 0, CSetRename({ fid: FidRef(0), newdir: ROOT, newname: "b" }))))
+            .expect(fsHasEnt(sdb.fs, ROOT, "b") and not(fsHasEnt(sdb.fs, ROOT, "a")))
+            .then(runM(one(0, 0, CRead({ fid: FidRef(0), off: 0, len: 1 }))))
+            .then(runM(one(0, 0, CClose(FidRef(0)))))
+
 }

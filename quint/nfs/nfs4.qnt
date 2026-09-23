@@ -2331,4 +2331,40 @@ module nfs4 {
 
     val inv = invFs and invSdb and statePinsLive and
               orphansPinned and minorSeparation and capsRespected
+    // Named regressions are exported as ordinary ITF traces by a configured
+    // cell. They cover rare transitions without changing the random walk.
+    run coverageBootRun =
+        init
+            .then(if (MINOR == 0)
+                runC([RSetclientid({ownerSym: 1, verfSym: 1, tok: 1})])
+                else runC([RExchangeId({ownerSym: 1, verfSym: 1})]))
+            .then(if (MINOR == 0)
+                runC([RSetclientidConfirm({client: 0, tok: 1})])
+                else runC([RCreateSession({client: 0, csaSeq: 1, backChan: true})]))
+            .then(if (MINOR == 0) runC([RPutfh(ROOT), RGetattr])
+                else runC(withSess(0, [RReclaimComplete])))
+
+    run typeCoverageRegression =
+        coverageBootRun
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                RCreate({ctype: FFifo, name: "fifo", mode: 420, target: ""}), RGetfh])))
+            .then(runC(withSess(0, [RPutfh(1), RRead({sel: SelAnon, off: 0, len: 1})])))
+            .then(runC(withSess(0, [RPutfh(1), RWrite({sel: SelAnon, off: 0, len: 1, pat: 1, stable: 2})])))
+            .then(runC(withSess(0, [RPutfh(1), RSetattr({sel: SelAnon, mode: -1, sizeBlocks: 1})])))
+
+    run copyCoverageRegression =
+        coverageBootRun
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 1, oseq: 0, claim: OCNull("src"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}), RGetfh])))
+            .then(runC(withSess(0, [RPutfh(1),
+                RWrite({sel: SelAnon, off: 0, len: 2, pat: 2, stable: 2})])))
+            .then(runC(withSess(0, [RPutfh(1), RNverifySize(2), RGetattr])))
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 2, oseq: 0, claim: OCNull("dst"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}), RGetfh])))
+            .then(runC(withSess(0, [RPutfh(1), RSavefh, RPutfh(2),
+                RCopy({srcSel: SelAnon, dstSel: SelAnon, srcOff: 0, dstOff: 1, cnt: 2})])))
+            .then(runC(withSess(0, [RPutfh(2), RRead({sel: SelAnon, off: 0, len: 3})])))
+
 }

@@ -65,28 +65,12 @@ set(Q ${CMAKE_CURRENT_SOURCE_DIR}/quint)
 # deviation off, which is precisely the spec-conformant corpus those gates
 # always meant to measure.
 
-# Coverage gates: NOT REGISTERED, deliberately, and this is a gap to close.
-#
-# They classified the LEGACY corpus into behaviour buckets and failed if one was
-# never exercised.  That corpus is gone, and the gates cannot simply be repointed
-# at a cell:
-#
-#   * coverage/nfsaux and coverage/nfsdrc have nothing to point AT here.  Those
-#     families are configured only by consumers -- this repo owns no cell for
-#     either -- so their gates belong with whoever owns the configs.
-#   * coverage/nfs4 is a RATCHET against quint/nfs/nfs4_coverage_baseline.txt,
-#     recorded over all 142 legacy nfs4 traces.  The conformance cells generate
-#     a different set, so the baseline no longer describes them.  Rewriting it
-#     (coverage.py --write-expect) is exactly the deliberate act the ratchet
-#     exists to force, and doing it as a side effect of this refactor would
-#     destroy the signal it was built to give.
-#
-# The per-cell equivalents that DO run: tools/devliveness.py gates every cell on
-# its enabled deviations actually being exercised, and each cell's strict twin
-# re-measures the conformance debt.  Neither replaces bucket coverage.
-#
-# Follow-up: give this repo reference configs (one per family, no deviations),
-# point the gates at those cells, and re-baseline the nfs4 ratchet on purpose.
+# Behavioral coverage gates belong to the consumer that owns the configs.
+# Chimera registers NFS3/NFS4, nfsaux, nfsdrc and per-family SMB gates against
+# its generated cells. Its named regression traces retain the NFS4 legacy
+# ratchet without lowering the baseline. Generated coverage and live replay
+# remain separate results: a generated bucket cannot establish conformance.
+# Standalone conformance configurations still need their own coverage policy.
 
 # ---------------------------------------------------------------------------
 # Samba conformance (harness/samba)
