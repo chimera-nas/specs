@@ -202,9 +202,10 @@ def scan(path, buckets):
         for cap, on in init["value"]["caps"].items():
             if on:
                 buckets["caps:" + cap] = True
+    pending = {}
     for state_index, st in enumerate(states[1:], 1):
         lo = st.get(key)
-        if not lo or lo.get("tag") != "LMsg":
+        if not lo or lo.get("tag") not in ("LMsg", "LCreateComplete"):
             continue
         v = lo["value"]
         cmds = v["msg"]["cmds"]
@@ -224,7 +225,18 @@ def scan(path, buckets):
             cv = c.get("value", {})
             rv = r.get("value", {})
             status = as_int(rv.get("st", 0)) & 0xFFFFFFFF
+            if ctag in ("CBreakAck", "CClose") and status == ST_SUCCESS:
+                for request in pending:
+                    pending[request] = ctag
             if ctag == "CCreate":
+                if status == 0x103:
+                    buckets["create:pending"] = True
+                    buckets["park:1"] = True
+                    pending.setdefault(as_int(v.get("request", v.get("tag"))), None)
+                elif lo["tag"] == "LCreateComplete":
+                    resolved_by = pending.pop(as_int(v["request"]), None)
+                    buckets["create:complete:" + str(resolved_by)] = True
+                    buckets["create:complete:0x%08x" % status] = True
                 acc = profile(cv["access"], "rwd")
                 disp = cv["disp"]["tag"]
                 buckets["disp:" + disp] = True
@@ -614,7 +626,9 @@ def required_buckets(flavor, observed=None):
         # A CREATE that had to park behind an ack-required break, and one that
         # did not: without both, the async-interim path is untested in one
         # direction.
-        req += ["park:0", "park:1"]
+        req += ["park:0", "park:1", "create:pending",
+                "create:complete:CBreakAck", "create:complete:CClose",
+                "create:complete:0x00000000", "create:complete:0xc0000043"]
         req += ["break:ack:1", "break:new:0x01", "break:new:0x03"]
         # Acknowledgment outcomes, including the three rejections.  A break
         # that needs no ack is never acknowledged, so with caching capped there

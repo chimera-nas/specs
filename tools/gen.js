@@ -67,7 +67,18 @@ const spec = JSON.parse(fs.readFileSync(specPath, 'utf8'))
 let cliCommands
 try {
   const cli = fs.realpathSync(spec.quintCli)
-  cliCommands = require(path.join(path.dirname(cli), 'cliCommands'))
+  // npm's Windows launcher is a .cmd file alongside node_modules, rather
+  // than a symlink into the package. Resolve that standard installation
+  // layout without changing the pinned package or relying on NODE_PATH.
+  const directory = path.dirname(cli)
+  const candidates = [
+    path.join(directory, 'cliCommands'),
+    path.join(directory, 'node_modules', '@informalsystems', 'quint', 'dist', 'src', 'cliCommands'),
+    path.join(directory, '..', '@informalsystems', 'quint', 'dist', 'src', 'cliCommands'),
+  ]
+  const commands = candidates.find(candidate => fs.existsSync(candidate + '.js'))
+  if (!commands) throw new Error('cannot locate the Quint package beside its launcher')
+  cliCommands = require(commands)
 } catch (err) {
   die(`could not load quint's cliCommands from ${spec.quintCli}: ${err.message}\n` +
       `        this file depends on quint internals; see the caveat at the top`)
@@ -114,6 +125,7 @@ function argsFor(batch) {
     // randomised check into a fixed one.
     seed: batch.seed !== undefined ? BigInt(batch.seed) : undefined,
     mbt: false,
+    match: batch.run ? `^${batch.run}$` : undefined,
     verbosity: 0,
     quiet: true,
     out: undefined,
@@ -141,25 +153,51 @@ async function main() {
     stage.args = argsFor(tc)
     const res = await cliCommands.runTests(stage)
     if (res.isLeft() || (res.value.status && res.value.status !== 'passed')) {
-      die(`self-test ${tc.name} (${tc.main}) failed for ${spec.model}`)
+      die(`self-test ${tc.name} (${tc.main}) failed for ${spec.model}: ` +
+          JSON.stringify(res.value.failed ?? res.value.errors ?? res.value.status))
     }
   }
 
   let failed = 0
   for (const batch of spec.batches) {
     fs.mkdirSync(batch.outdir, { recursive: true })
+    for (let i = 0; i < batch.nTraces; i++) {
+      fs.rmSync(path.join(batch.outdir,
+        `${batch.naming.replace('{seq}', String(i))}.itf.json`), { force: true })
+    }
     // Per-batch configuration is just args; the typechecked table does not move.
     stage.args = argsFor(batch)
-    const res = await cliCommands.runSimulator(stage)
+    const res = batch.run ? await cliCommands.runTests(stage)
+                          : await cliCommands.runSimulator(stage)
     // A violated invariant comes back as a Left, exactly as it fails the CLI --
     // the gate has to keep gating.
-    if (res.isLeft()) {
+    if (res.isLeft() || (batch.run &&
+        (res.value.passed.length !== 1 ||
+         res.value.passed[0].split('::').pop() !== batch.run))) {
       failed++
-      const label = `${batch.main}/${batch.step}`
+      const label = `${batch.main}/${batch.run ?? batch.step}`
       console.error(`  FAILED ${label}: ${JSON.stringify(res.value.errors ?? res.value.status)}`)
+    }
+    // A misspelled run name can select zero tests successfully. Every declared
+    // output must exist, including a named regression's single replay trace.
+    for (let i = 0; i < batch.nTraces; i++) {
+      const output = path.join(batch.outdir,
+        `${batch.naming.replace('{seq}', String(i))}.itf.json`)
+      if (!fs.existsSync(output)) die(`missing generated trace ${output}`)
     }
   }
   if (failed > 0) die(`${failed} batch(es) failed for ${spec.model}`)
+  // Replay and coverage both consume whole generated directories. Remove
+  // obsolete generated traces only after every declared output succeeded, so
+  // changing a batch/seed cannot leave an old trace satisfying a coverage gate.
+  for (const { path: directory, traces } of spec.directories || []) {
+    const expected = new Set(traces)
+    for (const name of fs.readdirSync(directory)) {
+      if (name.endsWith('.itf.json') && !expected.has(name)) {
+        fs.unlinkSync(path.join(directory, name))
+      }
+    }
+  }
   console.log(`  ${path.basename(spec.model)}: ${tests.length} self-test(s) + ` +
               `${spec.batches.length} batch(es) in ${((Date.now() - t0) / 1000).toFixed(1)}s`)
 }

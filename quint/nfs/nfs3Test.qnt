@@ -124,7 +124,7 @@ module nfs3Test {
             // Stale guard: NOT_SYNC and no change.
             .then(applySetattr(1, 493, 0, 2))
             .expect(lastOp == OSetattr({ obj: 1, mode: 493, sizeBlocks: 0,
-                                         guard: 2, status: ERR_NOT_SYNC }))
+                                         guard: 2, status: ERR_NOT_SYNC, cred: ROOT_CRED }))
             .expect(fs.get(1).mode == 420 and fs.get(1).data == [2, 0, 0])
             .then(applySetattr(1, 493, -1, 0))
             .expect(fs.get(1).mode == 493)

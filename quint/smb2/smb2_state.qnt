@@ -846,7 +846,7 @@ module smb2state {
     pure def sameGrant(a: Open, b: Open): bool =
         isLeaseGrant(a.caching) and isLeaseGrant(b.caching) and
         leaseKeyOf(a.caching) == leaseKeyOf(b.caching) and
-        a.session == b.session
+        a.clientTag == b.clientTag
 
     // The lowest-numbered member of a coalesced grant: the one open whose
     // notification represents the whole grant, so a break of a two-open
@@ -890,7 +890,7 @@ module smb2state {
             not(bitsEq(bitsAnd(cur, retain), cur)) and
             not(spareLeases and isLeaseGrant(o.caching)) and
             not(selfKey >= 0 and leaseKeyOf(o.caching) == selfKey and
-                o.session == selfSess)
+                o.clientTag == sdb.sessions.get(selfSess).clientTag)
         })
 
     // The notification set a break over `holders` puts on the wire (one per

@@ -28,11 +28,16 @@ module posixTestStd {
         P_RENAME_CTIME = FeatOff,
         P_STRICT_ATIME = FeatMandatory,
         P_STICKY_WRITE_ARM = FeatOff,
+        P_STATELESS_IO_DAC = false,
         P_CHOWN_SUPP_GROUP = FeatMandatory,
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatOff,
         P_ERR_LOCK_AGAIN = FeatMandatory,
+        P_DIR_SEEK_DOMAIN = FeatOff,
+        P_ORPHAN_CTIME = FeatOff,
+        P_SYMLINK_ATIME = FeatOff,
+        P_RENAME_KERNEL_ORDER = FeatOff,
         // DEVS = Set(): the self-tests check the STANDARD, so no
         // implementation deviation is switched on here.  That is the point of
         // keeping them separate from the generated corpus -- a config may
@@ -64,7 +69,7 @@ module posixTestStd {
         | LInit(x) => -1
     }
 
-    val noStatR = { e: -999, ftype: FReg, mode: 0, uid: -1, gid: -1,
+    val noStatR = { e: -999, ftype: FReg, mode: 0, optionalSetids: 0, uid: -1, gid: -1,
                     nlink: 0, sizeB: 0, ino: -1, atime: 0, mtime: 0,
                     ctime: 0 }
 
@@ -641,7 +646,9 @@ module posixTestStd {
         .then(runOp(0, RLockf({ fd: 0, cmd: LfTlock, len: 2 })))
         .expect(lastE == OK)
         .then(runOp(1, RLockf({ fd: 0, cmd: LfTst, len: 2 })))
-        .expect(lastE == EAGAIN)
+        // glibc's lockf() names EACCES for a F_TEST conflict itself, rather
+        // than passing on the kernel's EAGAIN as F_LOCK/F_TLOCK do.
+        .expect(lastE == EACCES)
         .then(runOp(1, RLseek({ fd: 0, off: 4, wh: WSet })))
         .expect(lastOff == 4)
         .then(runOp(1, RLockf({ fd: 0, cmd: LfTlock, len: 2 })))
@@ -656,6 +663,110 @@ module posixTestStd {
         .expect(lastFd == 1)
         .then(runOp(0, RLockf({ fd: 1, cmd: LfTlock, len: 1 })))
         .expect(lastE == EBADF)
+        // ... but F_TEST and F_ULOCK do not ask for write access at all: XSH
+        // lockf binds that EBADF to F_LOCK and F_TLOCK by name, and the same
+        // read-only descriptor serves both of these.
+        .then(runOp(0, RLockf({ fd: 1, cmd: LfTst, len: 1 })))
+        .expect(lastE == OK)
+        .then(runOp(0, RLockf({ fd: 1, cmd: LfUlock, len: 1 })))
+        .expect(lastE == OK)
+        // F_TEST asks whether a READER would conflict (glibc tests with
+        // F_RDLCK), so another process's read lock is no conflict -- though a
+        // writer still collides with it.
+        .then(runOp(1, RFcntlLock({ fd: 0, cmd: CSetlk, lk: LkRd, lo: 8,
+                                    hi: 9 })))
+        .expect(lastE == OK)
+        .then(runOp(0, RLseek({ fd: 0, off: 8, wh: WSet })))
+        .expect(lastOff == 8)
+        .then(runOp(0, RLockf({ fd: 0, cmd: LfTst, len: 1 })))
+        .expect(lastE == OK)
+        .then(runOp(0, RLockf({ fd: 0, cmd: LfTlock, len: 1 })))
+        .expect(lastE == EAGAIN)
+
+    // Allocating data or punching within EOF sheds set-id bits like a write.
+    // A punch wholly beyond EOF permits preservation as well as clearing.
+    run fallocateSetidTest =
+        init
+        .then(runOp(0, RMknod({ pth: ap(["f"]), ft: FReg, mode: 1517 })))
+        .expect(lastE == OK and fsGet(fs, 1).mode == 1517)
+        .then(runOp(0, ROpen({ dfd: -1, pth: ap(["f"]), fl: FLRW })))
+        .expect(lastFd == 0)
+        .then(runOp(0, RFallocate({ fd: 0, mode: 0, off: 0, len: 4096 })))
+        .expect(lastE == OK and fsGet(fs, 1).mode == 493)
+        // and the punching arm clears on the same rule
+        .then(runOp(0, RChmod({ dfd: -1, pth: ap(["f"]), mode: 1517 })))
+        .expect(lastE == OK and fsGet(fs, 1).mode == 1517)
+        .then(runOp(0, RFallocate({ fd: 0, mode: 1, off: 0, len: 4096 })))
+        .expect(lastE == OK and fsGet(fs, 1).mode == 493)
+
+    run emptyPunchSetidTest =
+        init
+        .then(runOp(0, ROpen({ dfd: -1, pth: ap(["f"]), fl: FLRW.with("creat", true).with("mode", 1517) })))
+        .then(runOp(0, RFchmod({ fd: 0, mode: 1517 })))
+        .then(runOp(0, RFallocate({ fd: 0, mode: 1, off: 4096, len: 4096 })))
+        .expect(lastE == OK and fsGet(fs, 1).mode == 493 and
+                fsGet(fs, 1).optionalSetids == 1024)
+        // Repeating a no-op must keep the same two outcomes.
+        .then(runOp(0, RFallocate({ fd: 0, mode: 1, off: 0, len: 4096 })))
+        .expect(fsGet(fs, 1).optionalSetids == 1024)
+        .then(runOp(0, RWrite({ fd: 0, len: 1, pat: 1 })))
+        .expect(lastE == OK and fsGet(fs, 1).mode == 493 and
+                fsGet(fs, 1).optionalSetids == 0)
+        .then(runOp(0, RFchmod({ fd: 0, mode: 1517 })))
+        .expect(fsGet(fs, 1).mode == 1517 and fsGet(fs, 1).optionalSetids == 0)
+
+    run statelessIoDacTest =
+        init
+        .then(runOp(0, ROpen({ dfd: -1, pth: ap(["f"]),
+                              fl: FLRW.with("creat", true).with("mode", 511) })))
+        .then(runOp(0, RWrite({ fd: 0, len: 4096, pat: 1 })))
+        .then(runOp(1, ROpen({ dfd: -1, pth: ap(["f"]), fl: FLRW })))
+        .expect(lastE == OK)
+        .then(runOp(0, RFchmod({ fd: 0, mode: 0 })))
+        .expect(errOf(opRead(fs, ps, caps.with("statelessIoDac", true),
+                            1, 0, 1).res) == EACCES)
+        .expect(opRead(fs, ps, caps.with("statelessIoDac", true),
+                       1, 0, 1).ps2 == ps)
+        .expect(errOf(opWrite(fs, ps, caps.with("statelessIoDac", true),
+                             1, 0, 1, 2).res) == EACCES)
+        .expect(opWrite(fs, ps, caps.with("statelessIoDac", true),
+                        1, 0, 1, 2).fs2 == fs)
+        .expect(errOf(opFtruncate(fs, ps, caps.with("statelessIoDac", true),
+                                 1, 0, 4096).res) == EACCES)
+        .expect(errOf(opFallocate(fs, ps, caps.with("statelessIoDac", true),
+                                 1, 0, 0, 4096, 4096).res) == EACCES)
+        .expect(errOf(opFallocate(fs, ps, caps.with("statelessIoDac", true),
+                                 1, 0, 1, 0, 4096).res) == EACCES)
+        .expect(errOf(opFallocate(fs, ps, caps.with("statelessIoDac", true),
+                                 1, 0, 0, 0, 4096).res) == OK)
+        .expect(errOf(opFallocate(fs, ps, caps.with("statelessIoDac", true),
+                                 1, 0, 1, 4096, 4096).res) == OK)
+        // Owners retain access; stateful non-owner descriptors do too.
+        .expect(errOf(opRead(fs, ps, caps.with("statelessIoDac", true),
+                            0, 0, 1).res) == OK)
+        .then(runOp(1, RRead({ fd: 0, len: 1 })))
+        .expect(lastE == OK and lastN == 1)
+
+    // chown(-1, -1) names neither id and moves neither, but XSH chown asks
+    // for the setid bits of an executable regular file to be cleared "upon
+    // successful return from chown()" without asking whether an id changed --
+    // and chown_common() adds ATTR_KILL_SUID|ATTR_KILL_SGID for any
+    // non-directory outside the two tests that look at user and group.
+    run chownNoopSetidTest =
+        init
+        .then(runOp(0, RMknod({ pth: ap(["f"]), ft: FReg, mode: 2541 })))
+        .expect(lastE == OK and fsGet(fs, 1).mode == 2541)
+        .then(runOp(0, RChown({ dfd: -1, pth: ap(["f"]), u: -1, g: -1,
+                                follow: true })))
+        .expect(lastE == OK and fsGet(fs, 1).mode == 493)
+        // a directory keeps them: the kill is for non-directories only
+        .then(runOp(0, RMkdir({ dfd: -1, pth: ap(["d"]), mode: 493 })))
+        .expect(lastE == OK)
+        .then(runOp(0, RChmod({ dfd: -1, pth: ap(["d"]), mode: 2541 })))
+        .expect(lastE == OK and fsGet(fs, 2).mode == 2541)
+        .then(runOp(0, RChown({ dfd: -1, pth: ap(["d"]), u: -1, g: -1,
+                                follow: true })))
+        .expect(lastE == OK and fsGet(fs, 2).mode == 2541)
 
     // ---------------- directory streams ----------------
 
@@ -813,9 +924,15 @@ module posixTestStd {
 
     run gidSgidTest =
         init
-        .then(runOp(0, RMkdir({ dfd: -1, pth: ap(["d"]), mode: 1517 })))
+        // mkdir cannot confer S_ISGID -- the mode argument's set-id bits are
+        // masked off (see newDirMode), measured against ext4 -- so the bit is
+        // set afterwards, which is the only way a directory that does not
+        // inherit it from ITS parent can come to have it.
+        .then(runOp(0, RMkdir({ dfd: -1, pth: ap(["d"]), mode: 493 })))
         .expect(lastE == OK and fsGet(fs, 1).gid == 10 and
-                bitOn(fsGet(fs, 1).mode, MB_SGID))
+                not(bitOn(fsGet(fs, 1).mode, MB_SGID)))
+        .then(runOp(0, RChmod({ dfd: -1, pth: ap(["d"]), mode: 1517 })))
+        .expect(lastE == OK and bitOn(fsGet(fs, 1).mode, MB_SGID))
         .then(runOp(0, RChown({ dfd: -1, pth: ap(["d"]), u: -1, g: 30,
                                 follow: true })))
         .expect(lastE == OK and fsGet(fs, 1).gid == 30 and
@@ -923,11 +1040,16 @@ module posixTestRoot {
         P_RENAME_CTIME = FeatOff,
         P_STRICT_ATIME = FeatMandatory,
         P_STICKY_WRITE_ARM = FeatOff,
+        P_STATELESS_IO_DAC = false,
         P_CHOWN_SUPP_GROUP = FeatMandatory,
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
         P_ERR_UNLINKDIR_ISDIR = FeatOff,
         P_ERR_LOCK_AGAIN = FeatMandatory,
+        P_DIR_SEEK_DOMAIN = FeatOff,
+        P_ORPHAN_CTIME = FeatOff,
+        P_SYMLINK_ATIME = FeatOff,
+        P_RENAME_KERNEL_ORDER = FeatOff,
         // DEVS = Set(): the self-tests check the STANDARD, so no
         // implementation deviation is switched on here.  That is the point of
         // keeping them separate from the generated corpus -- a config may
@@ -1001,5 +1123,147 @@ module posixTestRoot {
         .expect(lastE == OK and fsGet(fs, 4).mode == 448)
 
     run rootWalkTest =
+        init.then(80.reps(_ => step.expect(inv)))
+}
+
+// The policies POSIX leaves open and Linux settles one way.  They are not
+// deviations -- both answers conform, so no implementation owes anything for
+// them -- which is exactly why they need a home here: a cell that enables one
+// is the only thing exercising that code, and a cell is measured against a
+// server, not against the model.  This profile pins the ON behaviour so a
+// refactor cannot quietly lose it between ext4 runs.
+module posixTestLinux {
+    import posixfs.* from "./posix_fs"
+    import posixstate.* from "./posix_state"
+    import posixops.* from "./posix_ops"
+    import posix(
+        F_COPY_RANGE = FeatMandatory,
+        F_CLONE_RANGE = FeatMandatory,
+        F_SEEK_HOLE = FeatMandatory,
+        F_ROOT = FeatOff,
+        P_GID_FROM_PARENT = FeatOff,
+        P_SGID_INHERIT = FeatOff,
+        P_WRITE_CLEARS_SETIDS = FeatMandatory,
+        P_PWRITE_APPENDS = FeatOff,
+        P_RENAME_CTIME = FeatOff,
+        P_STRICT_ATIME = FeatMandatory,
+        P_STICKY_WRITE_ARM = FeatOff,
+        P_STATELESS_IO_DAC = false,
+        P_CHOWN_SUPP_GROUP = FeatMandatory,
+        P_ERR_NOTEMPTY = FeatMandatory,
+        P_ERR_STICKY_ACCES = FeatMandatory,
+        P_ERR_UNLINKDIR_ISDIR = FeatOff,
+        P_ERR_LOCK_AGAIN = FeatMandatory,
+        // the three under test
+        P_DIR_SEEK_DOMAIN = FeatMandatory,
+        P_ORPHAN_CTIME = FeatMandatory,
+        P_SYMLINK_ATIME = FeatMandatory,
+        P_RENAME_KERNEL_ORDER = FeatMandatory,
+        DEVS = Set(),
+        T_STICKY_REMOVAL_EPERM = false
+    ).* from "./posix"
+
+    def lastE = match lastOp {
+        | LCall(c) => errOf(c.res)
+        | LInit(x) => -999
+    }
+
+    def lastFd = match lastOp {
+        | LCall(c) => match c.res { | SFd(x) => x.fd | _ => -1 }
+        | LInit(x) => -1
+    }
+
+    def lastOff = match lastOp {
+        | LCall(c) => match c.res { | SOff(x) => x.off | _ => -1 }
+        | LInit(x) => -1
+    }
+
+    val noStatR = { e: -999, ftype: FReg, mode: 0, optionalSetids: 0, uid: -1, gid: -1,
+                    nlink: 0, sizeB: 0, ino: -1, atime: 0, mtime: 0,
+                    ctime: 0 }
+
+    def lastStatR = match lastOp {
+        | LCall(c) => match c.res { | SStatR(x) => x | _ => noStatR }
+        | LInit(x) => noStatR
+    }
+
+    pure def ap(cs: List[Name]): Path = { abs: true, comps: cs, slash: false }
+
+    pure val FLR: OpenFlags = { acc: AccR, creat: false, excl: false,
+                                trunc: false, appendF: false,
+                                directory: false, nofollow: false, mode: 0 }
+    pure val FLRW: OpenFlags = FLR.with("acc", AccRW)
+
+    // A directory's offsets are cookies over a domain of their own, so every
+    // offset below its end is data and the only hole is at the end.
+    run dirSeekDomainTest =
+        init
+        .then(runOp(0, RMkdir({ dfd: -1, pth: ap(["d"]), mode: 511 })))
+        .expect(lastE == OK)
+        .then(runOp(0, ROpen({ dfd: -1, pth: ap(["d"]), fl: FLR })))
+        .expect(lastFd == 0)
+        .then(runOp(0, RLseek({ fd: 0, off: 0, wh: WData })))
+        .expect(lastE == OK and lastOff == 0)
+        .then(runOp(0, RLseek({ fd: 0, off: 5120, wh: WData })))
+        .expect(lastE == OK and lastOff == 5120)
+        .then(runOp(0, RLseek({ fd: 0, off: 1024, wh: WHole })))
+        .expect(lastE == OK and lastOff == DIR_SEEK_MAX)
+        // SEEK_END counts back from the end of the domain, and past it the
+        // position is EINVAL by way of vfs_setpos().
+        .then(runOp(0, RLseek({ fd: 0, off: -1, wh: WEnd })))
+        .expect(lastE == OK and lastOff == DIR_SEEK_MAX - 1)
+        .then(runOp(0, RLseek({ fd: 0, off: 1024, wh: WEnd })))
+        .expect(lastE == EINVAL)
+        // A read at an offset that large is EINVAL before it is EISDIR:
+        // rw_verify_area() runs inside vfs_read(), ahead of the file's op.
+        .then(runOp(0, RRead({ fd: 0, len: 4096 })))
+        .expect(lastE == EINVAL)
+
+    // Losing the last link marks the object's ctime, and an open descriptor
+    // keeps the orphan observable enough to see it.
+    run orphanCtimeTest =
+        init
+        .then(runOp(0, RMknod({ pth: ap(["f"]), ft: FReg, mode: 438 })))
+        .expect(lastE == OK)
+        .then(runOp(0, ROpen({ dfd: -1, pth: ap(["f"]), fl: FLRW })))
+        .expect(lastFd == 0)
+        .then(runOp(0, RFstat({ fd: 0 })))
+        .expect(lastE == OK and lastStatR.ctime == lastStatR.mtime)
+        .then(runOp(0, RUnlink({ dfd: -1, pth: ap(["f"]) })))
+        .expect(lastE == OK)
+        .then(runOp(0, RFstat({ fd: 0 })))
+        .expect(lastE == OK and lastStatR.nlink == 0 and
+                lastStatR.ctime > lastStatR.mtime)
+
+    // Expanding a symbolic link READS it, so traversal marks its atime --
+    // including a traversal that goes on to fail, because the link still had
+    // to be read to discover where it pointed.
+    run symlinkAtimeTest =
+        init
+        .then(runOp(0, RMknod({ pth: ap(["t"]), ft: FReg, mode: 438 })))
+        .expect(lastE == OK)
+        .then(runOp(0, RSymlink({ dfd: -1, pth: ap(["l"]),
+                                  tgt: { abs: false, comps: List("t") } })))
+        .expect(lastE == OK)
+        .then(runOp(0, RStat({ dfd: -1, pth: ap(["l"]), follow: false })))
+        .expect(lastE == OK and lastStatR.atime == lastStatR.mtime)
+        .then(runOp(0, RStat({ dfd: -1, pth: ap(["l"]), follow: true })))
+        .expect(lastE == OK)
+        .then(runOp(0, RStat({ dfd: -1, pth: ap(["l"]), follow: false })))
+        .expect(lastE == OK and lastStatR.atime > lastStatR.mtime)
+        // A DANGLING link earns the mark too, and its resolution ends ENOENT
+        // -- the case resolveEx() once rewrote with a fresh result, dropping
+        // the record of what the walk had read.
+        .then(runOp(0, RSymlink({ dfd: -1, pth: ap(["g"]),
+                                  tgt: { abs: false, comps: List("nope") } })))
+        .expect(lastE == OK)
+        .then(runOp(0, RStat({ dfd: -1, pth: ap(["g"]), follow: false })))
+        .expect(lastE == OK and lastStatR.atime == lastStatR.mtime)
+        .then(runOp(0, RStat({ dfd: -1, pth: ap(["g"]), follow: true })))
+        .expect(lastE == ENOENT)
+        .then(runOp(0, RStat({ dfd: -1, pth: ap(["g"]), follow: false })))
+        .expect(lastE == OK and lastStatR.atime > lastStatR.mtime)
+
+    run linuxWalkTest =
         init.then(80.reps(_ => step.expect(inv)))
 }

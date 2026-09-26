@@ -33,6 +33,7 @@ module smb2Test {
     def lastResults: List[Res] =
         match lastOp {
             | LMsg(l) => l.results
+            | LCreateComplete(l) => l.results
             | LInit(_) => []
         }
 
@@ -93,6 +94,7 @@ module smb2Test {
     def lastNotes: Set[NotifyNote] =
         match lastOp {
             | LMsg(l) => l.notes
+            | LCreateComplete(l) => l.notes
             | LInit(_) => Set()
         }
 
@@ -945,14 +947,9 @@ module smb2Test {
             .expect(stAt(0) == ST_SUCCESS and asCreate(resAt(0)).parked)
             .expect(asCreate(resAt(0)).breaks.exists(n => n.ackReq))
             .expect(sdb.opens.get(0).breaking)
-            .then(stepLease)
-            .expect(match lastOp {
-                | LMsg(x) => match x.msg.cmds.nth(0) {
-                    | CBreakAck(a) => a.fid == FidRef(0)
-                    | _ => false
-                }
-                | _ => false
-            })
+            .then(runM(one(0, 0, ackKeep(0, false, BITS_NONE))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .expect(not(sdb.opens.get(0).breaking))
 
     run batchShareConflictWaitsForAckTest =
         boot2Run
@@ -963,10 +960,9 @@ module smb2Test {
             .expect(stAt(0) == ST_SHARING_VIOLATION)
             .expect(asCreate(resAt(0)).parked)
             .expect(sdb.opens.get(0).breaking)
-            // The bounded wire generator must service the outstanding
-            // break before observing the deferred operation's effects.
-            .then(stepLease)
-            .expect(match resAt(0) { | RBreakAck(_) => true | _ => false })
+            .then(runM(one(0, 0, ackKeep(0, false, BITS_NONE))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .expect(not(sdb.opens.get(0).breaking))
 
     // A share-CONFLICTING open behind a handle-caching holder is refused, but
     // the holder is STILL told to relinquish its handle cache so a later retry
@@ -3060,6 +3056,15 @@ module smb2Test {
             .expect(noteOf(0).recs == [ { act: FA_MODIFIED, name: "a" } ])
 
 
+    // The generated scenarios also guard the model's pending/completion rules.
+    run pendingAckTest = leasePendingAckRegression
+    run pendingCloseTest = leasePendingCloseRegression
+    run cacheAckTest = leaseCacheAckRegression
+    run cacheCloseTest = leaseCacheCloseRegression
+    run leaseKeyCreationTest = leaseKeyCreationRegression
+    run leaseUpgradeSizeTest = leaseUpgradeSizeRegression
+    run duplicateGuidTest = duplicateNondurableGuidRegression
+
 }
 
 // A SECOND instance of the same model with durable handles NOT advertised.
@@ -3090,6 +3095,7 @@ module smb2TestNoDurable {
     def lastResults: List[Res] =
         match lastOp {
             | LMsg(l) => l.results
+            | LCreateComplete(l) => l.results
             | LInit(_) => []
         }
 
@@ -3164,6 +3170,7 @@ module smb2TestNoLease {
     def lastResults: List[Res] =
         match lastOp {
             | LMsg(l) => l.results
+            | LCreateComplete(l) => l.results
             | LInit(_) => []
         }
 
@@ -3215,4 +3222,5 @@ module smb2TestNoLease {
     // The whole request-matrix walk with caching off: no grant may appear.
     run noLeaseWalkTest =
         init.then(60.reps(_ => all { inv, stepReq }))
+
 }

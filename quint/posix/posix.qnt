@@ -40,11 +40,16 @@ module posix {
     const P_RENAME_CTIME: FeatureMode      // rename marks moved ctime
     const P_STRICT_ATIME: FeatureMode      // harness enforces atime marks
     const P_STICKY_WRITE_ARM: FeatureMode  // sticky exempts write-perm
+    const P_STATELESS_IO_DAC: bool         // stateless transport rechecks I/O
     const P_CHOWN_SUPP_GROUP: FeatureMode  // chgrp to a supplementary group
     const P_ERR_NOTEMPTY: FeatureMode      // ENOTEMPTY (else EEXIST)
     const P_ERR_STICKY_ACCES: FeatureMode  // EACCES (else EPERM)
     const P_ERR_UNLINKDIR_ISDIR: FeatureMode // EISDIR (else EPERM)
     const P_ERR_LOCK_AGAIN: FeatureMode    // EAGAIN (else EACCES)
+    const P_DIR_SEEK_DOMAIN: FeatureMode   // directories have a seek domain
+    const P_ORPHAN_CTIME: FeatureMode      // losing the last link marks ctime
+    const P_SYMLINK_ATIME: FeatureMode     // traversing a symlink marks its atime
+    const P_RENAME_KERNEL_ORDER: FeatureMode // rename reports shape before permission
 
     // Known divergences from POSIX.1-2024 that the implementation under test
     // still carries.  A deviation is DESCRIBED by the model, gated on the
@@ -232,14 +237,20 @@ module posix {
         nondet eSt = oneOf(capChoices(P_ERR_STICKY_ACCES))
         nondet eUd = oneOf(capChoices(P_ERR_UNLINKDIR_ISDIR))
         nondet eLk = oneOf(capChoices(P_ERR_LOCK_AGAIN))
+        nondet dSk = oneOf(capChoices(P_DIR_SEEK_DOMAIN))
+        nondet oCt = oneOf(capChoices(P_ORPHAN_CTIME))
+        nondet sAt = oneOf(capChoices(P_SYMLINK_ATIME))
+        nondet rTf = oneOf(capChoices(P_RENAME_KERNEL_ORDER))
         val c: Caps = {
             copyRange: copyR, cloneRange: cloneR, seekHole: seekH,
             withRoot: rootP, gidFromParent: gidPar, sgidInherit: sgidInh,
             writeClearsSets: wClear, pwriteAppends: pwApp,
             renameCtime: rnCt, strictAtime: sAtime, stickyWriteArm: stArm,
-            chownSuppGroup: chSup,
+            chownSuppGroup: chSup, statelessIoDac: P_STATELESS_IO_DAC,
             errNotempty: eNe, errStickyAcces: eSt,
             errUnlinkDirIsdir: eUd, errLockAgain: eLk,
+            dirSeekDomain: dSk, orphanCtime: oCt, symlinkAtime: sAt,
+            renameKernelOrder: rTf,
             devs: DEVS, stickyRemovalEperm: T_STICKY_REMOVAL_EPERM
         }
         all {
@@ -1129,10 +1140,15 @@ module posix {
         capChoices(P_STRICT_ATIME).contains(caps.strictAtime),
         capChoices(P_STICKY_WRITE_ARM).contains(caps.stickyWriteArm),
         capChoices(P_CHOWN_SUPP_GROUP).contains(caps.chownSuppGroup),
+        caps.statelessIoDac == P_STATELESS_IO_DAC,
         capChoices(P_ERR_NOTEMPTY).contains(caps.errNotempty),
         capChoices(P_ERR_STICKY_ACCES).contains(caps.errStickyAcces),
         capChoices(P_ERR_UNLINKDIR_ISDIR).contains(caps.errUnlinkDirIsdir),
-        capChoices(P_ERR_LOCK_AGAIN).contains(caps.errLockAgain)
+        capChoices(P_ERR_LOCK_AGAIN).contains(caps.errLockAgain),
+        capChoices(P_DIR_SEEK_DOMAIN).contains(caps.dirSeekDomain),
+        capChoices(P_ORPHAN_CTIME).contains(caps.orphanCtime),
+        capChoices(P_SYMLINK_ATIME).contains(caps.symlinkAtime),
+        capChoices(P_RENAME_KERNEL_ORDER).contains(caps.renameKernelOrder)
     }
 
     val inv = all {

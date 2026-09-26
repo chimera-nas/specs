@@ -175,7 +175,9 @@ module nfs3 {
         | OInit
         | OLookup({ dir: Fid, name: Name, status: int, child: Fid })
         | OGetattr({ obj: Fid, status: int })
-        | OSetattr({ obj: Fid, mode: int, sizeBlocks: int, guard: int, status: int })
+        | OCreateTruncate({ dir: Fid, name: Name, sizeBlocks: int,
+                            status: int, obj: Fid, cred: Cred })
+        | OSetattr({ obj: Fid, mode: int, sizeBlocks: int, guard: int, status: int, cred: Cred })
         | OAccess({ obj: Fid, mask: int, status: int, access: int })
         | OCreate({ dir: Fid, name: Name, cmode: CreateMode, mode: int, verf: int,
                     status: int, obj: Fid, cred: Cred, statusAccept: Set[int] })
@@ -214,6 +216,7 @@ module nfs3 {
     // nfsstat3 values (RFC 1813 section 2.6), numerically identical to the
     // wire encoding so the harness compares raw status with no decode step.
     pure val OK = 0
+    pure val ERR_PERM = 1
     pure val ERR_ACCES = 13
     pure val ERR_NOENT = 2
     pure val ERR_EXIST = 17
@@ -390,23 +393,28 @@ module nfs3 {
     // ctime (harness fetches it), 2 = deliberately stale guard.
     // ------------------------------------------------------------------
 
-    action applySetattr(o: Fid, m: int, sz: int, guard: int): bool = all {
-        fs' =
-            if (guard == 2) fs
-            else fs.setBy(o, nd => {
-                val nd1 = if (m >= 0) nd.with("mode", m) else nd
-                // A size change updates mtime and clears the exclusive-create
-                // verifier; a mode-only SETATTR touches ctime only and leaves
-                // it intact (probed 2026-08-08).
-                if (sz >= 0) nd1.with("data", resizeBlocks(nd1.data, sz)).with("xverf", 0)
-                else nd1
-            }),
+    // SETATTR checks the acting identity before changing either mode or data.
+    def setattrStatus(o: Fid, m: int, sz: int, guard: int, c: Cred): int =
+        if (m >= 0 and c.uid != 0 and not(isOwner(fs.get(o), c))) ERR_PERM
+        else if (sz >= 0 and not(canWrite(fs.get(o), c))) ERR_ACCES
+        else if (guard == 2) ERR_NOT_SYNC else OK
+
+    action applySetattrAs(o: Fid, m: int, sz: int, guard: int, c: Cred): bool = all {
+        fs' = if (setattrStatus(o, m, sz, guard, c) != OK) fs
+              else fs.setBy(o, nd => {
+                  val nd1 = if (m >= 0) nd.with("mode", m) else nd
+                  if (sz >= 0) nd1.with("data", resizeBlocks(nd1.data, sz)).with("xverf", 0)
+                  else nd1
+              }),
         removed' = removed,
         nextFid' = nextFid,
         devHits' = Set(),
         lastOp' = OSetattr({ obj: o, mode: m, sizeBlocks: sz, guard: guard,
-                             status: if (guard == 2) ERR_NOT_SYNC else OK }),
+                             status: setattrStatus(o, m, sz, guard, c), cred: c }),
     }
+
+    action applySetattr(o: Fid, m: int, sz: int, guard: int): bool =
+        applySetattrAs(o, m, sz, guard, ROOT_CRED)
 
     action setattrMode = {
         nondet o = oneOf(fs.keys().filter(f =>
@@ -1257,4 +1265,65 @@ module nfs3 {
     val rootAlive = fs.keys().contains(ROOT) and fs.get(ROOT).ftype == TDir
 
     val inv = entsLive and removedStayDead and nlinkConsistent and rootAlive
+    // RFC 1813 3.3.8: UNCHECKED CREATE can set the size of an existing file.
+    // The generator selects existing regular files; creation is covered by
+    // applyCreate. A denied truncate preserves the contents and the name.
+    action applyCreateTruncate(d: Fid, n: Name, sz: int, c: Cred): bool = {
+        val f = fs.get(d).ents.get(n)
+        val status = if (canSearch(fs.get(d), c) and canWrite(fs.get(f), c)) OK
+                     else ERR_ACCES
+        all {
+            fs' = if (status == OK)
+                      fs.setBy(f, nd => nd.with("data", resizeBlocks(nd.data, sz)).with("xverf", 0))
+                  else fs,
+            removed' = removed,
+            nextFid' = nextFid,
+            devHits' = Set(),
+            lastOp' = OCreateTruncate({ dir: d, name: n, sizeBlocks: sz,
+                                        status: status, obj: f, cred: c }),
+        }
+    }
+
+    action createTruncate = {
+        nondet d = oneOf(dirs.filter(d => fs.get(d).ents.keys().exists(n =>
+            fs.get(fs.get(d).ents.get(n)).ftype == TReg)))
+        nondet n = oneOf(fs.get(d).ents.keys().filter(n =>
+            fs.get(fs.get(d).ents.get(n)).ftype == TReg))
+        nondet sz = oneOf(0.to(MAX_BLOCKS))
+        nondet c = oneOf(CREDS)
+        applyCreateTruncate(d, n, sz, c)
+    }
+
+    action setattrAs = {
+        nondet f = oneOf(files)
+        nondet c = oneOf(CREDS)
+        nondet sz = oneOf(0.to(MAX_BLOCKS))
+        nondet m = oneOf(Set(-1, 384, 438))
+        applySetattrAs(f, m, sz, 0, c)
+    }
+
+    action stepPermissions = any { create, write, read, setattrAs, createTruncate }
+
+    run authorizationRegression =
+        init
+            .then(applyCreate(ROOT, "file", Unchecked, 384, ROOT_CRED))
+            .then(applyWrite(1, 0, 1, 1, 2, ROOT_CRED))
+            .then(applySetattrAs(1, -1, 0, 0, ALICE))
+            .then(applySetattrAs(1, 438, 0, 0, ALICE))
+            .then(applyCreateTruncate(ROOT, "file", 0, ALICE))
+            .expect(fs.get(1).data == [1] and fs.get(1).mode == 384)
+            .then(applyRead(1, 0, 1, ROOT_CRED))
+            .then(applySetattr(1, 438, -1, 0))
+            .then(applyWrite(1, 0, 1, 2, 2, ALICE))
+            .then(applyRead(1, 0, 1, ROOT_CRED))
+            .then(applyCreateTruncate(ROOT, "file", 3, ROOT_CRED))
+            .expect(fs.get(1).data == [2, 0, 0])
+            .then(applyRead(1, 0, 3, ROOT_CRED))
+            .then(applyCreateTruncate(ROOT, "file", 1, ROOT_CRED))
+            .expect(fs.get(1).data == [2])
+            .then(applyRead(1, 0, 3, ROOT_CRED))
+            .then(applyCreateTruncate(ROOT, "file", 0, ROOT_CRED))
+            .expect(fs.get(1).data == [])
+            .then(applyRead(1, 0, 1, ROOT_CRED))
+
 }

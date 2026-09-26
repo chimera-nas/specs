@@ -1,0 +1,85 @@
+{
+  "family": "posix",
+  "description": "Linux ext4, mounted strictatime inside the kvm-test-base guest the runner boots, driven through real syscalls by harness/posix/posix_driver.py.  This is the reference POSIX implementation the model is written against, so its value is the reverse of the other cells': where this one needs a deviation, the suspicion falls on the model first.",
+  "traceStem": "ext4",
+
+  // Measured by `posix_replay.py --probe` against the guest's ext4 on
+  // 2026-09-02, not assumed.  --check-profile re-measures and fails on drift,
+  // which is what keeps these honest as the kernel moves.
+  "features": {
+    "copyRange": "supported",
+    "cloneRange": "unsupported",
+    "seekHole": "supported",
+    "root": "explore"
+  },
+
+  "policies": {
+    "gidFromParent": "unsupported",
+    "sgidInherit": "supported",
+    "writeClearsSetids": "supported",
+    "pwriteAppends": "supported",
+    "renameCtime": "supported",
+    "strictAtime": "supported",
+    "stickyWriteArm": "unsupported",
+    "chownSuppGroup": "supported",
+    "rmdirEnotempty": "supported",
+    "stickyEacces": "unsupported",
+    "unlinkDirIsdir": "supported",
+    // EAGAIN.  An earlier reading of the corpus flipped this to EACCES on the
+    // strength of an "expected 11, got 13" that was a permission failure
+    // rather than a lock conflict; the next run answered "expected 13, got 11"
+    // on both lockf and fcntl, which is the conflict case saying EAGAIN.
+    "lockEagain": "supported",
+    "dirSeekDomain": "supported",
+    "orphanCtime": "supported",
+    "symlinkAtime": "supported",
+    "renameKernelOrder": "supported"
+  },
+
+  // NONE, and the two attempts to enable some are worth recording because the
+  // measurement refuted both.
+  //
+  // PD15/PD15b/PD15c looked like exact matches: ext4 answers EEXIST where the
+  // model wants ENOTDIR or ELOOP for mkdir over an existing name with a
+  // trailing slash, which is what those ids describe.  Enabling them made the
+  // cell WORSE -- seven stat calls started failing that had passed -- because
+  // the ids do not gate the creating call.  They clear slashIsDir/slashFollows
+  // inside resolve(), which every path-taking op runs, so they say "ignore the
+  // trailing slash everywhere".  That is chimera's behaviour.  ext4 ignores it
+  // only where the name is being CREATED: stat("f/") on a non-directory is
+  // still ENOTDIR here, and a final symlink is still followed.
+  //
+  // So the id is too coarse to describe this kernel, and splitting the
+  // creating-call half out of it is the fix -- one a chimera cell would want
+  // too, since it would then say which half it has.  Left unenabled and
+  // failing until then, because an id that makes a cell report MORE
+  // disagreements than it has is worse than no id.
+  "deviations": [
+    "S-slash-create-eexist",
+    "S-utimens-mixed-owner"
+  ],
+
+  "batches": [
+    { "flavor": "step",            "steps": 128, "traces": 10, "seed": "0x1"   },
+    { "flavor": "step",            "steps": 128, "traces": 6,  "seed": "0x2"   },
+    { "flavor": "step",            "steps": 256, "traces": 3,  "seed": "0x100" },
+    { "flavor": "step",            "steps": 512, "traces": 2,  "seed": "0x5"   },
+    { "flavor": "stepNamespace",   "steps": 128, "traces": 4,  "seed": "0x1"   },
+    { "flavor": "stepNamespace",   "steps": 256, "traces": 2,  "seed": "0x9"   },
+    { "flavor": "stepDescriptors", "steps": 128, "traces": 4,  "seed": "0x1"   },
+    { "flavor": "stepMetadata",    "steps": 128, "traces": 4,  "seed": "0x1"   },
+    { "flavor": "stepDirs",        "steps": 128, "traces": 3,  "seed": "0x1"   },
+    { "flavor": "stepData",        "steps": 128, "traces": 4,  "seed": "0x1"   },
+    { "flavor": "stepLocks",       "steps": 128, "traces": 6,  "seed": "0x1"   },
+    { "flavor": "stepLocks",       "steps": 256, "traces": 3,  "seed": "0x7"   },
+    { "flavor": "stepPerms",       "steps": 128, "traces": 5,  "seed": "0x1"   },
+    { "flavor": "stepLinks",       "steps": 128, "traces": 5,  "seed": "0x1"   },
+    { "flavor": "stepFds",         "steps": 128, "traces": 5,  "seed": "0x1"   },
+    { "flavor": "stepTooLong",     "steps": 128, "traces": 4,  "seed": "0x1"   },
+    { "flavor": "stepPrefix",      "steps": 128, "traces": 5,  "seed": "0x1"   },
+    { "flavor": "stepFallocate",   "steps": 128, "traces": 4,  "seed": "0x1"   },
+    { "flavor": "stepVectored",    "steps": 128, "traces": 4,  "seed": "0x1"   },
+    { "flavor": "stepLockOps",     "steps": 128, "traces": 4,  "seed": "0x1"   },
+    { "flavor": "stepDevice",      "steps": 128, "traces": 3,  "seed": "0x1"   }
+  ]
+}
