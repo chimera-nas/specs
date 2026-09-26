@@ -131,9 +131,9 @@ module nfsauxRef {
         // SM_NOTIFY's fallback cannot tell monitored hosts apart.
         NSM_ADDRS_DISTINCT = false,
         NSM_INITIAL_STATE = 1,
-        // A re-LOCK of a range this owner holds is an idempotent retry,
-        // mode included, so an upgrade is a silent no-op.
-        NLM_UPGRADE_IS_NOOP = true,
+        // Upgrades recheck peer locks; accepted locks replace the owner's
+        // overlapping range, and partial unlock preserves outside fragments.
+        NLM_UPGRADE_IS_NOOP = false,
         // DOS share reservations are accepted, not enforced.
         NLM_SHARE_ENFORCED = false,
         // Lock state does not survive a restart, so there is nothing to
@@ -205,7 +205,7 @@ module nfsauxGrace {
         NSM_MON_FROM_LOCKS = true,
         NSM_ADDRS_DISTINCT = false,
         NSM_INITIAL_STATE = 1,
-        NLM_UPGRADE_IS_NOOP = true,
+        NLM_UPGRADE_IS_NOOP = false,
         NLM_SHARE_ENFORCED = false,
         // Only reclaim requests are admitted until the window closes.
         NLM_IN_GRACE = true,

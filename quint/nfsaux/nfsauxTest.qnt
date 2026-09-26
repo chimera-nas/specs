@@ -639,6 +639,23 @@ module nfsauxTestFull {
                                          asyncs: List(),
                                          reply: RNlm(NLM4_DENIED) }))
 
+    /// A partial unlock retains both outside fragments.
+    run partialUnlockTest =
+        init
+            .then(nlmLock(2, lk(ownerA, 0, 32, true), false, false))
+            .then(nlmUnlock(false, lk(ownerA, 8, 8, true)))
+            .expect(held == List(lk(ownerA, 0, 8, true),
+                                lk(ownerA, 16, 16, true)))
+
+    /// An uncontested upgrade replaces only its own overlapping range.
+    run successfulPartialUpgradeTest =
+        init
+            .then(nlmLock(2, lk(ownerA, 0, 32, false), false, false))
+            .then(nlmLock(2, lk(ownerA, 8, 8, true), false, false))
+            .expect(held == List(lk(ownerA, 0, 8, false),
+                                lk(ownerA, 16, 16, false),
+                                lk(ownerA, 8, 8, true)))
+
     /// Enforced share reservations: a deny-write holder blocks a writer,
     /// and UNSHARE lets it through.
     run shareEnforcedTest =

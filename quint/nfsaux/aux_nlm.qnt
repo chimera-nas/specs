@@ -169,22 +169,27 @@ module nlmProto {
         aOff >= bOff and
         (bLen == 0 or (aLen != 0 and aOff + aLen <= bOff + bLen))
 
-    /**
-     * UNLOCK's reach: the owner's locks on the file that lie WITHIN the
-     * named range are released, not only an exactly-equal one -- every real
-     * client unlocks [0, to-EOF) at close(2) to drop whatever it still
-     * holds on the file, and an exact-match unlock would leave those locks
-     * (and the open handles pinning their files) held forever.
-     * Containment only: a lock straddling the range boundary would need a
-     * split, which the server under test does not implement and no known
-     * client emits.
-     */
+    /// -1 represents an unbounded endpoint without an out-of-i64 literal,
+    /// keeping both Quint evaluators usable. Finite model ranges are small.
+    pure def rangeEnd(l: Lock): int =
+        if (posixLen(l.wireLen) == 0) -1 else l.offset + l.wireLen
+
     pure def dropWithin(held: List[Lock], probe: Lock): List[Lock] =
-        held.select(l => not(
-            l.file == probe.file and
-            sameOwner(l.owner, probe.owner) and
-            rangeWithin(l.offset, posixLen(l.wireLen),
-                        probe.offset, posixLen(probe.wireLen))))
+        held.foldl(List(), (acc, l) => {
+            val finish = rangeEnd(l)
+            val cutEnd = rangeEnd(probe)
+            if (l.file != probe.file or not(sameOwner(l.owner, probe.owner)) or
+                (cutEnd >= 0 and l.offset >= cutEnd) or
+                (finish >= 0 and probe.offset >= finish)) acc.append(l)
+            else {
+                val left = if (l.offset < probe.offset)
+                    acc.append(l.with("wireLen", probe.offset - l.offset)) else acc
+                if (cutEnd >= 0 and (finish < 0 or cutEnd < finish))
+                    left.append(l.with("offset", cutEnd).with("wireLen",
+                        if (finish < 0) 0 else finish - cutEnd))
+                else left
+            }
+        })
 
     // ------------------------------------------------------------------
     // LOCK
@@ -216,10 +221,10 @@ module nlmProto {
     /// queued instead (see `blockedAfterLock`), and an idempotent retry
     /// leaves the existing entry exactly as it was, mode included.
     pure def heldAfterLock(held: List[Lock], probe: Lock,
-                           status: int): List[Lock] =
+                           status: int, upgradeIsNoop: bool): List[Lock] =
         if (status != NLM4_GRANTED) held
-        else if (holdsExact(held, probe)) held
-        else held.append(probe)
+        else if (upgradeIsNoop and holdsExact(held, probe)) held
+        else dropWithin(held, probe).append(probe)
 
     // ------------------------------------------------------------------
     // The blocking queue
@@ -261,7 +266,7 @@ module nlmProto {
                               queue: acc.queue.append(q),
                               granted: acc.granted }
                         else
-                            { held: acc.held.append(q.lock),
+                            { held: dropWithin(acc.held, q.lock).append(q.lock),
                               queue: acc.queue,
                               granted: acc.granted.append(q) })
 
