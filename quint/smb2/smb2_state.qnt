@@ -203,9 +203,10 @@ module smb2state {
     // SMB-only bits (H caching, delete share, delete-on-close, the caching
     // grant this handle holds and its break progress).
     type Open = {
-        // Original ClientGuid survives a non-lease reconnect by another client.
-        clientTag: int,
         session: SessionId,
+        // Open.ClientGuid is fixed at creation. A non-leased durable open
+        // may reconnect on another client without changing this identity.
+        clientTag: int,
         tree: TreeId,
         file: Ino,
         // the (dir,name) this handle was opened under, so delete-on-close
@@ -288,8 +289,8 @@ module smb2state {
     // have had to break it (probe D7 / D7b) -- so leaving it in the live map
     // would make it conflict with openers the server lets through.
     //
-    // `owner` is the ClientGuid tag (Session.clientTag) of the client that owns
-    // it; `hadLease` and `leaseKey` record whether the surviving handle held an
+    // `owner` is the original Open.ClientGuid tag, retained across reconnects;
+    // `hadLease` and `leaseKey` record whether the surviving handle held an
     // RqLs lease, because the ClientGuid / lease-key / file-name reconnect
     // checks of 3.3.5.9.7 apply ONLY to a leased handle.
     //
@@ -429,7 +430,7 @@ module smb2state {
             sdb.trees.get(t).session == sess)
         val deadOpens = sdb.opens.keys().filter(f =>
             sdb.opens.get(f).session == sess)
-        deadOpens.fold(sdb, (acc, f) => doCloseRaw(acc, f))
+        deadOpens.fold(sdb, (acc, f) => doClose(acc, f).sdb2)
            .with("trees", sdb.trees.keys().exclude(deadTrees)
                  .mapBy(t => sdb.trees.get(t)))
            .with("sessions", smapDrop(sdb.sessions, sess))
@@ -448,7 +449,7 @@ module smb2state {
     pure def doTreeDisconnect(sdb: StateDB, tree: TreeId): StateDB = {
         val deadOpens = sdb.opens.keys().filter(f =>
             sdb.opens.get(f).tree == tree)
-        deadOpens.fold(sdb, (acc, f) => doCloseRaw(acc, f))
+        deadOpens.fold(sdb, (acc, f) => doClose(acc, f).sdb2)
            .with("trees", smapDrop(sdb.trees, tree))
     }
 
@@ -509,8 +510,8 @@ module smb2state {
         val fid = sdb.nextFile
         { sdb2: sdb
               .with("opens", sdb.opens.put(fid, {
-                  clientTag: sdb.sessions.get(sess).clientTag,
-                  session: sess, tree: tree, file: f, dir: dir, name: name,
+                  session: sess, clientTag: sdb.sessions.get(sess).clientTag,
+                  tree: tree, file: f, dir: dir, name: name,
                   granted: granted, denied: deny, caching: CNone,
                   breaking: false, breakTo: CNone,
                   deleteOnClose: delOnClose, modified: false,
@@ -608,7 +609,10 @@ module smb2state {
             { sdb2: StateDB, gone: Ino } = {
         val o = sdb.opens.get(fid)
         val isLast = opensOfFile(sdb, o.file).exclude(Set(fid)).size() == 0
-        if (isLast and sdb.deletePending.contains(o.file) and
+        val marked = if (o.deleteOnClose)
+                         sdb.with("deletePending", sdb.deletePending.union(Set(o.file)))
+                     else sdb
+        if (isLast and marked.deletePending.contains(o.file) and
             fsHasEnt(sdb.fs, o.dir, o.name) and
             fsChild(sdb.fs, o.dir, o.name) == o.file) {
             // last close of a delete-pending file: unlink now (no pins left).
@@ -625,18 +629,16 @@ module smb2state {
                                 sdb.deletePending.exclude(Set(o.file)))
             { sdb2: doCloseRaw(sdb1, fid), gone: o.file }
         } else {
-            { sdb2: doCloseRaw(sdb, fid), gone: -1 }
+            { sdb2: doCloseRaw(marked, fid), gone: -1 }
         }
     }
 
-    // SetDisposition (MS-FSA 2.1.5.14.2 SetFileDispositionInformation):
-    // arm or disarm delete-on-close on a handle and mark/unmark the inode
-    // delete-pending.
+    // FileDispositionInformation (MS-FSA 2.1.5.15.3) changes Link.IsDeleted,
+    // not Open.Mode.FILE_DELETE_ON_CLOSE. The latter is the CREATE option
+    // preserved in deleteOnClose and re-marks the link when that open closes.
     pure def doSetDisposition(sdb: StateDB, fid: FileId, del: bool): StateDB = {
         val o = sdb.opens.get(fid)
-        sdb.with("opens", sdb.opens.setBy(fid, x =>
-                x.with("deleteOnClose", del)))
-           .with("deletePending",
+        sdb.with("deletePending",
                  if (del) sdb.deletePending.union(Set(o.file))
                  else sdb.deletePending.exclude(Set(o.file)))
     }
@@ -780,16 +782,21 @@ module smb2state {
     pure def doMarkModified(sdb: StateDB, fid: FileId): StateDB =
         sdb.with("opens", sdb.opens.setBy(fid, o => o.with("modified", true)))
 
-    // Set (or replace) the caching grant on a handle.
+    // A lease belongs to the client/key, not to one member open.  Joining or
+    // upgrading it updates every established member, including a member whose
+    // previous lease state was NONE.  Otherwise the oldest representative can
+    // suppress a real break of a newer member's read cache.
     pure def doSetCaching(sdb: StateDB, fid: FileId, c: Caching): StateDB = {
-        val o = sdb.opens.get(fid)
-        val members = if (isLeaseGrant(c)) sdb.opens.keys().filter(f => {
-            val peer = sdb.opens.get(f)
-            peer.file == o.file and peer.clientTag == o.clientTag and
-            isLeaseGrant(peer.caching) and leaseKeyOf(peer.caching) == leaseKeyOf(c)
-        }).union(Set(fid)) else Set(fid)
-        members.fold(sdb, (a, f) =>
-            a.with("opens", a.opens.setBy(f, p => p.with("caching", c))))
+        val target = sdb.opens.get(fid).with("caching", c)
+        sdb.with("opens", sdb.opens.keys().mapBy(k => {
+            val peer = sdb.opens.get(k)
+            if (k == fid or (peer.file == target.file and
+                            isLeaseGrantEstablished(c) and
+                            isLeaseGrantEstablished(peer.caching) and
+                            sameGrant(peer, target)))
+                peer.with("caching", c)
+            else peer
+        }))
     }
 
     pure def cachingLevelNone(c: Caching): bool = bitsEmpty(cachBits(c))
@@ -829,21 +836,10 @@ module smb2state {
     // the harness gives each connection its own ClientGuid to match.
     // Is this open VISIBLE to the fresh-grant arbitration?
     //
-    // An attribute-only open (DesiredAccess with no R/W/D) holds no share-mode
-    // rights and registers an INERT share reservation -- granted = 0 and
-    // denied = 0 (M-5, smb_proc_create.c "Attribute-only opens hold no
-    // share-mode rights and impose no deny") -- and vfs_state's sole-open cap
-    // skips inert entries outright ("Pure attribute-only opens take no share
-    // reservation, so they do not preclude an oplock").  So such a peer caps
-    // nothing on the wire: probe O12[20]-O12[25] measure a full BATCH oplock
-    // and a full RWH lease handed out behind one.
-    //
-    // MS-FSA 2.1.5.18.1 counts Opens on the stream, not share reservations, so
-    // that exemption is a chimera deviation (DEVIATIONS-SMB.md S-3) and this
-    // predicate is deliberately NOT used to decide whether a WRITE cache may be
-    // granted -- the model stays spec-first there and caps against every peer
-    // open.  It is used only for the HANDLE-cap rule, which is a discretionary
-    // (grant-LESS) choice, and by the generator's guard.
+    // Metadata-only opens hold no share-mode rights or denies. They still
+    // count for the legacy exclusive and NO_OPLOCK sole-open rules. This
+    // predicate only controls the discretionary HANDLE-cache cap against
+    // unkeyed data opens; it does not define those sole-open checks.
     pure def openVisibleToGrant(o: Open): bool =
         o.granted.r or o.granted.w or o.granted.d
 
@@ -899,18 +895,8 @@ module smb2state {
 
     // The notification set a break over `holders` puts on the wire (one per
     // GRANT, so coalesced same-key opens produce a single note).
-    // `oplockNoAck` forces the legacy-oplock notes to report "no ack needed".
-    // A TWO-STEP break of one op (a truncating open: the pre-share handle
-    // recall, then break_on_write) settles a legacy oplock outright: the server
-    // stamps the post-break level onto the open at the first step
-    // (`open_file->oplock_level = new_level`), so the second step recomputes
-    // ack_required against the ALREADY-LOWERED level and gets false, which
-    // clears grant->break_ack_required and settles the lease.  An RqLs lease
-    // recomputes from the grant's granted mode, which the ack has not yet
-    // lowered, so it still waits.
-    pure def breakNotesEx(sdb: StateDB, f: Ino, holders: Set[FileId],
-                          retain: LeaseState,
-                          oplockNoAck: bool): Set[BreakNote] =
+    pure def breakNotes(sdb: StateDB, f: Ino, holders: Set[FileId],
+                        retain: LeaseState): Set[BreakNote] =
         holders.filter(fid => isGrantRep(sdb, f, fid)).map(fid => {
             val o = sdb.opens.get(fid)
             val cur = cachBits(o.caching)
@@ -922,14 +908,11 @@ module smb2state {
               curState: leaseWire(cur),
               newState: leaseWire(nb),
               newLevel: oplockWire(oplockOfBits(nb)),
-              ackReq: breakNeedsAck(o.caching, nb) and
-                      not(oplockNoAck and not(isLeaseGrant(o.caching))),
+              ackReq: breakNeedsAck(o.caching, nb),
               epoch: match bumped { | CLease(x) => x.epoch | _ => 0 } }
         })
 
-    pure def breakNotes(sdb: StateDB, f: Ino, holders: Set[FileId],
-                        retain: LeaseState): Set[BreakNote] =
-        breakNotesEx(sdb, f, holders, retain, false)
+
 
     // Apply a break to one holder: an ack-required break marks the grant
     // breaking and records the retained level; a no-ack break settles at once.
@@ -1025,7 +1008,6 @@ module smb2state {
     pure def doDisconnect(sdb: StateDB, sess: SessionId): StateDB = {
         val mine = sdb.opens.keys().filter(f => sdb.opens.get(f).session == sess)
         val dur = mine.filter(f => sdb.opens.get(f).durable.on)
-        val tag = sdb.sessions.get(sess).clientTag
         // Park the durable ones first (they leave `opens` without any of
         // doClose's unlink/reap side effects -- the file stays open).
         val sdb1 = dur.fold(sdb, (a, f) => {
