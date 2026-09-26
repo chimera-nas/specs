@@ -597,6 +597,38 @@ module smb2Test {
                                x.st.r and not(x.st.w) and not(x.st.h)
                 | _ => false })
 
+    // Promotion of an existing lease requests the entire new state. If an
+    // unkeyed peer prevents RWH, the old NONE state and epoch are retained;
+    // a subsequent R-only request can succeed without that peer closing.
+    run leasePromotionRequiresRequestedStateTest =
+        boot2Run
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RW,
+                                        SHARE_RWD, false,
+                                        OrLease({ key: 5, r: true, w: false,
+                                                  h: false, v2: true,
+                                                  epoch: 1 })))))
+            .then(runM(one(1, 1, create(ROOT, "a", DispOpen, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .then(runM(one(1, 1, CWrite({ fid: FidRef(1), off: 0, len: 1,
+                                          pat: 7 }))))
+            .expect(cachBits(sdb.opens.get(0).caching) == BITS_NONE)
+            .then(runM(one(0, 0, create(ROOT, "a", DispOpen, ACCESS_RW,
+                                        SHARE_RWD, false,
+                                        OrLease({ key: 5, r: true, w: true,
+                                                  h: true, v2: true,
+                                                  epoch: 1 })))))
+            .expect(match asCreate(resAt(0)).caching {
+                | CLease(x) => x.st == BITS_NONE and x.epoch == 3
+                | _ => false })
+            .then(runM(one(0, 0, create(ROOT, "a", DispOpen, ACCESS_RW,
+                                        SHARE_RWD, false,
+                                        OrLease({ key: 5, r: true, w: false,
+                                                  h: false, v2: true,
+                                                  epoch: 1 })))))
+            .expect(match asCreate(resAt(0)).caching {
+                | CLease(x) => x.st == BITS_R and x.epoch == 4
+                | _ => false })
+
     // A lease grants RWH to a sole opener; write caching (W) is only handed
     // to a sole opener (discretion).  A v2 lease is granted at the client's
     // epoch + 1 (MS-SMB2 3.3.5.9.11; probe O7 observed epoch 2 for a request
@@ -720,6 +752,117 @@ module smb2Test {
                 stCapsRespected(cached, false, true)
             })
 
+    // An upgrade from a still-established NONE lease changes the oldest
+    // member too, so break notification selection cannot lose the new grant.
+    run leaseCoalesceUpgradeRepresentativeTest =
+        boot2Run
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RW,
+                                        SHARE_RWD, false,
+                                        OrLease({ key: 5, r: true, w: false,
+                                                  h: false, v2: true,
+                                                  epoch: 1 })))))
+            .then(runM(one(0, 0, create(ROOT, "a", DispOpen, ACCESS_R,
+                                        SHARE_RWD, false,
+                                        OrLease({ key: 5, r: true, w: false,
+                                                  h: false, v2: true,
+                                                  epoch: 1 })))))
+            .expect({
+                val none = withBits(sdb.opens.get(0).caching, BITS_NONE)
+                val cleared = doSetCaching(sdb, 0, none)
+                val upgraded = doSetCaching(cleared, 1, withBits(none, BITS_R))
+                val holders = breakHolders(upgraded, sdb.opens.get(0).file,
+                                           -1, BITS_RWH, BITS_NONE, false,
+                                           -1, 1)
+                cachBits(upgraded.opens.get(0).caching) == BITS_R and
+                cachBits(upgraded.opens.get(1).caching) == BITS_R and
+                breakNotes(upgraded, sdb.opens.get(0).file, holders,
+                           BITS_NONE).size() == 1
+            })
+
+    // An existing RH lease can upgrade despite a metadata-only unkeyed peer;
+    // the NO_OPLOCK sole-open rule does not govern this granular transition.
+    run leaseUpgradeWithMetadataPeerTest =
+        boot2Run
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_H,
+                                        SHARE_RWD, false,
+                                        OrLease({ key: 5, r: true, w: false,
+                                                  h: true, v2: false,
+                                                  epoch: 0 })))))
+            .then(runM(one(0, 0, create(ROOT, "a", DispOpen, ACCESS_H,
+                                        SHARE_RWD, false, OrNone))))
+            .then(runM(one(0, 0, create(ROOT, "a", DispOpen, ACCESS_RW,
+                                        SHARE_RWD, false,
+                                        OrLease({ key: 5, r: true, w: true,
+                                                  h: true, v2: true,
+                                                  epoch: 1 })))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .expect(cachBits(asCreate(resAt(0)).caching) == BITS_RWH)
+            .expect(cachBits(sdb.opens.get(0).caching) == BITS_RWH)
+            .expect(asCreate(resAt(0)).breaks.size() == 0)
+
+    // A metadata-only peer leaves RW caching intact; legacy shared fallback
+    // must not grant LEVEL_II alongside that exclusive cache.
+    run metadataOplockBehindWriteLeaseTest =
+        boot2Run
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RW,
+                                        SHARE_RWD, false,
+                                        OrLease({ key: 5, r: true, w: true,
+                                                  h: false, v2: true,
+                                                  epoch: 1 })))))
+            .then(runM(one(0, 0, create(ROOT, "a", DispOpen, ACCESS_H,
+                                        SHARE_RWD, false, OrBatch))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .expect(asCreate(resAt(0)).caching == CNone)
+            .expect(asCreate(resAt(0)).breaks.size() == 0)
+            .then(runM(one(1, 1, create(ROOT, "a", DispOpen, ACCESS_H,
+                                        SHARE_RWD, false, OrLevelII))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .expect(asCreate(resAt(0)).caching == CNone)
+            .expect(asCreate(resAt(0)).breaks.size() == 0)
+            .expect(cachBits(sdb.opens.get(0).caching) == BITS_RW)
+
+    run metadataLeaseBehindWriteLeaseTest =
+        boot2Run
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_H,
+                                        SHARE_RWD, false,
+                                        OrLease({ key: 5, r: true, w: true,
+                                                  h: true, v2: true,
+                                                  epoch: 1 })))))
+            .expect(cachBits(sdb.opens.get(0).caching) == BITS_RWH)
+            .then(runM(one(1, 1, create(ROOT, "a", DispOpen, ACCESS_H,
+                                        SHARE_RWD, false,
+                                        OrLease({ key: 6, r: true, w: false,
+                                                  h: true, v2: true,
+                                                  epoch: 1 })))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .expect(cachBits(asCreate(resAt(0)).caching) == BITS_NONE)
+            .expect(asCreate(resAt(0)).breaks.size() == 0)
+            .expect(cachBits(sdb.opens.get(0).caching) == BITS_RWH)
+
+    // A new grant is published only after a parked CREATE's break completes.
+    // Raw exclusive caching must not suppress its shared fallback after ACK.
+    run grantAfterExclusiveBreakTest =
+        boot2Run
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_H,
+                                        SHARE_RWD, false, OrExclusive))))
+            .then(runM(one(1, 1, create(ROOT, "a", DispOpen, ACCESS_D,
+                                        SHARE_RWD, false, OrExclusive))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .expect(asCreate(resAt(0)).parked)
+            .expect(asCreate(resAt(0)).caching == COplock(OpLevelII))
+            .expect(asCreate(resAt(0)).breaks.size() == 1)
+            .then(runM(one(0, 0, create(ROOT, "b", DispCreate, ACCESS_H,
+                                        SHARE_RWD, false, OrExclusive))))
+            .then(runM(one(1, 1, create(ROOT, "b", DispOpen, ACCESS_R,
+                                        SHARE_RWD, false,
+                                        OrLease({ key: 9, r: true, w: false,
+                                                  h: false, v2: true,
+                                                  epoch: 1 })))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .expect(asCreate(resAt(0)).parked)
+            .expect(cachBits(asCreate(resAt(0)).caching) == BITS_R)
+            .expect(asCreate(resAt(0)).breaks.size() == 1)
+
     // Two opens under ONE lease key coalesce onto a single grant: the second
     // reports the first's state and epoch, never reduces it, and the pair
     // breaks ONCE (MS-SMB2 3.3.5.9.8/.11; probe O7).
@@ -790,6 +933,38 @@ module smb2Test {
             // An ack for a settled lease -> STATUS_UNSUCCESSFUL.
             .then(runM(one(0, 0, ackKeep(0, true, BITS_NONE))))
             .expect(stAt(0) == ST_UNSUCCESSFUL)
+
+    run batchOverwriteRequiresRealAckTest =
+        boot2Run
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RW,
+                                        SHARE_RWD, false, OrBatch))))
+            .then(runM(one(1, 1, create(ROOT, "a", DispOverwrite, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(stAt(0) == ST_SUCCESS and asCreate(resAt(0)).parked)
+            .expect(asCreate(resAt(0)).breaks.exists(n => n.ackReq))
+            .expect(sdb.opens.get(0).breaking)
+            .then(stepLease)
+            .expect(match lastOp {
+                | LMsg(x) => match x.msg.cmds.nth(0) {
+                    | CBreakAck(a) => a.fid == FidRef(0)
+                    | _ => false
+                }
+                | _ => false
+            })
+
+    run batchShareConflictWaitsForAckTest =
+        boot2Run
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RW,
+                                        SHARE_NONE, false, OrBatch))))
+            .then(runM(one(1, 1, create(ROOT, "a", DispOpen, ACCESS_R,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(stAt(0) == ST_SHARING_VIOLATION)
+            .expect(asCreate(resAt(0)).parked)
+            .expect(sdb.opens.get(0).breaking)
+            // The bounded wire generator must service the outstanding
+            // break before observing the deferred operation's effects.
+            .then(stepLease)
+            .expect(match resAt(0) { | RBreakAck(_) => true | _ => false })
 
     // A share-CONFLICTING open behind a handle-caching holder is refused, but
     // the holder is STILL told to relinquish its handle cache so a later retry
@@ -1130,10 +1305,7 @@ module smb2Test {
     // A rename onto the handle's OWN current name is a no-op SUCCESS, not a
     // collision: MS-FSA 2.1.5.14.11.1 guards the OBJECT_NAME_COLLISION branch
     // on the target link being a DIFFERENT link (which is what makes a
-    // case-only rename expressible at all).  chimera answers
-    // OBJECT_NAME_COLLISION here -- DEVIATIONS-SMB.md Q-14, unresolved, which
-    // is why the generated corpus never draws this shape.  Pinned so the model
-    // rule cannot drift while the question is open.
+    // case-only rename expressible at all).
     run renameToSelfTest =
         bootRun
             .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RWD,
@@ -1178,15 +1350,115 @@ module smb2Test {
             .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RWD,
                                         SHARE_RWD, true, OrNone))))
             .expect(stAt(0) == ST_SUCCESS and
-                    sdb.deletePending.contains(asCreate(resAt(0)).ino))
-            // A concurrent OPEN observes the pending delete -> DELETE_PENDING.
+                    not(sdb.deletePending.contains(asCreate(resAt(0)).ino)))
+            // CREATE-DOC alone does not mark Link.IsDeleted.
             .then(runM(one(1, 1, create(ROOT, "a", DispOpen, ACCESS_R,
                                         SHARE_RWD, false, OrNone))))
-            .expect(stAt(0) == ST_DELETE_PENDING)
-            // Closing the delete-on-close handle unlinks the file.
+            .expect(stAt(0) == ST_SUCCESS)
+            // The DOC close marks pending but cannot unlink the peer's open.
             .then(runM(one(0, 0, CClose(FidRef(0)))))
+            .expect(stAt(0) == ST_SUCCESS and sdb.deletePending.contains(1))
+            .then(runM(one(0, 0, create(ROOT, "a", DispOpen, ACCESS_R,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(stAt(0) == ST_DELETE_PENDING)
+            .then(runM(one(1, 1, CClose(FidRef(1)))))
             .expect(stAt(0) == ST_SUCCESS)
             .expect(not(fsLive(sdb.fs, 1)) and sdb.fs.removed.contains(1))
+
+    // Plain disposition clear cannot remove the CREATE delete-on-close mode
+    // (MS-FSA FileDispositionInformation and Closing an Open).
+    run dispositionClearPreservesCreateModeTest =
+        bootRun
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RWD,
+                                        SHARE_RWD, true, OrNone))))
+            .then(runM(one(0, 0, CSetDisposition({ fid: FidRef(0), del: true }))))
+            .then(runM(one(0, 0, CSetDisposition({ fid: FidRef(0), del: false }))))
+            .expect(stAt(0) == ST_SUCCESS and not(sdb.deletePending.contains(1))
+                    and sdb.opens.get(0).deleteOnClose)
+            .then(runM(one(0, 0, CClose(FidRef(0)))))
+            .expect(stAt(0) == ST_SUCCESS and not(fsHasEnt(sdb.fs, ROOT, "a")))
+
+    // A plain SET true does not create a per-open mode either: a peer may
+    // clear the link mark, and the original setter's CLOSE must not re-arm it.
+    run peerDispositionClearDoesNotRearmTest =
+        boot2Run
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RWD,
+                                        SHARE_RWD, false, OrNone))))
+            .then(runM(one(1, 1, create(ROOT, "a", DispOpen, ACCESS_RWD,
+                                        SHARE_RWD, false, OrNone))))
+            .then(runM(one(0, 0, CSetDisposition({ fid: FidRef(0), del: true }))))
+            .expect(stAt(0) == ST_SUCCESS and not(sdb.opens.get(0).deleteOnClose))
+            .then(runM(one(1, 1, CSetDisposition({ fid: FidRef(1), del: false }))))
+            .then(runM(one(0, 0, CClose(FidRef(0)))))
+            .expect(stAt(0) == ST_SUCCESS and not(sdb.deletePending.contains(1)))
+            .then(runM(one(1, 1, CClose(FidRef(1)))))
+            .expect(stAt(0) == ST_SUCCESS and fsHasEnt(sdb.fs, ROOT, "a"))
+
+    run logoffClosesDeleteOnCloseTest =
+        boot2Run
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RWD,
+                                        SHARE_RWD, true, OrNone))))
+            .then(runM(one(1, 1, create(ROOT, "a", DispOpen, ACCESS_R,
+                                        SHARE_RWD, false, OrNone))))
+            .then(runM(one(0, 0, CLogoff)))
+            .expect(stAt(0) == ST_SUCCESS and sdb.deletePending.contains(1))
+            .expect(fsHasEnt(sdb.fs, ROOT, "a"))
+            .then(runM(one(1, 1, CTreeDisconnect)))
+            .expect(stAt(0) == ST_SUCCESS and not(fsHasEnt(sdb.fs, ROOT, "a")))
+
+    // Marking an existing link pending forbids every successful existing-file
+    // CREATE disposition before share arbitration. A create-only collision
+    // remains a collision and a refused overwrite leaves bytes intact.
+    run pendingCreateDispositionTest =
+        boot2Run
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RWD,
+                                        SHARE_NONE, false, OrNone))))
+            .then(runM(one(0, 0, CWrite({ fid: FidRef(0), off: 0, len: 2,
+                                          pat: 3 }))))
+            .then(runM(one(0, 0, CSetDisposition({ fid: FidRef(0), del: true }))))
+            .then(runM(one(1, 1, create(ROOT, "a", DispOpen, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(stAt(0) == ST_DELETE_PENDING)
+            .then(runM(one(1, 1, create(ROOT, "a", DispOverwrite, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(stAt(0) == ST_DELETE_PENDING)
+            .then(runM(one(1, 1, create(ROOT, "a", DispOverwriteIf, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(stAt(0) == ST_DELETE_PENDING)
+            .then(runM(one(1, 1, create(ROOT, "a", DispSupersede, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(stAt(0) == ST_DELETE_PENDING)
+            .then(runM(one(1, 1, create(ROOT, "a", DispCreate, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .expect(stAt(0) == ST_OBJECT_NAME_COLLISION)
+            .expect(fsGet(sdb.fs, 1).sizeBlocks == 2 and sdb.opens.keys().size() == 1)
+
+    // MS-FSA FileRenameInformation tests IsDeleted before exact-name success
+    // and before probing a colliding destination. Clearing disposition
+    // restores normal rename behavior without changing either name earlier.
+    run pendingRenamePrecedenceTest =
+        bootRun
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RWD,
+                                        SHARE_RWD, false, OrNone))))
+            .then(runM(one(0, 0, create(ROOT, "b", DispCreate, ACCESS_RWD,
+                                        SHARE_RWD, false, OrNone))))
+            .then(runM(one(0, 0, CSetDisposition({ fid: FidRef(0), del: true }))))
+            .then(runM(one(0, 0, CSetRename({ fid: FidRef(0), newdir: ROOT,
+                                              newname: "a" }))))
+            .expect(stAt(0) == ST_ACCESS_DENIED)
+            .then(runM(one(0, 0, CSetRename({ fid: FidRef(0), newdir: ROOT,
+                                              newname: "b" }))))
+            .expect(stAt(0) == ST_ACCESS_DENIED)
+            .then(runM(one(0, 0, CSetRename({ fid: FidRef(0), newdir: ROOT,
+                                              newname: "c" }))))
+            .expect(stAt(0) == ST_ACCESS_DENIED and
+                    fsChild(sdb.fs, ROOT, "a") == 1 and
+                    fsChild(sdb.fs, ROOT, "b") == 2 and
+                    not(fsHasEnt(sdb.fs, ROOT, "c")))
+            .then(runM(one(0, 0, CSetDisposition({ fid: FidRef(0), del: false }))))
+            .then(runM(one(0, 0, CSetRename({ fid: FidRef(0), newdir: ROOT,
+                                              newname: "a" }))))
+            .expect(stAt(0) == ST_SUCCESS)
 
     // Delete-deferred-to-last-close (MS-FSA 2.1.5.4): with delete-disposition
     // armed and a second handle still open, the directory entry persists
@@ -1396,9 +1668,8 @@ module smb2Test {
     // with W -- is refused when "Open.File.OpenList contains more than one Open
     // whose Stream is the same as Open.Stream, and NO_OPLOCK is present in
     // Open.Stream.Oplock.State".  No OplockKey and no client-identity exemption
-    // appears in that clause, so the model caps W against EVERY peer open, and
-    // chimera's two exemptions stay in DEVIATIONS-SMB.md (S-3) rather than in
-    // the model.
+    // appears in that clause, so the model caps a fresh W grant against every
+    // peer open, including metadata-only and same-client peers.
     //
     // DISCRETION (MS-SMB2 3.3.5.9 -- granting LESS is always allowed), pinned
     // to what probe O12 measured on the wire:
@@ -1480,7 +1751,7 @@ module smb2Test {
                 | CLease(x) => x.st.r and x.st.h
                 | _ => false })
             // But it is still an Open on the stream, so the W bit is refused:
-            // the model does NOT copy chimera's inert-peer exemption (S-3).
+            // an attribute-only peer is still counted.
             .then(runM(one(0, 0, create(ROOT, "d", DispOpen, ACCESS_R,
                                         SHARE_RWD, false,
                                         OrLease({ key: 7, r: true, w: true,
@@ -1491,56 +1762,25 @@ module smb2Test {
                 | CLease(x) => not(x.st.w)
                 | _ => false })
 
-    // The generator guard that keeps the S-3 shapes out of the corpus, pinned
-    // in both directions so it can neither rot open nor quietly widen to the
-    // "any peer open at all" refusal it replaced.
-    run grantAgreedScopeTest =
+    // Same-session and metadata-only peers both count against the legacy
+    // sole-open condition, and a new lease cannot add write caching there.
+    run soleOpenCountsMetadataAndSameSessionTest =
         boot2Run
-            // Nothing open: every request shape is generatable.
-            .expect(grantAgreed("a", OrBatch, 0))
-            .expect(grantAgreed("a", OrLease({ key: 1, r: true, w: true,
-                                               h: true, v2: true, epoch: 1 }), 0))
-            // A peer open by ANOTHER session is the agreed shape: chimera and
-            // the model both withhold the write cache, so it is generatable.
-            .then(runM(one(1, 1, create(ROOT, "b", DispCreate, ACCESS_R,
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_R,
                                         SHARE_RWD, false, OrNone))))
+            .then(runM(one(0, 0, create(ROOT, "a", DispOpen, ACCESS_R,
+                                        SHARE_RWD, false, OrBatch))))
             .expect(stAt(0) == ST_SUCCESS)
-            .expect(grantAgreed("b", OrBatch, 0))
-            .expect(grantAgreed("b", OrExclusive, 0))
-            .expect(grantAgreed("b", OrLease({ key: 1, r: true, w: true,
-                                               h: true, v2: true, epoch: 1 }), 0))
-            // A peer open by the SAME session is S-3 for a LEGACY oplock
-            // (chimera grants the full BATCH there) but not for a lease
-            // (chimera caps it to R), so only the legacy request is suppressed.
-            .then(runM(one(0, 0, create(ROOT, "e", DispCreate, ACCESS_R,
+            .expect(not(cachBits(asCreate(resAt(0)).caching).w))
+            .then(runM(one(1, 1, create(ROOT, "b", DispCreate, ACCESS_H,
                                         SHARE_RWD, false, OrNone))))
+            .then(runM(one(0, 0, create(ROOT, "b", DispOpen, ACCESS_R,
+                                        SHARE_RWD, false,
+                                        OrLease({ key: 1, r: true, w: true,
+                                                  h: true, v2: true,
+                                                  epoch: 1 })))))
             .expect(stAt(0) == ST_SUCCESS)
-            .expect(not(grantAgreed("e", OrBatch, 0)))
-            .expect(not(grantAgreed("e", OrExclusive, 0)))
-            .expect(grantAgreed("e", OrLease({ key: 1, r: true, w: true,
-                                               h: true, v2: true, epoch: 1 }), 0))
-            // An ATTRIBUTE-ONLY peer is invisible to chimera's cap, so a
-            // write-caching request behind one is suppressed for both kinds.
-            .then(runM(one(1, 1, create(ROOT, "f", DispCreate, ACCESS_H,
-                                        SHARE_RWD, false, OrNone))))
-            .expect(stAt(0) == ST_SUCCESS)
-            .expect(not(grantAgreed("f", OrBatch, 0)))
-            .expect(not(grantAgreed("f", OrLease({ key: 1, r: true, w: true,
-                                                   h: true, v2: true,
-                                                   epoch: 1 }), 0)))
-            // A request that asks for no write cache is never suppressed: a
-            // shared oplock (MS-FSA 2.1.5.18.2) has no sole-Open condition.
-            .expect(grantAgreed("f", OrLevelII, 0))
-            .expect(grantAgreed("f", OrNone, 0))
-            .expect(grantAgreed("f", OrLease({ key: 1, r: true, w: false,
-                                               h: true, v2: true, epoch: 1 }), 0))
-            .expect(grantAgreed("e", OrLevelII, 0))
-            // Once a peer that DOES cap joins the attribute-only one, the
-            // shape is agreed again and generation resumes.
-            .then(runM(one(1, 1, create(ROOT, "f", DispOpen, ACCESS_R,
-                                        SHARE_RWD, false, OrNone))))
-            .expect(stAt(0) == ST_SUCCESS)
-            .expect(grantAgreed("f", OrBatch, 0))
+            .expect(not(cachBits(asCreate(resAt(0)).caching).w))
 
     // ------------------------------------------------------------------
     // Durable handles (MS-SMB2 3.3.5.9.6/.10 request, 3.3.7.1 park,
@@ -1570,6 +1810,41 @@ module smb2Test {
                   durable: DurC({ v2: v2, fid: fid, guid: guid,
                                   persistent: persistent, alsoQ: alsoQ,
                                   withName: withName }) })
+
+    // Lease tables belong to ClientGuid across live sessions and disconnect.
+    // A failed wrong-file request must not create the missing name.
+    val bindingLease = OrLease({ key: 17, r: true, w: false, h: true,
+                                v2: true, epoch: 1 })
+    run leaseBindingAcrossSessionsTest =
+        bootRun
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RW,
+                SHARE_RWD, false, bindingLease))))
+            .then(runM({ sess: -1, tree: -1, related: false, cs: 0, replay: false,
+                cmds: [ CReconnect({ prev: 0 }) ] }))
+            .then(runM(one(1, -1, CTreeConnect({ share: 1 }))))
+            .then(runM(one(1, 1, create(ROOT, "b", DispOpenIf, ACCESS_RW,
+                SHARE_RWD, false, bindingLease))))
+            .expect(stAt(0) == ST_INVALID_PARAMETER)
+            .expect(not(sdb.fs.inodes.get(ROOT).ents.keys().contains("b")))
+            .then(runM(one(1, 1, create(ROOT, "a", DispOpen, ACCESS_RW,
+                SHARE_RWD, false, bindingLease))))
+            .expect(stAt(0) == ST_SUCCESS)
+
+    run leaseBindingWhileParkedTest =
+        bootRun
+            .then(runM(one(0, 0, createDurQ("a", DispCreate, ACCESS_RW,
+                SHARE_RWD, bindingLease, true, 17))))
+            .expect(stAt(0) == ST_SUCCESS and asCreate(resAt(0)).durable)
+            .then(runM(one(0, -1, CDisconnect)))
+            .expect(sdb.parked.keys() == Set(0))
+            .then(runM({ sess: -1, tree: -1, related: false, cs: 0, replay: false,
+                cmds: [ CReconnect({ prev: 0 }) ] }))
+            .then(runM(one(1, -1, CTreeConnect({ share: 1 }))))
+            .then(runM(one(1, 1, create(ROOT, "b", DispOpenIf, ACCESS_RW,
+                SHARE_RWD, false, bindingLease))))
+            .expect(stAt(0) == ST_INVALID_PARAMETER)
+            .expect(not(sdb.fs.inodes.get(ROOT).ents.keys().contains("b")))
+            .expect(sdb.parked.keys() == Set(0))
 
     // D1: the durable precondition is on the caching grant that was actually
     // MADE -- a BATCH oplock or a lease carrying HANDLE caching.  LEVEL_II and
@@ -1835,6 +2110,26 @@ module smb2Test {
                                             SHARE_RWD, OrBatch, false, 5))))
             .expect(stAt(0) == ST_SUCCESS and asCreate(resAt(0)).durable)
 
+    // DH2C re-homes an unleased durable open across clients, but does not
+    // reinitialize Open.ClientGuid (MS-SMB2 3.3.5.9.10). Registry collisions
+    // and a later disconnect still use the original client identity.
+    run durableReclaimPreservesClientGuidTest =
+        boot2Run
+            .then(runM(one(0, 0, createDurQ("a", DispCreate, ACCESS_RW,
+                                            SHARE_RWD, OrBatch, true, 5))))
+            .expect(stAt(0) == ST_SUCCESS and asCreate(resAt(0)).durable)
+            .then(runM(one(0, -1, CDisconnect)))
+            .then(runM(one(1, 1, createDurC("", OrNone, true, 0, 5, false,
+                                            false, false))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .expect(sdb.opens.get(0).clientTag == 0)
+            .expect(durGuidCollision(sdb, 5, 0))
+            .expect(not(durGuidCollision(sdb, 5, 1)))
+            .then(runM(one(1, -1, CDisconnect)))
+            .expect(sdb.parked.get(0).owner == 0)
+            .expect(durGuidCollision(sdb, 5, 0))
+            .expect(not(durGuidCollision(sdb, 5, 1)))
+
     // A durable grant needs the server to advertise durable handles at all
     // (config persistent_handles).  This is what makes caps.durable
     // load-bearing: with it off no grant is made and nothing can ever park,
@@ -1867,9 +2162,8 @@ module smb2Test {
         init.then(60.reps(_ => all { inv, stepData }))
 
     // Every flavor the corpus is generated from must itself preserve the
-    // invariant.  stepIo is NOT generated (delete-on-close, Q-1) but is walked
-    // anyway: it is the superset stepReq was carved out of, so a rule gap that
-    // only delete-on-close reaches still shows up here.
+    // invariant. stepIo is also walked as the superset of the focused request
+    // and namespace flavors, including delete-on-close transitions.
     run randomCoreWalkTest =
         init.then(60.reps(_ => all { inv, stepCore }))
 
@@ -2062,18 +2356,28 @@ module smb2Test {
                                             pat: 1 }), 0x9000)))
             .expect(stAt(0) == ST_FILE_CLOSED)
 
-    // MS-FSA 2.1.5.14: setting file information is gated on the access the
-    // class requires, and FileEndOfFileInformation requires FILE_WRITE_DATA --
-    // so a SET_EOF through a read-only or attribute-only handle is
-    // ACCESS_DENIED even at a perfectly fresh ChannelSequence.
-    //
-    // This pins the arm the generated corpus deliberately does NOT draw:
-    // chimera answers SUCCESS and resizes the file (DEVIATIONS-SMB.md S-4,
-    // probe R15), so `smbSetEofCs` draws only writable handles.  Without this
-    // test the rule would be unowned the moment the generator stopped
-    // reaching it.  The two positive arms keep it honest: a writable handle
-    // succeeds, and the refusal changes nothing (a later read still sees the
-    // original size).
+    // SET_EOF must revoke peer read caching before changing the data extent;
+    // a later WRITE cannot emit the same transition a second time.
+    run setEofRecallsPeerReadCacheTest =
+        boot2Run
+            .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RW,
+                                        SHARE_RWD, false, OrNone))))
+            .then(runM(one(1, 1, create(ROOT, "a", DispOpen, ACCESS_R,
+                                        SHARE_RWD, false, OrLevelII))))
+            .expect(cachBits(sdb.opens.get(1).caching) == BITS_R)
+            .then(runM(one(0, 0, CSetEof({ fid: FidRef(0), sizeBlocks: 1 }))))
+            .expect(stAt(0) == ST_SUCCESS)
+            .expect(cachBits(sdb.opens.get(1).caching) == BITS_NONE)
+            .expect(match resAt(0) {
+                | RSetEof(x) => x.breaks.size() == 1
+                | _ => false
+            })
+            .then(runM(one(0, 0, CWrite({ fid: FidRef(0), off: 0, len: 1,
+                                          pat: 1 }))))
+            .expect(asWrite(resAt(0)).breaks == Set())
+
+    // FileEndOfFileInformation requires FILE_WRITE_DATA; denial leaves the
+    // original size intact even when ChannelSequence is current.
     run setEofNeedsWriteTest =
         bootRun
             .then(runM(one(0, 0, create(ROOT, "a", DispCreate, ACCESS_RW,
@@ -2421,7 +2725,7 @@ module smb2Test {
     // These pin the arms the generated corpus deliberately cannot reach --
     // the compound-position rule (the chimera replayer sends compound slots as
     // separate messages), and everything that needs a directory to be DELETED
-    // while a watch is on it (the Q-1 removal-timing question) -- plus the
+    // while a watch is on it -- plus the
     // boundary cases where a fixed sequence says more than a random walk: the
     // exact buffer arithmetic, and the two filters being genuinely different.
     // ==================================================================

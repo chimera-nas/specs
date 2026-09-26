@@ -305,7 +305,7 @@ module smb2ops {
         | RWrite({ st: int, count: int, breaks: Set[BreakNote] })
         | RFlush({ st: int })
         | RLock({ st: int })
-        | RSetEof({ st: int })
+        | RSetEof({ st: int, breaks: Set[BreakNote] })
         | RSetDisposition({ st: int })
         | RSetRename({ st: int, breaks: Set[BreakNote] })
         | RQueryBasic({ st: int, attrs: AttrSnap })
@@ -574,9 +574,8 @@ module smb2ops {
     //    2.1.5.18.1 apply only to UPGRADING a stream that already holds an
     //    R / RH oplock, and a same-lease-key re-open never reaches the FSA
     //    layer at all (MS-SMB2 3.3.5.9.8 coalesces it -- the `joined` arm
-    //    below).  So the model caps W against EVERY peer open; chimera exempts
-    //    two peer shapes and that is recorded as DEVIATIONS-SMB.md S-3, not
-    //    copied into the model.
+    //    below). New exclusive grants therefore count every peer open;
+    //    existing granular lease upgrades use the key checks below.
     //  - HANDLE caching on a lease is capped instead against a peer open that
     //    is not itself lease-backed (probe O12): two RqLs leases coexist at
     //    R+H, but a plain open owns the handle exclusively.  Granting less than
@@ -642,18 +641,26 @@ module smb2ops {
             p.owner == myTag and isLeaseGrant(p.open.caching) and
                 cachBits(p.open.caching).h
         })
+        // A metadata-only open need not break an existing write cache. A
+        // legacy request cannot fall back to LEVEL_II while that exclusive
+        // cache remains: MS-FSA 2.1.5.18.2 rejects shared requests in EXCLUSIVE.
+        // CREATE's result describes the grant after its requested breaks
+        // have been acknowledged, so inspect their retained state.
+        val writeCacheHeld = others.exists(g =>
+            cachBits(effCaching(sdb.opens.get(g))).w) or survivors.exists(k =>
+            cachBits(effCaching(sdb.parked.get(k).open)).w)
         match oplock {
             | OrNone => CNone
             | OrLevelII =>
-                if (caps.oplocks and not(ownHandleLease))
+                if (caps.oplocks and not(ownHandleLease) and not(writeCacheHeld))
                     COplock(oplockOfBits(capForceLevel2(caps, BITS_R)))
                 else CNone
             | OrExclusive =>
-                if (not(caps.oplocks) or ownHandleLease) CNone
+                if (not(caps.oplocks) or ownHandleLease or writeCacheHeld) CNone
                 else if (sole) COplock(oplockOfBits(capForceLevel2(caps, BITS_RW)))
                 else COplock(oplockOfBits(capForceLevel2(caps, BITS_R)))
             | OrBatch =>
-                if (not(caps.oplocks) or ownHandleLease) CNone
+                if (not(caps.oplocks) or ownHandleLease or writeCacheHeld) CNone
                 else if (sole) COplock(oplockOfBits(capForceLevel2(caps, BITS_RWH)))
                 else COplock(oplockOfBits(capForceLevel2(caps, BITS_R)))
             | OrLease(x) => {
@@ -668,10 +675,39 @@ module smb2ops {
                 val req = if (not(caps.leases) or not(x.r)) BITS_NONE
                           else capForceLevel2(caps, { r: x.r, w: x.w,
                                                       h: x.h })
-                // W caching only to a sole opener (MS-FSA 2.1.5.18.1, the
-                // mandate above); H caching only when no non-lease peer
-                // open owns the handle (probe O12, discretion).
-                val st = { r: req.r, w: req.w and sole,
+                // MS-FSA 2.1.5.18.1 distinguishes a new NO_OPLOCK grant
+                // from an existing granular R/RH lease upgrade. The latter
+                // checks the caching holders' keys, not the OpenList count:
+                // an unrelated metadata-only open does not prohibit it.
+                val sameKeyUpgrade = isLeaseGrant(joined) and
+                    not(bitsEmpty(cachBits(joined))) and not(capsHandle) and
+                    survivors.size() == 0 and others.forall(g => {
+                        val peer = sdb.opens.get(g)
+                        not(peer.breaking) and
+                        (bitsEmpty(cachBits(peer.caching)) or
+                         (isLeaseGrant(peer.caching) and peer.session == sess and
+                          leaseKeyOf(peer.caching) == x.key))
+                    })
+                // H caching remains subject to the discretionary unkeyed
+                // data-open cap used by this server policy.
+                val foreignWriteCache = others.exists(g => {
+                    val peer = sdb.opens.get(g)
+                    cachBits(effCaching(peer)).w and
+                        not(isLeaseGrant(peer.caching) and
+                            peer.clientTag == myTag and
+                            leaseKeyOf(peer.caching) == x.key)
+                }) or survivors.exists(k => {
+                    val peer = sdb.parked.get(k)
+                    cachBits(effCaching(peer.open)).w and
+                        not(isLeaseGrant(peer.open.caching) and
+                            peer.owner == myTag and
+                            leaseKeyOf(peer.open.caching) == x.key)
+                })
+                // A transparent metadata open cannot displace an exclusive
+                // cache just to obtain its own granular read/handle grant.
+                // MS-FSA 2.1.5.18.1/.2 reject that incompatible request.
+                val st = if (foreignWriteCache) BITS_NONE else
+                         { r: req.r, w: req.w and (sole or sameKeyUpgrade),
                            h: req.h and not(capsHandle) }
                 if (not(isLeaseGrant(joined))) {
                     CLease({ key: x.key,
@@ -716,9 +752,15 @@ module smb2ops {
                     // caching it can now hold rather than leaving it dead.
                     match joined {
                         | CLease(j) => {
-                            val up = { r: j.st.r or st.r,
-                                       w: j.st.w or st.w,
-                                       h: j.st.h or st.h }
+                            // Existing-lease promotion asks the object store
+                            // for the requested superset, not a capped subset
+                            // (MS-SMB2 3.3.5.9.11). A refused promotion leaves
+                            // both state and epoch unchanged.
+                            val superset = (not(j.st.r) or req.r) and
+                                           (not(j.st.w) or req.w) and
+                                           (not(j.st.h) or req.h)
+                            val up = if (superset and bitsEq(st, req)) req
+                                     else j.st
                             if (bitsEq(up, j.st)) joined
                             else CLease({ key: j.key, st: up,
                                           // The lease keeps the version it was
@@ -1327,10 +1369,10 @@ module smb2ops {
         else {
             val dec = decideCreate(acc.sdb.fs, x.dir, x.name, x.disp, x.isDir)
             if (dec.st != ST_SUCCESS) createErr(acc, dec.st)
-            // delete pending on the target -> DELETE_PENDING (only for an
-            // existing object being opened; a fresh create has a new ino).
+            // A marked existing link cannot be opened, overwritten, or
+            // superseded. Only a newly created object has a new identity.
             else if (acc.sdb.deletePending.contains(dec.ino) and
-                     dec.act == ACT_OPENED)
+                     dec.act != ACT_CREATED)
                 createErr(acc, ST_DELETE_PENDING)
             else {
                 val want = wantOf(x.access, x.disp)
@@ -1406,13 +1448,21 @@ module smb2ops {
                 // used to get wrong by keying off the mere presence of the
                 // context (samba conformance suite, SD-6).
                 if (acc.caps.leases and selfKey >= 0 and
-                    sdb1.opens.keys().exists(g => {
-                        val o = sdb1.opens.get(g)
-                        o.session == acc.sess and
+                    (acc.sdb.opens.keys().exists(g => {
+                        val o = acc.sdb.opens.get(g)
+                        o.clientTag == acc.sdb.sessions.get(acc.sess).clientTag and
                         leaseKeyOf(o.caching) == selfKey and
                         o.file != dec.ino
-                    }))
-                    emit(acc.with("sdb", sdb1),
+                    }) or acc.sdb.parked.keys().exists(g => {
+                        val p = acc.sdb.parked.get(g)
+                        p.owner == acc.sdb.sessions.get(acc.sess).clientTag and
+                        leaseKeyOf(p.open.caching) == selfKey and
+                        p.open.file != dec.ino
+                    })))
+                    // Rejection precedes namespace effects and parked purge.
+                    // ClientGuid, not SessionId, owns the lease table; parked
+                    // opens retain membership until final retirement.
+                    emit(acc,
                          RCreate({ st: ST_INVALID_PARAMETER, fid: -1, act: 0,
                                    ino: -1, caching: CNone, breaks: Set(),
                                    parked: false, durable: false }),
@@ -1427,15 +1477,10 @@ module smb2ops {
                 val h1 = if (stat) Set()
                          else breakHolders(sdb1, dec.ino, -1, BITS_H, r1, true,
                                            selfKey, acc.sess)
-                // A truncating open then ALSO runs break_on_write, so a legacy
-                // oplock broken here is broken a second time -- and settles
-                // without an ack (see breakNotesEx).
-                val n1 = breakNotesEx(sdb1, dec.ino, h1, r1, trunc)
-                val sdb2a = h1.fold(sdb1, (a, fid) => doBreakOne(a, fid, r1))
-                val sdb2 = if (not(trunc)) sdb2a
-                           else h1.fold(sdb2a, (a, fid) =>
-                               if (isLeaseGrant(a.opens.get(fid).caching)) a
-                               else doAckBreak(a, fid, BITS_NONE))
+                // Truncation must wait for a batch holder's acknowledgment;
+                // a subsequent write invalidation cannot manufacture an ACK.
+                val n1 = breakNotes(sdb1, dec.ino, h1, r1)
+                val sdb2 = h1.fold(sdb1, (a, fid) => doBreakOne(a, fid, r1))
                 // --- share reservation check (MS-FSA SharingViolation) -----
                 // Skipped only for a true STAT open -- attribute-only AND
                 // non-truncating.  It used to be skipped for any
@@ -1456,7 +1501,14 @@ module smb2ops {
                     emit(acc.with("sdb", sdb3),
                          RCreate({ st: ST_SHARING_VIOLATION, fid: -1, act: 0,
                                    ino: -1, caching: CNone,
-                                   breaks: n1.union(n2), parked: false,
+                                   // A legacy batch's deferred handle may
+                                   // close during its break.  The server must
+                                   // wait before final share adjudication;
+                                   // an ACK retaining that handle then yields
+                                   // the same sharing violation recorded here.
+                                   breaks: n1.union(n2),
+                                   parked: n1.exists(b => b.ackReq and
+                                                        not(b.isLease)),
                                    durable: false }),
                          ST_SHARING_VIOLATION)
                 } else {
@@ -1488,10 +1540,10 @@ module smb2ops {
                     val gr = grantCaching(sdb3, dec.ino, ins.fid, x.oplock,
                                           acc.caps, acc.sess)
                     val sdb4 = doSetCaching(sdb3, ins.fid, gr)
-                    val sdb4b = if (x.delOnClose)
-                                   sdb4.with("deletePending",
-                                             sdb4.deletePending.union(Set(dec.ino)))
-                               else sdb4
+                    // FILE_DELETE_ON_CLOSE is Open.Mode, not Link.IsDeleted.
+                    // Closing that Open marks the link pending; an explicit
+                    // SET_DISPOSITION marks it immediately (MS-FSA 2.1.5.5).
+                    val sdb4b = sdb4
                     // --- grant this open's DURABILITY -----------------------
                     // MS-SMB2 3.3.5.9.6 / 3.3.5.9.10, measured by probe D1:
                     // the durable request is honored only when the caching
@@ -1576,7 +1628,7 @@ module smb2ops {
             // REMOVED record no directory ever saw.
             val unlinks = opensOfFile(acc.sdb, o.file).exclude(Set(fid))
                               .size() == 0 and
-                acc.sdb.deletePending.contains(o.file) and
+                (o.deleteOnClose or acc.sdb.deletePending.contains(o.file)) and
                 fsHasEnt(acc.sdb.fs, o.dir, o.name) and
                 fsChild(acc.sdb.fs, o.dir, o.name) == o.file
             // The handle's own watch dies FIRST: chimera tears the notify
@@ -1815,30 +1867,47 @@ module smb2ops {
     pure def doCmdSetEof(acc, x) = {
         val fid = resolveFid(acc, x.fid)
         if (not(acc.sdb.opens.keys().contains(fid)))
-            emit(acc, RSetEof({ st: ST_FILE_CLOSED }), ST_FILE_CLOSED)
+            emit(acc, RSetEof({ st: ST_FILE_CLOSED, breaks: Set() }), ST_FILE_CLOSED)
         else if (csRefuse(acc, fid))
-            emit(acc, RSetEof({ st: ST_FILE_NOT_AVAILABLE }),
+            emit(acc, RSetEof({ st: ST_FILE_NOT_AVAILABLE, breaks: Set() }),
                  ST_FILE_NOT_AVAILABLE)
         else {
             val a1 = csAccept(acc, fid)
             val o = a1.sdb.opens.get(fid)
             if (not(o.granted.w))
-                emit(a1, RSetEof({ st: ST_ACCESS_DENIED }), ST_ACCESS_DENIED)
-            else
+                emit(a1, RSetEof({ st: ST_ACCESS_DENIED, breaks: Set() }), ST_ACCESS_DENIED)
+            else {
+                // Resizing mutates cached data just like WRITE: recall other
+                // grants, preserving the writer's own coherent lease key.
+                val holders = breakHolders(a1.sdb, o.file, fid, BITS_RWH,
+                                           BITS_NONE, false,
+                                           leaseKeyOf(o.caching), o.session)
+                val notes = breakNotes(a1.sdb, o.file, holders, BITS_NONE)
+                val sdb1 = holders.fold(a1.sdb, (a, h) =>
+                               doBreakOne(a, h, BITS_NONE))
+                val selfII = match o.caching {
+                    | COplock(l) => l == OpLevelII
+                    | _ => false
+                }
+                val selfNotes = if (selfII)
+                                    breakNotes(sdb1, o.file, Set(fid), BITS_NONE)
+                                else Set()
+                val sdb2 = if (selfII) doBreakOne(sdb1, fid, BITS_NONE) else sdb1
                 // MS-FSA 2.1.5.14.5 (SetFileEndOfFileInformation): a length
                 // change is a SIZE change and, because it changes the file's
                 // data extent, a LAST_WRITE one -- which is why the model
                 // raises FILE_MODIFIED alongside SIZE rather than treating the
                 // two filters as alternatives.
                 emit(a1.with("sdb",
-                         stEmitEv(a1.sdb.with("fs",
-                                      fsResize(a1.sdb.fs, o.file,
+                         stEmitEv(sdb2.with("fs",
+                                      fsResize(sdb2.fs, o.file,
                                                x.sizeBlocks)),
                                   o.dir,
                                   Set(EV_SIZE, EV_FILE_MODIFIED,
                                       EV_STREAM_SIZE),
                                   o.name, "")),
-                     RSetEof({ st: ST_SUCCESS }), ST_SUCCESS)
+                     RSetEof({ st: ST_SUCCESS, breaks: notes.union(selfNotes) }), ST_SUCCESS)
+            }
         }
     }
 
@@ -1855,10 +1924,7 @@ module smb2ops {
             // MS-FSA 2.1.5.14.3 (FileDispositionInformation): the set
             // requires DELETE access on the handle -- marking or UNmarking a
             // file for deletion is a delete-authorization decision -- and
-            // without it the operation MUST fail ACCESS_DENIED.  chimera does
-            // not check (smb_proc_set_info.c has no access check of any kind,
-            // DEVIATIONS-SMB.md S-4), so the model stays spec-first here and
-            // the generator draws only DELETE-capable handles.
+            // without it the operation MUST fail ACCESS_DENIED.
             if (not(o.granted.d))
                 emit(acc, RSetDisposition({ st: ST_ACCESS_DENIED }),
                      ST_ACCESS_DENIED)
@@ -1898,6 +1964,12 @@ module smb2ops {
             // the model used to have no access check here at all and answered
             // SUCCESS for every read-only handle).
             if (not(o.granted.d))
+                emit(acc, RSetRename({ st: ST_ACCESS_DENIED, breaks: Set() }),
+                     ST_ACCESS_DENIED)
+            else
+            // MS-FSA FileRenameInformation rejects Open.Link.IsDeleted
+            // before checking exact-name success or destination collisions.
+            if (acc.sdb.deletePending.contains(o.file))
                 emit(acc, RSetRename({ st: ST_ACCESS_DENIED, breaks: Set() }),
                      ST_ACCESS_DENIED)
             else

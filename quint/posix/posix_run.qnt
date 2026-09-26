@@ -99,12 +99,13 @@ module posixDisk {
 // The NFS3-loopback profile (client -> in-process server ->
 // backend), pinned to `--probe --backend nfs3_{memfs,diskfs,cairn}` on
 // 2026-08-12: all three backends probe identically behind the server, so one
-// instance serves the three.  No copy/clone offload (the VFS copy fallback
-// refuses proxy handles) and no SEEK_DATA/SEEK_HOLE in the NFS3 protocol;
+// instance serves the three. As of 2026-09-23 the VFS buffered COPY fallback
+// supports proxy handles. Clone remains unsupported, as does SEEK_DATA/SEEK_HOLE
+// in the NFS3 protocol;
 // atime propagates strictly (reads refresh it through the wire attributes).
 module posixNfs3 {
     import posix(
-        F_COPY_RANGE = FeatOff,
+        F_COPY_RANGE = FeatMandatory,
         F_CLONE_RANGE = FeatOff,
         F_SEEK_HOLE = FeatOff,
         F_ROOT = FeatIfAdvertised,
@@ -125,7 +126,8 @@ module posixNfs3 {
 }
 
 // The NFS4-loopback profile, pinned the same day: again identical
-// across the three backends.  NFS4.2 SEEK backs SEEK_DATA/SEEK_HOLE; atime
+// across the three backends. Buffered COPY support was enabled 2026-09-23.
+// NFS4.2 SEEK backs SEEK_DATA/SEEK_HOLE; atime
 // is not strictly observed.  unlink(dir) now yields EISDIR
 // (P_ERR_UNLINKDIR_ISDIR mandatory, matching nfs3 and the engine backends):
 // the generic remove path enforces the rmdir/unlink type assertion for every
@@ -133,7 +135,7 @@ module posixNfs3 {
 // no longer removes a directory.
 module posixNfs4 {
     import posix(
-        F_COPY_RANGE = FeatOff,
+        F_COPY_RANGE = FeatMandatory,
         F_CLONE_RANGE = FeatOff,
         F_SEEK_HOLE = FeatMandatory,
         F_ROOT = FeatIfAdvertised,

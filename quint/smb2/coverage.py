@@ -41,6 +41,7 @@ ST_END_OF_FILE = 0xC0000011
 ST_OBJECT_NAME_NOT_FOUND = 0xC0000034
 ST_OBJECT_NAME_COLLISION = 0xC0000035
 ST_SHARING_VIOLATION = 0xC0000043
+ST_DELETE_PENDING = 0xC0000056
 ST_INVALID_DEVICE_REQUEST = 0xC0000010
 ST_FILE_IS_A_DIRECTORY = 0xC00000BA
 ST_NOT_A_DIRECTORY = 0xC0000103
@@ -201,7 +202,7 @@ def scan(path, buckets):
         for cap, on in init["value"]["caps"].items():
             if on:
                 buckets["caps:" + cap] = True
-    for st in states[1:]:
+    for state_index, st in enumerate(states[1:], 1):
         lo = st.get(key)
         if not lo or lo.get("tag") != "LMsg":
             continue
@@ -230,6 +231,8 @@ def scan(path, buckets):
                 buckets["acc:" + acc] = True
                 buckets["shr:" + profile(cv["share"], "rwd")] = True
                 buckets["cr_status:0x%08x" % status] = True
+                if cv.get("delOnClose"):
+                    buckets["create_doc:0x%08x" % status] = True
                 # The M-1 shape, bucketed by OUTCOME.  A truncating
                 # disposition needs WRITE at open time even when DesiredAccess
                 # never asked for it, so it must be arbitrated against a peer's
@@ -325,6 +328,16 @@ def scan(path, buckets):
                         % (1 if cv["del"] else 0, status)] = True
             elif ctag == "CSetRename":
                 buckets["rename:0x%08x" % status] = True
+                selector = cv["fid"]
+                if selector.get("tag") == "FidRef":
+                    sdb_key = key.rsplit("::", 1)[0] + "::sdb"
+                    previous = states[state_index - 1][sdb_key]
+                    fid = as_int(selector["value"])
+                    for open_id, opened in previous["opens"]["#map"]:
+                        if (as_int(open_id) == fid and
+                                opened["name"] == cv["newname"] and
+                                as_int(opened["dir"]) == as_int(cv["newdir"])):
+                            buckets["rename_self:0x%08x" % status] = True
             elif ctag == "CLogoff":
                 buckets["logoff:0x%08x" % status] = True
             elif ctag == "CNotify":
@@ -485,16 +498,18 @@ def required_buckets(flavor, observed=None):
         # A rename that moved a name and one refused because the target was
         # occupied (MS-FSA 2.1.5.14.11, ReplaceIfExists = FALSE).
         req += ["rename:0x%08x" % ST_SUCCESS,
-                "rename:0x%08x" % ST_OBJECT_NAME_COLLISION]
+                "rename:0x%08x" % ST_OBJECT_NAME_COLLISION,
+                "rename_self:0x%08x" % ST_SUCCESS]
         # Teardown actually happening, both scopes.
         req += ["logoff:0x%08x" % ST_SUCCESS,
                 "treedisc:0x%08x" % ST_SUCCESS]
         # A query is drawn here too, and it is what proves a renamed handle
         # still resolves to the object it named before the move.
         req += ["query:0x%08x" % ST_SUCCESS]
-        # The FileDispositionInformation class, unmark arm (see smb2.qnt's
-        # smbSetDispositionOff for why only that arm is generated).
-        req += ["setdisp:0:0x%08x" % ST_SUCCESS]
+        req += ["setdisp:0:0x%08x" % ST_SUCCESS,
+                "setdisp:1:0x%08x" % ST_SUCCESS,
+                "create_doc:0x%08x" % ST_SUCCESS,
+                "cr_status:0x%08x" % ST_DELETE_PENDING]
     if flavor in NOTIFY_NS_FLAVORS:
         # This flavor is not about the CREATE matrix at all -- it is the
         # notify machinery watched through the name filters, and it draws a
@@ -570,14 +585,12 @@ def required_buckets(flavor, observed=None):
         req += ["notifyrec:act:%d" % a for a in FILE_ACTIONS]
     if flavor in DIR_FLAVORS:
         # Both diagonals of the type matrix (a file open of a directory and a
-        # directory open of a file), and a READ through a directory handle --
-        # STATUS_INVALID_DEVICE_REQUEST, the guard MS-FSA 2.1.5.2 mandates.
-        # (A directory WRITE is deliberately not generated: DEVIATIONS-SMB.md
-        # S-2.  Add "write:0x%08x" % ST_INVALID_DEVICE_REQUEST here when it
-        # closes.)
+        # directory open of a file), plus READ and WRITE through directory
+        # handles: MS-FSA 2.1.5.2/.3 mandate INVALID_DEVICE_REQUEST.
         req += ["cr_status:0x%08x" % s for s in
                 (ST_FILE_IS_A_DIRECTORY, ST_NOT_A_DIRECTORY)]
-        req += ["read:0x%08x" % ST_INVALID_DEVICE_REQUEST]
+        req += ["read:0x%08x" % ST_INVALID_DEVICE_REQUEST,
+                "write:0x%08x" % ST_INVALID_DEVICE_REQUEST]
     if flavor not in CACHING_FLAVORS:
         return req
     # --- caching lifecycle (oplocks + leases) ---------------------------

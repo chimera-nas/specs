@@ -64,6 +64,14 @@ A harness that cannot drive part of the corpus says so per batch and reports a
 SKIP, which keeps the gap visible and attributable to the harness rather than
 hiding it in what was never generated.
 
+The SMB lease generator has an explicit abstraction limit: its state transition
+records a successful CREATE before an asynchronous break acknowledgment permits
+the wire reply. Until the model represents pending commands, `stepLease` issues
+ACKs before subsequent operations and uses quiet-file compound CREATEs. This
+avoids predicting suffix effects before their prerequisite has completed; it
+does not cover concurrent operations during a break or parked compound suffixes.
+Those schedules need dedicated wire probes and a future pending-command model.
+
 ## Testing the models against a real server
 
 `ctest -L samba` replays the generated SMB2 corpus against a real Samba `smbd`

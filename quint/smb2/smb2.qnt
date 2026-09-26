@@ -218,10 +218,8 @@ module smb2 {
         NAMES.exclude(sdb.fs.inodes.get(ROOT).ents.keys())
     // Names under ROOT naming a FILE that nothing currently has open.  The
     // delete idiom (open-for-delete, close) removes such a name on its own
-    // close, so the model and chimera agree on WHEN the entry goes -- which
-    // they do not when a second handle is open, the unresolved Q-1 question
-    // (MS-FSA 2.1.5.4 keeps the entry until the last handle drops; chimera
-    // unlinks at the delete-on-close handle's close).
+    // close. Notification-focused actions use this to force a removal event;
+    // stepNs separately covers deletion deferred across multiple opens.
     def quietNames: Set[Name] =
         NAMES.filter(n =>
             fsHasEnt(sdb.fs, ROOT, n) and
@@ -248,49 +246,6 @@ module smb2 {
     // absent (so the open would be the sole opener of a fresh object).
     def targetIno(n: Name): Ino =
         if (fsHasEnt(sdb.fs, ROOT, n)) fsChild(sdb.fs, ROOT, n) else -1
-
-    // May this CREATE ask for a WRITE cache behind the peer opens that exist?
-    //
-    // This guard is NARROW and it names a MEASURED chimera deviation, S-3
-    // (DEVIATIONS-SMB.md), not a suspicion.  MS-FSA 2.1.5.18.1 refuses an
-    // exclusive oplock -- legacy EXCLUSIVE / BATCH, or a lease carrying W --
-    // whenever "Open.File.OpenList contains more than one Open whose Stream is
-    // the same as Open.Stream", with no OplockKey and no client-identity
-    // exemption.  Probe O12 measures chimera exempting two peer shapes anyway:
-    //
-    //   * an ATTRIBUTE-ONLY peer open, whose share reservation is inert, caps
-    //     nothing -- a full BATCH oplock and a full RWH lease are handed out
-    //     behind one (O12[20], O12[21], O12[23], O12[25]);
-    //   * a peer open by the SAME client caps no LEGACY oplock (O12[6],
-    //     O12[7], O12[11], O12[12]) -- though it does cap a lease (O12[9]).
-    //
-    // Those two shapes, and only those, are kept out of the generated corpus,
-    // exactly as delete-on-close is kept out pending Q-1: the model stays
-    // spec-first and is never weakened to match.  Everything else is now
-    // GENERATED -- most importantly a caching request behind a peer open by a
-    // different client, which is the WPTS Oplocks/Leases surface and which the
-    // predecessor of this guard (keyed on "any peer open at all", justified by
-    // the since-retired S-1) suppressed wholesale.
-    //
-    // A request that asks for no WRITE cache -- OrNone, OrLevelII, an R / RH
-    // lease -- is a SHARED oplock request (MS-FSA 2.1.5.18.2), has no
-    // sole-Open condition, and is never guarded.
-    def grantAgreed(n: Name, opl: OplockReq, sess: SessionId): bool = {
-        val ino = targetIno(n)
-        if (not(reqWantsWrite(opl)) or ino < 0) true
-        else {
-            val peers = opensOfFile(sdb, ino)
-            // Sole opener: model and wire both grant the full request.
-            peers.size() == 0 or
-            // Otherwise at least one peer must be one that chimera's cap
-            // actually sees, so that both sides withhold the write cache.
-            peers.exists(f => {
-                val o = sdb.opens.get(f)
-                openVisibleToGrant(o) and
-                (reqIsLease(opl) or o.session != sess)
-            })
-        }
-    }
 
     // ------------------------------------------------------------------
     // Bootstrap: session + tree
@@ -376,8 +331,7 @@ module smb2 {
                           epoch: 1 }),
                 OrLease({ key: lk, r: true, w: false, h: true, v2: v2,
                           epoch: 1 })))
-            val opl = if (grantAgreed(n, oplWant, treeSess(t))) oplWant
-                      else OrNone
+            val opl = oplWant
             runM(one(treeSess(t), t,
                 CCreate({ dir: ROOT, name: n, disp: disp, access: acc,
                           share: sh, isDir: false, delOnClose: doc,
@@ -542,9 +496,9 @@ module smb2 {
     // ------------------------------------------------------------------
 
     action smbSetEof = all {
-        writeOpens.size() > 0,
+        opens.size() > 0,
         {
-            nondet f = oneOf(writeOpens)
+            nondet f = oneOf(opens)
             val o = sdb.opens.get(f)
             nondet sz = oneOf(0.to(MAX_BLOCKS))
             runM(one(o.session, o.tree,
@@ -563,22 +517,12 @@ module smb2 {
         },
     }
 
-    // The generated disposition change: DELETE-capable handle, and only the
-    // UNMARK arm.
-    //
-    // Two narrowings, each for a recorded reason.  The handle must hold DELETE
-    // because chimera does not access-check SET_INFO at all (S-4) while the
-    // model does; and `del` is fixed FALSE because arming delete-on-close
-    // through SET_INFO lands in the same unresolved Q-1 family as arming it on
-    // the CREATE -- the model adjudicates DELETE_PENDING before the sharing
-    // check and the wire the other way round.  What survives is real: the
-    // FileDispositionInformation parse, the class dispatch and the
-    // delete-pending clear, none of which any generated trace could reach
-    // before.  Widen to `oneOf(Set(false, true))` when Q-1 closes.
+    // Focused disposition-clear action; the namespace flavor also generates
+    // deletion arming and observes pending links through subsequent operations.
     action smbSetDispositionOff = all {
-        deleteOpens.size() > 0,
+        opens.size() > 0,
         {
-            nondet f = oneOf(deleteOpens)
+            nondet f = oneOf(opens)
             val o = sdb.opens.get(f)
             runM(one(o.session, o.tree,
                 CSetDisposition({ fid: FidRef(f), del: false })))
@@ -596,17 +540,9 @@ module smb2 {
         },
     }
 
-    // The generated rename: the target name is drawn from NAMES MINUS the
-    // handle's own current name.
-    //
-    // A rename onto the handle's OWN name is the unresolved Q-14 case -- the
-    // model treats it as a no-op SUCCESS (MS-FSA 2.1.5.14.11.1 guards the
-    // collision branch on the target link being a DIFFERENT link, which is
-    // what makes a case-only rename possible at all), chimera answers
-    // OBJECT_NAME_COLLISION because its destination probe never asks whether
-    // the destination IS the source.  Until a probe ratifies one of the two,
-    // the corpus stays free of it, exactly as it does for S-2 and Q-1; the
-    // model's own rule is pinned by smb2Test.renameToSelfTest.
+    // A rename guaranteed to choose a different name, used by notification
+    // flavors that need an actual namespace change. The namespace flavor
+    // also generates self-renames and checks their no-op SUCCESS semantics.
     action smbSetRenameNew = all {
         opens.size() > 0,
         {
@@ -793,8 +729,7 @@ module smb2 {
                           epoch: 1 }),
                 OrLease({ key: lk, r: true, w: false, h: false, v2: true,
                           epoch: 1 })))
-            val opl = if (grantAgreed(n, oplWant, treeSess(t))) oplWant
-                      else OrNone
+            val opl = oplWant
             all {
                 cachingQuiet(n),
                 runM(one(treeSess(t), t,
@@ -1122,7 +1057,7 @@ module smb2 {
     }
 
     // Delete a file nothing else has open: the SMB unlink idiom (there is no
-    // path-based REMOVE), narrowed so its removal timing is not the Q-1 case.
+    // path-based REMOVE), guaranteeing removal on that compound's close.
     // This is what raises FILE_REMOVED for the name-filter profiles, and the
     // tombstone that a CHANGE_NOTIFY armed afterwards on a handle to the same
     // object must report.
@@ -1376,11 +1311,8 @@ module smb2 {
     }
 
     // The caching CREATE: the full oplock/lease request draw, but never
-    // delete-on-close.  Delete-on-close removal timing against a second open
-    // handle is the unresolved Q-1 question, and it interacts with the CREATE
-    // ordering (the model adjudicates DELETE_PENDING before the share check,
-    // the server the other way round), so it is excluded here exactly as it is
-    // from `stepCore` -- the caching lifecycle is what this flavor is for.
+    // delete-on-close. The caching flavor concentrates on grant/break/ACK
+    // ordering; stepNs covers pending deletion and its CREATE precedence.
     action smbCreateCache = all {
         trees.size() > 0,
         liveInos.size() < MAX_OBJECTS,
@@ -1402,8 +1334,7 @@ module smb2 {
                           epoch: 1 }),
                 OrLease({ key: lk, r: true, w: false, h: true, v2: v2,
                           epoch: 1 })))
-            val opl = if (grantAgreed(n, oplWant, treeSess(t))) oplWant
-                      else OrNone
+            val opl = oplWant
             runM(one(treeSess(t), t,
                 CCreate({ dir: ROOT, name: n, disp: disp, access: acc,
                           share: sh, isDir: false, delOnClose: false,
@@ -1414,15 +1345,24 @@ module smb2 {
     // Oplock/lease lifecycle: grants, cross-handle break, every acknowledgment
     // arm, and the I/O that drives break-on-write.  Every command here is one
     // the in-process replayer builds on the wire, so this flavor is
-    // generatable as well as self-testable.
-    action stepLease = any {
+    // generatable as well as self-testable.  This abstract model records the
+    // accepted CREATE effect before its deferred wire reply.  Until explicit
+    // pending-command state is modeled, generated traces must acknowledge its
+    // outstanding breaks before observing or mutating that effect.  Compound
+    // CREATE/WRITE/CLOSE therefore uses the quiet-file variant: otherwise its
+    // modeled suffix would run before the parked CREATE could finish on wire.
+    // Concurrent work during a break and parked compound suffixes remain wire
+    // probe coverage, not coverage claimed by this bounded generator.
+    action stepLease = if (breakingOpens.size() > 0) any {
+        smbBreakAck, smbBreakAckNone, smbBreakAckKeepRead,
+    } else any {
         smbSessionSetup, smbTreeConnect,
         smbCreateCache, smbCreateCache, smbCreateCache, smbCreateCache,
         smbClose, smbClose,
         smbRead, smbWrite, smbWrite,
         smbBreakAck, smbBreakAck, smbBreakAckNone,
         smbBreakAckKeepRead, smbBreakAckStale,
-        smbCompoundCreateWriteClose,
+        smbCompoundQuiet,
     }
 
     // Data / lock heavy.
@@ -1450,15 +1390,8 @@ module smb2 {
 
     // stepIo without delete-on-close.
     //
-    // `stepIo` itself is NOT generatable: it draws smbCreate (which draws
-    // delOnClose) and smbDeleteExisting, and delete-on-close is the unresolved
-    // Q-1 question.  Measured, not assumed: `smb2Base/stepIo 60x8 seed 0x11`
-    // replays 2 of 8 clean, and every mismatch in the other six is the Q-1
-    // family -- the model says STATUS_DELETE_PENDING (MS-FSA 2.1.5.1
-    // adjudicates delete-pending before the sharing check) where the wire says
-    // STATUS_SHARING_VIOLATION or, once the model and the server disagree about
-    // whether the name still exists, STATUS_SUCCESS.  Registering it would land
-    // a red suite on an unratified expectation.
+    // Pending-deletion behavior is generated in stepNs; this flavor keeps
+    // the request-context matrix independent of namespace lifetime changes.
     //
     // What stepIo reaches that stepCore does not, and this flavor keeps, is the
     // oplock/lease REQUEST matrix on a server with caching OFF: smbCreateCache
@@ -1528,10 +1461,6 @@ module smb2 {
     // QUERY_INFO oracle then has to agree about, so the query is checking a
     // moving value rather than a constant.
     //
-    // smbSetEof draws `writeOpens`, not `opens`: a SET_INFO through a handle
-    // without FILE_WRITE_DATA is DEVIATIONS-SMB.md S-4 (chimera does not
-    // access-check SET_INFO at all), and the corpus stays free of the
-    // unratified arm exactly as it does for S-2 and Q-1.
     action stepInfo = any {
         smbSessionSetup, smbTreeConnect,
         smbCreateCore, smbCreateCore,
@@ -1556,20 +1485,17 @@ module smb2 {
     // so the objects those opens pinned become removable and the handles
     // themselves must be gone.
     //
-    // smbSetDisposition is deliberately NOT drawn: setting delete-on-close
-    // through SET_INFO lands in the same unresolved Q-1 family as setting it
-    // on the CREATE (the model adjudicates DELETE_PENDING before the sharing
-    // check, the wire the other way round), and generating it would bake an
-    // unratified expectation.  The command is still built by the replayer and
-    // pinned deterministically by smb2Test; add it here when Q-1 closes.
+    // CREATE-DOC arms an individual Open; SET_DISPOSITION marks the link
+    // immediately. Both paths are generated and observed after the first
+    // close while a peer remains, and again after the last close.
     action stepNs = any {
         smbSessionSetup, smbSessionSetup, smbTreeConnect, smbTreeConnect,
-        smbCreateCore, smbCreateCore, smbCreateCore,
+        smbCreateCore, smbCreateCore, smbCreate,
         smbClose, smbClose,
         smbRead, smbWrite,
         smbQuery,
-        smbSetRenameNew, smbSetRenameNew,
-        smbSetDispositionOff,
+        smbSetRename, smbSetRename,
+        smbSetDisposition,
         smbLogoff, smbTreeDisconnect,
         smbCompoundCreateWriteClose,
     }
@@ -1583,29 +1509,19 @@ module smb2 {
     // replayer builds on the wire, so the flavor is generatable as well as
     // self-testable.
     //
-    // smbMkdirRW is deliberately NOT drawn here: it is the only way to reach a
-    // WRITE through a directory handle, and that is an OPEN deviation --
-    // chimera answers STATUS_INTERNAL_ERROR where MS-FSA 2.1.5.3 mandates
-    // STATUS_INVALID_DEVICE_REQUEST (DEVIATIONS-SMB.md S-2).  The model stays
-    // spec-first and the guard is pinned deterministically by
-    // smb2Test.directoryIoGuardTest; the generated corpus stays free of the
-    // unresolved case, exactly as it does for delete-on-close (Q-1).  Add
-    // smbMkdirRW here when S-2 closes.
+    // Writable directory handles exercise the mandatory INVALID_DEVICE_REQUEST
+    // guard on WRITE as well as READ (MS-FSA 2.1.5.2/.3).
     action stepDir = any {
         smbSessionSetup, smbTreeConnect,
-        smbMkdir, smbMkdirExcl,
+        smbMkdir, smbMkdirRW, smbMkdirExcl,
         smbCreateCore, smbCreateCore,
         smbClose, smbClose,
         smbRead, smbRead, smbWrite,
         smbCompoundCreateWriteClose,
     }
 
-    // stepDir plus a directory open that asks for WRITE access -- the only way
-    // to reach a WRITE issued through a directory handle.  Deliberately NOT
-    // registered as a generated batch: it is the standing reproduction for
-    // DEVIATIONS-SMB.md S-2 (chimera answers such a WRITE
-    // STATUS_INTERNAL_ERROR where MS-FSA 2.1.5.3 mandates
-    // STATUS_INVALID_DEVICE_REQUEST).  Register it when S-2 closes.
+    // Focused directory-I/O flavor; the registered stepDir also covers these
+    // writable directory handles alongside the broader type matrix.
     action stepDirRW = any {
         smbSessionSetup, smbTreeConnect,
         smbMkdirRW, smbMkdirExcl,
@@ -1618,10 +1534,9 @@ module smb2 {
     // reconnect, reclaim (well-formed and every malformed arm), and the
     // conflicting open that PURGES a parked holder.
     //
-    // Deliberately narrow, for the same reason stepReq is: delete-on-close (Q-1)
-    // and directories are excluded, so a failure here is a durable-handle
-    // failure and not an unrelated known gap.  smbCreateCore supplies the
-    // smbCreateQuiet supplies the conflicting opens that drive the purge (probe
+    // Delete-on-close and directories have separate namespace/type flavors;
+    // this flavor exercises durable lifecycle transitions. smbCreateQuiet
+    // supplies the conflicting opens that drive the purge (probe
     // D7) and, being attribute-capable, also the stat opens that must NOT purge
     // (D7b).
     //
@@ -1694,22 +1609,12 @@ module smb2 {
     // OPPOSITE place to WRITE's -- before the class check rather than after
     // the access check (probe R12) -- so the corpus needs both.
     //
-    // Drawn from `writeOpens`, not from every open, and the restriction is a
-    // KNOWN DEVIATION being kept out of the corpus, not a modeling choice:
-    // chimera does not access-check a SET_INFO at all, so a SET_EOF through a
-    // handle with no FILE_WRITE_DATA succeeds and resizes the file where
-    // MS-FSA 2.1.5.14 mandates STATUS_ACCESS_DENIED (DEVIATIONS-SMB.md S-4,
-    // measured by probe R15).  The model stays spec-first -- doCmdSetEof still
-    // answers ACCESS_DENIED and is pinned by smb2Test.setEofNeedsWriteTest --
-    // and the generator simply does not draw the unratified shape, exactly as
-    // stepDir declines to draw a directory WRITE for S-2.  What this flavor is
-    // FOR is unaffected: the sequence gate's placement is measured on writable
-    // handles, both the accepted and the FILE_NOT_AVAILABLE arm.
-    // When S-4 closes: draw from `opens` again.
+    // Include read-only and attribute-only handles: the sequence gate still
+    // precedes the FILE_WRITE_DATA check, and a refusal must preserve data.
     action smbSetEofCs = all {
-        writeOpens.size() > 0,
+        opens.size() > 0,
         {
-            nondet f = oneOf(writeOpens)
+            nondet f = oneOf(opens)
             val o = sdb.opens.get(f)
             nondet sz = oneOf(0.to(MAX_BLOCKS))
             nondet cs = oneOf(CS_VALUES)
@@ -1739,8 +1644,7 @@ module smb2 {
                 OrBatch,
                 OrLease({ key: lk, r: true, w: true, h: true, v2: true,
                           epoch: 1 })))
-            val opl = if (grantAgreed(n, oplWant, treeSess(t))) oplWant
-                      else OrNone
+            val opl = oplWant
             all {
                 cachingQuiet(n),
                 runM({ sess: treeSess(t), tree: t, related: false, cs: 0,

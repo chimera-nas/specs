@@ -349,6 +349,10 @@ specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Base stepNs 500 8 0xd
 # every caching grant caps to a read cache.
 specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Leases stepLease 300 8 0x21
           "smb2Leases_stepLease_300_0x21_{seq}" SMB2_GATE SMB2_DEPS)
+# Keep the original regression traces while adding a second deterministic
+# schedule for RH break coverage under the stricter grant rules.
+specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2Leases stepLease 300 8 0x23
+          "smb2Leases_stepLease_300_0x23_{seq}" SMB2_GATE SMB2_DEPS)
 specs_gen(smb2 ${Q}/smb2/smb2_run.qnt smb2ForceL2 stepLease 300 8 0x31
           "smb2ForceL2_stepLease_300_0x31_{seq}" SMB2_GATE SMB2_DEPS)
 # The durable-handle lifecycle: request, grant, park across a transport drop,
@@ -635,7 +639,7 @@ else()
         "stepDir|smb2Base_stepDir_500_0x5_*.itf.json"
         "stepInfo|smb2Base_stepInfo_500_0x9_*.itf.json"
         "stepNs|smb2Base_stepNs_500_0xd_*.itf.json"
-        "leases|smb2Leases_stepLease_300_0x21_*.itf.json"
+        "leases|smb2Leases_stepLease_300_*.itf.json"
         "forceL2|smb2ForceL2_stepLease_300_0x31_*.itf.json"
         "durable|smb2Durable_stepDurable_300_0x41_*.itf.json"
         "replay|smb2Replay_stepReplay_300_0x51_*.itf.json"
