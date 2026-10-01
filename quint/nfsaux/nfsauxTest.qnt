@@ -308,6 +308,28 @@ module nfsauxTestRef {
                                            granted: List(), asyncs: List(),
                                            reply: RNlm(NLM4_GRANTED) }))
 
+    /// UNLOCK of part of a held range keeps the rest (RFC 1813 A.6.4 is
+    /// POSIX fcntl semantics, and Linux lockd forwards a process's sub-range
+    /// unlock verbatim): a middle unlock splits the lock into a head and a
+    /// tail remainder, an edge unlock trims it, and the tail of a to-EOF
+    /// lock stays to-EOF.  The hole is free to another owner at once.
+    run unlockSplitTest =
+        init
+            .then(nlmLock(2, lk(ownerA, 0, 3, true), false, false))
+            .then(nlmUnlock(false, lk(ownerA, 1, 1, true)))
+            .expect(held == List(lk(ownerA, 0, 1, true),
+                                 lk(ownerA, 2, 1, true)))
+            .then(nlmTestOp(false, lk(ownerB, 1, 1, true)))
+            .expect(lastOp == ONlmTestOp({
+                msg: false, lock: lk(ownerB, 1, 1, true), asyncs: List(),
+                reply: RNlmTestRes({ stat: NLM4_GRANTED, holders: List() }) }))
+            .then(nlmUnlock(false, lk(ownerA, 0, 1, true)))
+            .expect(held == List(lk(ownerA, 2, 1, true)))
+            .then(nlmLock(2, lk(ownerA, 100, 0, true), false, false))
+            .then(nlmUnlock(false, lk(ownerA, 100, 10, true)))
+            .expect(held == List(lk(ownerA, 2, 1, true),
+                                 lk(ownerA, 110, 0, true)))
+
     /// A handle the server cannot decode is STALE_FH, and nothing is
     /// recorded for it.
     run staleHandleTest =

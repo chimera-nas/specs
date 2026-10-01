@@ -162,29 +162,42 @@ module nlmProto {
     pure def holdsExact(held: List[Lock], probe: Lock): bool =
         findExact(held, probe).length() > 0
 
-    /// Containment, with 0 meaning to-EOF on either side: is
-    /// [aOff, aOff+aLen) inside [bOff, bOff+bLen)?
-    pure def rangeWithin(aOff: int, aLen: int, bOff: int,
-                         bLen: int): bool =
-        aOff >= bOff and
-        (bLen == 0 or (aLen != 0 and aOff + aLen <= bOff + bLen))
-
     /**
-     * UNLOCK's reach: the owner's locks on the file that lie WITHIN the
-     * named range are released, not only an exactly-equal one -- every real
-     * client unlocks [0, to-EOF) at close(2) to drop whatever it still
-     * holds on the file, and an exact-match unlock would leave those locks
-     * (and the open handles pinning their files) held forever.
-     * Containment only: a lock straddling the range boundary would need a
-     * split, which the server under test does not implement and no known
-     * client emits.
+     * UNLOCK's reach (RFC 1813 A.6.4, which is POSIX fcntl semantics): the
+     * owner's bytes within the named range are released.  A lock inside the
+     * range goes away whole; a lock straddling a range edge keeps the bytes
+     * outside it, as a head remainder below the range and/or a tail
+     * remainder above it, in the held list where the lock was.  Both shapes
+     * reach a server: every real client unlocks [0, to-EOF) at close(2) to
+     * drop whatever it still holds on the file, and Linux lockd forwards a
+     * process's sub-range unlock verbatim, so unlocking the middle byte of
+     * a three-byte lock (cthon04 lock test 10) splits it in two.  A to-EOF
+     * tail stays to-EOF.
      */
     pure def dropWithin(held: List[Lock], probe: Lock): List[Lock] =
-        held.select(l => not(
-            l.file == probe.file and
-            sameOwner(l.owner, probe.owner) and
-            rangeWithin(l.offset, posixLen(l.wireLen),
-                        probe.offset, posixLen(probe.wireLen))))
+        held.foldl(List(), (acc, l) =>
+            if (not(l.file == probe.file and
+                    sameOwner(l.owner, probe.owner) and
+                    locksOverlap(l, probe)))
+                acc.append(l)
+            else {
+                val pLen = posixLen(probe.wireLen)
+                val lLen = posixLen(l.wireLen)
+                val below =
+                    if (l.offset < probe.offset)
+                        List(l.with("wireLen", probe.offset - l.offset))
+                    else List()
+                val above =
+                    if (pLen == 0) List()
+                    else if (lLen == 0)
+                        List(l.with("offset", probe.offset + pLen))
+                    else if (l.offset + lLen > probe.offset + pLen)
+                        List(l.with("offset", probe.offset + pLen)
+                              .with("wireLen",
+                                    l.offset + lLen - (probe.offset + pLen)))
+                    else List()
+                acc.concat(below).concat(above)
+            })
 
     // ------------------------------------------------------------------
     // LOCK
