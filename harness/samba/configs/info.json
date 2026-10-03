@@ -13,8 +13,7 @@
   // takes its branch does not change one byte of that cell's corpus -- it is a
   // statement about coverage, not about the server.
   "deviationsOff": [
-    "SD-4",
-    "SD-5"
+    "SD-4"
   ],
 
   "batches": [

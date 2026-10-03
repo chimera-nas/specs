@@ -1,0 +1,10 @@
+{
+  "extends": "./_windows.json",
+  "family": "smb2",
+  "description": "the namespace half -- SET_INFO rename, delete-on-close, session and tree teardown -- against the Windows SMB server; the only flavour that draws renames. The batch is the Samba cell's, unchanged.",
+  "traceStem": "smb2Base",
+
+  "batches": [
+    { "flavor": "stepNs", "steps": 500, "traces": 8, "seed": "0xd" }
+  ]
+}

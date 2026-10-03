@@ -1,0 +1,10 @@
+{
+  "extends": "./_windows.json",
+  "family": "smb2",
+  "description": "CHANGE_NOTIFY in full: both filters, the buffer and overflow arithmetic, and every way a parked request can end, against the Windows SMB server. The batch is the Samba cell's, unchanged.",
+  "traceStem": "smb2Base",
+
+  "batches": [
+    { "flavor": "stepNotify", "steps": 400, "traces": 8, "seed": "0x61" }
+  ]
+}

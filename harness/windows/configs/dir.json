@@ -1,0 +1,10 @@
+{
+  "extends": "./_windows.json",
+  "family": "smb2",
+  "description": "directory creation (FILE_DIRECTORY_FILE, exclusive and not) and the handles it produces, against the Windows SMB server. The batch is the Samba cell's, unchanged.",
+  "traceStem": "smb2Base",
+
+  "batches": [
+    { "flavor": "stepDir", "steps": 500, "traces": 8, "seed": "0x5" }
+  ]
+}

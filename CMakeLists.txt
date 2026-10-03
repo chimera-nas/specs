@@ -220,10 +220,10 @@ else()
     # second byte-identical corpus would be pure cost.
     #
     # A cell gets a STRICT twin and a liveness gate only when its config
-    # actually enables a deviation.  Three of the driveable flavours reach
+    # actually enables a deviation.  Five of the driveable flavours reach
     # none -- locks are drawn only by stepInfo and renames only by stepNs, so
-    # stepCore, stepReq and stepNotifyNs cannot take any of the branches -- and
-    # for those the cell already IS the strict corpus: it states the standard,
+    # stepCore, stepReq, stepDir, stepNotify and stepNotifyNs cannot take any
+    # of the branches -- and for those the cell already IS the strict corpus: it states the standard,
     # replay is an exact match, and it gates rather than reporting.  Generating
     # a byte-identical twin of it would buy nothing.
     #
@@ -231,14 +231,14 @@ else()
     set(SAMBA_CELLS
         "stepCore|core|yes|no"
         "stepReq|req|yes|no"
-        "stepDir|dir|yes|yes"
+        "stepDir|dir|yes|no"
         "stepInfo|info|yes|yes"
         "stepNs|ns|yes|yes"
         "leases|leases|no|no"
         "forceL2|force_l2|no|no"
         "durable|durable|no|no"
         "replay|replay|no|no"
-        "notify|notify|yes|yes"
+        "notify|notify|yes|no"
         "notifyNs|notify_ns|yes|no")
 
     foreach(c ${SAMBA_CELLS})
@@ -794,6 +794,87 @@ if(SPECS_EXT4_TESTS)
                 SKIP_RETURN_CODE 77
                 ENVIRONMENT "KVM_VMLINUZ=${KVM_IMAGE_DIR}/vmlinuz;KVM_ROOTFS=${KVM_IMAGE_DIR}/rootfs.qcow2")
         endforeach()
+    endforeach()
+endif()
+
+# ---------------------------------------------------------------------------
+# Windows SMB server conformance (harness/windows)
+#
+# The same SMB2 flavours the Samba suite replays, generated for the Windows
+# SMB server -- the implementation MS-SMB2 and MS-FSA describe -- and replayed
+# against the in-box server of a Windows Server and a Windows 11 machine by
+# harness/windows/run_windows_mbt.ps1, which drives the SAME replayer the Samba
+# suite does (harness/samba/smb2_replay.py).
+#
+# Only the CORPUS and its liveness gates are registered here.  The corpus is
+# generated wherever this project is built, which is Linux; the replay needs a
+# Windows machine and none of this build's toolchain, so CI runs the script
+# directly against the corpus the build job produced rather than through a
+# ctest that could never run where it was configured.
+# ---------------------------------------------------------------------------
+option(SPECS_WINDOWS_TESTS
+       "Register the Windows SMB server conformance corpus (default: on only \
+when specs is the top-level project)" ${_conformance_default})
+
+if(NOT SPECS_WINDOWS_TESTS)
+    message(STATUS
+        "windows MBT corpus: not registered (specs is a subdirectory of "
+        "${CMAKE_PROJECT_NAME}; -DSPECS_WINDOWS_TESTS=ON to register it)")
+else()
+    set(WINDOWS_HARNESS ${CMAKE_CURRENT_SOURCE_DIR}/harness/windows)
+    set(SPECS_DEVLIVENESS ${CMAKE_CURRENT_SOURCE_DIR}/tools/devliveness.py)
+    message(STATUS "windows MBT corpus: registered (replayed on Windows by "
+            "harness/windows/run_windows_mbt.ps1)")
+
+    # cell name | config stem | enables a deviation?
+    #
+    # The flavours the replayer can drive against Windows.  The four
+    # caching/durable cells the Samba suite registers only to report as a SKIP
+    # are not repeated here: they would be the same traces, skipped for the
+    # same reason, by the same replayer.  stepReq joins them on this server.
+    # It puts oplock requests on the wire and relies on the server granting
+    # none; SMB2 oplocks cannot be turned off on Windows (EnableOplocks governs
+    # SMB1 only), so it grants them, and the replayer has no break lifecycle.
+    #
+    # No cell enables a deviation: everything found so far that Windows does
+    # differently from the model's defaults is a POLICY its config sets
+    # (configs/_windows.json), which a strict twin would leave alone.
+    set(WINDOWS_CELLS
+        "stepCore|core|no"
+        "stepDir|dir|no"
+        "stepInfo|info|no"
+        "stepNs|ns|no"
+        "notify|notify|no"
+        "notifyNs|notify_ns|no")
+
+    foreach(c ${WINDOWS_CELLS})
+        string(REPLACE "|" ";" parts "${c}")
+        list(GET parts 0 bname)
+        list(GET parts 1 cstem)
+        list(GET parts 2 hasdev)
+        set(wcfg ${WINDOWS_HARNESS}/configs/${cstem}.json)
+
+        # A strict twin only where the config enables a deviation: a cell that
+        # enables none already IS the strict corpus.
+        if("${hasdev}" STREQUAL "yes")
+            specs_corpus(NAME    windows/smb2/${bname}
+                         FAMILY  smb2
+                         CONFIG  ${wcfg}
+                         OUT_DIR WINDOWS_TRACES
+                         STRICT_OUT_DIR WINDOWS_STRICT)
+        else()
+            specs_corpus(NAME    windows/smb2/${bname}
+                         FAMILY  smb2
+                         CONFIG  ${wcfg}
+                         OUT_DIR WINDOWS_TRACES)
+        endif()
+
+        add_test(NAME windows/smb2/${bname}/devliveness
+                 COMMAND ${Python3_EXECUTABLE} ${SPECS_DEVLIVENESS}
+                         ${wcfg} ${WINDOWS_TRACES})
+        set_tests_properties(windows/smb2/${bname}/devliveness PROPERTIES
+            LABELS "windows;smb2;devliveness"
+            TIMEOUT 120)
     endforeach()
 endif()
 

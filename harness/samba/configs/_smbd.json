@@ -27,7 +27,11 @@
     // 0x0300 -- smbprotocol's Dialects.SMB_3_0_0, what smb2_wire.py negotiates
     "dialect": 768,
     "leaseOpenBreak": true,
-    "forceLevel2": false
+    "forceLevel2": false,
+    // FILE_CREATE onto an existing directory opened FILE_NON_DIRECTORY_FILE
+    // reports FILE_IS_A_DIRECTORY rather than the collision.  Windows does
+    // the same.  (Formerly the deviation SD-5.)
+    "createTypeFirst": true
   },
 
   // The Samba divergences the model is told to PREDICT, so the trace's
@@ -39,7 +43,6 @@
   "deviations": [
     "SD-2",
     "SD-4",
-    "SD-5",
     "SD-8",
     "SD-9",
     "SD-13"
