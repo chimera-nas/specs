@@ -11,7 +11,8 @@ module s3Test {
     // deviation is switched on here.  That is the point of keeping them
     // separate from the generated corpus -- a config may describe a server that
     // gets something wrong, but the model's own tests always assert AWS.
-    import s3(DEVS = Set()).* from "./s3"
+    import s3(DEVS = Set(), P_CREATE_OWNED_CONFLICT = false,
+              P_COPY_SOURCE_FIRST = false).* from "./s3"
 
     // Key shorthands (component lists).
     pure val kA: Key = ["a"]

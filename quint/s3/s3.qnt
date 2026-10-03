@@ -21,7 +21,7 @@
 //    divergences of the server under test are branches gated on the DEVS
 //    constant (see "Known implementation deviations" below), never the
 //    default.  Where AWS behavior is
-//    region-dependent the model follows us-east-1 (the legacy region every
+//    region-dependent the default follows us-east-1 (the legacy region every
 //    filesystem gateway emulates): CreateBucket on a bucket you already own
 //    returns 200, not 409 BucketAlreadyOwnedByYou.
 //  - Object keys are lists of path components (e.g. ["d", "a"] is the key
@@ -250,6 +250,23 @@ module s3 {
     // Every id here must be declared, with a citation, in the family's
     // corpus.schema.json before a config may switch it on.
     const DEVS: Set[str]
+
+    // ------------------------------------------------------------------
+    // Policies: places where S3 itself has more than one right answer, and an
+    // implementation picks.  Unlike a deviation, neither value is a fault, so
+    // these carry no devHits record and no strict twin turns them off.
+    // ------------------------------------------------------------------
+
+    // CreateBucket on a bucket the caller already owns.  false: the legacy
+    // us-east-1 answer, 200 OK.  true: what every other AWS region answers,
+    // 409 BucketAlreadyOwnedByYou (S3 API Reference, CreateBucket).
+    const P_CREATE_OWNED_CONFLICT: bool
+
+    // CopyObject when the destination bucket AND the source key are both
+    // missing.  S3 documents no precedence between the two 404s.  false: the
+    // destination bucket is resolved first (NoSuchBucket) -- the request URI
+    // names it.  true: the source is resolved first (NoSuchKey).
+    const P_COPY_SOURCE_FIRST: bool
 
     pure def dev(id: str): bool = DEVS.contains(id)
 
@@ -528,22 +545,19 @@ module s3 {
     // CreateBucket (PUT /{bucket})
     // ------------------------------------------------------------------
 
-    // us-east-1 semantics: creating a bucket that already exists and is
-    // yours is idempotent 200 (elsewhere AWS returns 409
-    // BucketAlreadyOwnedByYou; a single-tenant gateway is "us-east-1").
+    // Creating a bucket that already exists and is yours: us-east-1 answers an
+    // idempotent 200, every other AWS region 409 BucketAlreadyOwnedByYou.
+    // Which one the service under test gives is P_CREATE_OWNED_CONFLICT.
     action applyCreateBucket(b: str): bool = all {
         bkts' = if (liveBuckets.contains(b)) bkts else bkts.put(b, EMPTY_BKT),
         nextUpl' = nextUpl,
-        // MinIO answers the 409 BucketAlreadyOwnedByYou every AWS region but
-        // us-east-1 gives, although us-east-1 is the region it reports.  The
-        // bucket is left as it was either way.
-        devHits' =
-            if (liveBuckets.contains(b) and dev("M-create-bucket-owned-409"))
-                Set("M-create-bucket-owned-409")
-            else Set(),
+        devHits' = Set(),
+        // Both answers are S3's own: which one a service gives is the
+        // P_CREATE_OWNED_CONFLICT policy, not a deviation.  The bucket is left
+        // as it was either way.
         lastOp' = OCreateBucket({
             bucket: b,
-            status: if (liveBuckets.contains(b) and dev("M-create-bucket-owned-409"))
+            status: if (liveBuckets.contains(b) and P_CREATE_OWNED_CONFLICT)
                         HTTP_CONFLICT
                     else HTTP_OK }),
     }
@@ -946,10 +960,10 @@ module s3 {
     // the whole object: content, metadata, and (x-amz-tagging-directive
     // COPY being the default) the tag set.
     //
-    // AWS documents no precedence between the two failures, and MinIO takes
-    // the other order: it resolves the SOURCE first, so a copy of a missing key
-    // into a missing bucket reports NoSuchKey.  (With both buckets missing the
-    // two orders give the same NoSuchBucket.)
+    // AWS documents no precedence between the two failures, so which is
+    // resolved first is the P_COPY_SOURCE_FIRST policy: source first, and a
+    // copy of a missing key into a missing bucket reports NoSuchKey.  (With
+    // both buckets missing the two orders give the same NoSuchBucket.)
     pure def copySrcKeyFirstIn(bs: str -> Bkt, sb: str, sk: Key, db: str): bool =
         not(bs.keys().contains(db)) and bs.keys().contains(sb)
             and not(bs.get(sb).objs.keys().contains(sk))
@@ -981,13 +995,9 @@ module s3 {
                     and bkts.get(sb).objs.keys().contains(sk)
                     and sb == db and sk == dk and dev("copy-self-200"))
                 Set("copy-self-200")
-            else if (copySrcKeyFirstIn(bkts, sb, sk, db)
-                    and dev("M-copy-source-before-dst-bucket"))
-                Set("M-copy-source-before-dst-bucket")
             else Set(),
         lastOp' =
-            if (copySrcKeyFirstIn(bkts, sb, sk, db)
-                    and dev("M-copy-source-before-dst-bucket"))
+            if (copySrcKeyFirstIn(bkts, sb, sk, db) and P_COPY_SOURCE_FIRST)
                 OCopyObject({ srcBucket: sb, srcKey: sk, dstBucket: db, dstKey: dk,
                               status: HTTP_NOT_FOUND, err: "NoSuchKey" })
             else if (not(liveBuckets.contains(db)))
@@ -1046,11 +1056,18 @@ module s3 {
     action applyGetAttrs(b: str, k: Key): bool = all {
         bkts' = bkts,
         nextUpl' = nextUpl,
+        //
+        // M-getattrs-root-lowercase is the same kind: the document's root
+        // element is named getObjectAttributesResponse, with a lower-case g,
+        // where the API Reference names it GetObjectAttributesResponse.  Every
+        // successful reply takes it.
         devHits' =
-            if (liveBuckets.contains(b) and bkts.get(b).objs.keys().contains(k)
-                    and bkts.get(b).objs.get(k).data.length() == 0
-                    and dev("M-getattrs-zero-size-omitted"))
-                Set("M-getattrs-zero-size-omitted")
+            if (liveBuckets.contains(b) and bkts.get(b).objs.keys().contains(k))
+                (if (dev("M-getattrs-root-lowercase"))
+                    Set("M-getattrs-root-lowercase") else Set())
+                .union(if (bkts.get(b).objs.get(k).data.length() == 0
+                           and dev("M-getattrs-zero-size-omitted"))
+                    Set("M-getattrs-zero-size-omitted") else Set())
             else Set(),
         lastOp' =
             if (not(liveBuckets.contains(b)))

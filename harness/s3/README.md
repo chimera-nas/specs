@@ -20,8 +20,15 @@ server actually does, the trace's expectation is already the truth, and replay
 is an exact match. Every such branch is declared with its measurement and
 citation in `quint/s3/corpus.schema.json` (the `M-*` ids), switched on by
 `harness/s3/configs/*.json`, and kept honest by `tools/devliveness.py`, which
-fails a cell that claims a deviation its own corpus never reaches. The harness
-has **no notion of a forgivable difference**.
+fails a cell that claims a deviation its own corpus never reaches.
+
+Not every difference is a fault. Where S3 itself has more than one right answer
+and a service picks one, the choice is a **policy** — a named constant of the
+model that each implementation's config sets — and not a deviation: it records
+no hit and a strict twin leaves it alone. Either way the branch is in the model
+and the setting is in the config, so `configs/_minio.json` is the whole
+statement of how this server differs. The harness has **no notion of a
+forgivable difference**.
 
 ## The server
 
@@ -81,7 +88,7 @@ reports at its last write is the value every later GET, HEAD, listing,
 GetObjectAttributes and CompleteMultipartUpload must report until it is
 rewritten.
 
-Three things here are choices, and are stated rather than left implicit:
+Two things here are choices, and are stated rather than left implicit:
 
 * **It is a correct client.** DeleteObjects and the tagging PUTs carry
   `Content-MD5` and GetObjectAttributes carries `x-amz-object-attributes`,
@@ -89,15 +96,12 @@ Three things here are choices, and are stated rather than left implicit:
   would measure the harness.
 * **The default Content-Type is `binary/octet-stream`.** That is what S3
   reports for an object stored with no Content-Type, and what MinIO reports.
-* **The root element name of the GetObjectAttributes response is not
-  compared.** The API Reference calls it `GetObjectAttributesResponse`, the
-  service model calls the same shape `GetObjectAttributesOutput`, MinIO sends
-  `getObjectAttributesResponse`, and no REST-XML client reads it.
 
 ## Divergences found
 
-The first replay of the strict corpus diverged in all 34 traces. Fifteen
-distinct causes came out of it.
+The first replay of the strict corpus diverged in all 34 traces. Sixteen
+distinct causes came out of it: one of the model's own, two places where S3
+allows either answer, and thirteen MinIO faults.
 
 ### The model — one, and it is the harness-facing half
 
@@ -110,11 +114,17 @@ The value is not a field of the trace label — the model carries only the
 `s3.qnt` and applied by this harness. A consumer whose own harness expects
 `application/octet-stream` is asserting its server's default, not S3's.
 
+### S3 allows either — policies
+
+| policy | default | MinIO |
+|--------|---------|-------|
+| `createOwnedBucketConflict` | `false`: CreateBucket on a bucket you own answers 200, as us-east-1 does | `true`: 409 `BucketAlreadyOwnedByYou`, as every other AWS region does |
+| `copySourceFirst` | `false`: a CopyObject of a missing key into a missing bucket reports `NoSuchBucket` | `true`: it reports `NoSuchKey` — the source is resolved first |
+
 ### MinIO deviates, and the model predicts it
 
 | id | what MinIO does | cell |
 |----|-----------------|------|
-| `M-create-bucket-owned-409` | CreateBucket on a bucket you own answers 409 `BucketAlreadyOwnedByYou`, the non-us-east-1 answer, while reporting us-east-1 | both |
 | `M-list-marker-outside-prefix-501` | a V1 `marker` or Versions `key-marker` that does not begin with the prefix is refused with 501 `NotImplemented`, before the bucket is even looked up | both |
 | `M-list-marker-inside-prefix-skipped` | with a delimiter, a common prefix the start key lies inside is never returned, though later keys still roll up into it | base |
 | `M-416-no-content-range` | a 416 carries no `Content-Range: bytes */<length>` | base |
@@ -122,8 +132,8 @@ The value is not a field of the trace label — the model carries only the
 | `M-get-bucket-tagging-no-bucket-check` | GetBucketTagging on a missing bucket answers `NoSuchTagSet`, not `NoSuchBucket` | base |
 | `M-delete-bucket-tagging-no-bucket-check` | DeleteBucketTagging on a missing bucket answers 204 | base |
 | `M-delete-objects-dup-empty` | a key named twice in one DeleteObjects comes back once with its key and once as an empty `<Deleted/>` | base |
-| `M-copy-source-before-dst-bucket` | CopyObject of a missing key into a missing bucket reports `NoSuchKey`: the source is resolved first | base |
 | `M-getattrs-zero-size-omitted` | GetObjectAttributes omits `<ObjectSize>` when the size is 0 | base |
+| `M-getattrs-root-lowercase` | the GetObjectAttributes document's root element is `getObjectAttributesResponse`, lower-case g | base |
 | `M-part-zero-invalidpart` | `partNumber=0` is `InvalidPart`, not `InvalidArgument` | multipart |
 | `M-complete-empty-manifest-invalidrequest` | an empty Complete manifest is `InvalidRequest`, not `MalformedXML` | multipart |
 | `M-complete-duplicate-part-accepted` | a manifest repeating a part number in place (1,2,2) is **accepted**, and the part is assembled once per occurrence | multipart |
@@ -136,15 +146,11 @@ longer than the manifest's distinct parts. A registry could only have abandoned
 the trace there. Modelled, the model completes the upload too and concatenates
 the repeat, and the trace keeps testing.
 
-Three of the fourteen change no field of the trace label, only something the
+Four of the thirteen change no field of the trace label, only something the
 harness derives: the missing 416 header, the empty `<Deleted/>`, the omitted
-`<ObjectSize>`. For those the model records the hit in `devHits` and the
+`<ObjectSize>`, the root element's name. For those the model records the hit in `devHits` and the
 harness reads it from the trace, so the expectation still comes from the model
 and never from the harness knowing which server it is talking to.
-
-Two are precedence or region choices rather than faults —
-`M-create-bucket-owned-409` and `M-copy-source-before-dst-bucket` — and are
-recorded the same way so that the comparison stays exact.
 
 ### The cells
 
@@ -153,13 +159,14 @@ recorded the same way so that the comparison stays exact.
 | `base` | `base.json` | 29 | 8 KiB | yes |
 | `multipart` | `multipart.json` | 5 | 5 MiB | yes |
 
-Both extend `configs/_minio.json`, which carries the server's fourteen
-deviations; each cell switches off the ones its own flavours cannot reach. The
+Both extend `configs/_minio.json`, which carries the server's two policies
+and thirteen deviations; each cell switches off the ones its own flavours cannot reach. The
 batch lists are the ones the consuming project replays against its own server,
 unchanged: the corpus is protocol-level, so what distinguishes these cells is
 only which divergences the model is told to predict.
 
-The strict twins are the same batches with every deviation forced off. They
+The strict twins are the same batches with every deviation forced off and the
+policies left as set. They
 fail, by design: their failures are exactly MinIO's conformance debt,
 re-measured on every extended run rather than remembered.
 

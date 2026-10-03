@@ -260,7 +260,8 @@ class Oracle:
         if not self.check_status(op, res):
             return
         if op["status"] == 409:
-            # the label carries no err: the model predicts one 409 only
+            # the label carries no err: the model predicts one 409 only, the
+            # createOwnedBucketConflict policy's
             if res.error_code() != "BucketAlreadyOwnedByYou":
                 self.mism("error <Code>: expected 'BucketAlreadyOwnedByYou', "
                           f"got '{res.error_code()}'")
@@ -441,14 +442,11 @@ class Oracle:
         if op["status"] != 200:
             self.check_error_code(op, res)
             return
-        # The root element's NAME is not checked.  The API Reference calls it
-        # GetObjectAttributesResponse, the service model calls the same shape
-        # GetObjectAttributesOutput, servers are found using either (and
-        # MinIO a third, getObjectAttributesResponse), and no REST-XML client
-        # reads it.  That it is not an <Error> is what matters.
-        root = res.xml()
-        if root is None or root.tag == "Error":
-            self.mism("GetAttrs: response is not an attributes document")
+        root = self.xml(res,
+                        "getObjectAttributesResponse"
+                        if self.hit("M-getattrs-root-lowercase")
+                        else "GetObjectAttributesResponse", "GetAttrs")
+        if root is None:
             return
         want = (None if self.hit("M-getattrs-zero-size-omitted")
                 else str(op["sizeBlocks"] * self.bs))

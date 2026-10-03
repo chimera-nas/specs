@@ -8,6 +8,15 @@
   "family": "s3",
   "description": "the MinIO harness/s3 stands up: single node, single drive, default region.",
 
+  // Where S3 has more than one right answer, which one this server gives.
+  "policies": {
+    // 409 BucketAlreadyOwnedByYou for a bucket the caller already owns: the
+    // answer of every AWS region but us-east-1.
+    "createOwnedBucketConflict": true,
+    // A copy of a missing key into a missing bucket reports NoSuchKey.
+    "copySourceFirst": true
+  },
+
   // The MinIO divergences the model is told to PREDICT, so the trace's
   // expectation is already what this server does and replay is an exact match.
   // Declared with their measurements and citations in
@@ -15,7 +24,6 @@
   // cannot reach, because tools/devliveness.py fails a cell that enables a
   // deviation its corpus never exercises.
   "deviations": [
-    "M-create-bucket-owned-409",
     "M-get-bucket-tagging-no-bucket-check",
     "M-delete-bucket-tagging-no-bucket-check",
     "M-416-no-content-range",
@@ -23,8 +31,8 @@
     "M-list-marker-outside-prefix-501",
     "M-list-marker-inside-prefix-skipped",
     "M-delete-objects-dup-empty",
-    "M-copy-source-before-dst-bucket",
     "M-getattrs-zero-size-omitted",
+    "M-getattrs-root-lowercase",
     "M-part-zero-invalidpart",
     "M-complete-empty-manifest-invalidrequest",
     "M-complete-duplicate-part-accepted",
