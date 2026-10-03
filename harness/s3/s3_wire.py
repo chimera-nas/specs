@@ -247,6 +247,88 @@ class _ExpectResponse(http.client.HTTPResponse):
         return super()._read_status()
 
 
+# The rule every bucket this suite creates carries from the moment it exists:
+# whatever is still in it after a day expires, and so does an upload nobody
+# finished.  A bucket has no lifetime of its own in S3 -- only its contents can
+# be given one -- so this bounds what a leaked bucket can cost until a sweep
+# (s3_sweep.py) removes the bucket itself.
+EXPIRE_LIFECYCLE = (
+    b"<LifecycleConfiguration><Rule><ID>specs-mbt-expire</ID>"
+    b"<Filter><Prefix></Prefix></Filter><Status>Enabled</Status>"
+    b"<Expiration><Days>1</Days></Expiration>"
+    b"<AbortIncompleteMultipartUpload><DaysAfterInitiation>1"
+    b"</DaysAfterInitiation></AbortIncompleteMultipartUpload>"
+    b"</Rule></LifecycleConfiguration>")
+
+
+def location_constraint(region):
+    """The CreateBucket body a region demands: every region but us-east-1
+    refuses a create that does not name it."""
+    if region == "us-east-1":
+        return b""
+    return ("<CreateBucketConfiguration><LocationConstraint>" + region +
+            "</LocationConstraint></CreateBucketConfiguration>").encode()
+
+
+def list_buckets(client, prefix=""):
+    """[(name, CreationDate)] of the caller's buckets whose name starts with
+    `prefix`, following the listing's continuation tokens.  The prefix is
+    applied here as well as asked of the server: a server that ignores the
+    parameter must not widen what a caller goes on to delete."""
+    out, token = [], None
+    while True:
+        query = [("prefix", prefix)] if prefix else []
+        if token:
+            query.append(("continuation-token", token))
+        res = client.call("GET", "/", query=query)
+        root = res.xml()
+        if res.status != 200 or root is None:
+            raise OSError(f"ListBuckets: {res.status} {res.error_code()}")
+        for b in root.iter("Bucket"):
+            name = b.findtext("Name", "")
+            if name.startswith(prefix):
+                out.append((name, b.findtext("CreationDate", "")))
+        token = root.findtext("ContinuationToken")
+        if not token:
+            return out
+
+
+def purge_bucket(client, name):
+    """Abort every upload in bucket `name`, delete every object, delete the
+    bucket.  Returns "" on success (a bucket already gone is a success), else
+    what stopped it."""
+    path = f"/{name}"
+    for _ in range(1000):
+        res = client.call("GET", path, query=[("uploads", "")])
+        if res.status == 404:
+            return ""
+        root = res.xml()
+        if res.status != 200 or root is None:
+            return f"ListMultipartUploads: {res.status} {res.error_code()}"
+        ups = [(u.findtext("Key", ""), u.findtext("UploadId", ""))
+               for u in root.findall("Upload")]
+        for key, upl in ups:
+            client.call("DELETE", f"{path}/{key}", query=[("uploadId", upl)])
+        if root.findtext("IsTruncated") != "true":
+            break
+    for _ in range(1000):
+        res = client.call("GET", path, query=[("list-type", "2")])
+        if res.status == 404:
+            return ""
+        root = res.xml()
+        if res.status != 200 or root is None:
+            return f"ListObjectsV2: {res.status} {res.error_code()}"
+        keys = [c.findtext("Key", "") for c in root.findall("Contents")]
+        if not keys:
+            break
+        for key in keys:
+            client.call("DELETE", f"{path}/{key}")
+    res = client.call("DELETE", path)
+    if res.status in (204, 404):
+        return ""
+    return f"DeleteBucket: {res.status} {res.error_code()}"
+
+
 def wait_ready(host, port, access_key, secret_key, timeout=60.0, **kw):
     """Wait until the server answers S3, not merely until it listens.
 

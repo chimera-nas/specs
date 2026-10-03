@@ -598,6 +598,10 @@ jobs:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_S3_BUCKET: ${{ vars.AWS_S3_BUCKET }}
       AWS_REGION: ${{ vars.AWS_REGION }}
+      # What every bucket the bucket cells create is named under; the
+      # credentials hold rights on <prefix>-* and on nothing else they could
+      # create.
+      AWS_S3_BUCKET_PREFIX: chimera-ci-mbt
     steps:
       - uses: actions/checkout@v4
 
@@ -648,18 +652,30 @@ jobs:
               cmake --build build -j"$(nproc)"
             '
 
+      # The bucket cells create real buckets and delete them as each trace
+      # ends, but a cancelled run never gets that far and S3 gives a bucket no
+      # lifetime of its own.  So before replaying, remove what earlier runs
+      # leaked -- only buckets old enough that no live run can still own them.
+      # Housekeeping, not a verdict: it does not fail the job.
+      - name: Sweep buckets leaked by earlier runs
+        if: env.AWS_ACCESS_KEY_ID != ''
+        run: |
+          python3 harness/s3/s3_sweep.py --prefix "${AWS_S3_BUCKET_PREFIX}-" \
+            --max-age-hours 3 || echo "::warning::bucket sweep failed"
+
       # -e NAME with no value passes the variable through from this step's
       # environment, so the secret never appears on a command line.  The run
-      # id and attempt go in too: they are what makes the key prefix unique.
+      # id and attempt go in too: they are what makes the key prefix and the
+      # bucket names unique.
       - name: Replay the corpus against Amazon S3
         run: |
           docker run --rm -v "$PWD:/specs" -w /specs \
             -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
-            -e AWS_S3_BUCKET -e AWS_REGION \
+            -e AWS_S3_BUCKET -e AWS_S3_BUCKET_PREFIX -e AWS_REGION \
             -e GITHUB_RUN_ID -e GITHUB_RUN_ATTEMPT \
             specs-dev:${{ github.sha }} \
             bash -c '
-              ctest --test-dir build -L aws -V --no-tests=error -j 2
+              ctest --test-dir build -L aws -V --no-tests=error -j 4
               rc=$?
               if [ "$rc" != 0 ]; then
                 echo "=== ctest exited $rc; LastTest.log ==="
@@ -667,6 +683,16 @@ jobs:
               fi
               exit $rc
             '
+
+      # Whatever happened above -- failed, timed out, cancelled -- nothing of
+      # this run's is left behind.  Scoped to this run and attempt, so it
+      # cannot touch a concurrent pipeline's buckets.
+      - name: Remove this run's buckets
+        if: always() && env.AWS_ACCESS_KEY_ID != ''
+        run: |
+          python3 harness/s3/s3_sweep.py \
+            --prefix "${AWS_S3_BUCKET_PREFIX}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-" \
+            --max-age-hours 0
 
   # A single check for the ruleset to require.
   #

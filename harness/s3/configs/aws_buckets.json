@@ -1,0 +1,13 @@
+{
+  "extends": "./_aws.json",
+  "family": "s3",
+  "description": "Amazon S3 over what one shared bucket cannot reach: the bucket lifecycle, ListBuckets, bucket tagging, every NoSuchBucket path and cross-bucket copies. The trace's own CreateBucket calls make real buckets, which the replayer names uniquely per trace and removes when the trace ends.",
+  "traceStem": "awsbk",
+
+  "batches": [
+    { "flavor": "stepBucket", "steps": 64,  "traces": 6, "seed": "0x1" },
+    { "flavor": "step",       "steps": 128, "traces": 4, "seed": "0x21" },
+    { "flavor": "stepTag",    "steps": 128, "traces": 4, "seed": "0x21" },
+    { "flavor": "stepData",   "steps": 128, "traces": 2, "seed": "0x21" }
+  ]
+}

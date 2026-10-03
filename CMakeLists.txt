@@ -1003,16 +1003,24 @@ endif()
 # AWS itself, which is the only server that can say whether the model read the
 # reference correctly -- MinIO can only say whether MinIO did.
 #
-# There is no server to stand up and no bucket to create: the credentials hold
-# rights on ONE existing bucket, so the cells are generated under the
-# fixedBucket policy and the replayer isolates each trace under a key prefix of
-# its own.  The tests need AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and
-# AWS_S3_BUCKET in the environment at ctest time and report a SKIP without
-# them, so a machine (or a fork's pull request) that has none is not a failure.
+# There is no server to stand up.  Two kinds of cell:
 #
-# The bucket may be shared with any number of other pipelines.  Every trace's
-# keys go under a prefix unique to the run, the cell and the trace, and the
-# cells touch nothing bucket-wide, so they need no lock and run concurrently.
+#   fixed      generated under the fixedBucket policy and replayed in ONE
+#              existing bucket (AWS_S3_BUCKET), which may be shared with any
+#              number of other pipelines: every trace's keys go under a prefix
+#              unique to the run, the cell and the trace, and nothing
+#              bucket-wide is touched.
+#   ephemeral  generated with the bucket calls in, and replayed in real buckets
+#              the trace itself creates, named uniquely per run, cell and trace
+#              and removed when the trace ends.  Covers what one shared bucket
+#              cannot: the bucket lifecycle, ListBuckets, bucket tagging, the
+#              NoSuchBucket paths and cross-bucket copies.
+#
+# Either way no two tests share a name, so they need no lock and run
+# concurrently.  The tests need AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+# (and the fixed ones AWS_S3_BUCKET) in the environment at ctest time and
+# report a SKIP without them, so a machine (or a fork's pull request) that has
+# none is not a failure.
 # ---------------------------------------------------------------------------
 option(SPECS_AWS_TESTS
        "Register the Amazon S3 conformance suite (default: on only when specs \
@@ -1028,19 +1036,22 @@ else()
     message(STATUS "aws MBT tests: registered (they SKIP without AWS "
             "credentials in the environment)")
 
-    # cell name | config stem | block size
+    # cell name | config stem | block size | buckets
     #
     # No strict twins: the cells enable no deviation, so each already IS the
     # strict corpus.
     set(AWS_CELLS
-        "base|aws_base|8192"
-        "multipart|aws_multipart|5242880")
+        "base|aws_base|8192|fixed"
+        "multipart|aws_multipart|5242880|fixed"
+        "buckets|aws_buckets|8192|ephemeral"
+        "multipart_buckets|aws_multipart_buckets|5242880|ephemeral")
 
     foreach(c ${AWS_CELLS})
         string(REPLACE "|" ";" parts "${c}")
         list(GET parts 0 cname)
         list(GET parts 1 cstem)
         list(GET parts 2 bsize)
+        list(GET parts 3 bmode)
         set(acfg ${S3_HARNESS}/configs/${cstem}.json)
 
         specs_corpus(NAME    aws/s3/${cname}
@@ -1061,7 +1072,7 @@ else()
             LABELS "aws;s3;mbt"
             TIMEOUT 1800
             SKIP_RETURN_CODE 77
-            ENVIRONMENT "SPECS_S3_BLOCK_SIZE=${bsize}")
+            ENVIRONMENT "SPECS_S3_BLOCK_SIZE=${bsize};SPECS_AWS_BUCKETS=${bmode}")
     endforeach()
 endif()
 

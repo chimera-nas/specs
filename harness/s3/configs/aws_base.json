@@ -4,6 +4,16 @@
   "description": "Amazon S3 over the modeled object surface at the default block size: objects, ranges, listings, copies, tagging and batch delete, in one existing bucket. The MinIO base cell's batches without stepBucket, which is the bucket lifecycle and cannot be drawn against a bucket the tester may not create or delete.",
   "traceStem": "aws",
 
+  "policies": {
+    // The credentials for this cell hold rights on ONE bucket that already
+    // exists and is shared with other pipelines.  So the model starts with its
+    // one bucket live and never draws CreateBucket, DeleteBucket, ListBuckets
+    // or the bucket-level tagging calls, whose state no key prefix can keep
+    // apart.  This narrows what the corpus contains; it changes nothing the
+    // model predicts.  The bucket cells cover what this leaves out.
+    "fixedBucket": true
+  },
+
   "batches": [
     { "flavor": "step",     "steps": 128, "traces": 8, "seed": "0x1" },
     { "flavor": "step",     "steps": 256, "traces": 3, "seed": "0x100" },
