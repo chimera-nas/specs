@@ -201,7 +201,7 @@ module s3 {
         | OHeadObject({ bucket: str, key: Key, status: int, sizeBlocks: int })
         | ODeleteObject({ bucket: str, key: Key, status: int, err: str })
         | ODeleteObjects({ bucket: str, keys: List[Key], quiet: bool,
-                           status: int, err: str })
+                           status: int, err: str, deleted: List[Key] })
         | OCopyObject({ srcBucket: str, srcKey: Key, dstBucket: str, dstKey: Key,
                         status: int, err: str })
         | OGetAttrs({ bucket: str, key: Key, status: int, err: str,
@@ -279,29 +279,43 @@ module s3 {
     // a corpus CONTAINS; it changes nothing the model predicts.
     const P_FIXED_BUCKET: bool
 
-    // A 416 InvalidRange carries "Content-Range: bytes */<length>".  RFC 9110
-    // 15.5.17 says a server SHOULD send it.  true: it does, and the label's
-    // `total` says what length to expect.  false: it does not, and `total` is
-    // -1 on a 416 -- the header must be ABSENT.  AWS does not send it.
+    // ---- relaxations: what AWS does NOT do, and an implementation may ----
+    //
+    // The defaults above and below are Amazon S3's own behaviour, measured.
+    // Each of these four is FALSE on AWS.  Setting one true is an explicit
+    // statement that the implementation under test departs from AWS there and
+    // that the departure is accepted -- which is the only way the model will
+    // predict it.
+
+    // A 416 InvalidRange carries "Content-Range: bytes */<length>", as RFC
+    // 9110 15.5.17 says a server SHOULD.  AWS sends none: false, and the
+    // label's `total` is -1 on a 416 -- the header must be ABSENT.  true: the
+    // header is sent and `total` says what length it must name.
     const P_RANGE_ERR_CONTENT_RANGE: bool
 
-    // A suffix range (bytes=-N) against a zero-length object.  false: it is
-    // unsatisfiable like every other range against an empty object, 416
-    // InvalidRange.  true: the range is ignored and the request answers as an
-    // unranged GET would, 200 with an empty body.  AWS is true.
-    const P_EMPTY_SUFFIX_RANGE_OK: bool
+    // A suffix range (bytes=-N) against a zero-length object.  AWS ignores
+    // the range and answers as an unranged GET would, 200 with an empty body:
+    // false.  true: it is unsatisfiable like every other range against an
+    // empty object, 416 InvalidRange.
+    const P_EMPTY_SUFFIX_RANGE_UNSATISFIABLE: bool
 
     // Listing with a delimiter from a start key (marker / start-after /
     // key-marker) that lies INSIDE a common prefix, "d/" for a start key
-    // "d/a".  false: keys after the start key still roll up into that prefix
-    // and it is returned.  true: the prefix is taken to sort before the start
-    // key and is never returned.  AWS is true.
-    const P_LIST_SKIPS_MARKER_PREFIX: bool
+    // "d/a".  AWS takes the prefix to sort before the start key and never
+    // returns it: false.  true: keys after the start key still roll up into
+    // the prefix and it is returned.
+    const P_LIST_RETURNS_MARKER_PREFIX: bool
 
-    // CopyObject of an object onto itself with no metadata directive.  false:
-    // 400 InvalidRequest, as the API Reference describes.  true: the copy is
-    // performed and answers 200.  AWS is true, as measured.
-    const P_COPY_SELF_OK: bool
+    // CopyObject of an object onto itself with no metadata directive.  AWS
+    // performs the copy and answers 200: false.  true: 400 InvalidRequest,
+    // which is what the API Reference describes and AWS, measured, does not
+    // do.
+    const P_COPY_SELF_REJECTED: bool
+
+    // DeleteObjects naming the same key more than once.  AWS reports that key
+    // ONCE, however many times the request named it: false.  true: one
+    // <Deleted> entry per occurrence.
+    const P_DELETE_REPORTS_DUPLICATES: bool
 
     // The bucket names a request may carry.
     val BKT_UNIVERSE = if (P_FIXED_BUCKET) Set("bk0") else BUCKETS
@@ -421,8 +435,8 @@ module s3 {
     // IsTruncated reports whether any further key would have emitted a new
     // entry.  AWS returns an empty, non-truncated result for max-keys=0.
     //
-    // skipIn is the P_LIST_SKIPS_MARKER_PREFIX policy: a common prefix the
-    // start key lies INSIDE ("d/" for a start key "d/a") is never emitted,
+    // skipIn is AWS's behaviour, relaxed by P_LIST_RETURNS_MARKER_PREFIX: a
+    // common prefix the start key lies INSIDE ("d/" for a start key "d/a") is never emitted,
     // although keys past the start key still roll up into it.
     pure def listWalk(objs: Set[Key], p: Prefix, delim: bool, sa: Key, maxKeys: int,
                       skipIn: bool): ListOut =
@@ -792,7 +806,8 @@ module s3 {
             else if (getIsEmptySuffix(bkts, b, k, r) and dev("M-suffix-range-empty-206"))
                 OGetObject({ bucket: b, key: k, range: r, status: HTTP_PARTIAL,
                              err: "", data: [], first: 0, total: 0 })
-            else if (getIsEmptySuffix(bkts, b, k, r) and P_EMPTY_SUFFIX_RANGE_OK)
+            else if (getIsEmptySuffix(bkts, b, k, r)
+                    and not(P_EMPTY_SUFFIX_RANGE_UNSATISFIABLE))
                 OGetObject({ bucket: b, key: k, range: r, status: HTTP_OK,
                              err: "", data: [], first: 0, total: 0 })
             else
@@ -943,8 +958,22 @@ module s3 {
 
     // Every named key is reported <Deleted>, present or not (idempotent,
     // matching single DeleteObject); Quiet suppresses the <Deleted>
-    // entries.  Duplicate keys in one request are legal and each occurrence
-    // is reported.
+    // entries.  Duplicate keys in one request are legal; see deletedReport
+    // for how they are reported.
+    // The <Deleted> entries of the reply, as a list of keys.  The ORDER is not
+    // part of the contract -- AWS does not keep the request's -- so a harness
+    // compares it as a multiset.  Quiet reports nothing.  A key named more
+    // than once is reported once (AWS), once per occurrence
+    // (P_DELETE_REPORTS_DUPLICATES), or once by name and then as an entry
+    // naming no key at all, NO_KEY (MinIO, M-delete-objects-dup-empty).
+    pure def deletedReport(ks: List[Key], quiet: bool): List[Key] =
+        if (quiet) []
+        else ks.foldl([], (acc, k) =>
+            if (not(acc.select(x => x == k).length() > 0)) acc.append(k)
+            else if (dev("M-delete-objects-dup-empty")) acc.append(NO_KEY)
+            else if (P_DELETE_REPORTS_DUPLICATES) acc.append(k)
+            else acc)
+
     action applyDeleteObjects(b: str, ks: List[Key], quiet: bool): bool = all {
         bkts' =
             if (liveBuckets.contains(b))
@@ -952,11 +981,10 @@ module s3 {
                     bk.with("objs", ks.foldl(bk.objs, (m, k) => mapDrop(m, k))))
             else bkts,
         nextUpl' = nextUpl,
-        // M-delete-objects-dup-empty changes no field of the label either:
         // MinIO deletes the key and reports its FIRST occurrence, then answers
-        // every repeat with an empty <Deleted/> element that names no key.
-        // The hit tells the harness which shape to expect.  Quiet mode reports
-        // nothing for anyone, so only a verbose request can take it.
+        // every repeat with an empty <Deleted/> element that names no key
+        // (M-delete-objects-dup-empty; NO_KEY in `deleted`).  Quiet mode
+        // reports nothing for anyone, so only a verbose request can take it.
         devHits' =
             if (liveBuckets.contains(b) and not(quiet) and ks.length() == 2
                     and ks[0] == ks[1] and dev("M-delete-objects-dup-empty"))
@@ -965,10 +993,12 @@ module s3 {
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 ODeleteObjects({ bucket: b, keys: ks, quiet: quiet,
-                                 status: HTTP_NOT_FOUND, err: "NoSuchBucket" })
+                                 status: HTTP_NOT_FOUND, err: "NoSuchBucket",
+                                 deleted: [] })
             else
                 ODeleteObjects({ bucket: b, keys: ks, quiet: quiet,
-                                 status: HTTP_OK, err: "" }),
+                                 status: HTTP_OK, err: "",
+                                 deleted: deletedReport(ks, quiet) }),
     }
 
     action deleteObjects = all {
@@ -1048,7 +1078,7 @@ module s3 {
                 OCopyObject({ srcBucket: sb, srcKey: sk, dstBucket: db, dstKey: dk,
                               status: HTTP_NOT_FOUND, err: "NoSuchKey" })
             else if (sb == db and sk == dk and not(dev("copy-self-200"))
-                    and not(P_COPY_SELF_OK))
+                    and P_COPY_SELF_REJECTED)
                 OCopyObject({ srcBucket: sb, srcKey: sk, dstBucket: db, dstKey: dk,
                               status: HTTP_BAD_REQUEST, err: "InvalidRequest" })
             else
@@ -1163,7 +1193,7 @@ module s3 {
                                keys: [], prefixes: [], truncated: false })
             else
                 val w = listWalk(bkts.get(b).objs.keys(), p, delim, sa, mk,
-                                 P_LIST_SKIPS_MARKER_PREFIX)
+                                 not(P_LIST_RETURNS_MARKER_PREFIX))
                 OListObjects({ bucket: b, prefix: p, delim: delim, startAfter: sa,
                                maxKeys: mk, mode: mode, status: HTTP_OK, err: "",
                                keys: w.keys, prefixes: w.prefixes,

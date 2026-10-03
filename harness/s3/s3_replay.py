@@ -431,16 +431,14 @@ class Oracle:
         root = self.xml(res, "DeleteResult", "DeleteObjects")
         if root is None:
             return
-        # non-quiet: one <Deleted><Key> per named key; quiet: none.  Never an
-        # <Error>: every key is deletable.  Compared as a multiset: the API
-        # promises an entry per key and no order, and Amazon S3 does not keep
-        # the request's.
-        got = [self.mk(d.findtext("Key", ""))
-               for d in root.findall("Deleted")]
-        want = [] if op["quiet"] else keys
-        if self.hit("M-delete-objects-dup-empty"):
-            # a repeated key comes back as an empty <Deleted/>
-            want = [k if k not in keys[:i] else "" for i, k in enumerate(keys)]
+        # The model predicts the <Deleted> entries (`deleted`).  Never an
+        # <Error>: every key is deletable.  Compared as a multiset: Amazon S3
+        # does not keep the request's order, and the API promises none.
+        # a <Deleted/> that names no key at all stays "", which is how the
+        # model writes that entry too (the empty key)
+        got = [self.mk(k) if k else ""
+               for k in (d.findtext("Key", "") for d in root.findall("Deleted"))]
+        want = [key_str(k) for k in op["deleted"]]
         if sorted(got) != sorted(want):
             self.mism(f"DeleteObjects: <Deleted> keys {got}, expected {want}")
         if root.find("Error") is not None:
