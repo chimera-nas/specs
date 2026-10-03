@@ -1424,6 +1424,12 @@ class Oracle:
         res = self.call("POST", self.op(bucket, key),
                         query=[("uploadId", self.wire_upload(uplid))],
                         body=body, xml_body=True)
+        if res.status == 200 and op["status"] != 200 and \
+                res.error_code() == op["err"]:
+            # The API Reference says so in as many words: this call may send
+            # 200 and its headers before it knows the outcome, and report a
+            # failure in the body.  The error named is what is predicted.
+            return
         if not self.check_status(op, res):
             return
         if op["status"] != 200:

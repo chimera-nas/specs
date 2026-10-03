@@ -219,6 +219,19 @@ class S3Client:
         self.last_request = (method, target, sorted(
             (k, v) for k, v in headers.items() if k != "authorization"))
 
+        # A request that presents credentials differently from the client's
+        # own signed header -- none, a presigned URL, somebody else's key --
+        # gets a connection to itself.  Measured against Amazon S3: on a
+        # keep-alive connection that has just carried one, the next correctly
+        # signed request is now and then refused SignatureDoesNotMatch,
+        # although the canonical request the service reports is byte for byte
+        # the one that was signed.  Authentication state is evidently kept
+        # per connection, and a conformance replay has no business depending
+        # on that.
+        foreign = anonymous or creds is not None
+        if foreign:
+            self.close()
+
         # One reconnect: the server is entitled to drop an idle keep-alive
         # connection, and that is not a divergence.  A request that fails on
         # a fresh connection is.
@@ -243,7 +256,7 @@ class S3Client:
                     raise
         resp = Response(r.status,
                         {k.lower(): v for k, v in r.getheaders()}, data)
-        if r.will_close:
+        if r.will_close or foreign:
             self.close()
         return resp
 
