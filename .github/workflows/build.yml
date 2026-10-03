@@ -508,7 +508,7 @@ jobs:
 
   # A single check for the ruleset to require.
   #
-  # samba, ganesha, knfsd and ext4 all hang off `build`, so requiring `build`
+  # samba, ganesha, knfsd, ext4 and windows all hang off `build`, so requiring `build`
   # alone
   # goes green as soon as the corpus compiles -- while the three conformance
   # replays that actually exercise it are still running.  A pull request could
@@ -523,7 +523,7 @@ jobs:
   # people edit rather than in a setting they do not see.
   ci-complete:
     name: CI complete
-    needs: [build, samba, ganesha, knfsd, ext4]
+    needs: [build, samba, ganesha, knfsd, ext4, windows]
     if: always()
     runs-on: ubuntu-latest
     # It reads `needs` and nothing else -- no checkout, no API call -- so the
