@@ -18,9 +18,7 @@
   "deviationsOff": [
     "M-get-bucket-tagging-no-bucket-check",
     "M-delete-bucket-tagging-no-bucket-check",
-    "M-416-no-content-range",
     "M-suffix-range-empty-206",
-    "M-list-marker-inside-prefix-skipped",
     "M-delete-objects-dup-empty",
     "M-getattrs-zero-size-omitted",
     "M-getattrs-root-lowercase"

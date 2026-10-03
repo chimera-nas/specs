@@ -365,7 +365,9 @@ class Oracle:
                     self.mism(f"GetObject Content-Range: expected '{want}', "
                               f"got '{res.header('content-range')}'")
         elif expected == 416:
-            want = ("" if self.hit("M-416-no-content-range")
+            # total is -1 where the service sends no Content-Range with a
+            # 416 (the rangeErrorContentRange policy): the header is absent
+            want = ("" if op["total"] < 0
                     else f"bytes */{op['total'] * self.bs}")
             if res.header("content-range") != want:
                 self.mism(f"416 Content-Range: expected '{want}', got "
@@ -429,15 +431,17 @@ class Oracle:
         root = self.xml(res, "DeleteResult", "DeleteObjects")
         if root is None:
             return
-        # non-quiet: one <Deleted><Key> per named key, in request order;
-        # quiet: none.  Never an <Error>: every key is deletable.
+        # non-quiet: one <Deleted><Key> per named key; quiet: none.  Never an
+        # <Error>: every key is deletable.  Compared as a multiset: the API
+        # promises an entry per key and no order, and Amazon S3 does not keep
+        # the request's.
         got = [self.mk(d.findtext("Key", ""))
                for d in root.findall("Deleted")]
         want = [] if op["quiet"] else keys
         if self.hit("M-delete-objects-dup-empty"):
             # a repeated key comes back as an empty <Deleted/>
             want = [k if k not in keys[:i] else "" for i, k in enumerate(keys)]
-        if got != want:
+        if sorted(got) != sorted(want):
             self.mism(f"DeleteObjects: <Deleted> keys {got}, expected {want}")
         if root.find("Error") is not None:
             self.mism("DeleteObjects: unexpected <Error> entry")

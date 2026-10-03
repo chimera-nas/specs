@@ -37,6 +37,34 @@
       "default": false,
       "doc": "the service under test is handed ONE bucket that already exists, and the tester may neither create nor delete buckets -- a real account in which the credentials hold rights on a single bucket. true: the model starts with bucket bk0 live and empty; CreateBucket, DeleteBucket and ListBuckets are never drawn; no request names another bucket, so the NoSuchBucket paths and cross-bucket copies are not generated. The bucket may be SHARED with other runs at the same moment, so the bucket-level tagging calls are not drawn either: a bucket's tag set is one value for the whole bucket and nothing partitions it. This narrows what the corpus CONTAINS and changes nothing the model predicts, so a cell that sets it covers less, not something different. The replay harness maps bk0 onto the real bucket and isolates each trace under a key prefix of its own, which is what keeps concurrent runs apart."
     },
+    "P_RANGE_ERR_CONTENT_RANGE": {
+      "kind": "policy",
+      "key": "policies.rangeErrorContentRange",
+      "type": "bool",
+      "default": true,
+      "doc": "does a 416 InvalidRange carry 'Content-Range: bytes */<complete-length>'? RFC 9110 15.5.17 says a server SHOULD send it. true: it does. false: it does not, and the label's `total` is -1 on a 416, which tells a harness the header must be absent. Measured false against Amazon S3 (us-east-2) and against MinIO, which reports the length only in the XML body. Status, <Code> and body are the same either way."
+    },
+    "P_EMPTY_SUFFIX_RANGE_OK": {
+      "kind": "policy",
+      "key": "policies.emptySuffixRangeOk",
+      "type": "bool",
+      "default": false,
+      "doc": "a suffix range (bytes=-N) against a zero-length object. false: 416 InvalidRange, like every other range against an empty object. true: the range is ignored and the request answers as an unranged GET, 200 with an empty body. Measured true against Amazon S3 (us-east-2); bytes=0- and bytes=0-N against the same object are 416 under either value. (MinIO does a third thing, which is a fault: M-suffix-range-empty-206.)"
+    },
+    "P_LIST_SKIPS_MARKER_PREFIX": {
+      "kind": "policy",
+      "key": "policies.listSkipsMarkerPrefix",
+      "type": "bool",
+      "default": false,
+      "doc": "listing with a delimiter from a start key (marker / start-after / key-marker) that lies INSIDE a common prefix. false: keys sorting after the start key still roll up into that prefix and it is returned -- with d/a, d/c and d/e/c stored, start-after=d/a&delimiter=/ returns CommonPrefixes 'd/'. true: the prefix is never returned, and KeyCount and IsTruncated follow the shorter page. Measured true against Amazon S3 (us-east-2) and against MinIO, on all three listing calls."
+    },
+    "P_COPY_SELF_OK": {
+      "kind": "policy",
+      "key": "policies.copySelfOk",
+      "type": "bool",
+      "default": false,
+      "doc": "CopyObject of an object onto itself with no metadata directive. false: 400 InvalidRequest, as the S3 API Reference describes ('This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes'). true: the copy is performed and answers 200 with a CopyObjectResult. Measured true against Amazon S3 (us-east-2), on a bucket with the default SSE-S3 encryption every bucket now has; MinIO is false. The deviation id copy-self-200 predates this policy and predicts the same reply."
+    },
     "DEVS": {
       "kind": "deviation",
       "key": "deviations",
@@ -50,10 +78,8 @@
         "range-full-200": "AWS answers 206 for every satisfiable Range including one covering the whole object (RFC 7233 4.1); chimera collapses a whole-object range to 200.",
         "M-get-bucket-tagging-no-bucket-check": "MINIO. GetBucketTagging on a bucket that does not exist answers 404 NoSuchTagSet instead of 404 NoSuchBucket: the handler reads the bucket's metadata without first asking whether the bucket exists, so a missing bucket reads as a bucket with no tags. Status matches; only the <Code> diverges. Fix: minio: check bucket existence in GetBucketTaggingHandler. Model: applyGetBktTagging.",
         "M-delete-bucket-tagging-no-bucket-check": "MINIO. DeleteBucketTagging on a bucket that does not exist answers 204 No Content instead of 404 NoSuchBucket, for the same reason (PutBucketTagging does check, and answers NoSuchBucket). Nothing is created, so state stays in step. Fix: minio: check bucket existence in DeleteBucketTaggingHandler. Model: applyDelBktTagging.",
-        "M-416-no-content-range": "MINIO. A 416 InvalidRange carries no Content-Range header. RFC 9110 15.5.17: a server generating a 416 to a byte-range request SHOULD send 'Content-Range: bytes */<complete-length>', and AWS does. MinIO reports the length only in the XML body (<ActualObjectSize>). Status, <Code> and body agree; the label is unchanged and the recorded hit tells the harness to expect the header absent. Fix: minio: set Content-Range on the InvalidRange error path. Model: applyGetObject (getIs416).",
         "M-suffix-range-empty-206": "MINIO. A suffix range (bytes=-N) against a zero-length object answers 206 with an empty body and 'Content-Range: bytes 0--1/0', a header no byte range can mean. AWS answers 416 InvalidRange for any range against a zero-length object, and MinIO itself does for bytes=0- and bytes=0-N; only the suffix form slips through. Fix: minio: reject a suffix range when the object size is 0. Model: applyGetObject (getIsEmptySuffix).",
         "M-list-marker-outside-prefix-501": "MINIO. ListObjects (V1) with a marker, or ListObjectVersions with a key-marker, that does not begin with the request prefix is refused with 501 NotImplemented -- before the bucket is looked up, so a missing bucket reports 501 too. On AWS the marker is just an exclusive start key (S3 API Reference, ListObjects: 'Marker is where you want Amazon S3 to start listing from'), unrelated to the prefix, and the request lists whatever matches the prefix and sorts after it. ListObjectsV2's start-after is served correctly, so this is the V1/Versions argument check, not the walk. Fix: minio: drop the marker-has-prefix requirement in checkListObjsArgs. Model: applyListObjects (listMarkerOutside).",
-        "M-list-marker-inside-prefix-skipped": "MINIO. With a delimiter, a common prefix that the start key (marker / start-after / key-marker) lies INSIDE is never returned, although keys sorting after the start key still roll up into it: with d/a, d/c and d/e/c stored, start-after=d/a&delimiter=/ omits CommonPrefixes 'd/'. AWS starts 'listing after this specified key' (S3 API Reference, ListObjectsV2, StartAfter) and rolls d/c up into d/, which it returns. KeyCount and IsTruncated follow the shorter page. All three listing calls do it. Fix: minio: do not treat a marker inside a prefix as having already returned that prefix. Model: listWalk (skipIn).",
         "M-delete-objects-dup-empty": "MINIO. DeleteObjects naming the same key twice reports the first occurrence as <Deleted><Key>k</Key></Deleted> and every repeat as an EMPTY <Deleted/> element that names no key. AWS reports each occurrence with its key (S3 API Reference, DeleteObjects: one Deleted element per object in the request). The key is deleted either way and Quiet mode is unaffected; the label is unchanged and the recorded hit tells the harness which shape to expect. Fix: minio: fill in the result entry for a de-duplicated key. Model: applyDeleteObjects.",
         "M-getattrs-zero-size-omitted": "MINIO. GetObjectAttributes on a zero-length object omits <ObjectSize> from the response instead of reporting 0, although ObjectSize was requested (S3 API Reference, GetObjectAttributes: ObjectSize is 'the size of the object in bytes'). A zero value falling out of an omit-if-empty encoder. ETag and StorageClass are present and correct; the label is unchanged and the recorded hit tells the harness to expect the element absent. Fix: minio: encode ObjectSize whenever it was requested. Model: applyGetAttrs.",
         "M-getattrs-root-lowercase": "MINIO. The GetObjectAttributes response document's root element is named getObjectAttributesResponse -- a lower-case g, a Go type name that leaked into the encoder -- where the S3 API Reference names it GetObjectAttributesResponse ('Root level tag for the GetObjectAttributesResponse parameters'). REST-XML clients do not read the root element's name, which is how it survives; the children are correct. The label is unchanged and the recorded hit tells the harness which name to expect. Fix: minio: give the response struct an XMLName. Model: applyGetAttrs.",

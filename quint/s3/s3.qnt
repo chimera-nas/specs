@@ -279,6 +279,30 @@ module s3 {
     // a corpus CONTAINS; it changes nothing the model predicts.
     const P_FIXED_BUCKET: bool
 
+    // A 416 InvalidRange carries "Content-Range: bytes */<length>".  RFC 9110
+    // 15.5.17 says a server SHOULD send it.  true: it does, and the label's
+    // `total` says what length to expect.  false: it does not, and `total` is
+    // -1 on a 416 -- the header must be ABSENT.  AWS does not send it.
+    const P_RANGE_ERR_CONTENT_RANGE: bool
+
+    // A suffix range (bytes=-N) against a zero-length object.  false: it is
+    // unsatisfiable like every other range against an empty object, 416
+    // InvalidRange.  true: the range is ignored and the request answers as an
+    // unranged GET would, 200 with an empty body.  AWS is true.
+    const P_EMPTY_SUFFIX_RANGE_OK: bool
+
+    // Listing with a delimiter from a start key (marker / start-after /
+    // key-marker) that lies INSIDE a common prefix, "d/" for a start key
+    // "d/a".  false: keys after the start key still roll up into that prefix
+    // and it is returned.  true: the prefix is taken to sort before the start
+    // key and is never returned.  AWS is true.
+    const P_LIST_SKIPS_MARKER_PREFIX: bool
+
+    // CopyObject of an object onto itself with no metadata directive.  false:
+    // 400 InvalidRequest, as the API Reference describes.  true: the copy is
+    // performed and answers 200.  AWS is true, as measured.
+    const P_COPY_SELF_OK: bool
+
     // The bucket names a request may carry.
     val BKT_UNIVERSE = if (P_FIXED_BUCKET) Set("bk0") else BUCKETS
 
@@ -397,9 +421,9 @@ module s3 {
     // IsTruncated reports whether any further key would have emitted a new
     // entry.  AWS returns an empty, non-truncated result for max-keys=0.
     //
-    // skipIn is the M-list-marker-inside-prefix-skipped deviation: a common
-    // prefix the start key lies INSIDE ("d/" for a start key "d/a") is never
-    // emitted, although keys past the start key still roll up into it.
+    // skipIn is the P_LIST_SKIPS_MARKER_PREFIX policy: a common prefix the
+    // start key lies INSIDE ("d/" for a start key "d/a") is never emitted,
+    // although keys past the start key still roll up into it.
     pure def listWalk(objs: Set[Key], p: Prefix, delim: bool, sa: Key, maxKeys: int,
                       skipIn: bool): ListOut =
         if (maxKeys == 0)
@@ -744,12 +768,6 @@ module s3 {
         bs.keys().contains(b) and bs.get(b).objs.keys().contains(k)
             and bs.get(b).objs.get(k).data.length() == 0 and isSuffixRange(r)
 
-    // Does this GET answer 416 in THIS cell?
-    pure def getIs416(bs: str -> Bkt, b: str, k: Key, r: Range): bool =
-        bs.keys().contains(b) and bs.get(b).objs.keys().contains(k)
-            and rangeApply(bs.get(b).objs.get(k).data, r).status == HTTP_RANGE_ERR
-            and not(getIsEmptySuffix(bs, b, k, r) and dev("M-suffix-range-empty-206"))
-
     action applyGetObject(b: str, k: Key, r: Range): bool = all {
         bkts' = bkts,
         nextUpl' = nextUpl,
@@ -757,20 +775,12 @@ module s3 {
         // sends no Content-Range, which is consistent with the 200 it chose).
         // RNone is untouched: an unranged GET is 200 on AWS too, so only a
         // request that carried a Range header can take this branch.
-        //
-        // M-416-no-content-range changes no field of the label: a 416 still
-        // reports `total`, and the hit recorded here is what tells the harness
-        // that this server sends no "Content-Range: bytes */<total>" with it
-        // (RFC 9110 15.5.17 says a server SHOULD).
         devHits' =
             (if (getIsFullRange(bkts, b, k, r) and dev("range-full-200"))
                 Set("range-full-200")
             else Set())
             .union(if (getIsEmptySuffix(bkts, b, k, r) and dev("M-suffix-range-empty-206"))
                 Set("M-suffix-range-empty-206")
-            else Set())
-            .union(if (getIs416(bkts, b, k, r) and dev("M-416-no-content-range"))
-                Set("M-416-no-content-range")
             else Set()),
         lastOp' =
             if (not(liveBuckets.contains(b)))
@@ -782,6 +792,9 @@ module s3 {
             else if (getIsEmptySuffix(bkts, b, k, r) and dev("M-suffix-range-empty-206"))
                 OGetObject({ bucket: b, key: k, range: r, status: HTTP_PARTIAL,
                              err: "", data: [], first: 0, total: 0 })
+            else if (getIsEmptySuffix(bkts, b, k, r) and P_EMPTY_SUFFIX_RANGE_OK)
+                OGetObject({ bucket: b, key: k, range: r, status: HTTP_OK,
+                             err: "", data: [], first: 0, total: 0 })
             else
                 val d = bkts.get(b).objs.get(k).data
                 val ro = rangeApply(d, r)
@@ -790,7 +803,10 @@ module s3 {
                                          HTTP_OK
                                      else ro.status,
                              err: ro.err, data: ro.out, first: ro.first,
-                             total: d.length() }),
+                             // -1 on a 416 that carries no Content-Range
+                             total: if (ro.status == HTTP_RANGE_ERR and
+                                        not(P_RANGE_ERR_CONTENT_RANGE)) -1
+                                    else d.length() }),
     }
 
     // Unranged GET over live buckets: both hits and misses (k spans KEYS).
@@ -1031,7 +1047,8 @@ module s3 {
             else if (not(bkts.get(sb).objs.keys().contains(sk)))
                 OCopyObject({ srcBucket: sb, srcKey: sk, dstBucket: db, dstKey: dk,
                               status: HTTP_NOT_FOUND, err: "NoSuchKey" })
-            else if (sb == db and sk == dk and not(dev("copy-self-200")))
+            else if (sb == db and sk == dk and not(dev("copy-self-200"))
+                    and not(P_COPY_SELF_OK))
                 OCopyObject({ srcBucket: sb, srcKey: sk, dstBucket: db, dstKey: dk,
                               status: HTTP_BAD_REQUEST, err: "InvalidRequest" })
             else
@@ -1126,22 +1143,12 @@ module s3 {
     pure def listMarkerOutside(p: Prefix, sa: Key, mode: int): bool =
         mode != 2 and sa != NO_KEY and not(keyMatches(sa, p))
 
-    // Did skipping the common prefix the start key lies inside change the page?
-    pure def listSkipChanged(bs: str -> Bkt, b: str, p: Prefix, delim: bool, sa: Key,
-                             mk: int): bool =
-        bs.keys().contains(b) and
-        listWalk(bs.get(b).objs.keys(), p, delim, sa, mk, true) !=
-            listWalk(bs.get(b).objs.keys(), p, delim, sa, mk, false)
-
     action applyListObjects(b: str, p: Prefix, delim: bool, sa: Key, mk: int, mode: int): bool = all {
         bkts' = bkts,
         nextUpl' = nextUpl,
         devHits' =
             if (listMarkerOutside(p, sa, mode) and dev("M-list-marker-outside-prefix-501"))
                 Set("M-list-marker-outside-prefix-501")
-            else if (listSkipChanged(bkts, b, p, delim, sa, mk)
-                    and dev("M-list-marker-inside-prefix-skipped"))
-                Set("M-list-marker-inside-prefix-skipped")
             else Set(),
         lastOp' =
             if (listMarkerOutside(p, sa, mode) and dev("M-list-marker-outside-prefix-501"))
@@ -1156,7 +1163,7 @@ module s3 {
                                keys: [], prefixes: [], truncated: false })
             else
                 val w = listWalk(bkts.get(b).objs.keys(), p, delim, sa, mk,
-                                 dev("M-list-marker-inside-prefix-skipped"))
+                                 P_LIST_SKIPS_MARKER_PREFIX)
                 OListObjects({ bucket: b, prefix: p, delim: delim, startAfter: sa,
                                maxKeys: mk, mode: mode, status: HTTP_OK, err: "",
                                keys: w.keys, prefixes: w.prefixes,

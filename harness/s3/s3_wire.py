@@ -32,7 +32,6 @@ import hashlib
 import hmac
 import http.client
 import select
-import socket
 import sys
 import time
 import urllib.parse
@@ -198,7 +197,14 @@ class S3Client:
 
     def _request_expect(self, method, target, headers, body):
         """Send the headers with Expect: 100-continue, and the body only if
-        the server asks for it (or says nothing for EXPECT_WAIT seconds)."""
+        the server asks for it (or says nothing for EXPECT_WAIT seconds).
+
+        http.client cannot do this: its response parser swallows an interim
+        100 and blocks for the final status, which never comes while the body
+        is unsent.  So the first status line is read here, through the same
+        response object that then parses whatever follows it.  The connection
+        is not reused afterwards.
+        """
         c = self.conn
         # skip_host: the signed headers already carry Host, and a second one
         # is a 400.
@@ -209,38 +215,36 @@ class S3Client:
         c.putheader("expect", "100-continue")
         c.endheaders()
 
+        r = _ExpectResponse(c.sock, method=method)
         send_body = True
         if select.select([c.sock], [], [], EXPECT_WAIT)[0]:
-            # Peek, so that a final response is left intact for http.client.
-            head = b""
-            while len(head) < 12:
-                more = c.sock.recv(12, socket.MSG_PEEK)
-                if len(more) <= len(head) and not select.select(
-                        [c.sock], [], [], EXPECT_WAIT)[0]:
-                    break
-                if not more:
-                    break
-                head = more
-            if head[9:12] == b"100":
-                # Consume exactly the interim response: status line, any
-                # headers, blank line.
-                seen = b""
-                while not seen.endswith(b"\r\n\r\n"):
-                    ch = c.sock.recv(1)
-                    if not ch:
-                        raise http.client.RemoteDisconnected(
-                            "connection closed inside 100 Continue")
-                    seen += ch
+            first = http.client.HTTPResponse._read_status(r)
+            if first[1] == http.client.CONTINUE:
+                # the rest of the interim response: any headers, a blank line
+                while r.fp.readline(65537).strip():
+                    pass
             else:
-                # The final answer, given on the headers alone.  The body is
-                # not sent, so the connection cannot be reused.
+                # The final answer, given on the headers alone.  Hand its
+                # status line back to the parser; the body is never sent.
+                r.first_status = first
                 send_body = False
         if send_body:
             c.send(body)
-        r = c.getresponse()
-        if not send_body:
-            r.will_close = True
+        r.begin()
+        r.will_close = True
         return r
+
+
+class _ExpectResponse(http.client.HTTPResponse):
+    """A response whose first status line may already have been read."""
+
+    first_status = None
+
+    def _read_status(self):
+        if self.first_status is not None:
+            first, self.first_status = self.first_status, None
+            return first
+        return super()._read_status()
 
 
 def wait_ready(host, port, access_key, secret_key, timeout=60.0, **kw):

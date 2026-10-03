@@ -13,7 +13,11 @@ module s3Test {
     // gets something wrong, but the model's own tests always assert AWS.
     import s3(DEVS = Set(), P_CREATE_OWNED_CONFLICT = false,
               P_COPY_SOURCE_FIRST = false,
-              P_FIXED_BUCKET = false).* from "./s3"
+              P_FIXED_BUCKET = false,
+              P_RANGE_ERR_CONTENT_RANGE = true,
+              P_EMPTY_SUFFIX_RANGE_OK = false,
+              P_LIST_SKIPS_MARKER_PREFIX = false,
+              P_COPY_SELF_OK = false).* from "./s3"
 
     // Key shorthands (component lists).
     pure val kA: Key = ["a"]

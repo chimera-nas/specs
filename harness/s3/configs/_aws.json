@@ -14,7 +14,20 @@
     // and never draws those calls, nor the bucket-level tagging calls, whose
     // state no key prefix can keep apart.  This narrows what the corpus
     // contains; it changes nothing the model predicts.
-    "fixedBucket": true
+    "fixedBucket": true,
+
+    // Where Amazon S3 takes the other arm from the model's default.  Each is
+    // declared, with what was measured, in quint/s3/corpus.schema.json.
+    //
+    // A 416 carries no Content-Range header.
+    "rangeErrorContentRange": false,
+    // bytes=-N against a zero-length object answers 200 with an empty body.
+    "emptySuffixRangeOk": true,
+    // With a delimiter, a common prefix the start key lies inside is never
+    // returned.
+    "listSkipsMarkerPrefix": true,
+    // A copy of an object onto itself is performed and answers 200.
+    "copySelfOk": true
   },
 
   // AWS is what the model states.  A difference found here is a model bug

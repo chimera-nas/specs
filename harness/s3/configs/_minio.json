@@ -14,7 +14,12 @@
     // answer of every AWS region but us-east-1.
     "createOwnedBucketConflict": true,
     // A copy of a missing key into a missing bucket reports NoSuchKey.
-    "copySourceFirst": true
+    "copySourceFirst": true,
+    // A 416 carries no Content-Range header.  Amazon S3 sends none either.
+    "rangeErrorContentRange": false,
+    // With a delimiter, a common prefix the start key lies inside is never
+    // returned.  Amazon S3 does the same.
+    "listSkipsMarkerPrefix": true
   },
 
   // The MinIO divergences the model is told to PREDICT, so the trace's
@@ -26,10 +31,8 @@
   "deviations": [
     "M-get-bucket-tagging-no-bucket-check",
     "M-delete-bucket-tagging-no-bucket-check",
-    "M-416-no-content-range",
     "M-suffix-range-empty-206",
     "M-list-marker-outside-prefix-501",
-    "M-list-marker-inside-prefix-skipped",
     "M-delete-objects-dup-empty",
     "M-getattrs-zero-size-omitted",
     "M-getattrs-root-lowercase",
