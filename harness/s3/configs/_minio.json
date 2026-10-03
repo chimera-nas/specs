@@ -1,0 +1,41 @@
+{
+  // The MinIO this suite stands up (harness/s3/run_minio_mbt.sh): the last
+  // AGPLv3 community MinIO, built from chimera-nas/minio, as a single node on
+  // a single drive -- a fresh one per trace, on an empty data directory.
+  //
+  // This file carries the SERVER, not a corpus: it declares no batches and is
+  // never registered as a cell.  Each cell extends it and adds its batch list.
+  "family": "s3",
+  "description": "the MinIO harness/s3 stands up: single node, single drive, default region.",
+
+  // Where S3 has more than one right answer, which one this server gives.
+  "policies": {
+    // 409 BucketAlreadyOwnedByYou for a bucket the caller already owns: the
+    // answer of every AWS region but us-east-1.
+    "createOwnedBucketConflict": true,
+    // A copy of a missing key into a missing bucket reports NoSuchKey.
+    "copySourceFirst": true
+  },
+
+  // The MinIO divergences the model is told to PREDICT, so the trace's
+  // expectation is already what this server does and replay is an exact match.
+  // Declared with their measurements and citations in
+  // quint/s3/corpus.schema.json; a cell switches off the ones its own flavours
+  // cannot reach, because tools/devliveness.py fails a cell that enables a
+  // deviation its corpus never exercises.
+  "deviations": [
+    "M-get-bucket-tagging-no-bucket-check",
+    "M-delete-bucket-tagging-no-bucket-check",
+    "M-416-no-content-range",
+    "M-suffix-range-empty-206",
+    "M-list-marker-outside-prefix-501",
+    "M-list-marker-inside-prefix-skipped",
+    "M-delete-objects-dup-empty",
+    "M-getattrs-zero-size-omitted",
+    "M-getattrs-root-lowercase",
+    "M-part-zero-invalidpart",
+    "M-complete-empty-manifest-invalidrequest",
+    "M-complete-duplicate-part-accepted",
+    "M-abort-unknown-upload-204"
+  ]
+}

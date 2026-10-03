@@ -3,11 +3,11 @@
   "modelFile": "./s3",
   "modelModule": "s3",
 
-  // The S3 model is spec-first: it states the documented AWS behaviour
-  // (us-east-1).  It has no feature or policy knobs -- there is nothing
-  // optional in the modelled surface -- but it does carry the one kind of knob
-  // every family needs: the set of KNOWN DEVIATIONS a given implementation
-  // still has.  Enabling one makes the model predict what that implementation
+  // The S3 model is spec-first: it states the documented AWS behaviour.  Two
+  // kinds of knob tell it about the implementation under test.  A POLICY is a
+  // place where S3 itself has more than one right answer and a service picks
+  // one.  A DEVIATION is a place where the implementation is known to get S3
+  // wrong: the set of KNOWN DEVIATIONS a given implementation still has.  Enabling one makes the model predict what that implementation
   // actually does, so the trace's expectation is already the truth and replay
   // is an exact match.  The harness no longer needs a registry, and the
   // deviation stops being something a reader has to remember.
@@ -16,17 +16,44 @@
   // enable it, and tools/devliveness.py fails the build if a cell enables one
   // its corpus never exercises -- so an entry cannot outlive its fix.
   "consts": {
+    "P_CREATE_OWNED_CONFLICT": {
+      "kind": "policy",
+      "key": "policies.createOwnedBucketConflict",
+      "type": "bool",
+      "default": false,
+      "doc": "CreateBucket on a bucket the caller already owns. false: 200 OK, the legacy us-east-1 answer (S3 API Reference, CreateBucket: 'in the us-east-1 Region you will get 200 OK'). true: 409 BucketAlreadyOwnedByYou, what every other AWS region answers. Both are S3's own behaviour, so this is a policy a service picks and not a deviation: it records no hit and a strict twin leaves it alone."
+    },
+    "P_COPY_SOURCE_FIRST": {
+      "kind": "policy",
+      "key": "policies.copySourceFirst",
+      "type": "bool",
+      "default": false,
+      "doc": "CopyObject when the destination bucket and the source key are both missing: which 404 is reported. S3 documents no precedence between them. false: the destination bucket is resolved first and the reply is NoSuchBucket (the request URI names it). true: the source is resolved first and the reply is NoSuchKey. Same status, nothing written either way."
+    },
     "DEVS": {
       "kind": "deviation",
       "key": "deviations",
       "type": "devset",
-      "doc": "Known chimera divergences from AWS S3, per cell.",
+      "doc": "Known divergences from AWS S3, per cell. The unprefixed ids are chimera's; M-* are MinIO's, measured against the last AGPLv3 community MinIO (chimera-nas/minio, single node, single drive) by harness/s3.",
       "known": {
         "delete-object-200": "AWS DeleteObject answers 204 No Content for a key it removed (S3 API Reference, DeleteObject); chimera answers 200 OK.",
         "delete-object-missing-404": "AWS DeleteObject is idempotent -- 204 for a key that was never there; chimera answers 404 NoSuchKey.",
         "delete-bucket-nonempty-500": "AWS DeleteBucket answers 409 BucketNotEmpty; chimera maps BUCKET_NOT_EMPTY through its default 500 InternalError.",
         "copy-self-200": "AWS rejects a CopyObject of an object onto itself with no metadata directive: 400 InvalidRequest; chimera performs it and answers 200.",
-        "range-full-200": "AWS answers 206 for every satisfiable Range including one covering the whole object (RFC 7233 4.1); chimera collapses a whole-object range to 200."
+        "range-full-200": "AWS answers 206 for every satisfiable Range including one covering the whole object (RFC 7233 4.1); chimera collapses a whole-object range to 200.",
+        "M-get-bucket-tagging-no-bucket-check": "MINIO. GetBucketTagging on a bucket that does not exist answers 404 NoSuchTagSet instead of 404 NoSuchBucket: the handler reads the bucket's metadata without first asking whether the bucket exists, so a missing bucket reads as a bucket with no tags. Status matches; only the <Code> diverges. Fix: minio: check bucket existence in GetBucketTaggingHandler. Model: applyGetBktTagging.",
+        "M-delete-bucket-tagging-no-bucket-check": "MINIO. DeleteBucketTagging on a bucket that does not exist answers 204 No Content instead of 404 NoSuchBucket, for the same reason (PutBucketTagging does check, and answers NoSuchBucket). Nothing is created, so state stays in step. Fix: minio: check bucket existence in DeleteBucketTaggingHandler. Model: applyDelBktTagging.",
+        "M-416-no-content-range": "MINIO. A 416 InvalidRange carries no Content-Range header. RFC 9110 15.5.17: a server generating a 416 to a byte-range request SHOULD send 'Content-Range: bytes */<complete-length>', and AWS does. MinIO reports the length only in the XML body (<ActualObjectSize>). Status, <Code> and body agree; the label is unchanged and the recorded hit tells the harness to expect the header absent. Fix: minio: set Content-Range on the InvalidRange error path. Model: applyGetObject (getIs416).",
+        "M-suffix-range-empty-206": "MINIO. A suffix range (bytes=-N) against a zero-length object answers 206 with an empty body and 'Content-Range: bytes 0--1/0', a header no byte range can mean. AWS answers 416 InvalidRange for any range against a zero-length object, and MinIO itself does for bytes=0- and bytes=0-N; only the suffix form slips through. Fix: minio: reject a suffix range when the object size is 0. Model: applyGetObject (getIsEmptySuffix).",
+        "M-list-marker-outside-prefix-501": "MINIO. ListObjects (V1) with a marker, or ListObjectVersions with a key-marker, that does not begin with the request prefix is refused with 501 NotImplemented -- before the bucket is looked up, so a missing bucket reports 501 too. On AWS the marker is just an exclusive start key (S3 API Reference, ListObjects: 'Marker is where you want Amazon S3 to start listing from'), unrelated to the prefix, and the request lists whatever matches the prefix and sorts after it. ListObjectsV2's start-after is served correctly, so this is the V1/Versions argument check, not the walk. Fix: minio: drop the marker-has-prefix requirement in checkListObjsArgs. Model: applyListObjects (listMarkerOutside).",
+        "M-list-marker-inside-prefix-skipped": "MINIO. With a delimiter, a common prefix that the start key (marker / start-after / key-marker) lies INSIDE is never returned, although keys sorting after the start key still roll up into it: with d/a, d/c and d/e/c stored, start-after=d/a&delimiter=/ omits CommonPrefixes 'd/'. AWS starts 'listing after this specified key' (S3 API Reference, ListObjectsV2, StartAfter) and rolls d/c up into d/, which it returns. KeyCount and IsTruncated follow the shorter page. All three listing calls do it. Fix: minio: do not treat a marker inside a prefix as having already returned that prefix. Model: listWalk (skipIn).",
+        "M-delete-objects-dup-empty": "MINIO. DeleteObjects naming the same key twice reports the first occurrence as <Deleted><Key>k</Key></Deleted> and every repeat as an EMPTY <Deleted/> element that names no key. AWS reports each occurrence with its key (S3 API Reference, DeleteObjects: one Deleted element per object in the request). The key is deleted either way and Quiet mode is unaffected; the label is unchanged and the recorded hit tells the harness which shape to expect. Fix: minio: fill in the result entry for a de-duplicated key. Model: applyDeleteObjects.",
+        "M-getattrs-zero-size-omitted": "MINIO. GetObjectAttributes on a zero-length object omits <ObjectSize> from the response instead of reporting 0, although ObjectSize was requested (S3 API Reference, GetObjectAttributes: ObjectSize is 'the size of the object in bytes'). A zero value falling out of an omit-if-empty encoder. ETag and StorageClass are present and correct; the label is unchanged and the recorded hit tells the harness to expect the element absent. Fix: minio: encode ObjectSize whenever it was requested. Model: applyGetAttrs.",
+        "M-getattrs-root-lowercase": "MINIO. The GetObjectAttributes response document's root element is named getObjectAttributesResponse -- a lower-case g, a Go type name that leaked into the encoder -- where the S3 API Reference names it GetObjectAttributesResponse ('Root level tag for the GetObjectAttributesResponse parameters'). REST-XML clients do not read the root element's name, which is how it survives; the children are correct. The label is unchanged and the recorded hit tells the harness which name to expect. Fix: minio: give the response struct an XMLName. Model: applyGetAttrs.",
+        "M-part-zero-invalidpart": "MINIO. UploadPart and UploadPartCopy with partNumber=0 answer 400 InvalidPart -- the CompleteMultipartUpload error for a part that was never uploaded -- instead of 400 InvalidArgument ('Part number must be an integer between 1 and 10000, inclusive'), which MinIO does return for 10001. Same status, nothing stored. Fix: minio: report the lower bound the way the upper bound is reported. Model: applyUploadPart, applyUploadPartCopy.",
+        "M-complete-empty-manifest-invalidrequest": "MINIO. CompleteMultipartUpload with no <Part> elements answers 400 InvalidRequest ('You must specify at least one part') instead of 400 MalformedXML, the code AWS gives a manifest that does not validate against the schema. Same status; the upload stays open either way. Model: completeCheckWith (emptyReq).",
+        "M-complete-duplicate-part-accepted": "MINIO. CompleteMultipartUpload accepts a manifest that repeats a part number in place (1,2,2) and assembles that part once PER OCCURRENCE: the object comes out one part longer, with an ETag suffix counting the repeat. AWS requires ascending order and refuses it with 400 InvalidPartOrder (S3 API Reference, CompleteMultipartUpload: 'the parts list must be specified in order by part number'). MinIO's check is 'not descending'. This one changes STATE -- the upload is consumed and an object the client never described exists -- so the model completes the upload and concatenates the repeat. Fix: minio: require strictly ascending part numbers. Model: completeCheckWith (dupOk), assembleParts.",
+        "M-abort-unknown-upload-204": "MINIO. AbortMultipartUpload of an upload id that does not exist in an existing bucket -- never minted, already aborted, or already completed -- answers 204 No Content instead of 404 NoSuchUpload (S3 API Reference, AbortMultipartUpload, error NoSuchUpload). Every other multipart call on the same id (UploadPart, ListParts, Complete) does report NoSuchUpload, and a missing bucket still reports NoSuchBucket. Nothing changes, so state stays in step. Model: applyAbortMpu."
       }
     }
   },

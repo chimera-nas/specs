@@ -18,9 +18,10 @@
 // Modeling conventions:
 //  - The model is spec-first: it encodes the documented AWS S3 behavior
 //    (API Reference, 2006-03-01), not any one implementation's.  Known
-//    divergences of the server under test are reconciled by the harness's
-//    deviation registry, NOT encoded here.  Where AWS behavior is
-//    region-dependent the model follows us-east-1 (the legacy region every
+//    divergences of the server under test are branches gated on the DEVS
+//    constant (see "Known implementation deviations" below), never the
+//    default.  Where AWS behavior is
+//    region-dependent the default follows us-east-1 (the legacy region every
 //    filesystem gateway emulates): CreateBucket on a bucket you already own
 //    returns 200, not 409 BucketAlreadyOwnedByYou.
 //  - Object keys are lists of path components (e.g. ["d", "a"] is the key
@@ -48,7 +49,8 @@
 //    is backend-dependent.
 //  - Object metadata is abstracted to one small enum `mtag` driving a
 //    Content-Type + x-amz-meta header pair (0 = neither: the response
-//    Content-Type falls back to application/octet-stream).  Tag sets are
+//    Content-Type falls back to the service default, which on AWS is
+//    binary/octet-stream).  Tag sets are
 //    sets of small tag ids; the harness maps id i to the ("tk<i>","tv<i>")
 //    pair.  A completed multipart object has no metadata and no tags (none
 //    are supplied at Initiate).
@@ -175,6 +177,7 @@ module s3 {
     pure val HTTP_CONFLICT = 409
     pure val HTTP_RANGE_ERR = 416
     pure val HTTP_INTERNAL = 500
+    pure val HTTP_NOT_IMPL = 501
 
     // ------------------------------------------------------------------
     // The trace-visible request/response label
@@ -247,6 +250,23 @@ module s3 {
     // Every id here must be declared, with a citation, in the family's
     // corpus.schema.json before a config may switch it on.
     const DEVS: Set[str]
+
+    // ------------------------------------------------------------------
+    // Policies: places where S3 itself has more than one right answer, and an
+    // implementation picks.  Unlike a deviation, neither value is a fault, so
+    // these carry no devHits record and no strict twin turns them off.
+    // ------------------------------------------------------------------
+
+    // CreateBucket on a bucket the caller already owns.  false: the legacy
+    // us-east-1 answer, 200 OK.  true: what every other AWS region answers,
+    // 409 BucketAlreadyOwnedByYou (S3 API Reference, CreateBucket).
+    const P_CREATE_OWNED_CONFLICT: bool
+
+    // CopyObject when the destination bucket AND the source key are both
+    // missing.  S3 documents no precedence between the two 404s.  false: the
+    // destination bucket is resolved first (NoSuchBucket) -- the request URI
+    // names it.  true: the source is resolved first (NoSuchKey).
+    const P_COPY_SOURCE_FIRST: bool
 
     pure def dev(id: str): bool = DEVS.contains(id)
 
@@ -362,7 +382,12 @@ module s3 {
     // <CommonPrefixes> entry; the page closes after maxKeys emissions and
     // IsTruncated reports whether any further key would have emitted a new
     // entry.  AWS returns an empty, non-truncated result for max-keys=0.
-    pure def listWalk(objs: Set[Key], p: Prefix, delim: bool, sa: Key, maxKeys: int): ListOut =
+    //
+    // skipIn is the M-list-marker-inside-prefix-skipped deviation: a common
+    // prefix the start key lies INSIDE ("d/" for a start key "d/a") is never
+    // emitted, although keys past the start key still roll up into it.
+    pure def listWalk(objs: Set[Key], p: Prefix, delim: bool, sa: Key, maxKeys: int,
+                      skipIn: bool): ListOut =
         if (maxKeys == 0)
             { keys: [], prefixes: [], truncated: false }
         else
@@ -378,7 +403,13 @@ module s3 {
                             st
                         else
                             val em = if (delim) rollup(k, p) else EKey(k)
-                            if (st.last == LSome(em))
+                            val inside = match em {
+                                | EKey(kk) => false
+                                | EPfx(pc) => skipIn and isStrictPrefix(pc, sa)
+                            }
+                            if (inside)
+                                st
+                            else if (st.last == LSome(em))
                                 // Absorbed into the already-emitted prefix.
                                 st
                             else if (st.done)
@@ -446,16 +477,24 @@ module s3 {
     // the precedence is out-of-order (non-increasing, duplicates included)
     // -> unknown part -> undersized (empty, i.e. below the 5 MiB part
     // minimum) non-final part.
-    pure def completeCheck(parts: int -> Blocks, manifest: List[int]): { status: int, err: str } =
+    //
+    // Two MinIO deviations live here, as parameters so the action can ask
+    // whether either one changed the answer: emptyReq reports the empty
+    // manifest as InvalidRequest, and dupOk accepts a part number repeated in
+    // place (1,2,2) -- its order check is "not descending", not "ascending" --
+    // and then assembles the part once per occurrence.
+    pure def completeCheckWith(parts: int -> Blocks, manifest: List[int], dupOk: bool,
+                               emptyReq: bool): { status: int, err: str } =
         if (manifest.length() == 0)
-            { status: HTTP_BAD_REQUEST, err: "MalformedXML" }
+            { status: HTTP_BAD_REQUEST,
+              err: if (emptyReq) "InvalidRequest" else "MalformedXML" }
         else
             val w = manifest.foldl(
                 { i: 0, prev: 0, status: 0, err: "" },
                 (acc, pn) =>
                 if (acc.status != 0)
                     acc.with("i", acc.i + 1)
-                else if (pn <= acc.prev)
+                else if (pn < acc.prev or (pn == acc.prev and not(dupOk)))
                     acc.with("status", HTTP_BAD_REQUEST).with("err", "InvalidPartOrder")
                 else if (not(parts.keys().contains(pn)))
                     acc.with("status", HTTP_BAD_REQUEST).with("err", "InvalidPart")
@@ -465,6 +504,10 @@ module s3 {
                     { i: acc.i + 1, prev: pn, status: 0, err: "" })
             if (w.status != 0) { status: w.status, err: w.err }
             else { status: HTTP_OK, err: "" }
+
+    pure def completeCheck(parts: int -> Blocks, manifest: List[int]): { status: int, err: str } =
+        completeCheckWith(parts, manifest, dev("M-complete-duplicate-part-accepted"),
+                          dev("M-complete-empty-manifest-invalidrequest"))
 
     // The assembled object: manifest parts concatenated in manifest order
     // (empty parts contribute nothing).
@@ -502,14 +545,21 @@ module s3 {
     // CreateBucket (PUT /{bucket})
     // ------------------------------------------------------------------
 
-    // us-east-1 semantics: creating a bucket that already exists and is
-    // yours is idempotent 200 (elsewhere AWS returns 409
-    // BucketAlreadyOwnedByYou; a single-tenant gateway is "us-east-1").
+    // Creating a bucket that already exists and is yours: us-east-1 answers an
+    // idempotent 200, every other AWS region 409 BucketAlreadyOwnedByYou.
+    // Which one the service under test gives is P_CREATE_OWNED_CONFLICT.
     action applyCreateBucket(b: str): bool = all {
         bkts' = if (liveBuckets.contains(b)) bkts else bkts.put(b, EMPTY_BKT),
         nextUpl' = nextUpl,
         devHits' = Set(),
-        lastOp' = OCreateBucket({ bucket: b, status: HTTP_OK }),
+        // Both answers are S3's own: which one a service gives is the
+        // P_CREATE_OWNED_CONFLICT policy, not a deviation.  The bucket is left
+        // as it was either way.
+        lastOp' = OCreateBucket({
+            bucket: b,
+            status: if (liveBuckets.contains(b) and P_CREATE_OWNED_CONFLICT)
+                        HTTP_CONFLICT
+                    else HTTP_OK }),
     }
 
     action createBucket = {
@@ -659,6 +709,25 @@ module s3 {
             rangeIsFull(bs.get(b).objs.get(k).data, r)
         else false
 
+    pure def isSuffixRange(r: Range): bool =
+        match r {
+            | RSuffix(n) => true
+            | _ => false
+        }
+
+    // A suffix range against a zero-length object: unsatisfiable on AWS (416),
+    // but MinIO answers 206 with an empty body and the impossible
+    // "Content-Range: bytes 0--1/0".
+    pure def getIsEmptySuffix(bs: str -> Bkt, b: str, k: Key, r: Range): bool =
+        bs.keys().contains(b) and bs.get(b).objs.keys().contains(k)
+            and bs.get(b).objs.get(k).data.length() == 0 and isSuffixRange(r)
+
+    // Does this GET answer 416 in THIS cell?
+    pure def getIs416(bs: str -> Bkt, b: str, k: Key, r: Range): bool =
+        bs.keys().contains(b) and bs.get(b).objs.keys().contains(k)
+            and rangeApply(bs.get(b).objs.get(k).data, r).status == HTTP_RANGE_ERR
+            and not(getIsEmptySuffix(bs, b, k, r) and dev("M-suffix-range-empty-206"))
+
     action applyGetObject(b: str, k: Key, r: Range): bool = all {
         bkts' = bkts,
         nextUpl' = nextUpl,
@@ -666,10 +735,21 @@ module s3 {
         // sends no Content-Range, which is consistent with the 200 it chose).
         // RNone is untouched: an unranged GET is 200 on AWS too, so only a
         // request that carried a Range header can take this branch.
+        //
+        // M-416-no-content-range changes no field of the label: a 416 still
+        // reports `total`, and the hit recorded here is what tells the harness
+        // that this server sends no "Content-Range: bytes */<total>" with it
+        // (RFC 9110 15.5.17 says a server SHOULD).
         devHits' =
-            if (getIsFullRange(bkts, b, k, r) and dev("range-full-200"))
+            (if (getIsFullRange(bkts, b, k, r) and dev("range-full-200"))
                 Set("range-full-200")
-            else Set(),
+            else Set())
+            .union(if (getIsEmptySuffix(bkts, b, k, r) and dev("M-suffix-range-empty-206"))
+                Set("M-suffix-range-empty-206")
+            else Set())
+            .union(if (getIs416(bkts, b, k, r) and dev("M-416-no-content-range"))
+                Set("M-416-no-content-range")
+            else Set()),
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 OGetObject({ bucket: b, key: k, range: r, status: HTTP_NOT_FOUND,
@@ -677,6 +757,9 @@ module s3 {
             else if (not(bkts.get(b).objs.keys().contains(k)))
                 OGetObject({ bucket: b, key: k, range: r, status: HTTP_NOT_FOUND,
                              err: "NoSuchKey", data: [], first: -1, total: -1 })
+            else if (getIsEmptySuffix(bkts, b, k, r) and dev("M-suffix-range-empty-206"))
+                OGetObject({ bucket: b, key: k, range: r, status: HTTP_PARTIAL,
+                             err: "", data: [], first: 0, total: 0 })
             else
                 val d = bkts.get(b).objs.get(k).data
                 val ro = rangeApply(d, r)
@@ -831,7 +914,16 @@ module s3 {
                     bk.with("objs", ks.foldl(bk.objs, (m, k) => mapDrop(m, k))))
             else bkts,
         nextUpl' = nextUpl,
-        devHits' = Set(),
+        // M-delete-objects-dup-empty changes no field of the label either:
+        // MinIO deletes the key and reports its FIRST occurrence, then answers
+        // every repeat with an empty <Deleted/> element that names no key.
+        // The hit tells the harness which shape to expect.  Quiet mode reports
+        // nothing for anyone, so only a verbose request can take it.
+        devHits' =
+            if (liveBuckets.contains(b) and not(quiet) and ks.length() == 2
+                    and ks[0] == ks[1] and dev("M-delete-objects-dup-empty"))
+                Set("M-delete-objects-dup-empty")
+            else Set(),
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 ODeleteObjects({ bucket: b, keys: ks, quiet: quiet,
@@ -867,6 +959,15 @@ module s3 {
     // with no metadata directive is 400 InvalidRequest.  A copy replicates
     // the whole object: content, metadata, and (x-amz-tagging-directive
     // COPY being the default) the tag set.
+    //
+    // AWS documents no precedence between the two failures, so which is
+    // resolved first is the P_COPY_SOURCE_FIRST policy: source first, and a
+    // copy of a missing key into a missing bucket reports NoSuchKey.  (With
+    // both buckets missing the two orders give the same NoSuchBucket.)
+    pure def copySrcKeyFirstIn(bs: str -> Bkt, sb: str, sk: Key, db: str): bool =
+        not(bs.keys().contains(db)) and bs.keys().contains(sb)
+            and not(bs.get(sb).objs.keys().contains(sk))
+
     action applyCopyObject(sb: str, sk: Key, db: str, dk: Key): bool = all {
         bkts' =
             if (liveBuckets.contains(db) and liveBuckets.contains(sb)
@@ -896,7 +997,10 @@ module s3 {
                 Set("copy-self-200")
             else Set(),
         lastOp' =
-            if (not(liveBuckets.contains(db)))
+            if (copySrcKeyFirstIn(bkts, sb, sk, db) and P_COPY_SOURCE_FIRST)
+                OCopyObject({ srcBucket: sb, srcKey: sk, dstBucket: db, dstKey: dk,
+                              status: HTTP_NOT_FOUND, err: "NoSuchKey" })
+            else if (not(liveBuckets.contains(db)))
                 OCopyObject({ srcBucket: sb, srcKey: sk, dstBucket: db, dstKey: dk,
                               status: HTTP_NOT_FOUND, err: "NoSuchBucket" })
             else if (not(liveBuckets.contains(sb)))
@@ -945,10 +1049,26 @@ module s3 {
     // The harness requests ETag, StorageClass and ObjectSize (the
     // filesystem-suppliable set); the response reports the object size and
     // an unquoted ETag the harness checks for consistency.
+    //
+    // M-getattrs-zero-size-omitted changes no field of the label: MinIO leaves
+    // <ObjectSize> out of the document altogether when the size is 0, and the
+    // recorded hit tells the harness to expect it absent.
     action applyGetAttrs(b: str, k: Key): bool = all {
         bkts' = bkts,
         nextUpl' = nextUpl,
-        devHits' = Set(),
+        //
+        // M-getattrs-root-lowercase is the same kind: the document's root
+        // element is named getObjectAttributesResponse, with a lower-case g,
+        // where the API Reference names it GetObjectAttributesResponse.  Every
+        // successful reply takes it.
+        devHits' =
+            if (liveBuckets.contains(b) and bkts.get(b).objs.keys().contains(k))
+                (if (dev("M-getattrs-root-lowercase"))
+                    Set("M-getattrs-root-lowercase") else Set())
+                .union(if (bkts.get(b).objs.get(k).data.length() == 0
+                           and dev("M-getattrs-zero-size-omitted"))
+                    Set("M-getattrs-zero-size-omitted") else Set())
+            else Set(),
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 OGetAttrs({ bucket: b, key: k, status: HTTP_NOT_FOUND,
@@ -974,18 +1094,47 @@ module s3 {
     // ListObjects (GET /{bucket}, V1 / V2 / Versions)
     // ------------------------------------------------------------------
 
+    // A marker (V1) or key-marker (Versions) that does not itself begin with
+    // the request prefix.  On AWS that is an ordinary start key: the listing is
+    // whatever matches the prefix and sorts after it.  MinIO refuses the request
+    // outright with 501 NotImplemented -- before it looks at the bucket, so a
+    // missing bucket reports 501 too -- and only for those two spellings: V2's
+    // start-after is served.  keyMatches is string-prefix matching, which is
+    // exactly "the marker begins with the prefix".
+    pure def listMarkerOutside(p: Prefix, sa: Key, mode: int): bool =
+        mode != 2 and sa != NO_KEY and not(keyMatches(sa, p))
+
+    // Did skipping the common prefix the start key lies inside change the page?
+    pure def listSkipChanged(bs: str -> Bkt, b: str, p: Prefix, delim: bool, sa: Key,
+                             mk: int): bool =
+        bs.keys().contains(b) and
+        listWalk(bs.get(b).objs.keys(), p, delim, sa, mk, true) !=
+            listWalk(bs.get(b).objs.keys(), p, delim, sa, mk, false)
+
     action applyListObjects(b: str, p: Prefix, delim: bool, sa: Key, mk: int, mode: int): bool = all {
         bkts' = bkts,
         nextUpl' = nextUpl,
-        devHits' = Set(),
+        devHits' =
+            if (listMarkerOutside(p, sa, mode) and dev("M-list-marker-outside-prefix-501"))
+                Set("M-list-marker-outside-prefix-501")
+            else if (listSkipChanged(bkts, b, p, delim, sa, mk)
+                    and dev("M-list-marker-inside-prefix-skipped"))
+                Set("M-list-marker-inside-prefix-skipped")
+            else Set(),
         lastOp' =
-            if (not(liveBuckets.contains(b)))
+            if (listMarkerOutside(p, sa, mode) and dev("M-list-marker-outside-prefix-501"))
+                OListObjects({ bucket: b, prefix: p, delim: delim, startAfter: sa,
+                               maxKeys: mk, mode: mode, status: HTTP_NOT_IMPL,
+                               err: "NotImplemented",
+                               keys: [], prefixes: [], truncated: false })
+            else if (not(liveBuckets.contains(b)))
                 OListObjects({ bucket: b, prefix: p, delim: delim, startAfter: sa,
                                maxKeys: mk, mode: mode, status: HTTP_NOT_FOUND,
                                err: "NoSuchBucket",
                                keys: [], prefixes: [], truncated: false })
             else
-                val w = listWalk(bkts.get(b).objs.keys(), p, delim, sa, mk)
+                val w = listWalk(bkts.get(b).objs.keys(), p, delim, sa, mk,
+                                 dev("M-list-marker-inside-prefix-skipped"))
                 OListObjects({ bucket: b, prefix: p, delim: delim, startAfter: sa,
                                maxKeys: mk, mode: mode, status: HTTP_OK, err: "",
                                keys: w.keys, prefixes: w.prefixes,
@@ -1122,14 +1271,24 @@ module s3 {
 
     // GetBucketTagging with no tags stored is 404 NoSuchTagSet (unlike the
     // object-level call).
+    //
+    // MinIO's GET and DELETE never ask whether the bucket exists: a missing
+    // bucket reads as a bucket with no tags (NoSuchTagSet) and its tag set
+    // deletes successfully.  PutBucketTagging does check.
     action applyGetBktTagging(b: str): bool = all {
         bkts' = bkts,
         nextUpl' = nextUpl,
-        devHits' = Set(),
+        devHits' =
+            if (not(liveBuckets.contains(b)) and dev("M-get-bucket-tagging-no-bucket-check"))
+                Set("M-get-bucket-tagging-no-bucket-check")
+            else Set(),
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 OGetBktTagging({ bucket: b, status: HTTP_NOT_FOUND,
-                                 err: "NoSuchBucket", tags: Set() })
+                                 err: if (dev("M-get-bucket-tagging-no-bucket-check"))
+                                          "NoSuchTagSet"
+                                      else "NoSuchBucket",
+                                 tags: Set() })
             else if (bkts.get(b).btags.size() == 0)
                 OGetBktTagging({ bucket: b, status: HTTP_NOT_FOUND,
                                  err: "NoSuchTagSet", tags: Set() })
@@ -1149,9 +1308,14 @@ module s3 {
                 bkts.setBy(b, bk => bk.with("btags", Set()))
             else bkts,
         nextUpl' = nextUpl,
-        devHits' = Set(),
+        devHits' =
+            if (not(liveBuckets.contains(b)) and dev("M-delete-bucket-tagging-no-bucket-check"))
+                Set("M-delete-bucket-tagging-no-bucket-check")
+            else Set(),
         lastOp' =
-            if (not(liveBuckets.contains(b)))
+            if (not(liveBuckets.contains(b)) and dev("M-delete-bucket-tagging-no-bucket-check"))
+                ODelBktTagging({ bucket: b, status: HTTP_NO_CONTENT, err: "" })
+            else if (not(liveBuckets.contains(b)))
                 ODelBktTagging({ bucket: b, status: HTTP_NOT_FOUND,
                                  err: "NoSuchBucket" })
             else
@@ -1208,14 +1372,23 @@ module s3 {
                         m.with("parts", m.parts.put(n, d)))))
             else bkts,
         nextUpl' = nextUpl,
-        devHits' = Set(),
+        // AWS: "Part number must be an integer between 1 and 10000,
+        // inclusive" -- InvalidArgument.  MinIO says exactly that for 10001,
+        // but reports part number 0 as InvalidPart, the CompleteMultipartUpload
+        // error for a part that was never uploaded.
+        devHits' =
+            if (liveBuckets.contains(b) and n == 0 and dev("M-part-zero-invalidpart"))
+                Set("M-part-zero-invalidpart")
+            else Set(),
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 OUploadPart({ bucket: b, key: k, uplid: u, partNum: n, data: d,
                               status: HTTP_NOT_FOUND, err: "NoSuchBucket" })
             else if (n == 0)
                 OUploadPart({ bucket: b, key: k, uplid: u, partNum: n, data: d,
-                              status: HTTP_BAD_REQUEST, err: "InvalidArgument" })
+                              status: HTTP_BAD_REQUEST,
+                              err: if (dev("M-part-zero-invalidpart")) "InvalidPart"
+                                   else "InvalidArgument" })
             else if (not(bkts.get(b).mpu.keys().contains(u)))
                 OUploadPart({ bucket: b, key: k, uplid: u, partNum: n, data: d,
                               status: HTTP_NOT_FOUND, err: "NoSuchUpload" })
@@ -1278,7 +1451,10 @@ module s3 {
                             m.with("parts", m.parts.put(n, pdata)))))
                 else bkts,
             nextUpl' = nextUpl,
-            devHits' = Set(),
+            devHits' =
+                if (liveBuckets.contains(b) and n == 0 and dev("M-part-zero-invalidpart"))
+                    Set("M-part-zero-invalidpart")
+                else Set(),
             lastOp' =
                 if (not(liveBuckets.contains(b)))
                     OUploadPartCopy({ bucket: b, key: k, uplid: u, partNum: n,
@@ -1287,7 +1463,9 @@ module s3 {
                 else if (n == 0)
                     OUploadPartCopy({ bucket: b, key: k, uplid: u, partNum: n,
                                       srcBucket: sb, srcKey: sk, range: r, data: [],
-                                      status: HTTP_BAD_REQUEST, err: "InvalidArgument" })
+                                      status: HTTP_BAD_REQUEST,
+                                      err: if (dev("M-part-zero-invalidpart")) "InvalidPart"
+                                           else "InvalidArgument" })
                 else if (not(bkts.get(b).mpu.keys().contains(u)))
                     OUploadPartCopy({ bucket: b, key: k, uplid: u, partNum: n,
                                       srcBucket: sb, srcKey: sk, range: r, data: [],
@@ -1365,7 +1543,20 @@ module s3 {
                           .with("mpu", mapDrop(bk.mpu, u)))
                 else bkts,
             nextUpl' = nextUpl,
-            devHits' = Set(),
+            // Recorded only where the deviation decided the answer: the empty
+            // manifest, and a manifest the standard refuses for a repeated
+            // part that MinIO goes on to judge (and usually complete) instead.
+            devHits' =
+                if (live and manifest.length() == 0
+                        and dev("M-complete-empty-manifest-invalidrequest"))
+                    Set("M-complete-empty-manifest-invalidrequest")
+                else if (live and dev("M-complete-duplicate-part-accepted")
+                        and completeCheckWith(bkts.get(b).mpu.get(u).parts, manifest,
+                                              true, false) !=
+                            completeCheckWith(bkts.get(b).mpu.get(u).parts, manifest,
+                                              false, false))
+                    Set("M-complete-duplicate-part-accepted")
+                else Set(),
             lastOp' =
                 if (not(liveBuckets.contains(b)))
                     OCompleteMpu({ bucket: b, key: k, uplid: u, manifest: manifest,
@@ -1408,11 +1599,22 @@ module s3 {
                 bkts.setBy(b, bk => bk.with("mpu", mapDrop(bk.mpu, u)))
             else bkts,
         nextUpl' = nextUpl,
-        devHits' = Set(),
+        // MinIO's abort is idempotent: an upload that never existed, or was
+        // already aborted or completed, aborts successfully.  The bucket is
+        // still checked.
+        devHits' =
+            if (liveBuckets.contains(b) and not(bkts.get(b).mpu.keys().contains(u))
+                    and dev("M-abort-unknown-upload-204"))
+                Set("M-abort-unknown-upload-204")
+            else Set(),
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 OAbortMpu({ bucket: b, key: k, uplid: u,
                             status: HTTP_NOT_FOUND, err: "NoSuchBucket" })
+            else if (not(bkts.get(b).mpu.keys().contains(u))
+                    and dev("M-abort-unknown-upload-204"))
+                OAbortMpu({ bucket: b, key: k, uplid: u,
+                            status: HTTP_NO_CONTENT, err: "" })
             else if (not(bkts.get(b).mpu.keys().contains(u)))
                 OAbortMpu({ bucket: b, key: k, uplid: u,
                             status: HTTP_NOT_FOUND, err: "NoSuchUpload" })

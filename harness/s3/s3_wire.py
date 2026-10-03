@@ -1,0 +1,269 @@
+# SPDX-FileCopyrightText: 2026 The Quint Specs Authors
+#
+# SPDX-License-Identifier: MIT
+
+"""A raw S3 client for the conformance replayer: HTTP/1.1 plus SigV4, nothing
+else.
+
+Deliberately not an SDK.  A model replay has to put one exact request on the
+wire and read back the exact status line, headers and body the server chose --
+and an SDK is built to stop a caller seeing those: it retries, follows
+redirects, rewrites a 404 into an exception that has already thrown the body
+away, and adds checksum headers and addressing styles of its own.  This is the
+S3 counterpart of using smbprotocol at its raw layer in harness/samba.
+
+Standard library only (http.client, hashlib, hmac, xml.etree), so the suite
+needs nothing installed beyond the server under test.
+
+What it does send is what a correct client sends: every request is signed
+(AWS Signature Version 4, path-style addressing, the payload hash in
+x-amz-content-sha256), and a request whose body is an XML document carries
+Content-MD5, which the S3 API requires on DeleteObjects and the tagging PUTs.
+A large body is offered with "Expect: 100-continue", as the AWS SDKs offer
+theirs: a server that can refuse a request from its headers alone -- an upload
+id that does not exist -- then answers without the body ever being sent,
+instead of answering, closing the connection, and leaving the client writing
+megabytes into a reset.
+"""
+
+import base64
+import datetime
+import hashlib
+import hmac
+import http.client
+import select
+import socket
+import sys
+import time
+import urllib.parse
+import xml.etree.ElementTree as ET
+
+REGION = "us-east-1"
+SERVICE = "s3"
+
+# A body at least this large is offered with "Expect: 100-continue".
+EXPECT_THRESHOLD = 1 << 20
+# How long to wait for the server's verdict on the headers before sending the
+# body regardless (RFC 9110 10.1.1: a client need not wait indefinitely).
+EXPECT_WAIT = 5.0
+
+
+def _enc(s, safe=""):
+    """RFC 3986 percent-encoding as SigV4 defines it: everything but the
+    unreserved set, and '/' only where the caller says so."""
+    return urllib.parse.quote(s, safe=safe + "-_.~")
+
+
+def _hmac(key, msg):
+    return hmac.new(key, msg.encode(), hashlib.sha256).digest()
+
+
+class Response:
+    """One reply, as the server sent it."""
+
+    def __init__(self, status, headers, body):
+        self.status = status
+        self.headers = headers          # lower-cased name -> value
+        self.body = body
+        self._xml = None
+
+    def header(self, name):
+        """A header's value, "" when the server did not send it."""
+        return self.headers.get(name.lower(), "")
+
+    def xml(self):
+        """The body as an element tree with namespaces stripped, or None when
+        it is not XML.  S3 documents live in one namespace that some servers
+        declare and some do not, and no check here turns on which."""
+        if self._xml is None:
+            try:
+                root = ET.fromstring(self.body)
+            except ET.ParseError:
+                return None
+            for el in root.iter():
+                if "}" in el.tag:
+                    el.tag = el.tag.split("}", 1)[1]
+            self._xml = root
+        return self._xml
+
+    def error_code(self):
+        """The <Code> of an XML error body, "" when there is none (a success,
+        or a HEAD reply, which has no body)."""
+        root = self.xml()
+        if root is None or root.tag != "Error":
+            return ""
+        return root.findtext("Code", "")
+
+
+class S3Client:
+    def __init__(self, host, port, access_key, secret_key, timeout=60.0):
+        self.host = host
+        self.port = port
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.timeout = timeout
+        self.conn = None
+
+    def close(self):
+        if self.conn is not None:
+            self.conn.close()
+            self.conn = None
+
+    def _sign(self, method, path, query, headers, payload_hash):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+        date = amz_date[:8]
+        headers["host"] = f"{self.host}:{self.port}"
+        headers["x-amz-date"] = amz_date
+        headers["x-amz-content-sha256"] = payload_hash
+
+        signed = sorted(h for h in headers
+                        if h == "host" or h == "content-md5"
+                        or h.startswith("x-amz-"))
+        canonical = "\n".join([
+            method,
+            _enc(path, safe="/"),
+            "&".join(f"{_enc(k)}={_enc(v)}" for k, v in sorted(query)),
+            "".join(f"{h}:{headers[h].strip()}\n" for h in signed),
+            ";".join(signed),
+            payload_hash,
+        ])
+        scope = f"{date}/{REGION}/{SERVICE}/aws4_request"
+        to_sign = "\n".join([
+            "AWS4-HMAC-SHA256", amz_date, scope,
+            hashlib.sha256(canonical.encode()).hexdigest(),
+        ])
+        key = _hmac(("AWS4" + self.secret_key).encode(), date)
+        for part in (REGION, SERVICE, "aws4_request"):
+            key = _hmac(key, part)
+        sig = hmac.new(key, to_sign.encode(), hashlib.sha256).hexdigest()
+        headers["authorization"] = (
+            f"AWS4-HMAC-SHA256 Credential={self.access_key}/{scope}, "
+            f"SignedHeaders={';'.join(signed)}, Signature={sig}")
+
+    def call(self, method, path, query=(), headers=None, body=b"",
+             xml_body=False):
+        """Issue one request.
+
+        `query` is a sequence of (name, value) pairs; a bare subresource such
+        as ?uploads is the pair ("uploads", "").  `headers` are extra request
+        headers, lower-case names.  `xml_body` marks the body as an XML
+        document, which adds Content-MD5.
+        """
+        query = list(query)
+        headers = dict(headers or {})
+        if xml_body:
+            headers["content-md5"] = base64.b64encode(
+                hashlib.md5(body).digest()).decode()
+        self._sign(method, path, query, headers,
+                   hashlib.sha256(body).hexdigest())
+
+        target = _enc(path, safe="/")
+        if query:
+            target += "?" + "&".join(f"{_enc(k)}={_enc(v)}" for k, v in query)
+
+        # One reconnect: the server is entitled to drop an idle keep-alive
+        # connection, and that is not a divergence.  A request that fails on
+        # a fresh connection is.
+        for attempt in (0, 1):
+            if self.conn is None:
+                self.conn = http.client.HTTPConnection(
+                    self.host, self.port, timeout=self.timeout)
+            try:
+                if len(body) >= EXPECT_THRESHOLD:
+                    r = self._request_expect(method, target, headers, body)
+                else:
+                    self.conn.request(method, target, body=body,
+                                      headers=headers)
+                    r = self.conn.getresponse()
+                data = r.read()
+                break
+            except (http.client.RemoteDisconnected, ConnectionResetError,
+                    BrokenPipeError):
+                self.close()
+                if attempt:
+                    raise
+        resp = Response(r.status,
+                        {k.lower(): v for k, v in r.getheaders()}, data)
+        if r.will_close:
+            self.close()
+        return resp
+
+    def _request_expect(self, method, target, headers, body):
+        """Send the headers with Expect: 100-continue, and the body only if
+        the server asks for it (or says nothing for EXPECT_WAIT seconds)."""
+        c = self.conn
+        # skip_host: the signed headers already carry Host, and a second one
+        # is a 400.
+        c.putrequest(method, target, skip_host=True)
+        for k, v in headers.items():
+            c.putheader(k, v)
+        c.putheader("content-length", str(len(body)))
+        c.putheader("expect", "100-continue")
+        c.endheaders()
+
+        send_body = True
+        if select.select([c.sock], [], [], EXPECT_WAIT)[0]:
+            # Peek, so that a final response is left intact for http.client.
+            head = b""
+            while len(head) < 12:
+                more = c.sock.recv(12, socket.MSG_PEEK)
+                if len(more) <= len(head) and not select.select(
+                        [c.sock], [], [], EXPECT_WAIT)[0]:
+                    break
+                if not more:
+                    break
+                head = more
+            if head[9:12] == b"100":
+                # Consume exactly the interim response: status line, any
+                # headers, blank line.
+                seen = b""
+                while not seen.endswith(b"\r\n\r\n"):
+                    ch = c.sock.recv(1)
+                    if not ch:
+                        raise http.client.RemoteDisconnected(
+                            "connection closed inside 100 Continue")
+                    seen += ch
+            else:
+                # The final answer, given on the headers alone.  The body is
+                # not sent, so the connection cannot be reused.
+                send_body = False
+        if send_body:
+            c.send(body)
+        r = c.getresponse()
+        if not send_body:
+            r.will_close = True
+        return r
+
+
+def wait_ready(host, port, access_key, secret_key, timeout=60.0):
+    """Wait until the server answers S3, not merely until it listens.
+
+    A server can accept connections before it can serve: MinIO opens its port
+    and answers 503 XMinioServerNotInitialized until its object layer is up.
+    The only test that cannot be wrong about that is the thing itself -- a
+    signed ListBuckets that comes back 200.  Returns whether it did.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        c = S3Client(host, port, access_key, secret_key, timeout=5.0)
+        try:
+            if c.call("GET", "/").status == 200:
+                return True
+        except OSError:
+            pass
+        finally:
+            c.close()
+        time.sleep(0.05)
+    return False
+
+
+if __name__ == "__main__":
+    # s3_wire.py wait-ready <host> <port> <access-key> <secret-key> [seconds]
+    if len(sys.argv) < 6 or sys.argv[1] != "wait-ready":
+        sys.exit("usage: s3_wire.py wait-ready <host> <port> <access-key> "
+                 "<secret-key> [seconds]")
+    sys.exit(0 if wait_ready(sys.argv[2], int(sys.argv[3]), sys.argv[4],
+                             sys.argv[5],
+                             float(sys.argv[6]) if len(sys.argv) > 6 else 60.0)
+             else 1)

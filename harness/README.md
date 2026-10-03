@@ -23,6 +23,7 @@ divergence in that server — and both are worth having written down.
 | [`samba/`](samba/) | Samba `smbd` | `quint/smb2` |
 | [`nfs/`](nfs/) | NFS-Ganesha `ganesha.nfsd`; the Linux kernel NFS server (knfsd) in a KVM guest | `quint/nfs` (nfs3, nfs4) |
 | [`windows/`](windows/) | the Windows SMB server, on Windows Server 2025 and Windows 11 | `quint/smb2` |
+| [`s3/`](s3/) | MinIO (the last AGPLv3 community release, built from `chimera-nas/minio`) | `quint/s3` |
 
 Only the third-party servers' records live here. A consuming project's own
 divergences belong in that project, next to the code that has to change --
@@ -47,3 +48,9 @@ against the Linux kernel NFS server booted in a KVM guest. See
 The same SMB2 flavours the samba suite replays, against the Windows SMB server
 itself. It runs on a Windows machine rather than through ctest; see
 [`windows/README.md`](windows/README.md).
+
+## s3
+
+`ctest -L minio` replays the generated S3 corpus against a private MinIO, a
+fresh one per trace. See [`s3/README.md`](s3/README.md) for how it runs, what
+it checks, and the divergences found so far.
