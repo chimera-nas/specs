@@ -115,8 +115,16 @@ start_minio() {
         MINIO_PID=$!
         for _ in $(seq 1 300); do
             if bash -c "echo > /dev/tcp/127.0.0.1/${PORT}" 2>/dev/null; then
-                MINIO_OUT=$out
-                return 0
+                # Listening is not serving: MinIO opens the port and answers
+                # 503 XMinioServerNotInitialized until its object layer is up,
+                # which a slow machine makes long enough for a trace's first
+                # request to land in.  Wait for a signed request to succeed.
+                if python3 "${HERE}/s3_wire.py" wait-ready 127.0.0.1 "$PORT" \
+                        "$ACCESS_KEY" "$SECRET_KEY" 60; then
+                    MINIO_OUT=$out
+                    return 0
+                fi
+                break
             fi
             kill -0 "$MINIO_PID" 2>/dev/null || break
             sleep 0.05
@@ -125,7 +133,7 @@ start_minio() {
         grep -q "address already in use" "$out" 2>/dev/null && continue
         break
     done
-    echo "minio did not come up on 127.0.0.1:${PORT}"
+    echo "minio did not come up and serve on 127.0.0.1:${PORT}"
     cat "$out"
     return 1
 }

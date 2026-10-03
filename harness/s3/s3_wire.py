@@ -33,6 +33,8 @@ import hmac
 import http.client
 import select
 import socket
+import sys
+import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 
@@ -232,3 +234,36 @@ class S3Client:
         if not send_body:
             r.will_close = True
         return r
+
+
+def wait_ready(host, port, access_key, secret_key, timeout=60.0):
+    """Wait until the server answers S3, not merely until it listens.
+
+    A server can accept connections before it can serve: MinIO opens its port
+    and answers 503 XMinioServerNotInitialized until its object layer is up.
+    The only test that cannot be wrong about that is the thing itself -- a
+    signed ListBuckets that comes back 200.  Returns whether it did.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        c = S3Client(host, port, access_key, secret_key, timeout=5.0)
+        try:
+            if c.call("GET", "/").status == 200:
+                return True
+        except OSError:
+            pass
+        finally:
+            c.close()
+        time.sleep(0.05)
+    return False
+
+
+if __name__ == "__main__":
+    # s3_wire.py wait-ready <host> <port> <access-key> <secret-key> [seconds]
+    if len(sys.argv) < 6 or sys.argv[1] != "wait-ready":
+        sys.exit("usage: s3_wire.py wait-ready <host> <port> <access-key> "
+                 "<secret-key> [seconds]")
+    sys.exit(0 if wait_ready(sys.argv[2], int(sys.argv[3]), sys.argv[4],
+                             sys.argv[5],
+                             float(sys.argv[6]) if len(sys.argv) > 6 else 60.0)
+             else 1)
