@@ -72,6 +72,13 @@
       "default": false,
       "doc": "RELAXATION -- false is Amazon S3. DeleteObjects naming the same key more than once: AWS reports that key in ONE <Deleted> entry (measured, us-east-2). true: the implementation reports one entry per occurrence. The label's `deleted` list is what is predicted, compared as a multiset because AWS does not keep the request's order either. (MinIO does a third thing, which is a fault: M-delete-objects-dup-empty.)"
     },
+    "P_PUT_BUCKET_TAGGING_OK": {
+      "kind": "policy",
+      "key": "policies.putBucketTaggingOk",
+      "type": "bool",
+      "default": false,
+      "doc": "RELAXATION -- false is Amazon S3. The status of a successful PutBucketTagging: AWS answers 204 No Content (measured, us-east-2; it is also what the API Reference's sample response shows). true: the implementation answers 200 OK, as PutObjectTagging does. MinIO answers 200."
+    },
     "DEVS": {
       "kind": "deviation",
       "key": "deviations",

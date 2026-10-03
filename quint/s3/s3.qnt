@@ -282,7 +282,7 @@ module s3 {
     // ---- relaxations: what AWS does NOT do, and an implementation may ----
     //
     // The defaults above and below are Amazon S3's own behaviour, measured.
-    // Each of these four is FALSE on AWS.  Setting one true is an explicit
+    // Each of these is FALSE on AWS.  Setting one true is an explicit
     // statement that the implementation under test departs from AWS there and
     // that the departure is accepted -- which is the only way the model will
     // predict it.
@@ -316,6 +316,11 @@ module s3 {
     // ONCE, however many times the request named it: false.  true: one
     // <Deleted> entry per occurrence.
     const P_DELETE_REPORTS_DUPLICATES: bool
+
+    // A successful PutBucketTagging.  AWS answers 204 No Content: false.
+    // true: 200 OK, which is what PutObjectTagging answers and what an
+    // implementation sharing one code path between the two tends to give.
+    const P_PUT_BUCKET_TAGGING_OK: bool
 
     // The bucket names a request may carry.
     val BKT_UNIVERSE = if (P_FIXED_BUCKET) Set("bk0") else BUCKETS
@@ -1319,7 +1324,10 @@ module s3 {
                 OPutBktTagging({ bucket: b, tags: ts, status: HTTP_NOT_FOUND,
                                  err: "NoSuchBucket" })
             else
-                OPutBktTagging({ bucket: b, tags: ts, status: HTTP_OK, err: "" }),
+                OPutBktTagging({ bucket: b, tags: ts,
+                                 status: if (P_PUT_BUCKET_TAGGING_OK) HTTP_OK
+                                         else HTTP_NO_CONTENT,
+                                 err: "" }),
     }
 
     // Not drawn under P_FIXED_BUCKET: a bucket's tag set is one value for the

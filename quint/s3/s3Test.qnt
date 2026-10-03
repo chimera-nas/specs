@@ -19,7 +19,8 @@ module s3Test {
               P_EMPTY_SUFFIX_RANGE_UNSATISFIABLE = false,
               P_LIST_RETURNS_MARKER_PREFIX = false,
               P_COPY_SELF_REJECTED = false,
-              P_DELETE_REPORTS_DUPLICATES = false).* from "./s3"
+              P_DELETE_REPORTS_DUPLICATES = false,
+              P_PUT_BUCKET_TAGGING_OK = false).* from "./s3"
 
     // Key shorthands (component lists).
     pure val kA: Key = ["a"]

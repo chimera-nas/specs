@@ -17,7 +17,10 @@
     "copySourceFirst": true,
     // RELAXATION: a copy of an object onto itself is refused 400
     // InvalidRequest, as the API Reference describes.  Amazon S3 performs it.
-    "copySelfRejected": true
+    "copySelfRejected": true,
+    // RELAXATION: a successful PutBucketTagging answers 200 OK.  Amazon S3
+    // answers 204 No Content.
+    "putBucketTaggingOk": true
   },
 
   // The MinIO divergences the model is told to PREDICT, so the trace's
