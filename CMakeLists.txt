@@ -798,6 +798,81 @@ if(SPECS_EXT4_TESTS)
 endif()
 
 # ---------------------------------------------------------------------------
+# Windows SMB server conformance (harness/windows)
+#
+# The same SMB2 flavours the Samba suite replays, generated for the Windows
+# SMB server -- the implementation MS-SMB2 and MS-FSA describe -- and replayed
+# against the in-box server of a Windows Server and a Windows 11 machine by
+# harness/windows/run_windows_mbt.ps1, which drives the SAME replayer the Samba
+# suite does (harness/samba/smb2_replay.py).
+#
+# Only the CORPUS and its liveness gates are registered here.  The corpus is
+# generated wherever this project is built, which is Linux; the replay needs a
+# Windows machine and none of this build's toolchain, so CI runs the script
+# directly against the corpus the build job produced rather than through a
+# ctest that could never run where it was configured.
+# ---------------------------------------------------------------------------
+option(SPECS_WINDOWS_TESTS
+       "Register the Windows SMB server conformance corpus (default: on only \
+when specs is the top-level project)" ${_conformance_default})
+
+if(NOT SPECS_WINDOWS_TESTS)
+    message(STATUS
+        "windows MBT corpus: not registered (specs is a subdirectory of "
+        "${CMAKE_PROJECT_NAME}; -DSPECS_WINDOWS_TESTS=ON to register it)")
+else()
+    set(WINDOWS_HARNESS ${CMAKE_CURRENT_SOURCE_DIR}/harness/windows)
+    set(SPECS_DEVLIVENESS ${CMAKE_CURRENT_SOURCE_DIR}/tools/devliveness.py)
+    message(STATUS "windows MBT corpus: registered (replayed on Windows by "
+            "harness/windows/run_windows_mbt.ps1)")
+
+    # cell name | config stem | enables a deviation?
+    #
+    # The seven flavours the replayer can drive.  The four caching/durable
+    # cells the Samba suite registers only to report as a SKIP are not
+    # repeated here: they would be the same traces, skipped for the same
+    # reason, by the same replayer.
+    set(WINDOWS_CELLS
+        "stepCore|core|no"
+        "stepReq|req|no"
+        "stepDir|dir|no"
+        "stepInfo|info|no"
+        "stepNs|ns|no"
+        "notify|notify|no"
+        "notifyNs|notify_ns|no")
+
+    foreach(c ${WINDOWS_CELLS})
+        string(REPLACE "|" ";" parts "${c}")
+        list(GET parts 0 bname)
+        list(GET parts 1 cstem)
+        list(GET parts 2 hasdev)
+        set(wcfg ${WINDOWS_HARNESS}/configs/${cstem}.json)
+
+        # A strict twin only where the config enables a deviation: a cell that
+        # enables none already IS the strict corpus.
+        if("${hasdev}" STREQUAL "yes")
+            specs_corpus(NAME    windows/smb2/${bname}
+                         FAMILY  smb2
+                         CONFIG  ${wcfg}
+                         OUT_DIR WINDOWS_TRACES
+                         STRICT_OUT_DIR WINDOWS_STRICT)
+        else()
+            specs_corpus(NAME    windows/smb2/${bname}
+                         FAMILY  smb2
+                         CONFIG  ${wcfg}
+                         OUT_DIR WINDOWS_TRACES)
+        endif()
+
+        add_test(NAME windows/smb2/${bname}/devliveness
+                 COMMAND ${Python3_EXECUTABLE} ${SPECS_DEVLIVENESS}
+                         ${wcfg} ${WINDOWS_TRACES})
+        set_tests_properties(windows/smb2/${bname}/devliveness PROPERTIES
+            LABELS "windows;smb2;devliveness"
+            TIMEOUT 120)
+    endforeach()
+endif()
+
+# ---------------------------------------------------------------------------
 # Emit the build edges for every cell registered above (cmake/SpecsCorpus.cmake).
 #
 # A CONSUMER calls this itself, after its own specs_corpus() registrations; this

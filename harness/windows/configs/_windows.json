@@ -1,0 +1,39 @@
+{
+  // The Windows SMB server this suite configures (harness/windows/
+  // run_windows_mbt.ps1): the in-box LanmanServer of the runner it executes on
+  // -- Windows Server 2025 and Windows 11 in CI -- serving an NTFS directory,
+  // spoken to at SMB 3.0.0, with EnableOplocks and EnableLeasing both turned
+  // off.  Every caching grant is therefore off, which is the deterministic
+  // filesystem core: the CREATE disposition/type matrix, share arbitration,
+  // byte-range locks, I/O, delete-on-close, rename, compound threading and
+  // CHANGE_NOTIFY, with no oplock/lease break lifecycle interleaved with it.
+  //
+  // The same profile harness/samba/configs/_smbd.json describes, on purpose:
+  // the two servers are then asked exactly the same questions, and what
+  // distinguishes the cells is only which divergences the model is told to
+  // predict.
+  //
+  // This file carries the SERVER, not a corpus: it declares no batches and is
+  // never registered as a cell.  Each flavour extends it and adds the one
+  // batch that cell replays.
+  "family": "smb2",
+  "description": "the Windows SMB server harness/windows configures: SMB 3.0.0, oplocks and leasing off.",
+  "traceStem": "smb2Base",
+
+  "features": {
+    "oplocks": "unsupported",
+    "leases": "unsupported",
+    "dirLeases": "unsupported",
+    "durable": "unsupported"
+  },
+
+  "policies": {
+    // 0x0300 -- smbprotocol's Dialects.SMB_3_0_0, what smb2_wire.py negotiates
+    "dialect": 768,
+    "leaseOpenBreak": true,
+    "forceLevel2": false
+  },
+
+  // The Windows divergences the model is told to PREDICT.  None yet.
+  "deviations": []
+}
