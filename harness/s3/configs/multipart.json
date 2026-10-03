@@ -1,0 +1,33 @@
+{
+  "extends": "./_minio.json",
+  "family": "s3",
+  "description": "the same MinIO driven through multipart upload. A cell of its own because these traces must be replayed with a 5 MiB block size -- the S3 minimum part size -- which makes every non-empty part legal at that scale and leaves EntityTooSmall as the fate of an EMPTY non-final manifest part, exactly as the model encodes it.",
+  "traceStem": "miniomp",
+
+  // The block size is a harness setting (SPECS_S3_BLOCK_SIZE, set by CMake);
+  // recorded here as the fact that distinguishes this corpus from the base one.
+  "blockSize": 5242880,
+
+  // Which of the MinIO profile's deviations this cell's corpus REACHES.
+  // stepMultipart draws the multipart calls plus just enough of the rest to
+  // feed them (buckets, PutObject, an unranged GET, a listing), so the
+  // deviations that need a ranged GET, a tagging call, a batch delete, a copy
+  // or GetObjectAttributes are switched off here, and so is the one a
+  // delimiter listing could take but these five traces never do; see
+  // base.json for why.
+  "deviationsOff": [
+    "M-get-bucket-tagging-no-bucket-check",
+    "M-delete-bucket-tagging-no-bucket-check",
+    "M-416-no-content-range",
+    "M-suffix-range-empty-206",
+    "M-list-marker-inside-prefix-skipped",
+    "M-delete-objects-dup-empty",
+    "M-copy-source-before-dst-bucket",
+    "M-getattrs-zero-size-omitted"
+  ],
+
+  "batches": [
+    { "flavor": "stepMultipart", "steps": 64, "traces": 3, "seed": "0x1" },
+    { "flavor": "stepMultipart", "steps": 64, "traces": 2, "seed": "0x11" }
+  ]
+}

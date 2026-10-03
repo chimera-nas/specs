@@ -76,6 +76,9 @@ RUN if [ -n "$APT_MIRROR" ]; then \
 #                           (knfsd) for the NFS conformance suite.  x86 only, as
 #                           in the chimera devcontainer: KVM acceleration needs
 #                           a matching host, so the knfsd tests run on amd64.
+# (minio)                -- the server under test for the S3 conformance suite
+#                           is not packaged anywhere; it is built from source
+#                           in the next layer
 # python3-pip            -- the replay harness's SMB2 client (see below)
 # reuse                  -- the SPDX lint this repo's CI enforces
 # gdb                    -- only ever used post mortem: when a server under
@@ -109,6 +112,36 @@ RUN apt-get -y update && \
         "$VERSION_CODENAME" \
         > /etc/apt/sources.list.d/ddebs.list && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# MinIO, the server under test for the S3 conformance suite (harness/s3).
+#
+# Built from source because there is nothing else to install: upstream stopped
+# publishing community binaries and images in October 2025 and archived the
+# repository in April 2026.  chimera-nas/minio is a fork of that final AGPLv3
+# tree, and the commit below is its head -- pinned by hash, so the server the
+# model is measured against cannot move underneath the deviations recorded for
+# it.  Bumping it is a model change as much as an image change: re-run the
+# strict twins and see what moved.
+#
+# One layer, toolchain included and removed again: the Go toolchain is a build
+# input only, and a separate builder stage would not be kept by the mode=min
+# layer cache CI uses, so every job would rebuild it.  The image carries an
+# AGPLv3 binary; it is run as a separate process and never linked against, and
+# its complete corresponding source is the pinned commit.
+ARG MINIO_REPO=https://github.com/chimera-nas/minio
+ARG MINIO_COMMIT=7aac2a2c5b7c882e68c1ce017d8256be2feea27f
+RUN apt-get -y update && \
+    apt-get -y --no-install-recommends install golang-go && \
+    git init -q /tmp/minio && cd /tmp/minio && \
+    git remote add origin "$MINIO_REPO" && \
+    git fetch -q --depth 1 origin "$MINIO_COMMIT" && \
+    git checkout -q FETCH_HEAD && \
+    CGO_ENABLED=0 GOFLAGS=-trimpath GOPATH=/tmp/gopath GOCACHE=/tmp/gocache \
+        go build -o /usr/local/bin/minio . && \
+    cd / && rm -rf /tmp/minio /tmp/gopath /tmp/gocache && \
+    apt-get -y purge golang-go && apt-get -y autoremove --purge && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    minio --version
 
 # The replay harness speaks SMB2 through `smbprotocol`, a pure-Python SMB2/3
 # client.  It is used at its RAW layer -- the harness hand-builds each

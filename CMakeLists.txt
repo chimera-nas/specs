@@ -879,6 +879,124 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# MinIO conformance (harness/s3)
+#
+# The S3 counterpart of the suites above: replay an S3 corpus generated FOR
+# THIS SERVER against a real MinIO -- an object store with a flat namespace of
+# its own, nothing like the filesystem-backed gateway the s3 model was written
+# alongside -- and compare every reply to the result the model baked into the
+# trace.  What MinIO does differently is stated in the MODEL, switched on by
+# the cell's config and declared with its citation in
+# quint/s3/corpus.schema.json, so the comparison is exact and a NEW divergence
+# turns the suite red.
+#
+# One config is one cell is one ctest.  Each test starts a fresh MinIO per
+# trace on a free loopback port of its own (harness/s3/run_minio_mbt.sh), so
+# the cells run concurrently with no namespace, no root and no RESOURCE_LOCK.
+#
+# The server is the last AGPLv3 community MinIO, built from source out of
+# chimera-nas/minio (upstream publishes no binaries and has archived the
+# repository); the devcontainer carries it.
+# ---------------------------------------------------------------------------
+option(SPECS_MINIO_TESTS
+       "Register the MinIO conformance suite (default: on only when specs is \
+the top-level project)" ${_conformance_default})
+
+if(NOT SPECS_MINIO_TESTS)
+    message(STATUS
+        "minio MBT tests: not registered (specs is a subdirectory of "
+        "${CMAKE_PROJECT_NAME}; -DSPECS_MINIO_TESTS=ON to register them)")
+else()
+    set(S3_HARNESS ${CMAKE_CURRENT_SOURCE_DIR}/harness/s3)
+    find_program(MINIO_BIN NAMES minio
+                 PATHS /usr/local/bin /usr/bin
+                 DOC "MinIO server, the server under test for the S3 MBT suite")
+    # Same rule as the other suites: the config determines the corpus, the
+    # machine determines only whether the tests run.
+    if(MINIO_BIN)
+        message(STATUS "minio MBT tests: enabled (${MINIO_BIN})")
+    else()
+        message(STATUS
+            "minio MBT tests: corpus registered, tests disabled (minio not found)")
+    endif()
+
+    set(SPECS_DEVLIVENESS ${CMAKE_CURRENT_SOURCE_DIR}/tools/devliveness.py)
+
+    # cell name | config stem | block size | enables a deviation?
+    #
+    # The multipart cell is replayed at 5 MiB, the S3 minimum part size, which
+    # is the scale the model's EntityTooSmall encoding assumes.  A cell gets a
+    # strict twin only when its config enables a deviation: one that enables
+    # none already IS the strict corpus, and a byte-identical twin of it would
+    # buy nothing.
+    set(MINIO_CELLS
+        "base|base|8192|yes"
+        "multipart|multipart|5242880|yes")
+
+    foreach(c ${MINIO_CELLS})
+        string(REPLACE "|" ";" parts "${c}")
+        list(GET parts 0 cname)
+        list(GET parts 1 cstem)
+        list(GET parts 2 bsize)
+        list(GET parts 3 hasdev)
+        set(mcfg ${S3_HARNESS}/configs/${cstem}.json)
+
+        if("${hasdev}" STREQUAL "yes")
+            specs_corpus(NAME    minio/s3/${cname}
+                         FAMILY  s3
+                         CONFIG  ${mcfg}
+                         OUT_DIR MINIO_TRACES
+                         STRICT_OUT_DIR MINIO_STRICT)
+        else()
+            specs_corpus(NAME    minio/s3/${cname}
+                         FAMILY  s3
+                         CONFIG  ${mcfg}
+                         OUT_DIR MINIO_TRACES)
+            set(MINIO_STRICT "")
+        endif()
+
+        set(tname minio/s3/${cname})
+
+        # The liveness gate: a cell that enables a deviation no trace in its
+        # own corpus ever records having taken fails here.  It needs no server,
+        # so it runs everywhere the corpus is built.
+        add_test(NAME ${tname}/devliveness
+                 COMMAND ${Python3_EXECUTABLE} ${SPECS_DEVLIVENESS}
+                         ${mcfg} ${MINIO_TRACES})
+        set_tests_properties(${tname}/devliveness PROPERTIES
+            LABELS "minio;s3;devliveness"
+            TIMEOUT 120)
+
+        if(NOT MINIO_BIN)
+            continue()   # no minio to drive; the corpus above still exists
+        endif()
+
+        add_test(NAME ${tname}
+                 COMMAND ${S3_HARNESS}/run_minio_mbt.sh ${MINIO_TRACES})
+        set_tests_properties(${tname} PROPERTIES
+            LABELS "minio;s3;mbt"
+            TIMEOUT 1800
+            SKIP_RETURN_CODE 77
+            ENVIRONMENT "MINIO=${MINIO_BIN};SPECS_S3_BLOCK_SIZE=${bsize}")
+
+        if(MINIO_STRICT)
+            # The STRICT twin: every deviation forced off, so the corpus states
+            # the S3 API and nothing else.  REPORTING, not gating -- its
+            # failures are exactly MinIO's conformance debt, re-measured on
+            # every run.  Extended tier.
+            add_test(NAME ${tname}-strict
+                     CONFIGURATIONS extended
+                     COMMAND ${S3_HARNESS}/run_minio_mbt.sh ${MINIO_STRICT})
+            set_tests_properties(${tname}-strict PROPERTIES
+                LABELS "minio;s3;mbt;strict"
+                TIMEOUT 1800
+                SKIP_RETURN_CODE 77
+                ENVIRONMENT "MINIO=${MINIO_BIN};SPECS_S3_BLOCK_SIZE=${bsize}")
+        endif()
+    endforeach()
+endif()
+
+# ---------------------------------------------------------------------------
 # Emit the build edges for every cell registered above (cmake/SpecsCorpus.cmake).
 #
 # A CONSUMER calls this itself, after its own specs_corpus() registrations; this
