@@ -32,13 +32,11 @@ import hashlib
 import hmac
 import http.client
 import select
-import socket
 import sys
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 
-REGION = "us-east-1"
 SERVICE = "s3"
 
 # A body at least this large is offered with "Expect: 100-continue".
@@ -96,9 +94,12 @@ class Response:
 
 
 class S3Client:
-    def __init__(self, host, port, access_key, secret_key, timeout=60.0):
+    def __init__(self, host, port, access_key, secret_key, timeout=60.0,
+                 region="us-east-1", tls=False):
         self.host = host
         self.port = port
+        self.region = region
+        self.tls = tls
         self.access_key = access_key
         self.secret_key = secret_key
         self.timeout = timeout
@@ -113,7 +114,11 @@ class S3Client:
         now = datetime.datetime.now(datetime.timezone.utc)
         amz_date = now.strftime("%Y%m%dT%H%M%SZ")
         date = amz_date[:8]
-        headers["host"] = f"{self.host}:{self.port}"
+        # A default port is left out of Host, as every HTTP client leaves it
+        # out; the signature covers the header exactly as sent.
+        default = 443 if self.tls else 80
+        headers["host"] = (self.host if self.port == default
+                           else f"{self.host}:{self.port}")
         headers["x-amz-date"] = amz_date
         headers["x-amz-content-sha256"] = payload_hash
 
@@ -128,13 +133,13 @@ class S3Client:
             ";".join(signed),
             payload_hash,
         ])
-        scope = f"{date}/{REGION}/{SERVICE}/aws4_request"
+        scope = f"{date}/{self.region}/{SERVICE}/aws4_request"
         to_sign = "\n".join([
             "AWS4-HMAC-SHA256", amz_date, scope,
             hashlib.sha256(canonical.encode()).hexdigest(),
         ])
         key = _hmac(("AWS4" + self.secret_key).encode(), date)
-        for part in (REGION, SERVICE, "aws4_request"):
+        for part in (self.region, SERVICE, "aws4_request"):
             key = _hmac(key, part)
         sig = hmac.new(key, to_sign.encode(), hashlib.sha256).hexdigest()
         headers["authorization"] = (
@@ -167,7 +172,8 @@ class S3Client:
         # a fresh connection is.
         for attempt in (0, 1):
             if self.conn is None:
-                self.conn = http.client.HTTPConnection(
+                self.conn = (http.client.HTTPSConnection if self.tls
+                             else http.client.HTTPConnection)(
                     self.host, self.port, timeout=self.timeout)
             try:
                 if len(body) >= EXPECT_THRESHOLD:
@@ -191,7 +197,14 @@ class S3Client:
 
     def _request_expect(self, method, target, headers, body):
         """Send the headers with Expect: 100-continue, and the body only if
-        the server asks for it (or says nothing for EXPECT_WAIT seconds)."""
+        the server asks for it (or says nothing for EXPECT_WAIT seconds).
+
+        http.client cannot do this: its response parser swallows an interim
+        100 and blocks for the final status, which never comes while the body
+        is unsent.  So the first status line is read here, through the same
+        response object that then parses whatever follows it.  The connection
+        is not reused afterwards.
+        """
         c = self.conn
         # skip_host: the signed headers already carry Host, and a second one
         # is a 400.
@@ -202,41 +215,121 @@ class S3Client:
         c.putheader("expect", "100-continue")
         c.endheaders()
 
+        r = _ExpectResponse(c.sock, method=method)
         send_body = True
         if select.select([c.sock], [], [], EXPECT_WAIT)[0]:
-            # Peek, so that a final response is left intact for http.client.
-            head = b""
-            while len(head) < 12:
-                more = c.sock.recv(12, socket.MSG_PEEK)
-                if len(more) <= len(head) and not select.select(
-                        [c.sock], [], [], EXPECT_WAIT)[0]:
-                    break
-                if not more:
-                    break
-                head = more
-            if head[9:12] == b"100":
-                # Consume exactly the interim response: status line, any
-                # headers, blank line.
-                seen = b""
-                while not seen.endswith(b"\r\n\r\n"):
-                    ch = c.sock.recv(1)
-                    if not ch:
-                        raise http.client.RemoteDisconnected(
-                            "connection closed inside 100 Continue")
-                    seen += ch
+            first = http.client.HTTPResponse._read_status(r)
+            if first[1] == http.client.CONTINUE:
+                # the rest of the interim response: any headers, a blank line
+                while r.fp.readline(65537).strip():
+                    pass
             else:
-                # The final answer, given on the headers alone.  The body is
-                # not sent, so the connection cannot be reused.
+                # The final answer, given on the headers alone.  Hand its
+                # status line back to the parser; the body is never sent.
+                r.first_status = first
                 send_body = False
         if send_body:
             c.send(body)
-        r = c.getresponse()
-        if not send_body:
-            r.will_close = True
+        r.begin()
+        r.will_close = True
         return r
 
 
-def wait_ready(host, port, access_key, secret_key, timeout=60.0):
+class _ExpectResponse(http.client.HTTPResponse):
+    """A response whose first status line may already have been read."""
+
+    first_status = None
+
+    def _read_status(self):
+        if self.first_status is not None:
+            first, self.first_status = self.first_status, None
+            return first
+        return super()._read_status()
+
+
+# The rule every bucket this suite creates carries from the moment it exists:
+# whatever is still in it after a day expires, and so does an upload nobody
+# finished.  A bucket has no lifetime of its own in S3 -- only its contents can
+# be given one -- so this bounds what a leaked bucket can cost until a sweep
+# (s3_sweep.py) removes the bucket itself.
+EXPIRE_LIFECYCLE = (
+    b"<LifecycleConfiguration><Rule><ID>specs-mbt-expire</ID>"
+    b"<Filter><Prefix></Prefix></Filter><Status>Enabled</Status>"
+    b"<Expiration><Days>1</Days></Expiration>"
+    b"<AbortIncompleteMultipartUpload><DaysAfterInitiation>1"
+    b"</DaysAfterInitiation></AbortIncompleteMultipartUpload>"
+    b"</Rule></LifecycleConfiguration>")
+
+
+def location_constraint(region):
+    """The CreateBucket body a region demands: every region but us-east-1
+    refuses a create that does not name it."""
+    if region == "us-east-1":
+        return b""
+    return ("<CreateBucketConfiguration><LocationConstraint>" + region +
+            "</LocationConstraint></CreateBucketConfiguration>").encode()
+
+
+def list_buckets(client, prefix=""):
+    """[(name, CreationDate)] of the caller's buckets whose name starts with
+    `prefix`, following the listing's continuation tokens.  The prefix is
+    applied here as well as asked of the server: a server that ignores the
+    parameter must not widen what a caller goes on to delete."""
+    out, token = [], None
+    while True:
+        query = [("prefix", prefix)] if prefix else []
+        if token:
+            query.append(("continuation-token", token))
+        res = client.call("GET", "/", query=query)
+        root = res.xml()
+        if res.status != 200 or root is None:
+            raise OSError(f"ListBuckets: {res.status} {res.error_code()}")
+        for b in root.iter("Bucket"):
+            name = b.findtext("Name", "")
+            if name.startswith(prefix):
+                out.append((name, b.findtext("CreationDate", "")))
+        token = root.findtext("ContinuationToken")
+        if not token:
+            return out
+
+
+def purge_bucket(client, name):
+    """Abort every upload in bucket `name`, delete every object, delete the
+    bucket.  Returns "" on success (a bucket already gone is a success), else
+    what stopped it."""
+    path = f"/{name}"
+    for _ in range(1000):
+        res = client.call("GET", path, query=[("uploads", "")])
+        if res.status == 404:
+            return ""
+        root = res.xml()
+        if res.status != 200 or root is None:
+            return f"ListMultipartUploads: {res.status} {res.error_code()}"
+        ups = [(u.findtext("Key", ""), u.findtext("UploadId", ""))
+               for u in root.findall("Upload")]
+        for key, upl in ups:
+            client.call("DELETE", f"{path}/{key}", query=[("uploadId", upl)])
+        if root.findtext("IsTruncated") != "true":
+            break
+    for _ in range(1000):
+        res = client.call("GET", path, query=[("list-type", "2")])
+        if res.status == 404:
+            return ""
+        root = res.xml()
+        if res.status != 200 or root is None:
+            return f"ListObjectsV2: {res.status} {res.error_code()}"
+        keys = [c.findtext("Key", "") for c in root.findall("Contents")]
+        if not keys:
+            break
+        for key in keys:
+            client.call("DELETE", f"{path}/{key}")
+    res = client.call("DELETE", path)
+    if res.status in (204, 404):
+        return ""
+    return f"DeleteBucket: {res.status} {res.error_code()}"
+
+
+def wait_ready(host, port, access_key, secret_key, timeout=60.0, **kw):
     """Wait until the server answers S3, not merely until it listens.
 
     A server can accept connections before it can serve: MinIO opens its port
@@ -246,7 +339,7 @@ def wait_ready(host, port, access_key, secret_key, timeout=60.0):
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        c = S3Client(host, port, access_key, secret_key, timeout=5.0)
+        c = S3Client(host, port, access_key, secret_key, timeout=5.0, **kw)
         try:
             if c.call("GET", "/").status == 200:
                 return True

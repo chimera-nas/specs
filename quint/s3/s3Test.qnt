@@ -7,12 +7,20 @@
 // model regression is caught before it can invalidate generated traces.
 
 module s3Test {
-    // DEVS = Set(): the self-tests check the STANDARD, so no implementation
-    // deviation is switched on here.  That is the point of keeping them
+    // DEVS = Set(), and every relaxation off: the self-tests check the
+    // STANDARD -- Amazon S3 as measured -- so no implementation deviation or
+    // non-AWS relaxation is switched on here.  That is the point of keeping them
     // separate from the generated corpus -- a config may describe a server that
     // gets something wrong, but the model's own tests always assert AWS.
     import s3(DEVS = Set(), P_CREATE_OWNED_CONFLICT = false,
-              P_COPY_SOURCE_FIRST = false).* from "./s3"
+              P_COPY_SOURCE_FIRST = false,
+              P_FIXED_BUCKET = false,
+              P_RANGE_ERR_CONTENT_RANGE = false,
+              P_EMPTY_SUFFIX_RANGE_UNSATISFIABLE = false,
+              P_LIST_RETURNS_MARKER_PREFIX = false,
+              P_COPY_SELF_REJECTED = false,
+              P_DELETE_REPORTS_DUPLICATES = false,
+              P_PUT_BUCKET_TAGGING_OK = false).* from "./s3"
 
     // Key shorthands (component lists).
     pure val kA: Key = ["a"]
@@ -124,11 +132,18 @@ module s3Test {
             .then(applyHeadObject("bk0", kA))
             .expect(lastOp == OHeadObject({ bucket: "bk0", key: kA,
                                             status: HTTP_OK, sizeBlocks: 0 }))
-            // any range against a zero-length object is unsatisfiable
+            // a SUFFIX range against a zero-length object is ignored: 200,
+            // empty, as an unranged GET
             .then(applyGetObject("bk0", kA, RSuffix(1)))
             .expect(lastOp == OGetObject({ bucket: "bk0", key: kA, range: RSuffix(1),
+                                           status: HTTP_OK, err: "",
+                                           data: [], first: 0, total: 0 }))
+            // any other range against it is unsatisfiable, and the 416 carries
+            // no Content-Range (total -1)
+            .then(applyGetObject("bk0", kA, RFrom(0)))
+            .expect(lastOp == OGetObject({ bucket: "bk0", key: kA, range: RFrom(0),
                                            status: HTTP_RANGE_ERR, err: "InvalidRange",
-                                           data: [], first: -1, total: 0 }))
+                                           data: [], first: -1, total: -1 }))
 
     // AWS DeleteObject is idempotent: 204 whether or not the key exists.
     run deleteIdempotentTest =
@@ -176,12 +191,11 @@ module s3Test {
                                             dstBucket: "bk1", dstKey: kB,
                                             status: HTTP_NOT_FOUND,
                                             err: "NoSuchKey" }))
-            // copy onto itself without a metadata directive
+            // copy onto itself without a metadata directive: performed
             .then(applyCopyObject("bk0", kA, "bk0", kA))
             .expect(lastOp == OCopyObject({ srcBucket: "bk0", srcKey: kA,
                                             dstBucket: "bk0", dstKey: kA,
-                                            status: HTTP_BAD_REQUEST,
-                                            err: "InvalidRequest" }))
+                                            status: HTTP_OK, err: "" }))
             .expect(bkts.get("bk0").objs.get(kA).data == [1, 2])
 
     run rangeTest =
@@ -221,11 +235,11 @@ module s3Test {
             .expect(lastOp == OGetObject({ bucket: "bk0", key: kA,
                                            range: RClosed({ first: 3, last: 3 }),
                                            status: HTTP_RANGE_ERR, err: "InvalidRange",
-                                           data: [], first: -1, total: 3 }))
+                                           data: [], first: -1, total: -1 }))
             .then(applyGetObject("bk0", kA, RFrom(3)))
             .expect(lastOp == OGetObject({ bucket: "bk0", key: kA, range: RFrom(3),
                                            status: HTTP_RANGE_ERR, err: "InvalidRange",
-                                           data: [], first: -1, total: 3 }))
+                                           data: [], first: -1, total: -1 }))
 
     run listFlatTest =
         init
@@ -334,7 +348,7 @@ module s3Test {
             .expect(lastOp == OListObjects({ bucket: "bk0", prefix: pAll, delim: true,
                                              startAfter: kDA, maxKeys: 1000, mode: 2,
                                              status: HTTP_OK, err: "",
-                                             keys: [], prefixes: [["d"]],
+                                             keys: [], prefixes: [],
                                              truncated: false }))
             // start-after past the whole group
             .then(applyListObjects("bk0", pAll, true, kDB, 1000, 2))
@@ -425,22 +439,24 @@ module s3Test {
             .then(applyCreateBucket("bk0"))
             .then(applyPutObject("bk0", kA, [1], 0))
             .then(applyPutObject("bk0", kDA, [1], 0))
-            // present, missing and duplicate keys all report Deleted
+            // present and missing keys both report Deleted; a key named
+            // twice is reported once
             .then(applyDeleteObjects("bk0", [kA, kA], false))
             .expect(lastOp == ODeleteObjects({ bucket: "bk0", keys: [kA, kA],
                                                quiet: false, status: HTTP_OK,
-                                               err: "" }))
+                                               err: "", deleted: [kA] }))
             .expect(not(bkts.get("bk0").objs.keys().contains(kA)))
             .then(applyDeleteObjects("bk0", [kB, kDA], true))
             .expect(lastOp == ODeleteObjects({ bucket: "bk0", keys: [kB, kDA],
                                                quiet: true, status: HTTP_OK,
-                                               err: "" }))
+                                               err: "", deleted: [] }))
             .expect(bkts.get("bk0").objs.keys().size() == 0)
             .then(applyDeleteObjects("bk1", [kA], false))
             .expect(lastOp == ODeleteObjects({ bucket: "bk1", keys: [kA],
                                                quiet: false,
                                                status: HTTP_NOT_FOUND,
-                                               err: "NoSuchBucket" }))
+                                               err: "NoSuchBucket",
+                                               deleted: [] }))
 
     run getAttrsTest =
         init

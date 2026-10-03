@@ -10,11 +10,19 @@
 
   // Where S3 has more than one right answer, which one this server gives.
   "policies": {
-    // 409 BucketAlreadyOwnedByYou for a bucket the caller already owns: the
-    // answer of every AWS region but us-east-1.
+    // Not a relaxation -- S3 itself gives both answers, by region: 409
+    // BucketAlreadyOwnedByYou for a bucket the caller already owns, as every
+    // AWS region but us-east-1 answers.
     "createOwnedBucketConflict": true,
-    // A copy of a missing key into a missing bucket reports NoSuchKey.
-    "copySourceFirst": true
+    // RELAXATION: a copy of a missing key into a missing bucket reports
+    // NoSuchKey.  Amazon S3 reports NoSuchBucket.
+    "copySourceFirst": true,
+    // RELAXATION: a copy of an object onto itself is refused 400
+    // InvalidRequest, as the API Reference describes.  Amazon S3 performs it.
+    "copySelfRejected": true,
+    // RELAXATION: a successful PutBucketTagging answers 200 OK.  Amazon S3
+    // answers 204 No Content.
+    "putBucketTaggingOk": true
   },
 
   // The MinIO divergences the model is told to PREDICT, so the trace's
@@ -26,10 +34,8 @@
   "deviations": [
     "M-get-bucket-tagging-no-bucket-check",
     "M-delete-bucket-tagging-no-bucket-check",
-    "M-416-no-content-range",
     "M-suffix-range-empty-206",
     "M-list-marker-outside-prefix-501",
-    "M-list-marker-inside-prefix-skipped",
     "M-delete-objects-dup-empty",
     "M-getattrs-zero-size-omitted",
     "M-getattrs-root-lowercase",

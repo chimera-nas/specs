@@ -7,8 +7,11 @@
 HTTP, comparing every response against the model's expectation.
 
 Model-to-wire mapping:
-  - model bucket names are wire bucket names (path-style addressing);
-  - a model key (a list of path components) joins with '/' into the wire key;
+  - model bucket names are wire bucket names (path-style addressing), unless
+    --bucket maps one onto an existing bucket, or --ephemeral-buckets gives
+    every model bucket a real bucket of this trace's own (see Oracle);
+  - a model key (a list of path components) joins with '/' into the wire key,
+    under --key-prefix when one is given;
   - content block symbol s at index i is block-size bytes of 0x40+s at offset
     i * block-size; range requests scale block units by the block size;
   - the model's `status` is the HTTP status line, its `err` the <Code> of the
@@ -35,13 +38,19 @@ Exit status: 0 every trace matched, 1 a divergence, 2 a malformed trace.
 import argparse
 import json
 import os
+import signal
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from s3_wire import S3Client  # noqa: E402
+from s3_wire import (EXPIRE_LIFECYCLE, S3Client,  # noqa: E402
+                     location_constraint, purge_bucket)
 
 HIST = 10
+
+# The bucket names the model draws (quint/s3/s3.qnt, BUCKETS).
+MODEL_BUCKETS = ("bk0", "bk1")
 
 # An UploadId no Initiate ever minted, for the model's unknown-upload requests.
 UNKNOWN_UPLOAD_ID = "ffffffffffffffffffffffffffffffff"
@@ -138,15 +147,87 @@ class Oracle:
     that the model does not predict (ETags, wire upload ids), plus the
     mismatches of the step in hand."""
 
-    def __init__(self, client, block_size):
+    def __init__(self, client, block_size, buckets=None, key_prefix="",
+                 ephemeral="", settle=0.0):
         self.c = client
         self.bs = block_size
+        # Against a service where the tester creates real buckets in a
+        # namespace it shares with everyone (--ephemeral-buckets), a model
+        # bucket is served by "<ephemeral>-<model name>-g<n>", n counting how
+        # many times this trace has deleted that model bucket.  A new name per
+        # incarnation because S3 says a deleted bucket's name "might not be
+        # immediately available for reuse": the model is sequential, and a
+        # create refused because the delete before it has not finished
+        # propagating would be a statement about S3's control plane and not
+        # about the API.  While a model bucket is not live its requests go to
+        # the name its NEXT incarnation will take -- one that has never
+        # existed, which is exactly what the model means by a missing bucket.
+        self.eph = ephemeral
+        self.settle = settle
+        self.gen = {}        # model bucket -> incarnations deleted so far
+        self.made = set()    # real buckets this trace created and still owes
+        # Where the model's names live on the wire.  By default they ARE the
+        # wire names.  Against a service that hands the tester one existing
+        # bucket (the fixedBucket policy) the model bucket is mapped onto it
+        # and every key goes under a prefix of this trace's own, so a trace
+        # starts on an empty namespace without anything having to be deleted
+        # and concurrent runs cannot see each other.
+        self.buckets = buckets or {}
+        self.kp = key_prefix
         self.etags = {}      # (bucket, key) -> ETag at the last write
         self.upls = {}       # model uplid -> wire UploadId
         self.petags = {}     # (uplid, partNum) -> part ETag
         self.m = []          # mismatches of the current step
         self.hits = ()       # deviations the model took at the current step
         self.status = 0      # status of the current step's reply
+
+    # -- model names to wire names and back --
+
+    def wb(self, bucket):
+        if self.eph:
+            return f"{self.eph}-{bucket}-g{self.gen.get(bucket, 0)}"
+        return self.buckets.get(bucket, bucket)
+
+    def mb(self, wire_bucket):
+        """A bucket the server reported, as the model names it.  One that is
+        not the current incarnation of a model bucket is returned as it came,
+        so it shows up as the mismatch it is."""
+        if not self.eph:
+            return wire_bucket
+        for b in MODEL_BUCKETS:
+            if self.wb(b) == wire_bucket:
+                return b
+        return wire_bucket
+
+    def teardown(self):
+        """Remove every real bucket this trace still owns.  Never part of the
+        verdict: a bucket that will not go is reported and left to the
+        sweep."""
+        for name in sorted(self.made):
+            try:
+                why = purge_bucket(self.c, name)
+            except OSError as e:
+                why = str(e)
+            if why:
+                print(f"teardown: {name} not removed ({why}); the sweep "
+                      "will take it", file=sys.stderr)
+        self.made = set()
+
+    def wk(self, key):
+        return self.kp + key
+
+    def mk(self, wire_key):
+        """A key the server reported, as the model names it.  One from outside
+        this trace's prefix is returned as it came, so it shows up as the
+        mismatch it is."""
+        return (wire_key[len(self.kp):] if wire_key.startswith(self.kp)
+                else wire_key)
+
+    def bp(self, bucket):
+        return f"/{self.wb(bucket)}"
+
+    def op(self, bucket, key):
+        return f"/{self.wb(bucket)}/{self.wk(key)}"
 
     # -- plumbing --
 
@@ -255,8 +336,18 @@ class Oracle:
     # ---- buckets ----
 
     def OCreateBucket(self, op, post):
-        path = f"/{op['bucket']}"
-        res = self.call("PUT", path)
+        path = self.bp(op["bucket"])
+        res = self.call("PUT", path, body=location_constraint(self.c.region))
+        if self.eph and res.status == 200:
+            # Owed to teardown from the moment it exists, whatever the model
+            # expected -- and given the expiry rule at once, so that if this
+            # process dies the bucket cannot hold data for more than a day.
+            self.made.add(path[1:])
+            lc = self.c.call("PUT", path, query=[("lifecycle", "")],
+                             body=EXPIRE_LIFECYCLE, xml_body=True)
+            if lc.status != 200:
+                print(f"{path[1:]}: lifecycle rule not set ({lc.status} "
+                      f"{lc.error_code()})", file=sys.stderr)
         if not self.check_status(op, res):
             return
         if op["status"] == 409:
@@ -265,33 +356,72 @@ class Oracle:
             if res.error_code() != "BucketAlreadyOwnedByYou":
                 self.mism("error <Code>: expected 'BucketAlreadyOwnedByYou', "
                           f"got '{res.error_code()}'")
-        elif res.header("location") != path:
-            self.mism(f"CreateBucket Location: expected '{path}', got "
-                      f"'{res.header('location')}'")
+        else:
+            # Location names the bucket, in one of the two forms the API
+            # Reference shows: the path, or -- from a region that was named in
+            # a LocationConstraint -- the bucket's virtual-hosted URL.
+            loc = res.header("location")
+            if loc != path and not (
+                    loc.startswith(f"http://{path[1:]}.") and
+                    loc.endswith(".amazonaws.com/")):
+                self.mism(f"CreateBucket Location: expected '{path}' or the "
+                          f"bucket's URL, got '{loc}'")
 
     def OHeadBucket(self, op, post):
-        res = self.call("HEAD", f"/{op['bucket']}")
+        res = self.call("HEAD", self.bp(op["bucket"]))
         self.check_status(op, res)
         if res.body:
             self.mism(f"HeadBucket returned a body ({len(res.body)} bytes)")
 
     def ODeleteBucket(self, op, post):
-        res = self.call("DELETE", f"/{op['bucket']}")
+        path = self.bp(op["bucket"])
+        res = self.call("DELETE", path)
+        if self.eph and res.status == 204:
+            # that incarnation is gone; the next create takes a new name
+            self.made.discard(path[1:])
+            self.gen[op["bucket"]] = self.gen.get(op["bucket"], 0) + 1
         if self.check_status(op, res) and op["status"] != 204:
             self.check_error_code(op, res)
 
     def OListBuckets(self, op, post):
-        res = self.call("GET", "/")
+        # The account holds other buckets, other runs' among them: ask only
+        # for this trace's, and drop anything else a server that ignores the
+        # parameter sends anyway.
+        mine = self.eph + "-" if self.eph else ""
+        query = [("prefix", mine)] if mine else []
+        want = sorted(op["buckets"])
+        deadline = time.monotonic() + self.settle
+        waited = 0
+        while True:
+            res = self.call("GET", "/", query=query)
+            if res.status != 200:
+                break
+            root = res.xml()
+            if root is None or root.tag != "ListAllMyBucketsResult":
+                break
+            # Compared as a set: AWS documents no ordering contract here.
+            got = sorted(self.mb(n) for n in
+                         (b.findtext("Name", "") for b in root.iter("Bucket"))
+                         if n.startswith(mine))
+            # S3 documents this one listing as eventually consistent ("if you
+            # delete a bucket and immediately list all buckets, the deleted
+            # bucket might still appear").  The model is sequential, so with
+            # --settle a listing that disagrees is asked again until it agrees
+            # or the time is up -- and every wait is printed, so how often S3
+            # needs it is on the record and not hidden.
+            if got == want or time.monotonic() >= deadline:
+                break
+            waited += 1
+            time.sleep(1.0)
+        if waited:
+            print(f"ListBuckets: {'settled' if got == want else 'NOT settled'}"
+                  f" after {waited} retr{'y' if waited == 1 else 'ies'}")
         if not self.check_status(op, res):
             return
-        root = self.xml(res, "ListAllMyBucketsResult", "ListBuckets")
-        if root is None:
+        if self.xml(res, "ListAllMyBucketsResult", "ListBuckets") is None:
             return
-        # Compared as a set: AWS documents no ordering contract here.
-        got = sorted(b.findtext("Name", "") for b in root.iter("Bucket"))
-        if got != sorted(op["buckets"]):
-            self.mism(f"ListBuckets: got {got}, expected "
-                      f"{sorted(op['buckets'])}")
+        if got != want:
+            self.mism(f"ListBuckets: got {got}, expected {want}")
 
     # ---- objects ----
 
@@ -300,7 +430,7 @@ class Oracle:
         headers = {}
         if op["mtag"] in MTAG:
             headers["content-type"], headers["x-amz-meta-m"] = MTAG[op["mtag"]]
-        res = self.call("PUT", f"/{bucket}/{key}", headers=headers,
+        res = self.call("PUT", self.op(bucket, key), headers=headers,
                         body=self.blocks(op["data"]))
         ok = self.check_status(op, res)
         if ok and op["status"] == 200:
@@ -316,7 +446,7 @@ class Oracle:
         rng = self.range_header(op["range"])
         if rng:
             headers["range"] = rng
-        res = self.call("GET", f"/{bucket}/{key}", headers=headers)
+        res = self.call("GET", self.op(bucket, key), headers=headers)
         if not self.check_status(op, res):
             return
         expected = op["status"]
@@ -334,7 +464,9 @@ class Oracle:
                     self.mism(f"GetObject Content-Range: expected '{want}', "
                               f"got '{res.header('content-range')}'")
         elif expected == 416:
-            want = ("" if self.hit("M-416-no-content-range")
+            # total is -1 where the service sends no Content-Range with a
+            # 416 (the rangeErrorContentRange policy): the header is absent
+            want = ("" if op["total"] < 0
                     else f"bytes */{op['total'] * self.bs}")
             if res.header("content-range") != want:
                 self.mism(f"416 Content-Range: expected '{want}', got "
@@ -345,7 +477,7 @@ class Oracle:
 
     def OHeadObject(self, op, post):
         bucket, key = op["bucket"], key_str(op["key"])
-        res = self.call("HEAD", f"/{bucket}/{key}")
+        res = self.call("HEAD", self.op(bucket, key))
         if not self.check_status(op, res):
             return
         if res.body:
@@ -370,7 +502,7 @@ class Oracle:
 
     def ODeleteObject(self, op, post):
         bucket, key = op["bucket"], key_str(op["key"])
-        res = self.call("DELETE", f"/{bucket}/{key}")
+        res = self.call("DELETE", self.op(bucket, key))
         ok = self.check_status(op, res)
         # The object is gone (or never was) whenever the bucket existed.
         if op["err"] != "NoSuchBucket":
@@ -383,9 +515,10 @@ class Oracle:
         keys = [key_str(k) for k in op["keys"]]
         body = ("<Delete>" +
                 ("<Quiet>true</Quiet>" if op["quiet"] else "") +
-                "".join(f"<Object><Key>{k}</Key></Object>" for k in keys) +
+                "".join(f"<Object><Key>{self.wk(k)}</Key></Object>"
+                        for k in keys) +
                 "</Delete>").encode()
-        res = self.call("POST", f"/{bucket}", query=[("delete", "")],
+        res = self.call("POST", self.bp(bucket), query=[("delete", "")],
                         body=body, xml_body=True)
         if not self.check_status(op, res):
             return
@@ -397,14 +530,15 @@ class Oracle:
         root = self.xml(res, "DeleteResult", "DeleteObjects")
         if root is None:
             return
-        # non-quiet: one <Deleted><Key> per named key, in request order;
-        # quiet: none.  Never an <Error>: every key is deletable.
-        got = [d.findtext("Key", "") for d in root.findall("Deleted")]
-        want = [] if op["quiet"] else keys
-        if self.hit("M-delete-objects-dup-empty"):
-            # a repeated key comes back as an empty <Deleted/>
-            want = [k if k not in keys[:i] else "" for i, k in enumerate(keys)]
-        if got != want:
+        # The model predicts the <Deleted> entries (`deleted`).  Never an
+        # <Error>: every key is deletable.  Compared as a multiset: Amazon S3
+        # does not keep the request's order, and the API promises none.
+        # a <Deleted/> that names no key at all stays "", which is how the
+        # model writes that entry too (the empty key)
+        got = [self.mk(k) if k else ""
+               for k in (d.findtext("Key", "") for d in root.findall("Deleted"))]
+        want = [key_str(k) for k in op["deleted"]]
+        if sorted(got) != sorted(want):
             self.mism(f"DeleteObjects: <Deleted> keys {got}, expected {want}")
         if root.find("Error") is not None:
             self.mism("DeleteObjects: unexpected <Error> entry")
@@ -412,8 +546,8 @@ class Oracle:
     def OCopyObject(self, op, post):
         sb, sk = op["srcBucket"], key_str(op["srcKey"])
         db, dk = op["dstBucket"], key_str(op["dstKey"])
-        res = self.call("PUT", f"/{db}/{dk}",
-                        headers={"x-amz-copy-source": f"/{sb}/{sk}"})
+        res = self.call("PUT", self.op(db, dk),
+                        headers={"x-amz-copy-source": self.op(sb, sk)})
         ok = self.check_status(op, res)
         if ok and op["status"] == 200:
             # the destination was (re)written: its ETag is whatever
@@ -435,7 +569,7 @@ class Oracle:
         # x-amz-object-attributes is required by the API; ask for the fixed
         # set a filesystem-backed gateway can supply, which is what is checked.
         res = self.call(
-            "GET", f"/{bucket}/{key}", query=[("attributes", "")],
+            "GET", self.op(bucket, key), query=[("attributes", "")],
             headers={"x-amz-object-attributes": "ETag,StorageClass,ObjectSize"})
         if not self.check_status(op, res):
             return
@@ -475,16 +609,16 @@ class Oracle:
         query = [("max-keys", str(op["maxKeys"]))]
         if op["delim"]:
             query.append(("delimiter", "/"))
-        if pfx:
-            query.append(("prefix", pfx))
+        if pfx or self.kp:
+            query.append(("prefix", self.wk(pfx)))
         if mode == 2:
             query.append(("list-type", "2"))
         if mode == 3:
             query.append(("versions", ""))
         if sa:
             query.append(({1: "marker", 2: "start-after",
-                           3: "key-marker"}[mode], sa))
-        res = self.call("GET", f"/{bucket}", query=query)
+                           3: "key-marker"}[mode], self.wk(sa)))
+        res = self.call("GET", self.bp(bucket), query=query)
         if not self.check_status(op, res):
             return
         if op["status"] != 200:
@@ -498,7 +632,7 @@ class Oracle:
         objs = post.get(bucket, {}).get("objs", {})
         got_keys = []
         for ent in root.findall("Version" if mode == 3 else "Contents"):
-            k = ent.findtext("Key", "")
+            k = self.mk(ent.findtext("Key", ""))
             got_keys.append(k)
             # every listed object's Size and ETag must agree with the model
             # post-state / the ETag learned at its last write
@@ -515,7 +649,7 @@ class Oracle:
         if got_keys != want_keys:
             self.mism(f"ListObjects: keys {got_keys}, expected {want_keys}")
 
-        got_pfx = [p.findtext("Prefix", "")
+        got_pfx = [self.mk(p.findtext("Prefix", ""))
                    for p in root.findall("CommonPrefixes")]
         # a common prefix always renders with a trailing slash
         want_pfx = [key_str(p) + "/" for p in op["prefixes"]]
@@ -537,8 +671,8 @@ class Oracle:
     # ---- tagging ----
 
     def _tagging(self, op, what, method, has_key, send_tags):
-        path = f"/{op['bucket']}" + (f"/{key_str(op['key'])}" if has_key
-                                     else "")
+        path = (self.op(op["bucket"], key_str(op["key"])) if has_key
+                else self.bp(op["bucket"]))
         if send_tags:
             res = self.call(method, path, query=[("tagging", "")],
                             body=tagging_body(op["tags"]), xml_body=True)
@@ -582,7 +716,8 @@ class Oracle:
 
     def OCreateMpu(self, op, post):
         bucket, key = op["bucket"], key_str(op["key"])
-        res = self.call("POST", f"/{bucket}/{key}", query=[("uploads", "")])
+        res = self.call("POST", self.op(bucket, key),
+                        query=[("uploads", "")])
         if not self.check_status(op, res):
             return
         if op["status"] != 200:
@@ -596,7 +731,7 @@ class Oracle:
             self.mism("CreateMpu: missing <UploadId>")
             return
         self.upls[op["uplid"]] = wire
-        if root.findtext("Key") != key:
+        if self.mk(root.findtext("Key", "")) != key:
             self.mism(f"CreateMpu: <Key> {root.findtext('Key')!r}, expected "
                       f"'{key}'")
 
@@ -605,7 +740,7 @@ class Oracle:
                 ("uploadId", self.wire_upload(op["uplid"]))]
 
     def OUploadPart(self, op, post):
-        res = self.call("PUT", f"/{op['bucket']}/{key_str(op['key'])}",
+        res = self.call("PUT", self.op(op["bucket"], key_str(op["key"])),
                         query=self._part_query(op),
                         body=self.blocks(op["data"]))
         if not self.check_status(op, res):
@@ -621,10 +756,10 @@ class Oracle:
 
     def OUploadPartCopy(self, op, post):
         headers = {"x-amz-copy-source":
-                   f"/{op['srcBucket']}/{key_str(op['srcKey'])}"}
+                   self.op(op["srcBucket"], key_str(op["srcKey"]))}
         if op["range"]["tag"] == "RClosed":
             headers["x-amz-copy-source-range"] = self.range_header(op["range"])
-        res = self.call("PUT", f"/{op['bucket']}/{key_str(op['key'])}",
+        res = self.call("PUT", self.op(op["bucket"], key_str(op["key"])),
                         query=self._part_query(op), headers=headers)
         if not self.check_status(op, res):
             return
@@ -649,7 +784,7 @@ class Oracle:
             self.petags.get((uplid, pn), '"' + "0" * 32 + '"') +
             "</ETag></Part>" for pn in op["manifest"]) +
             "</CompleteMultipartUpload>").encode()
-        res = self.call("POST", f"/{bucket}/{key}",
+        res = self.call("POST", self.op(bucket, key),
                         query=[("uploadId", self.wire_upload(uplid))],
                         body=body, xml_body=True)
         if not self.check_status(op, res):
@@ -678,7 +813,7 @@ class Oracle:
         self.etag_check(bucket, key, quoted(etag), "CompleteMpu")
 
     def OAbortMpu(self, op, post):
-        res = self.call("DELETE", f"/{op['bucket']}/{key_str(op['key'])}",
+        res = self.call("DELETE", self.op(op["bucket"], key_str(op["key"])),
                         query=[("uploadId", self.wire_upload(op["uplid"]))])
         if not self.check_status(op, res):
             return
@@ -691,7 +826,7 @@ class Oracle:
 
     def OListParts(self, op, post):
         bucket, uplid = op["bucket"], op["uplid"]
-        res = self.call("GET", f"/{bucket}/{key_str(op['key'])}",
+        res = self.call("GET", self.op(bucket, key_str(op["key"])),
                         query=[("uploadId", self.wire_upload(uplid))])
         if not self.check_status(op, res):
             return
@@ -721,7 +856,10 @@ class Oracle:
             self.mism(f"ListParts: parts {got}, expected {op['partNums']}")
 
     def OListMpu(self, op, post):
-        res = self.call("GET", f"/{op['bucket']}", query=[("uploads", "")])
+        # the listing is bucket-wide; ask only for this trace's uploads
+        res = self.call("GET", self.bp(op["bucket"]),
+                        query=[("uploads", "")] +
+                              ([("prefix", self.kp)] if self.kp else []))
         if not self.check_status(op, res):
             return
         if op["status"] != 200:
@@ -740,7 +878,7 @@ class Oracle:
                 self.mism(f"ListMpu: unknown UploadId '{wire}' (key "
                           f"'{u.findtext('Key', '')}')")
                 return
-            got.append((u.findtext("Key", ""), by_wire[wire]))
+            got.append((self.mk(u.findtext("Key", "")), by_wire[wire]))
         want = sorted((key_str(u["key"]), u["uplid"]) for u in op["uploads"])
         if sorted(got) != want:
             self.mism(f"ListMpu: uploads {sorted(got)}, expected {want}")
@@ -748,7 +886,7 @@ class Oracle:
 
 # ---- trace driver ---------------------------------------------------------
 
-def run_trace(path, args, tally):
+def run_trace(path, args, tally, seq=0):
     """Replay one trace.  Returns the number of diverging steps."""
     states = load_states(path)
     name = os.path.basename(path)
@@ -758,8 +896,14 @@ def run_trace(path, args, tally):
         return 0
 
     client = S3Client(args.host, args.port, args.access_key, args.secret_key,
-                      timeout=args.timeout)
-    o = Oracle(client, args.block_size)
+                      timeout=args.timeout, region=args.region, tls=args.tls)
+    buckets = dict(b.split("=", 1) for b in args.bucket)
+    # One prefix per trace, so traces of a run are as isolated from each other
+    # as runs are.
+    kp = (f"{args.key_prefix.rstrip('/')}/{name}/" if args.key_prefix else "")
+    eph = (f"{args.ephemeral_buckets}-t{seq}" if args.ephemeral_buckets
+           else "")
+    o = Oracle(client, args.block_size, buckets, kp, eph, args.settle)
     history = []
     diverged = 0
     try:
@@ -788,7 +932,10 @@ def run_trace(path, args, tally):
             if not args.keep_going:
                 break
     finally:
-        client.close()
+        try:
+            o.teardown()
+        finally:
+            client.close()
     return diverged
 
 
@@ -799,8 +946,33 @@ def main():
     ap.add_argument("--trace", action="append", required=True)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, required=True)
-    ap.add_argument("--access-key", required=True)
-    ap.add_argument("--secret-key", required=True)
+    ap.add_argument("--access-key",
+                    default=os.environ.get("AWS_ACCESS_KEY_ID"),
+                    help="default: $AWS_ACCESS_KEY_ID")
+    ap.add_argument("--secret-key",
+                    default=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+                    help="default: $AWS_SECRET_ACCESS_KEY (prefer the "
+                         "environment: an argument is visible in ps)")
+    ap.add_argument("--region", default="us-east-1",
+                    help="the SigV4 signing region")
+    ap.add_argument("--tls", action="store_true", help="speak HTTPS")
+    ap.add_argument("--bucket", action="append", default=[],
+                    metavar="MODEL=REAL",
+                    help="serve model bucket MODEL from the existing bucket "
+                         "REAL (the fixedBucket policy)")
+    ap.add_argument("--key-prefix", default="",
+                    help="put every key under <prefix>/<trace name>/, so a "
+                         "trace starts on an empty namespace in a bucket "
+                         "that is not empty")
+    ap.add_argument("--ephemeral-buckets", default="", metavar="PREFIX",
+                    help="serve each model bucket from a real bucket named "
+                         "<PREFIX>-t<trace>-<model>-g<incarnation>, created "
+                         "by the trace's own CreateBucket and removed when "
+                         "the trace ends")
+    ap.add_argument("--settle", type=float, default=0.0,
+                    help="seconds a ListBuckets that disagrees with the "
+                         "model may take to agree (S3 documents the listing "
+                         "as eventually consistent); each wait is printed")
     ap.add_argument("--block-size", type=int, default=8192,
                     help="bytes per model block (multipart traces need the "
                          "5 MiB minimum part size)")
@@ -814,12 +986,21 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
+    if not args.access_key or not args.secret_key:
+        ap.error("no credentials: give --access-key/--secret-key or set "
+                 "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY")
+
+    # A wall-clock cap arrives as SIGTERM; turn it into an exit, so that a
+    # trace cut short still removes the buckets it made.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 
     tally = {}
     failed = 0
-    for t in args.trace:
+    if args.ephemeral_buckets and (args.bucket or args.key_prefix):
+        ap.error("--ephemeral-buckets excludes --bucket and --key-prefix")
+    for seq, t in enumerate(args.trace):
         try:
-            failed += 1 if run_trace(t, args, tally) else 0
+            failed += 1 if run_trace(t, args, tally, seq) else 0
         except TraceFormatError as e:
             print(e, file=sys.stderr)
             return 2

@@ -201,7 +201,7 @@ module s3 {
         | OHeadObject({ bucket: str, key: Key, status: int, sizeBlocks: int })
         | ODeleteObject({ bucket: str, key: Key, status: int, err: str })
         | ODeleteObjects({ bucket: str, keys: List[Key], quiet: bool,
-                           status: int, err: str })
+                           status: int, err: str, deleted: List[Key] })
         | OCopyObject({ srcBucket: str, srcKey: Key, dstBucket: str, dstKey: Key,
                         status: int, err: str })
         | OGetAttrs({ bucket: str, key: Key, status: int, err: str,
@@ -264,9 +264,67 @@ module s3 {
 
     // CopyObject when the destination bucket AND the source key are both
     // missing.  S3 documents no precedence between the two 404s.  false: the
-    // destination bucket is resolved first (NoSuchBucket) -- the request URI
-    // names it.  true: the source is resolved first (NoSuchKey).
+    // destination bucket is resolved first (NoSuchBucket), which is what AWS
+    // does, measured.  true: the source is resolved first (NoSuchKey) -- a
+    // relaxation.
     const P_COPY_SOURCE_FIRST: bool
+
+    // The service under test is handed ONE bucket that already exists, which
+    // the tester may neither create nor delete and may be SHARING with other
+    // runs -- an account in which the tester holds rights on a single bucket
+    // and nothing else.  true: the model starts with that bucket ("bk0") live
+    // and empty, never draws CreateBucket, DeleteBucket or ListBuckets, never
+    // names another bucket (so the NoSuchBucket paths and cross-bucket copies
+    // are not generated), and never touches the bucket's own tag set, the one
+    // piece of modeled state a key prefix cannot keep apart.  It narrows what
+    // a corpus CONTAINS; it changes nothing the model predicts.
+    const P_FIXED_BUCKET: bool
+
+    // ---- relaxations: what AWS does NOT do, and an implementation may ----
+    //
+    // The defaults above and below are Amazon S3's own behaviour, measured.
+    // Each of these is FALSE on AWS.  Setting one true is an explicit
+    // statement that the implementation under test departs from AWS there and
+    // that the departure is accepted -- which is the only way the model will
+    // predict it.
+
+    // A 416 InvalidRange carries "Content-Range: bytes */<length>", as RFC
+    // 9110 15.5.17 says a server SHOULD.  AWS sends none: false, and the
+    // label's `total` is -1 on a 416 -- the header must be ABSENT.  true: the
+    // header is sent and `total` says what length it must name.
+    const P_RANGE_ERR_CONTENT_RANGE: bool
+
+    // A suffix range (bytes=-N) against a zero-length object.  AWS ignores
+    // the range and answers as an unranged GET would, 200 with an empty body:
+    // false.  true: it is unsatisfiable like every other range against an
+    // empty object, 416 InvalidRange.
+    const P_EMPTY_SUFFIX_RANGE_UNSATISFIABLE: bool
+
+    // Listing with a delimiter from a start key (marker / start-after /
+    // key-marker) that lies INSIDE a common prefix, "d/" for a start key
+    // "d/a".  AWS takes the prefix to sort before the start key and never
+    // returns it: false.  true: keys after the start key still roll up into
+    // the prefix and it is returned.
+    const P_LIST_RETURNS_MARKER_PREFIX: bool
+
+    // CopyObject of an object onto itself with no metadata directive.  AWS
+    // performs the copy and answers 200: false.  true: 400 InvalidRequest,
+    // which is what the API Reference describes and AWS, measured, does not
+    // do.
+    const P_COPY_SELF_REJECTED: bool
+
+    // DeleteObjects naming the same key more than once.  AWS reports that key
+    // ONCE, however many times the request named it: false.  true: one
+    // <Deleted> entry per occurrence.
+    const P_DELETE_REPORTS_DUPLICATES: bool
+
+    // A successful PutBucketTagging.  AWS answers 204 No Content: false.
+    // true: 200 OK, which is what PutObjectTagging answers and what an
+    // implementation sharing one code path between the two tends to give.
+    const P_PUT_BUCKET_TAGGING_OK: bool
+
+    // The bucket names a request may carry.
+    val BKT_UNIVERSE = if (P_FIXED_BUCKET) Set("bk0") else BUCKETS
 
     pure def dev(id: str): bool = DEVS.contains(id)
 
@@ -383,9 +441,9 @@ module s3 {
     // IsTruncated reports whether any further key would have emitted a new
     // entry.  AWS returns an empty, non-truncated result for max-keys=0.
     //
-    // skipIn is the M-list-marker-inside-prefix-skipped deviation: a common
-    // prefix the start key lies INSIDE ("d/" for a start key "d/a") is never
-    // emitted, although keys past the start key still roll up into it.
+    // skipIn is AWS's behaviour, relaxed by P_LIST_RETURNS_MARKER_PREFIX: a
+    // common prefix the start key lies INSIDE ("d/" for a start key "d/a") is never emitted,
+    // although keys past the start key still roll up into it.
     pure def listWalk(objs: Set[Key], p: Prefix, delim: bool, sa: Key, maxKeys: int,
                       skipIn: bool): ListOut =
         if (maxKeys == 0)
@@ -533,9 +591,10 @@ module s3 {
     // ------------------------------------------------------------------
 
     // The service starts with no buckets; traces create what they use
-    // (CreateBucket is part of the modeled surface).
+    // (CreateBucket is part of the modeled surface).  Under P_FIXED_BUCKET it
+    // starts with the one bucket it will ever have.
     action init = all {
-        bkts' = Map(),
+        bkts' = if (P_FIXED_BUCKET) Map("bk0" -> EMPTY_BKT) else Map(),
         nextUpl' = 1,
         devHits' = Set(),
         lastOp' = OInit,
@@ -562,9 +621,12 @@ module s3 {
                     else HTTP_OK }),
     }
 
-    action createBucket = {
-        nondet b = oneOf(BUCKETS)
-        applyCreateBucket(b)
+    action createBucket = all {
+        not(P_FIXED_BUCKET),
+        {
+            nondet b = oneOf(BKT_UNIVERSE)
+            applyCreateBucket(b)
+        },
     }
 
     // ------------------------------------------------------------------
@@ -581,7 +643,7 @@ module s3 {
     }
 
     action headBucket = {
-        nondet b = oneOf(BUCKETS)
+        nondet b = oneOf(BKT_UNIVERSE)
         applyHeadBucket(b)
     }
 
@@ -629,9 +691,12 @@ module s3 {
                 ODeleteBucket({ bucket: b, status: HTTP_NO_CONTENT, err: "" }),
     }
 
-    action deleteBucket = {
-        nondet b = oneOf(BUCKETS)
-        applyDeleteBucket(b)
+    action deleteBucket = all {
+        not(P_FIXED_BUCKET),
+        {
+            nondet b = oneOf(BKT_UNIVERSE)
+            applyDeleteBucket(b)
+        },
     }
 
     // ------------------------------------------------------------------
@@ -641,6 +706,7 @@ module s3 {
     // The response bucket list is compared as a set: AWS documents no
     // contractual ordering for ListBuckets.
     action listBuckets = all {
+        not(P_FIXED_BUCKET),
         bkts' = bkts,
         nextUpl' = nextUpl,
         devHits' = Set(),
@@ -686,7 +752,7 @@ module s3 {
     action putObjectAny = all {
         totalObjs < MAX_OBJECTS,
         {
-            nondet b = oneOf(BUCKETS)
+            nondet b = oneOf(BKT_UNIVERSE)
             nondet k = oneOf(KEYS)
             nondet d = oneOf(DATAS)
             applyPutObject(b, k, d, 0)
@@ -722,12 +788,6 @@ module s3 {
         bs.keys().contains(b) and bs.get(b).objs.keys().contains(k)
             and bs.get(b).objs.get(k).data.length() == 0 and isSuffixRange(r)
 
-    // Does this GET answer 416 in THIS cell?
-    pure def getIs416(bs: str -> Bkt, b: str, k: Key, r: Range): bool =
-        bs.keys().contains(b) and bs.get(b).objs.keys().contains(k)
-            and rangeApply(bs.get(b).objs.get(k).data, r).status == HTTP_RANGE_ERR
-            and not(getIsEmptySuffix(bs, b, k, r) and dev("M-suffix-range-empty-206"))
-
     action applyGetObject(b: str, k: Key, r: Range): bool = all {
         bkts' = bkts,
         nextUpl' = nextUpl,
@@ -735,20 +795,12 @@ module s3 {
         // sends no Content-Range, which is consistent with the 200 it chose).
         // RNone is untouched: an unranged GET is 200 on AWS too, so only a
         // request that carried a Range header can take this branch.
-        //
-        // M-416-no-content-range changes no field of the label: a 416 still
-        // reports `total`, and the hit recorded here is what tells the harness
-        // that this server sends no "Content-Range: bytes */<total>" with it
-        // (RFC 9110 15.5.17 says a server SHOULD).
         devHits' =
             (if (getIsFullRange(bkts, b, k, r) and dev("range-full-200"))
                 Set("range-full-200")
             else Set())
             .union(if (getIsEmptySuffix(bkts, b, k, r) and dev("M-suffix-range-empty-206"))
                 Set("M-suffix-range-empty-206")
-            else Set())
-            .union(if (getIs416(bkts, b, k, r) and dev("M-416-no-content-range"))
-                Set("M-416-no-content-range")
             else Set()),
         lastOp' =
             if (not(liveBuckets.contains(b)))
@@ -760,6 +812,10 @@ module s3 {
             else if (getIsEmptySuffix(bkts, b, k, r) and dev("M-suffix-range-empty-206"))
                 OGetObject({ bucket: b, key: k, range: r, status: HTTP_PARTIAL,
                              err: "", data: [], first: 0, total: 0 })
+            else if (getIsEmptySuffix(bkts, b, k, r)
+                    and not(P_EMPTY_SUFFIX_RANGE_UNSATISFIABLE))
+                OGetObject({ bucket: b, key: k, range: r, status: HTTP_OK,
+                             err: "", data: [], first: 0, total: 0 })
             else
                 val d = bkts.get(b).objs.get(k).data
                 val ro = rangeApply(d, r)
@@ -768,7 +824,10 @@ module s3 {
                                          HTTP_OK
                                      else ro.status,
                              err: ro.err, data: ro.out, first: ro.first,
-                             total: d.length() }),
+                             // -1 on a 416 that carries no Content-Range
+                             total: if (ro.status == HTTP_RANGE_ERR and
+                                        not(P_RANGE_ERR_CONTENT_RANGE)) -1
+                                    else d.length() }),
     }
 
     // Unranged GET over live buckets: both hits and misses (k spans KEYS).
@@ -783,7 +842,7 @@ module s3 {
 
     // GET against any bucket name (NoSuchBucket coverage).
     action getObjectAny = {
-        nondet b = oneOf(BUCKETS)
+        nondet b = oneOf(BKT_UNIVERSE)
         nondet k = oneOf(KEYS)
         applyGetObject(b, k, RNone)
     }
@@ -885,7 +944,7 @@ module s3 {
 
     // Delete against any bucket name (NoSuchBucket coverage).
     action deleteObjectAny = {
-        nondet b = oneOf(BUCKETS)
+        nondet b = oneOf(BKT_UNIVERSE)
         nondet k = oneOf(KEYS)
         applyDeleteObject(b, k)
     }
@@ -905,8 +964,22 @@ module s3 {
 
     // Every named key is reported <Deleted>, present or not (idempotent,
     // matching single DeleteObject); Quiet suppresses the <Deleted>
-    // entries.  Duplicate keys in one request are legal and each occurrence
-    // is reported.
+    // entries.  Duplicate keys in one request are legal; see deletedReport
+    // for how they are reported.
+    // The <Deleted> entries of the reply, as a list of keys.  The ORDER is not
+    // part of the contract -- AWS does not keep the request's -- so a harness
+    // compares it as a multiset.  Quiet reports nothing.  A key named more
+    // than once is reported once (AWS), once per occurrence
+    // (P_DELETE_REPORTS_DUPLICATES), or once by name and then as an entry
+    // naming no key at all, NO_KEY (MinIO, M-delete-objects-dup-empty).
+    pure def deletedReport(ks: List[Key], quiet: bool): List[Key] =
+        if (quiet) []
+        else ks.foldl([], (acc, k) =>
+            if (not(acc.select(x => x == k).length() > 0)) acc.append(k)
+            else if (dev("M-delete-objects-dup-empty")) acc.append(NO_KEY)
+            else if (P_DELETE_REPORTS_DUPLICATES) acc.append(k)
+            else acc)
+
     action applyDeleteObjects(b: str, ks: List[Key], quiet: bool): bool = all {
         bkts' =
             if (liveBuckets.contains(b))
@@ -914,11 +987,10 @@ module s3 {
                     bk.with("objs", ks.foldl(bk.objs, (m, k) => mapDrop(m, k))))
             else bkts,
         nextUpl' = nextUpl,
-        // M-delete-objects-dup-empty changes no field of the label either:
         // MinIO deletes the key and reports its FIRST occurrence, then answers
-        // every repeat with an empty <Deleted/> element that names no key.
-        // The hit tells the harness which shape to expect.  Quiet mode reports
-        // nothing for anyone, so only a verbose request can take it.
+        // every repeat with an empty <Deleted/> element that names no key
+        // (M-delete-objects-dup-empty; NO_KEY in `deleted`).  Quiet mode
+        // reports nothing for anyone, so only a verbose request can take it.
         devHits' =
             if (liveBuckets.contains(b) and not(quiet) and ks.length() == 2
                     and ks[0] == ks[1] and dev("M-delete-objects-dup-empty"))
@@ -927,10 +999,12 @@ module s3 {
         lastOp' =
             if (not(liveBuckets.contains(b)))
                 ODeleteObjects({ bucket: b, keys: ks, quiet: quiet,
-                                 status: HTTP_NOT_FOUND, err: "NoSuchBucket" })
+                                 status: HTTP_NOT_FOUND, err: "NoSuchBucket",
+                                 deleted: [] })
             else
                 ODeleteObjects({ bucket: b, keys: ks, quiet: quiet,
-                                 status: HTTP_OK, err: "" }),
+                                 status: HTTP_OK, err: "",
+                                 deleted: deletedReport(ks, quiet) }),
     }
 
     action deleteObjects = all {
@@ -944,7 +1018,7 @@ module s3 {
     }
 
     action deleteObjectsAny = {
-        nondet b = oneOf(BUCKETS)
+        nondet b = oneOf(BKT_UNIVERSE)
         nondet ks = oneOf(DELETE_BATCHES)
         nondet q = oneOf(Set(false, true))
         applyDeleteObjects(b, ks, q)
@@ -1009,7 +1083,8 @@ module s3 {
             else if (not(bkts.get(sb).objs.keys().contains(sk)))
                 OCopyObject({ srcBucket: sb, srcKey: sk, dstBucket: db, dstKey: dk,
                               status: HTTP_NOT_FOUND, err: "NoSuchKey" })
-            else if (sb == db and sk == dk and not(dev("copy-self-200")))
+            else if (sb == db and sk == dk and not(dev("copy-self-200"))
+                    and P_COPY_SELF_REJECTED)
                 OCopyObject({ srcBucket: sb, srcKey: sk, dstBucket: db, dstKey: dk,
                               status: HTTP_BAD_REQUEST, err: "InvalidRequest" })
             else
@@ -1034,9 +1109,9 @@ module s3 {
     action copyObjectAny = all {
         totalObjs < MAX_OBJECTS,
         {
-            nondet sb = oneOf(BUCKETS)
+            nondet sb = oneOf(BKT_UNIVERSE)
             nondet sk = oneOf(KEYS)
-            nondet db = oneOf(BUCKETS)
+            nondet db = oneOf(BKT_UNIVERSE)
             nondet dk = oneOf(KEYS)
             applyCopyObject(sb, sk, db, dk)
         },
@@ -1104,22 +1179,12 @@ module s3 {
     pure def listMarkerOutside(p: Prefix, sa: Key, mode: int): bool =
         mode != 2 and sa != NO_KEY and not(keyMatches(sa, p))
 
-    // Did skipping the common prefix the start key lies inside change the page?
-    pure def listSkipChanged(bs: str -> Bkt, b: str, p: Prefix, delim: bool, sa: Key,
-                             mk: int): bool =
-        bs.keys().contains(b) and
-        listWalk(bs.get(b).objs.keys(), p, delim, sa, mk, true) !=
-            listWalk(bs.get(b).objs.keys(), p, delim, sa, mk, false)
-
     action applyListObjects(b: str, p: Prefix, delim: bool, sa: Key, mk: int, mode: int): bool = all {
         bkts' = bkts,
         nextUpl' = nextUpl,
         devHits' =
             if (listMarkerOutside(p, sa, mode) and dev("M-list-marker-outside-prefix-501"))
                 Set("M-list-marker-outside-prefix-501")
-            else if (listSkipChanged(bkts, b, p, delim, sa, mk)
-                    and dev("M-list-marker-inside-prefix-skipped"))
-                Set("M-list-marker-inside-prefix-skipped")
             else Set(),
         lastOp' =
             if (listMarkerOutside(p, sa, mode) and dev("M-list-marker-outside-prefix-501"))
@@ -1134,7 +1199,7 @@ module s3 {
                                keys: [], prefixes: [], truncated: false })
             else
                 val w = listWalk(bkts.get(b).objs.keys(), p, delim, sa, mk,
-                                 dev("M-list-marker-inside-prefix-skipped"))
+                                 not(P_LIST_RETURNS_MARKER_PREFIX))
                 OListObjects({ bucket: b, prefix: p, delim: delim, startAfter: sa,
                                maxKeys: mk, mode: mode, status: HTTP_OK, err: "",
                                keys: w.keys, prefixes: w.prefixes,
@@ -1260,13 +1325,23 @@ module s3 {
                 OPutBktTagging({ bucket: b, tags: ts, status: HTTP_NOT_FOUND,
                                  err: "NoSuchBucket" })
             else
-                OPutBktTagging({ bucket: b, tags: ts, status: HTTP_OK, err: "" }),
+                OPutBktTagging({ bucket: b, tags: ts,
+                                 status: if (P_PUT_BUCKET_TAGGING_OK) HTTP_OK
+                                         else HTTP_NO_CONTENT,
+                                 err: "" }),
     }
 
-    action putBktTagging = {
-        nondet b = oneOf(BUCKETS)
-        nondet ts = oneOf(TAGSETS)
-        applyPutBktTagging(b, ts)
+    // Not drawn under P_FIXED_BUCKET: a bucket's tag set is one value for the
+    // whole bucket, and a bucket the tester was handed may be shared with
+    // other runs at the same moment.  A key prefix partitions objects; nothing
+    // partitions this.
+    action putBktTagging = all {
+        not(P_FIXED_BUCKET),
+        {
+            nondet b = oneOf(BKT_UNIVERSE)
+            nondet ts = oneOf(TAGSETS)
+            applyPutBktTagging(b, ts)
+        },
     }
 
     // GetBucketTagging with no tags stored is 404 NoSuchTagSet (unlike the
@@ -1297,9 +1372,12 @@ module s3 {
                                  tags: bkts.get(b).btags }),
     }
 
-    action getBktTagging = {
-        nondet b = oneOf(BUCKETS)
-        applyGetBktTagging(b)
+    action getBktTagging = all {
+        not(P_FIXED_BUCKET),
+        {
+            nondet b = oneOf(BKT_UNIVERSE)
+            applyGetBktTagging(b)
+        },
     }
 
     action applyDelBktTagging(b: str): bool = all {
@@ -1322,9 +1400,12 @@ module s3 {
                 ODelBktTagging({ bucket: b, status: HTTP_NO_CONTENT, err: "" }),
     }
 
-    action delBktTagging = {
-        nondet b = oneOf(BUCKETS)
-        applyDelBktTagging(b)
+    action delBktTagging = all {
+        not(P_FIXED_BUCKET),
+        {
+            nondet b = oneOf(BKT_UNIVERSE)
+            applyDelBktTagging(b)
+        },
     }
 
     // ------------------------------------------------------------------
@@ -1514,7 +1595,7 @@ module s3 {
         uploadPairs.size() > 0,
         {
             nondet p = oneOf(uploadPairs)
-            nondet sb = oneOf(BUCKETS)
+            nondet sb = oneOf(BKT_UNIVERSE)
             // a genuinely absent source (bucket dead, or key not present),
             // so the copy always fails and never mints an oversized part
             nondet sk = oneOf(KEYS.filter(kk =>

@@ -1,0 +1,14 @@
+{
+  "extends": "./_aws.json",
+  "family": "s3",
+  "description": "Amazon S3 driven through multipart upload in buckets of the trace's own making: the multipart calls against a bucket that does not exist, and UploadPartCopy from one bucket into another.",
+  "traceStem": "awsmpbk",
+
+  // The block size is a harness setting (SPECS_S3_BLOCK_SIZE, set by CMake);
+  // recorded here as the fact that distinguishes this corpus from the base one.
+  "blockSize": 5242880,
+
+  "batches": [
+    { "flavor": "stepMultipart", "steps": 64, "traces": 3, "seed": "0x21" }
+  ]
+}

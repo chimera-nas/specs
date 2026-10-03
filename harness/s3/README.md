@@ -4,33 +4,169 @@ SPDX-License-Identifier: MIT
 -->
 # S3 conformance harness
 
-Replays the generated S3 corpus (`quint/s3`) against a real MinIO server and
-compares every reply to the result the model baked into the trace.
+Replays the generated S3 corpus (`quint/s3`) against two real services and
+compares every reply to the result the model baked into the trace:
 
-The point is not to test MinIO. It is to test the **model**. The s3 model was
-written alongside one filesystem-backed gateway, and a model developed that way
-drifts toward its implementation: the traces keep passing, and the passing
-keeps meaning less. MinIO is an object store nobody consulted while writing the
-model — a flat namespace of its own, no filesystem underneath the keys — so
-every disagreement is informative: either the model is wrong, or MinIO is.
+* **Amazon S3 itself** — the service the model claims to state, and the only
+  one that can say whether the model read it correctly;
+* **MinIO** — an object store nobody consulted while writing the model, which
+  can say whether an independent implementation agrees.
 
-A model bug is fixed in the model. A **MinIO** divergence is written into the
-model as a branch guarded on the cell's config, so the model predicts what this
-server actually does, the trace's expectation is already the truth, and replay
-is an exact match. Every such branch is declared with its measurement and
-citation in `quint/s3/corpus.schema.json` (the `M-*` ids), switched on by
-`harness/s3/configs/*.json`, and kept honest by `tools/devliveness.py`, which
-fails a cell that claims a deviation its own corpus never reaches.
+The point is to test the **model**. It was written alongside one
+filesystem-backed gateway, and a model developed that way drifts toward its
+implementation: the traces keep passing, and the passing keeps meaning less.
 
-Not every difference is a fault. Where S3 itself has more than one right answer
-and a service picks one, the choice is a **policy** — a named constant of the
-model that each implementation's config sets — and not a deviation: it records
-no hit and a strict twin leaves it alone. Either way the branch is in the model
-and the setting is in the config, so `configs/_minio.json` is the whole
-statement of how this server differs. The harness has **no notion of a
+## AWS is the default; everything else is said out loud
+
+The model's defaults are **Amazon S3 as measured**. S3 is a protocol whose
+implementations routinely decline exact parity, on purpose, so what has to be
+explicit is not what AWS does but what is *accepted that AWS does not do*.
+There are three kinds of setting, all of them in a config and none in the
+harness:
+
+* A **relaxation** is a policy that is `false` on AWS. Switching one on in a
+  config is a statement that the implementation departs from AWS there and that
+  the departure is accepted. It is the only way the model will predict it.
+* A **deviation** (`M-*` for MinIO) is a fault: the implementation gets
+  something wrong that no one would defend. It has an id, a measurement, and a
+  strict twin that turns it off, and `tools/devliveness.py` fails a cell that
+  claims one its corpus never reaches.
+* A **setup policy** describes the test arrangement rather than the service:
+  `fixedBucket`, and `createOwnedBucketConflict`, where S3 itself gives two
+  answers depending on the region.
+
+Every branch is in the model and every setting is in
+`configs/_aws.json` or `configs/_minio.json`, each of which is therefore the
+whole statement of how that service differs. Each is declared, with what was
+measured, in `quint/s3/corpus.schema.json`. The harness has **no notion of a
 forgivable difference**.
 
-## The server
+## Amazon S3
+
+```
+AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+AWS_S3_BUCKET=<bucket> AWS_REGION=<region> \
+    ctest --test-dir build -L aws
+```
+
+There is no server to start. There are two kinds of cell, for two kinds of
+credential: one that holds rights on a single existing bucket, and one that may
+also create and delete buckets under a name prefix.
+
+Without those in the environment the tests report a SKIP, so a machine with no
+credentials — or a fork's pull request, which gets no secrets — is not a
+failure. In CI they are repository secrets and variables, and the `aws` job
+fails outright if they are missing in this repository itself.
+
+### The shared-bucket cells
+
+`aws/s3/base` and `aws/s3/multipart` need nothing but rights on **one existing
+bucket**, which other pipelines share at the same moment. Two things follow.
+
+**The corpus is generated under `fixedBucket`.** The model starts with its one
+bucket live and empty; never draws CreateBucket, DeleteBucket or ListBuckets;
+never names another bucket; and never touches the bucket's own tag set, the one
+piece of modelled state nothing can partition. This narrows what the corpus
+*contains* and changes nothing the model predicts.
+
+**Isolation is by key prefix.** The replayer maps the model's bucket onto the
+real one and puts every key under
+`specs-mbt/<run>-<attempt>-<time>-<pid>/<trace>/`, unique to the run, the cell
+and the trace. A trace starts on an empty namespace in a bucket that is not
+empty, any number of runs can share the bucket, and nothing is deleted
+afterwards: the bucket carries a lifecycle rule that expires objects and
+unfinished multipart uploads after a day. Listings are asked for under the
+prefix and the prefix is stripped from what comes back; a key from outside it
+would show up as the mismatch it is.
+
+### The bucket cells
+
+One shared bucket cannot reach the bucket lifecycle, ListBuckets, bucket
+tagging, any `NoSuchBucket` path or a cross-bucket copy. `aws/s3/buckets` and
+`aws/s3/multipart_buckets` are generated with all of that in, and replayed in
+**real buckets the trace's own CreateBucket calls make**. They need credentials
+allowed to create and delete buckets named `<AWS_S3_BUCKET_PREFIX>-*` (default
+`chimera-ci-mbt`), and `s3:ListAllMyBuckets`.
+
+A model bucket is served by
+`<prefix>-<run>-<attempt>-<random>-t<trace>-<model name>-g<n>`, which no other
+run, cell or trace shares. `n` counts how many times the trace has deleted that
+model bucket: each incarnation gets a new name, because S3 says a deleted
+bucket's name may not be reusable at once, and a create refused for that reason
+would be a statement about S3's control plane, not about the API. While a model
+bucket does not exist, its requests go to the name its next incarnation will
+take — one that has never existed.
+
+**S3 gives a bucket no lifetime.** A lifecycle rule expires what is *in* a
+bucket, never the bucket. Four things stand in for one:
+
+1. the replayer empties and deletes a trace's buckets when the trace ends,
+   however it ends, including on the wall-clock cap;
+2. every bucket is given a one-day expiry rule the moment it is created, so a
+   bucket that outlives its run stops holding data within a day;
+3. the `aws` job removes every bucket of its own run in an `always()` step;
+4. `s3_sweep.py` removes any bucket under the prefix older than three hours —
+   at the start of each run, and from the scheduled `aws-sweep.yml` workflow.
+
+**One accommodation, and it is printed.** S3 documents ListBuckets as
+eventually consistent: a bucket just deleted may still be listed. The model is
+sequential, so the runner passes `--settle 30`: a listing that disagrees is
+asked again, for up to that long, and every such wait is printed. In the runs
+so far it has never been needed.
+
+A whole run is about 6,000 requests, and the multipart cells upload 5 MiB
+parts.
+
+### What AWS taught the model
+
+The first replay diverged in 21 of 25 traces. None of it was AWS being wrong.
+Five things the model predicted are things AWS does not do, and each is now a
+relaxation:
+
+| relaxation | what it accepts | what AWS does |
+|------------|-----------------|---------------|
+| `rangeErrorContentRange` | a 416 carries `Content-Range: bytes */<length>` | sends no such header |
+| `emptySuffixRangeUnsatisfiable` | `bytes=-N` against a zero-length object is 416 | ignores the range: 200, empty body |
+| `listReturnsMarkerPrefix` | with a delimiter, a common prefix the start key lies inside is returned | never returns it |
+| `copySelfRejected` | a copy of an object onto itself is 400 `InvalidRequest` | performs it: 200 |
+| `deleteReportsDuplicates` | a key named twice in DeleteObjects is reported twice | reports it once |
+
+`copySelfRejected` is the one to read twice. 400 is what the S3 API Reference
+describes, and it is not what AWS answered — measured in us-east-2, on a bucket
+with the default SSE-S3 encryption every bucket now has. The model follows the
+service.
+
+One more was not a relaxation but a comparison the harness made that the API
+never promised: DeleteObjects reports its entries in no particular order. The
+model now predicts the entries and the harness compares them as a multiset.
+
+The bucket cells then found a sixth:
+
+| relaxation | what it accepts | what AWS does |
+|------------|-----------------|---------------|
+| `putBucketTaggingOk` | a successful PutBucketTagging answers 200 | answers 204 |
+
+and settled what one bucket could not:
+
+* `copySourceFirst` is a relaxation too. A CopyObject of a missing key into a
+  missing bucket is `NoSuchBucket` on AWS — the destination is resolved first,
+  which is the default.
+* `createOwnedBucketConflict` is 409 `BucketAlreadyOwnedByYou` in us-east-2, as
+  documented. `_aws.json` sets it; a run in us-east-1 would not.
+* GetBucketTagging and DeleteBucketTagging on a missing bucket are
+  `NoSuchBucket`, so MinIO's two bucket-tagging deviations are now measured.
+
+With those in place all four cells replay against AWS with **no deviation and
+no relaxation**: 25 of 25, 5 of 5, 16 of 16 and 3 of 3.
+
+### What is still not measured
+
+A *successful* UploadPartCopy from one bucket into another: the three
+`multipart_buckets` traces draw the cross-bucket call only where it fails.
+
+## MinIO
+
+### The server
 
 MinIO's community edition is no longer released: upstream stopped publishing
 binaries in October 2025 and archived the repository in April 2026. The server
@@ -40,7 +176,7 @@ under test is the head of that final AGPLv3 tree, built from source out of
 single drive. Because the target no longer moves, the deviations below are
 MinIO's for good unless the pin is moved to a tree that fixes them.
 
-## Running
+### Running
 
 ```
 ctest --test-dir build -L minio                 # one test per cell
@@ -78,10 +214,11 @@ status lines, headers and error bodies a replay has to compare.
 
 Per request: the HTTP status and the `<Code>` of the XML error body, and then
 the observables the model predicts — body bytes and `Content-Length`,
-`Content-Range` on a 206 and a 416, the `Content-Type` and `x-amz-meta` echo,
-`x-amz-tagging-count`, listing keys, common prefixes, `IsTruncated` and
-`KeyCount`, tag sets, part lists, in-flight uploads, and the per-key
-`<Deleted>` report of a batch delete.
+`Content-Range` on a 206 and its absence or presence on a 416, the
+`Content-Type` and `x-amz-meta` echo, `x-amz-tagging-count`, listing keys,
+common prefixes, `IsTruncated` and `KeyCount`, tag sets, part lists, in-flight
+uploads, the `<Deleted>` report of a batch delete, and the name of each
+response document's root element.
 
 ETags are not predicted but are held **consistent**: the value an object
 reports at its last write is the value every later GET, HEAD, listing,
@@ -91,44 +228,38 @@ rewritten.
 Two things here are choices, and are stated rather than left implicit:
 
 * **It is a correct client.** DeleteObjects and the tagging PUTs carry
-  `Content-MD5` and GetObjectAttributes carries `x-amz-object-attributes`,
-  because the S3 API requires them and MinIO enforces it. Not sending them
-  would measure the harness.
-* **The default Content-Type is `binary/octet-stream`.** That is what S3
-  reports for an object stored with no Content-Type, and what MinIO reports.
+  `Content-MD5`, GetObjectAttributes carries `x-amz-object-attributes`, and a
+  large body is offered with `Expect: 100-continue`, because that is what the
+  S3 API requires and the AWS SDKs do. Not doing so would measure the harness.
+* **The default Content-Type is `binary/octet-stream`.** That is what AWS and
+  MinIO report for an object stored with no Content-Type. It is the one
+  AWS-versus-implementation difference still asserted by a harness rather than
+  set in a config: the trace carries only the `mtag` that selects a
+  Content-Type. A consumer whose own harness expects
+  `application/octet-stream` is asserting its server's default, not S3's.
 
-## Divergences found
+## What MinIO does differently
 
-The first replay of the strict corpus diverged in all 34 traces. Sixteen
-distinct causes came out of it: one of the model's own, two places where S3
-allows either answer, and thirteen MinIO faults.
+### Relaxations and setup policies
 
-### The model — one, and it is the harness-facing half
+| policy | MinIO | AWS |
+|--------|-------|-----|
+| `copySelfRejected` | `true`: a copy of an object onto itself is 400, as the API Reference describes | performs it |
+| `copySourceFirst` | `true`: a CopyObject of a missing key into a missing bucket reports `NoSuchKey` | `NoSuchBucket` |
+| `putBucketTaggingOk` | `true`: a successful PutBucketTagging answers 200 | 204 |
+| `createOwnedBucketConflict` | `true`: CreateBucket on a bucket you own answers 409 `BucketAlreadyOwnedByYou` | 200 in us-east-1, 409 elsewhere (measured in us-east-2) |
 
-| what was wrong |
-|----------------|
-| the model's convention for an object stored with no Content-Type was `application/octet-stream`; S3's is `binary/octet-stream` |
+On the other four relaxations MinIO does what AWS does. Two of them — the 416
+with no `Content-Range`, and the common prefix that is not returned — were
+first filed here as MinIO faults, and were withdrawn when AWS turned out to do
+the same.
 
-The value is not a field of the trace label — the model carries only the
-`mtag` that selects a Content-Type — so the fix is the convention stated in
-`s3.qnt` and applied by this harness. A consumer whose own harness expects
-`application/octet-stream` is asserting its server's default, not S3's.
-
-### S3 allows either — policies
-
-| policy | default | MinIO |
-|--------|---------|-------|
-| `createOwnedBucketConflict` | `false`: CreateBucket on a bucket you own answers 200, as us-east-1 does | `true`: 409 `BucketAlreadyOwnedByYou`, as every other AWS region does |
-| `copySourceFirst` | `false`: a CopyObject of a missing key into a missing bucket reports `NoSuchBucket` | `true`: it reports `NoSuchKey` — the source is resolved first |
-
-### MinIO deviates, and the model predicts it
+### Deviations
 
 | id | what MinIO does | cell |
 |----|-----------------|------|
 | `M-list-marker-outside-prefix-501` | a V1 `marker` or Versions `key-marker` that does not begin with the prefix is refused with 501 `NotImplemented`, before the bucket is even looked up | both |
-| `M-list-marker-inside-prefix-skipped` | with a delimiter, a common prefix the start key lies inside is never returned, though later keys still roll up into it | base |
-| `M-416-no-content-range` | a 416 carries no `Content-Range: bytes */<length>` | base |
-| `M-suffix-range-empty-206` | `bytes=-N` on a zero-length object answers 206 with `Content-Range: bytes 0--1/0` instead of 416 | base |
+| `M-suffix-range-empty-206` | `bytes=-N` on a zero-length object answers 206 with `Content-Range: bytes 0--1/0` | base |
 | `M-get-bucket-tagging-no-bucket-check` | GetBucketTagging on a missing bucket answers `NoSuchTagSet`, not `NoSuchBucket` | base |
 | `M-delete-bucket-tagging-no-bucket-check` | DeleteBucketTagging on a missing bucket answers 204 | base |
 | `M-delete-objects-dup-empty` | a key named twice in one DeleteObjects comes back once with its key and once as an empty `<Deleted/>` | base |
@@ -139,6 +270,10 @@ The value is not a field of the trace label — the model carries only the
 | `M-complete-duplicate-part-accepted` | a manifest repeating a part number in place (1,2,2) is **accepted**, and the part is assembled once per occurrence | multipart |
 | `M-abort-unknown-upload-204` | AbortMultipartUpload of an upload that does not exist answers 204, not `NoSuchUpload` | multipart |
 
+All eleven are confirmed against AWS rather than only against the
+documentation: the AWS cells reach the same requests with every deviation off
+and AWS answers as the model says.
+
 `M-complete-duplicate-part-accepted` is worth singling out, because it is the
 one that changes state: AWS refuses the request and the upload stays open,
 MinIO completes it and an object the client never described exists — one part
@@ -146,29 +281,32 @@ longer than the manifest's distinct parts. A registry could only have abandoned
 the trace there. Modelled, the model completes the upload too and concatenates
 the repeat, and the trace keeps testing.
 
-Four of the thirteen change no field of the trace label, only something the
-harness derives: the missing 416 header, the empty `<Deleted/>`, the omitted
-`<ObjectSize>`, the root element's name. For those the model records the hit in `devHits` and the
-harness reads it from the trace, so the expectation still comes from the model
-and never from the harness knowing which server it is talking to.
+Two of the eleven change no field of the trace label, only something the
+harness derives — the omitted `<ObjectSize>` and the root element's name. For
+those the model records the hit in `devHits` and the harness reads it from the
+trace, so the expectation still comes from the model and never from the harness
+knowing which server it is talking to.
 
-### The cells
+## The cells
 
 | cell | config | traces | block size | strict twin |
 |------|--------|--------|------------|-------------|
-| `base` | `base.json` | 29 | 8 KiB | yes |
-| `multipart` | `multipart.json` | 5 | 5 MiB | yes |
+| `aws/s3/base` | `aws_base.json` | 25 | 8 KiB | it *is* the strict corpus |
+| `aws/s3/multipart` | `aws_multipart.json` | 5 | 5 MiB | it *is* the strict corpus |
+| `aws/s3/buckets` | `aws_buckets.json` | 16 | 8 KiB | it *is* the strict corpus |
+| `aws/s3/multipart_buckets` | `aws_multipart_buckets.json` | 3 | 5 MiB | it *is* the strict corpus |
+| `minio/s3/base` | `base.json` | 29 | 8 KiB | yes |
+| `minio/s3/multipart` | `multipart.json` | 5 | 5 MiB | yes |
 
-Both extend `configs/_minio.json`, which carries the server's two policies
-and thirteen deviations; each cell switches off the ones its own flavours cannot reach. The
-batch lists are the ones the consuming project replays against its own server,
-unchanged: the corpus is protocol-level, so what distinguishes these cells is
-only which divergences the model is told to predict.
+The MinIO batch lists are the ones the consuming project replays against its
+own server, unchanged; the AWS base cell is the same list without `stepBucket`,
+which is the bucket lifecycle. Each MinIO cell switches off the deviations its
+own flavours cannot reach.
 
-The strict twins are the same batches with every deviation forced off and the
-policies left as set. They
-fail, by design: their failures are exactly MinIO's conformance debt,
-re-measured on every extended run rather than remembered.
+The MinIO strict twins are the same batches with every deviation forced off
+and the policies left as set. They fail, by design: their failures are exactly
+MinIO's conformance debt, re-measured on every extended run rather than
+remembered.
 
 ## Scope
 

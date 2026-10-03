@@ -997,6 +997,86 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# Amazon S3 conformance (harness/s3, run_aws_mbt.sh)
+#
+# The s3 model states the AWS S3 API Reference.  These cells replay it against
+# AWS itself, which is the only server that can say whether the model read the
+# reference correctly -- MinIO can only say whether MinIO did.
+#
+# There is no server to stand up.  Two kinds of cell:
+#
+#   fixed      generated under the fixedBucket policy and replayed in ONE
+#              existing bucket (AWS_S3_BUCKET), which may be shared with any
+#              number of other pipelines: every trace's keys go under a prefix
+#              unique to the run, the cell and the trace, and nothing
+#              bucket-wide is touched.
+#   ephemeral  generated with the bucket calls in, and replayed in real buckets
+#              the trace itself creates, named uniquely per run, cell and trace
+#              and removed when the trace ends.  Covers what one shared bucket
+#              cannot: the bucket lifecycle, ListBuckets, bucket tagging, the
+#              NoSuchBucket paths and cross-bucket copies.
+#
+# Either way no two tests share a name, so they need no lock and run
+# concurrently.  The tests need AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+# (and the fixed ones AWS_S3_BUCKET) in the environment at ctest time and
+# report a SKIP without them, so a machine (or a fork's pull request) that has
+# none is not a failure.
+# ---------------------------------------------------------------------------
+option(SPECS_AWS_TESTS
+       "Register the Amazon S3 conformance suite (default: on only when specs \
+is the top-level project)" ${_conformance_default})
+
+if(NOT SPECS_AWS_TESTS)
+    message(STATUS
+        "aws MBT tests: not registered (specs is a subdirectory of "
+        "${CMAKE_PROJECT_NAME}; -DSPECS_AWS_TESTS=ON to register them)")
+else()
+    set(S3_HARNESS ${CMAKE_CURRENT_SOURCE_DIR}/harness/s3)
+    set(SPECS_DEVLIVENESS ${CMAKE_CURRENT_SOURCE_DIR}/tools/devliveness.py)
+    message(STATUS "aws MBT tests: registered (they SKIP without AWS "
+            "credentials in the environment)")
+
+    # cell name | config stem | block size | buckets
+    #
+    # No strict twins: the cells enable no deviation, so each already IS the
+    # strict corpus.
+    set(AWS_CELLS
+        "base|aws_base|8192|fixed"
+        "multipart|aws_multipart|5242880|fixed"
+        "buckets|aws_buckets|8192|ephemeral"
+        "multipart_buckets|aws_multipart_buckets|5242880|ephemeral")
+
+    foreach(c ${AWS_CELLS})
+        string(REPLACE "|" ";" parts "${c}")
+        list(GET parts 0 cname)
+        list(GET parts 1 cstem)
+        list(GET parts 2 bsize)
+        list(GET parts 3 bmode)
+        set(acfg ${S3_HARNESS}/configs/${cstem}.json)
+
+        specs_corpus(NAME    aws/s3/${cname}
+                     FAMILY  s3
+                     CONFIG  ${acfg}
+                     OUT_DIR AWS_TRACES)
+
+        add_test(NAME aws/s3/${cname}/devliveness
+                 COMMAND ${Python3_EXECUTABLE} ${SPECS_DEVLIVENESS}
+                         ${acfg} ${AWS_TRACES})
+        set_tests_properties(aws/s3/${cname}/devliveness PROPERTIES
+            LABELS "aws;s3;devliveness"
+            TIMEOUT 120)
+
+        add_test(NAME aws/s3/${cname}
+                 COMMAND ${S3_HARNESS}/run_aws_mbt.sh ${AWS_TRACES})
+        set_tests_properties(aws/s3/${cname} PROPERTIES
+            LABELS "aws;s3;mbt"
+            TIMEOUT 1800
+            SKIP_RETURN_CODE 77
+            ENVIRONMENT "SPECS_S3_BLOCK_SIZE=${bsize};SPECS_AWS_BUCKETS=${bmode}")
+    endforeach()
+endif()
+
+# ---------------------------------------------------------------------------
 # Emit the build edges for every cell registered above (cmake/SpecsCorpus.cmake).
 #
 # A CONSUMER calls this itself, after its own specs_corpus() registrations; this
