@@ -480,9 +480,12 @@ class Oracle:
             # Reference shows: the path, or -- from a region that was named in
             # a LocationConstraint -- the bucket's virtual-hosted URL.
             loc = res.header("location")
+            url = urllib.parse.urlsplit(loc)
+            host = url.hostname or ""
             if loc != path and not (
-                    loc.startswith(f"http://{path[1:]}.") and
-                    loc.endswith(".amazonaws.com/")):
+                    url.scheme == "http" and url.path == "/" and
+                    host.startswith(path[1:] + ".") and
+                    host.endswith(".amazonaws.com")):
                 self.mism(f"CreateBucket Location: expected '{path}' or the "
                           f"bucket's URL, got '{loc}'")
 
