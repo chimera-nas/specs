@@ -19,6 +19,11 @@ What it does send is what a correct client sends: every request is signed
 (AWS Signature Version 4, path-style addressing, the payload hash in
 x-amz-content-sha256), and a request whose body is an XML document carries
 Content-MD5, which the S3 API requires on DeleteObjects and the tagging PUTs.
+A large body is offered with "Expect: 100-continue", as the AWS SDKs offer
+theirs: a server that can refuse a request from its headers alone -- an upload
+id that does not exist -- then answers without the body ever being sent,
+instead of answering, closing the connection, and leaving the client writing
+megabytes into a reset.
 """
 
 import base64
@@ -26,11 +31,19 @@ import datetime
 import hashlib
 import hmac
 import http.client
+import select
+import socket
 import urllib.parse
 import xml.etree.ElementTree as ET
 
 REGION = "us-east-1"
 SERVICE = "s3"
+
+# A body at least this large is offered with "Expect: 100-continue".
+EXPECT_THRESHOLD = 1 << 20
+# How long to wait for the server's verdict on the headers before sending the
+# body regardless (RFC 9110 10.1.1: a client need not wait indefinitely).
+EXPECT_WAIT = 5.0
 
 
 def _enc(s, safe=""):
@@ -155,8 +168,12 @@ class S3Client:
                 self.conn = http.client.HTTPConnection(
                     self.host, self.port, timeout=self.timeout)
             try:
-                self.conn.request(method, target, body=body, headers=headers)
-                r = self.conn.getresponse()
+                if len(body) >= EXPECT_THRESHOLD:
+                    r = self._request_expect(method, target, headers, body)
+                else:
+                    self.conn.request(method, target, body=body,
+                                      headers=headers)
+                    r = self.conn.getresponse()
                 data = r.read()
                 break
             except (http.client.RemoteDisconnected, ConnectionResetError,
@@ -164,5 +181,54 @@ class S3Client:
                 self.close()
                 if attempt:
                     raise
-        return Response(r.status,
+        resp = Response(r.status,
                         {k.lower(): v for k, v in r.getheaders()}, data)
+        if r.will_close:
+            self.close()
+        return resp
+
+    def _request_expect(self, method, target, headers, body):
+        """Send the headers with Expect: 100-continue, and the body only if
+        the server asks for it (or says nothing for EXPECT_WAIT seconds)."""
+        c = self.conn
+        # skip_host: the signed headers already carry Host, and a second one
+        # is a 400.
+        c.putrequest(method, target, skip_host=True)
+        for k, v in headers.items():
+            c.putheader(k, v)
+        c.putheader("content-length", str(len(body)))
+        c.putheader("expect", "100-continue")
+        c.endheaders()
+
+        send_body = True
+        if select.select([c.sock], [], [], EXPECT_WAIT)[0]:
+            # Peek, so that a final response is left intact for http.client.
+            head = b""
+            while len(head) < 12:
+                more = c.sock.recv(12, socket.MSG_PEEK)
+                if len(more) <= len(head) and not select.select(
+                        [c.sock], [], [], EXPECT_WAIT)[0]:
+                    break
+                if not more:
+                    break
+                head = more
+            if head[9:12] == b"100":
+                # Consume exactly the interim response: status line, any
+                # headers, blank line.
+                seen = b""
+                while not seen.endswith(b"\r\n\r\n"):
+                    ch = c.sock.recv(1)
+                    if not ch:
+                        raise http.client.RemoteDisconnected(
+                            "connection closed inside 100 Continue")
+                    seen += ch
+            else:
+                # The final answer, given on the headers alone.  The body is
+                # not sent, so the connection cannot be reused.
+                send_body = False
+        if send_body:
+            c.send(body)
+        r = c.getresponse()
+        if not send_body:
+            r.will_close = True
+        return r
