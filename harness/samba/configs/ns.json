@@ -14,7 +14,6 @@
   // statement about coverage, not about the server.
   "deviationsOff": [
     "SD-2",
-    "SD-5",
     "SD-8",
     "SD-9",
     "SD-13"

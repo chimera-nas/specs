@@ -39,7 +39,7 @@ A **cell** is one config in `configs/`: it binds every constant the smb2 model
 declares — which capabilities this smbd advertises, which of its known
 divergences the model is told to predict — and carries the one batch it
 replays. The cell then replays its whole trace directory: no filename carving,
-no per-trace skipping. Four cells also get a *strict* twin, the same profile
+no per-trace skipping. Two cells also get a *strict* twin, the same profile
 with every deviation forced off; that one is reporting rather than gating (it
 is exactly Samba's conformance debt, re-measured every run) and lives in the
 extended tier.
@@ -134,9 +134,15 @@ the cells named below. Their measurements and citations are in
 |----|-----------------|-------|-------|
 | SD-2 | refuses a LOCK on a handle with no data access with `STATUS_INVALID_HANDLE` instead of `STATUS_ACCESS_DENIED` | `devLockRefuseSt` | `stepInfo` |
 | SD-4 | checks the rename destination for a collision *before* checking the handle holds DELETE, so a rename failing both ways reports the collision | `devRenameSd4` | `stepNs` |
-| SD-5 | `FILE_CREATE` onto an existing *directory* opened `FILE_NON_DIRECTORY_FILE` reports `FILE_IS_A_DIRECTORY` instead of the collision — and asymmetrically, since the mirror case reports the collision | `devCreateSd5` | `stepDir`, `notify` |
 | SD-8 | a handle whose CREATE actually created or overwrote the file may take byte-range locks with no data access: the lock path consults the descriptor Samba opened for write, not the SMB GrantedAccess | `devLockSd8`, via `Open.createAct` | `stepInfo` |
 | SD-9 | the LOCK access check is applied to a lock request but not to an unlock request | `devLockSd9` | `stepInfo` |
+
+SD-5 is no longer in this table. `FILE_CREATE` onto an existing directory
+opened `FILE_NON_DIRECTORY_FILE` reporting `FILE_IS_A_DIRECTORY` instead of the
+collision was filed here as Samba's, until the Windows suite
+([`../windows/`](../windows/)) showed Windows doing exactly the same. A
+behaviour the reference implementation shares is not a deviation, so it is now
+the `createTypeFirst` **policy**, which `configs/_smbd.json` sets.
 
 SD-2, SD-8 and SD-9 are three distinct faults in one code path — the wrong
 status from the check, the wrong thing consulted by the check, and the check not
@@ -176,10 +182,10 @@ attributable to the harness rather than hidden in traces nobody generated.
 |------|--------|--------|--------------------|-------------|
 | `stepCore` | `core.json` | 8 | none | it *is* the strict corpus |
 | `stepReq`  | `req.json` | 8 | none | it *is* the strict corpus |
-| `stepDir`  | `dir.json` | 8 | SD-5 | yes |
+| `stepDir`  | `dir.json` | 8 | none | it *is* the strict corpus |
 | `stepInfo` | `info.json` | 8 | SD-2, SD-8, SD-9 | yes |
 | `stepNs`   | `ns.json` | 8 | SD-4 | yes |
-| `notify`   | `notify.json` | 8 | SD-5 | yes |
+| `notify`   | `notify.json` | 8 | none in the model (SD-10..12 in the registry) | it *is* the strict corpus |
 | `notifyNs` | `notify_ns.json` | 6 | none | it *is* the strict corpus |
 | `leases`   | `leases.json` | 8 | — | SKIP: needs the oplock/lease break lifecycle |
 | `forceL2`  | `force_l2.json` | 8 | — | SKIP: needs the oplock/lease break lifecycle |

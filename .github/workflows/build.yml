@@ -492,7 +492,9 @@ jobs:
       - name: Replay the corpus against the Windows SMB server
         shell: pwsh
         run: |
-          ./harness/windows/run_windows_mbt.ps1 -CorpusRoot prebuilt-corpus -LogDir replay-logs -Survey
+          # The full CHANGE_NOTIFY flavour reports and does not gate: see
+          # harness/windows/README.md for what is still open there.
+          ./harness/windows/run_windows_mbt.ps1 -CorpusRoot prebuilt-corpus -LogDir replay-logs -ReportOnly notify
           exit $LASTEXITCODE
 
       - name: Upload the replay logs

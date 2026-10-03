@@ -37,9 +37,23 @@
     // 0x0300 -- smbprotocol's Dialects.SMB_3_0_0, what smb2_wire.py negotiates
     "dialect": 768,
     "leaseOpenBreak": true,
-    "forceLevel2": false
+    "forceLevel2": false,
+
+    // Where implementations of the same documents differ, which arm this one
+    // takes.  Each is declared, with what was measured, in
+    // quint/smb2/corpus.schema.json.
+    //
+    // No GrantedAccess check on LOCK: a handle with neither FILE_READ_DATA nor
+    // FILE_WRITE_DATA locks and unlocks like any other.
+    "lockAccessCheck": false,
+    // FILE_SUPERSEDE of an existing file arbitrates for DELETE, not WRITE.
+    "supersedeWantsDelete": true,
+    // FILE_CREATE onto an existing directory opened FILE_NON_DIRECTORY_FILE
+    // reports FILE_IS_A_DIRECTORY rather than the collision.
+    "createTypeFirst": true
   },
 
-  // The Windows divergences the model is told to PREDICT.  None yet.
+  // Deviations are for what the server gets WRONG.  Nothing found so far is:
+  // every difference from the model's defaults is a policy above.
   "deviations": []
 }

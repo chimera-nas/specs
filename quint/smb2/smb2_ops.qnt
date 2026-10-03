@@ -127,6 +127,26 @@ module smb2ops {
         // instance rather than drawn at init.  (WPTS ShareForceLevel2 is the
         // single largest oplock family: 112 of its 156 green cases.)
         forceLevel2: bool,
+        // Is a LOCK request conditioned on the handle carrying FILE_READ_DATA
+        // or FILE_WRITE_DATA?  true: a handle with neither is refused
+        // STATUS_ACCESS_DENIED, for a lock and an unlock alike.  false: there
+        // is no such check -- the request runs on its merits through any open
+        // handle.  Windows is false; Samba checks (and gets three things about
+        // the check wrong, SD-2 / SD-8 / SD-9 / SD-13).
+        lockAccessCheck: bool,
+        // What a FILE_SUPERSEDE of an existing file arbitrates for at open
+        // time.  false: WRITE, like FILE_OVERWRITE -- it truncates.  true:
+        // DELETE -- it replaces the file, so it is refused by a holder that
+        // does not share delete and indifferent to one that does not share
+        // write.  Windows is true; Samba is false.
+        supersedeWantsDelete: bool,
+        // FILE_CREATE + FILE_NON_DIRECTORY_FILE onto an existing DIRECTORY:
+        // which refusal is reported.  false: the collision
+        // (STATUS_OBJECT_NAME_COLLISION), the order MS-FSA 2.1.5.1.2 is
+        // written in.  true: the type (STATUS_FILE_IS_A_DIRECTORY) -- the
+        // create-options type check runs first.  Windows and Samba are both
+        // true.  Nothing is created either way.
+        createTypeFirst: bool,
         // discretion: does a conflicting CREATE break a peer's lease at OPEN
         // time (MS-FSA-correct = true), or does an SMB2 RqLs lease survive a
         // conflicting open and break only on the later I/O / namespace op
@@ -868,20 +888,46 @@ module smb2ops {
         lockConflict(acc.sdb, acc.sdb.opens.get(fid).file, fid,
                      x.lo, x.hi, x.wr)
 
+    // All four are about a check that only exists under the lockAccessCheck
+    // policy.  Where the policy is off -- Windows -- a handle that carries
+    // neither FILE_READ_DATA nor FILE_WRITE_DATA locks and unlocks exactly as
+    // one that does: the lock is granted, a conflict is
+    // STATUS_LOCK_NOT_GRANTED, an unlock of a range not held is
+    // STATUS_RANGE_NOT_LOCKED, and none of the four has anything to shape.
+    pure def lockUnchecked(acc: Acc, fid: FileId): bool =
+        not(acc.caps.lockAccessCheck) and lockNoData(acc, fid)
+
     // ------------------------------------------------------------------
-    // DEVIATION SD-5: FILE_CREATE over an existing DIRECTORY
+    // POLICY supersedeWantsDelete: what FILE_SUPERSEDE arbitrates for
+    // ------------------------------------------------------------------
+    //
+    // wantOf() gives every truncating disposition a transient WRITE at
+    // arbitration time.  Under this policy FILE_OVERWRITE and
+    // FILE_OVERWRITE_IF keep it, but a FILE_SUPERSEDE of an existing file
+    // REPLACES the file, and what it arbitrates for is DELETE: it is refused
+    // by a holder that does not share delete, and is indifferent to one that
+    // does not share write.
+    pure def wantOfCaps(acc: Acc, a: DesiredAccess, disp: Disposition): Access =
+        if (acc.caps.supersedeWantsDelete and disp == DispSupersede)
+            { r: a.r, w: a.w, d: true }
+        else wantOf(a, disp)
+
+    // ------------------------------------------------------------------
+    // POLICY createTypeFirst: FILE_CREATE over an existing DIRECTORY
     // ------------------------------------------------------------------
     //
     // MS-FSA 2.1.5.1.2 decides the FILE_CREATE collision first and consults the
-    // target's TYPE afterwards (see decideCreate's CHECK ORDER note).  Samba
-    // runs the create-options type check ahead of the collision check, but only
-    // in ONE direction: an existing DIRECTORY opened FILE_CREATE +
-    // FILE_NON_DIRECTORY_FILE answers STATUS_FILE_IS_A_DIRECTORY, while an
-    // existing FILE opened FILE_CREATE + FILE_DIRECTORY_FILE still answers
-    // STATUS_OBJECT_NAME_COLLISION.  So only the not-isDir arm deviates.
-    pure def devCreateSd5(acc: Acc, dir: Ino, name: Name, disp: Disposition,
-                          isDir: bool): bool =
-        accDev(acc, "SD-5") and disp == DispCreate and not(isDir) and
+    // target's TYPE afterwards (see decideCreate's CHECK ORDER note).  Under
+    // this policy the create-options type check runs ahead of the collision
+    // check, but only in ONE direction: an existing DIRECTORY opened
+    // FILE_CREATE + FILE_NON_DIRECTORY_FILE answers STATUS_FILE_IS_A_DIRECTORY,
+    // while an existing FILE opened FILE_CREATE + FILE_DIRECTORY_FILE still
+    // answers STATUS_OBJECT_NAME_COLLISION.  Windows and Samba both do exactly
+    // this -- it was first filed as a Samba deviation (SD-5) and became a
+    // policy when Windows turned out to do the same.
+    pure def createTypeFirst(acc: Acc, dir: Ino, name: Name, disp: Disposition,
+                             isDir: bool): bool =
+        acc.caps.createTypeFirst and disp == DispCreate and not(isDir) and
         fsHasEnt(acc.sdb.fs, dir, name) and
         fsGet(acc.sdb.fs, fsChild(acc.sdb.fs, dir, name)).ftype == FDir
 
@@ -1464,11 +1510,11 @@ module smb2ops {
             createErr(acc, ST_ACCESS_DENIED)
         else {
             val dec = decideCreate(acc.sdb.fs, x.dir, x.name, x.disp, x.isDir)
-            // DEVIATION SD-5: the same refusal, reported as the type error the
-            // spec would only have reached afterwards.  See devCreateSd5.
+            // POLICY createTypeFirst: the same refusal, reported as the type
+            // error the spec would only have reached afterwards.
             if (dec.st != ST_SUCCESS)
-                if (devCreateSd5(acc, x.dir, x.name, x.disp, x.isDir))
-                    createErr(accHit(acc, "SD-5"), ST_FILE_IS_A_DIRECTORY)
+                if (createTypeFirst(acc, x.dir, x.name, x.disp, x.isDir))
+                    createErr(acc, ST_FILE_IS_A_DIRECTORY)
                 else createErr(acc, dec.st)
             // delete pending on the target -> DELETE_PENDING (only for an
             // existing object being opened; a fresh create has a new ino).
@@ -1476,7 +1522,7 @@ module smb2ops {
                      dec.act == ACT_OPENED)
                 createErr(acc, ST_DELETE_PENDING)
             else {
-                val want = wantOf(x.access, x.disp)
+                val want = wantOfCaps(acc, x.access, x.disp)
                 // An attribute-only open (no R/W/D in DesiredAccess) neither
                 // takes part in share arbitration nor IMPOSES a deny on later
                 // openers: chimera registers it as an inert (granted=0,
@@ -1943,6 +1989,7 @@ module smb2ops {
         // Which of the LOCK deviations, if any, shaped this reply.  Recorded on
         // the accumulator up front so every arm below carries it.
         val acc = if (not(acc0.sdb.opens.keys().contains(fid))) acc0
+                  else if (lockUnchecked(acc0, fid)) acc0
                   else if (devLockSd8(acc0, fid)) accHit(acc0, "SD-8")
                   else if (devLockSd9(acc0, fid, x.unlock)) accHit(acc0, "SD-9")
                   else if (devLockSd13(acc0, fid, x)) accHit(acc0, "SD-13")
@@ -1961,7 +2008,8 @@ module smb2ops {
         // refusal happening at all -- and then the request runs for real, so
         // the LOCK a deviating server grants is a lock the model now holds too
         // and every later read, write and unlock over that range keeps testing.
-        else if (lockNoData(acc, fid) and not(devLockSd8(acc, fid)) and
+        else if (lockNoData(acc, fid) and not(lockUnchecked(acc, fid)) and
+                 not(devLockSd8(acc, fid)) and
                  not(devLockSd9(acc, fid, x.unlock)))
             // SD-13 puts the range-conflict check first, so a conflicting
             // lock is refused as such and the access check never speaks.

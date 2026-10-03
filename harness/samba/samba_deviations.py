@@ -15,8 +15,9 @@ A divergence between the model and a real smbd is one of three things:
 Case 2 no longer belongs here EITHER.  A deviation is now written into the
 model as a branch guarded on the cell's config (quint/smb2/smb2_ops.qnt, and
 `deviations` in configs/*.json), so the trace's expectation is already what
-Samba does and replay is an exact match.  SD-2, SD-4, SD-5, SD-8 and SD-9
-moved there; see quint/smb2/corpus.schema.json for each one's measurement and
+Samba does and replay is an exact match.  SD-2, SD-4, SD-8 and SD-9 moved
+there (SD-5 went further and became the createTypeFirst policy, when Windows
+turned out to do the same thing); see quint/smb2/corpus.schema.json for each one's measurement and
 citation, and tools/devliveness.py for the gate that stops one outliving its
 fix.
 
@@ -307,8 +308,10 @@ KNOWN_DEVIATIONS = [
 #   SD-4 (samba)  rename checks the destination before the handle's DELETE
 #                 access, so a rename that fails both ways reports the
 #                 collision.
-#   SD-5 (samba)  FILE_CREATE onto an existing DIRECTORY opened
-#                 FILE_NON_DIRECTORY_FILE answers STATUS_FILE_IS_A_DIRECTORY.
+#   SD-5          retired: FILE_CREATE onto an existing DIRECTORY opened
+#                 FILE_NON_DIRECTORY_FILE answering STATUS_FILE_IS_A_DIRECTORY
+#                 is what Windows does too, so it is the createTypeFirst
+#                 POLICY now, not a Samba deviation.
 #   SD-8 (samba)  a handle whose CreateAction is not OPENED may lock without
 #                 data access -- and the lock it takes is now a lock the model
 #                 takes too, so the rest of the trace keeps testing instead of

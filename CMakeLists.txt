@@ -220,10 +220,10 @@ else()
     # second byte-identical corpus would be pure cost.
     #
     # A cell gets a STRICT twin and a liveness gate only when its config
-    # actually enables a deviation.  Three of the driveable flavours reach
+    # actually enables a deviation.  Five of the driveable flavours reach
     # none -- locks are drawn only by stepInfo and renames only by stepNs, so
-    # stepCore, stepReq and stepNotifyNs cannot take any of the branches -- and
-    # for those the cell already IS the strict corpus: it states the standard,
+    # stepCore, stepReq, stepDir, stepNotify and stepNotifyNs cannot take any
+    # of the branches -- and for those the cell already IS the strict corpus: it states the standard,
     # replay is an exact match, and it gates rather than reporting.  Generating
     # a byte-identical twin of it would buy nothing.
     #
@@ -231,14 +231,14 @@ else()
     set(SAMBA_CELLS
         "stepCore|core|yes|no"
         "stepReq|req|yes|no"
-        "stepDir|dir|yes|yes"
+        "stepDir|dir|yes|no"
         "stepInfo|info|yes|yes"
         "stepNs|ns|yes|yes"
         "leases|leases|no|no"
         "forceL2|force_l2|no|no"
         "durable|durable|no|no"
         "replay|replay|no|no"
-        "notify|notify|yes|yes"
+        "notify|notify|yes|no"
         "notifyNs|notify_ns|yes|no")
 
     foreach(c ${SAMBA_CELLS})
@@ -835,6 +835,10 @@ else()
     # It puts oplock requests on the wire and relies on the server granting
     # none; SMB2 oplocks cannot be turned off on Windows (EnableOplocks governs
     # SMB1 only), so it grants them, and the replayer has no break lifecycle.
+    #
+    # No cell enables a deviation: everything found so far that Windows does
+    # differently from the model's defaults is a POLICY its config sets
+    # (configs/_windows.json), which a strict twin would leave alone.
     set(WINDOWS_CELLS
         "stepCore|core|no"
         "stepDir|dir|no"

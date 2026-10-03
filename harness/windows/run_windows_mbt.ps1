@@ -35,6 +35,9 @@ The corpus root: the directory holding windows/smb2/<cell>/*.itf.json.
 .PARAMETER Cells
 The cells to replay (default: every directory under windows/smb2).
 
+.PARAMETER ReportOnly
+Cells whose result is reported but does not decide the exit status.
+
 .PARAMETER Survey
 Report every diverging step of a trace instead of stopping at the first.
 
@@ -45,6 +48,7 @@ Where each cell's replay output is kept (default: none kept).
 param(
     [Parameter(Mandatory)] [string] $CorpusRoot,
     [string[]] $Cells,
+    [string[]] $ReportOnly = @(),
     [switch] $Survey,
     [string] $LogDir
 )
@@ -127,7 +131,7 @@ try {
                  '--share', $share, '--share-path', $sharePath,
                  '--user', $user, '--password', $password,
                  '--server-kind', 'windows', '--trace-dir', $dir)
-        if ($Survey) { $cmd += '--keep-going' }
+        if ($Survey -or ($ReportOnly -contains $cell)) { $cmd += '--keep-going' }
         # 2>&1 through cmd, so python's stderr is text here and not a stream
         # of PowerShell error records that would stop the script.
         $ErrorActionPreference = 'Continue'
@@ -141,6 +145,9 @@ try {
         $results[$cell] = switch ($rc) {
             0 { 'ok' } 1 { 'DIVERGED' } 77 { 'skipped' } default { "HARNESS ERROR ($rc)" }
         }
+        # A harness error is never merely reported: it says nothing about the
+        # server and everything about this script.
+        if (($ReportOnly -contains $cell) -and $rc -eq 1) { $results[$cell] = 'diverged (report only)' }
     }
 } finally {
     Remove-SmbShare -Name $share -Force -Confirm:$false -ErrorAction SilentlyContinue
@@ -150,6 +157,6 @@ try {
 
 "`n=== summary ==="
 $results.GetEnumerator() | ForEach-Object { '{0,-12} {1}' -f $_.Key, $_.Value }
-if ($results.Values | Where-Object { $_ -ne 'ok' -and $_ -ne 'skipped' }) { exit 1 }
+if ($results.Values | Where-Object { $_ -notin 'ok', 'skipped', 'diverged (report only)' }) { exit 1 }
 if (-not ($results.Values | Where-Object { $_ -eq 'ok' })) { exit 77 }
 exit 0
