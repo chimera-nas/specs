@@ -1071,7 +1071,10 @@ module smb2ops {
             | CLogoff => doCmdLogoff(acc)
             | CTreeConnect(x) => doCmdTreeConnect(acc, x.share)
             | CTreeDisconnect => doCmdTreeDisconnect(acc)
-            | CCreate(x) => doCmdCreate(acc, x)
+            | CCreate(x) => {
+                val a1 = if (kd1Applies(acc, x)) accHit(acc, "KD-1") else acc
+                doCmdCreate(if (kd2Applies(acc, x)) accHit(a1, "KD-2") else a1, x)
+            }
             | CClose(sel) => doCmdClose(acc, sel)
             | CRead(x) => doCmdRead(acc, x)
             | CWrite(x) => doCmdWrite(acc, x)
@@ -1401,6 +1404,42 @@ module smb2ops {
                        caching: CNone, breaks: notes, parked: true,
                        durable: false }), ST_PENDING).with("done", true)
 
+    // ------------------------------------------------------------------
+    // DEVIATION KD-1: a truncate's write is not arbitrated
+    // ------------------------------------------------------------------
+    //
+    // MS-FSA 2.1.5.1.2 runs the sharing check for what the open is about to
+    // DO, so a truncating disposition conflicts with a holder that does not
+    // share write even when DesiredAccess asks for no write at all (wantOf).
+    // ksmbd arbitrates DesiredAccess as written: the truncate's write is not
+    // counted, and an attribute-only open is exempt from the check however
+    // it disposes of the file.  The open succeeds and the file is truncated
+    // under a holder that had denied exactly that.
+    //
+    // Recorded as taken when such an open reaches a file somebody has open,
+    // which is when the two rules can differ.
+    pure def kd1Applies(acc, x) =
+        accDev(acc, "KD-1") and truncating(x.disp) and not(x.access.w) and {
+            val dec = decideCreate(acc.sdb.fs, x.dir, x.name, x.disp, x.isDir)
+            dec.st == ST_SUCCESS and
+                acc.sdb.opens.keys().exists(g => acc.sdb.opens.get(g).file == dec.ino)
+        }
+
+    // ------------------------------------------------------------------
+    // DEVIATION KD-2: an attribute-only truncating open truncates nothing
+    // ------------------------------------------------------------------
+    //
+    // FILE_SUPERSEDE, FILE_OVERWRITE and FILE_OVERWRITE_IF on an existing
+    // file replace its contents whatever access the open asks for (MS-FSA
+    // 2.1.5.1.2).  ksmbd opens the file, answers as if it had, and leaves the
+    // contents exactly as they were when DesiredAccess carries no read, write
+    // or delete bit.  With any of those bits it truncates.
+    pure def kd2Applies(acc, x) =
+        accDev(acc, "KD-2") and truncating(x.disp) and attrOnly(x.access) and {
+            val dec = decideCreate(acc.sdb.fs, x.dir, x.name, x.disp, x.isDir)
+            dec.st == ST_SUCCESS and dec.act != ACT_CREATED
+        }
+
     pure def doCmdCreate(acc, x) =
         if (not(sessOk(acc))) createErr(acc, ST_USER_SESSION_DELETED)
         else if (not(treeOk(acc))) createErr(acc, ST_NETWORK_NAME_DELETED)
@@ -1522,7 +1561,9 @@ module smb2ops {
                      dec.act == ACT_OPENED)
                 createErr(acc, ST_DELETE_PENDING)
             else {
-                val want = wantOfCaps(acc, x.access, x.disp)
+                val kd1 = accDev(acc, "KD-1")
+                val want = if (kd1) { r: x.access.r, w: x.access.w, d: x.access.d }
+                           else wantOfCaps(acc, x.access, x.disp)
                 // An attribute-only open (no R/W/D in DesiredAccess) neither
                 // takes part in share arbitration nor IMPOSES a deny on later
                 // openers: chimera registers it as an inert (granted=0,
@@ -1535,7 +1576,8 @@ module smb2ops {
                 // Storing denyOf(share) here instead would let a stat-open with
                 // ShareAccess=NONE lock every later opener out.
                 val trunc = truncating(x.disp)
-                val stat = statOpen(x.access, x.disp) and not(x.delOnClose)
+                val stat = (if (kd1) attrOnly(x.access)
+                            else statOpen(x.access, x.disp)) and not(x.delOnClose)
                 // TWO deny values, because the open asserts one thing while it
                 // is being arbitrated and retains another once it is open.
                 //
@@ -1672,7 +1714,9 @@ module smb2ops {
                     // --- insert the open ------------------------------------
                     // The disposition's create/truncate lands HERE, on the
                     // success path, and nowhere else (see SD-7 above).
-                    val ins = doInsertOpen(sdb2.with("fs", dec.fs2),
+                    val ins = doInsertOpen(
+                        // KD-2: the contents survive
+                        if (kd2Applies(acc, x)) sdb2 else sdb2.with("fs", dec.fs2),
                         acc.sess, acc.tree, dec.ino,
                         x.dir, x.name,
                         { r: x.access.r, w: x.access.w, h: x.access.h,
@@ -1978,6 +2022,16 @@ module smb2ops {
         // attribute-only handle succeed; Samba refuses it, and so does Windows
         // (FlushFileBuffers on a read-only handle fails ERROR_ACCESS_DENIED).
         // Found by the samba conformance suite as SD-1.
+        // DEVIATION KD-3: ksmbd does not check the handle's access.  A flush
+        // through a handle with read or delete access succeeds, and one
+        // through an attribute-only handle -- which ksmbd opens without a
+        // file it could sync -- is STATUS_INVALID_HANDLE.
+        else if (not(acc.sdb.opens.get(fid).granted.w) and accDev(acc, "KD-3"))
+            if (acc.sdb.opens.get(fid).granted.r or acc.sdb.opens.get(fid).granted.d)
+                emit(accHit(acc, "KD-3"), RFlush({ st: ST_SUCCESS }), ST_SUCCESS)
+            else
+                emit(accHit(acc, "KD-3"), RFlush({ st: ST_INVALID_HANDLE }),
+                     ST_INVALID_HANDLE)
         else if (not(acc.sdb.opens.get(fid).granted.w))
             emit(acc, RFlush({ st: ST_ACCESS_DENIED }), ST_ACCESS_DENIED)
         else

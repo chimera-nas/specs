@@ -1101,6 +1101,127 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# ksmbd conformance (harness/ksmbd)
+#
+# The Samba suite's replayer against a third SMB server: ksmbd, the Linux
+# kernel's.  A kernel module needs a kernel, so the server is the KVM guest the
+# knfsd suite boots (KVM_IMAGE_DIR), driven over a TAP link from a network
+# namespace per test -- which is also what lets the cells run concurrently.
+#
+# Same rule as the other suites: the cells register on SPECS_KSMBD_TESTS alone,
+# so the job that generates the corpus emits these cells whether or not it can
+# boot a guest, and only add_test() waits on qemu and an image.
+# ---------------------------------------------------------------------------
+option(SPECS_KSMBD_TESTS
+       "Register the Linux kernel SMB server (ksmbd) conformance suite \
+(default: on only when specs is the top-level project)" ${_conformance_default})
+
+if(NOT SPECS_KSMBD_TESTS)
+    message(STATUS
+        "ksmbd MBT tests: not registered (specs is a subdirectory of "
+        "${CMAKE_PROJECT_NAME}; -DSPECS_KSMBD_TESTS=ON with -DKVM_IMAGE_DIR to "
+        "register them)")
+else()
+    set(KSMBD_HARNESS ${CMAKE_CURRENT_SOURCE_DIR}/harness/ksmbd)
+    set(SPECS_DEVLIVENESS ${CMAKE_CURRENT_SOURCE_DIR}/tools/devliveness.py)
+    find_program(KSMBD_QEMU_BIN NAMES qemu-system-x86_64 qemu-system-aarch64
+                 DOC "qemu, which boots the ksmbd guest")
+    set(KSMBD_CAN_RUN TRUE)
+    if(NOT KVM_IMAGE_DIR OR NOT EXISTS "${KVM_IMAGE_DIR}/vmlinuz"
+            OR NOT EXISTS "${KVM_IMAGE_DIR}/rootfs.qcow2")
+        set(KSMBD_CAN_RUN FALSE)
+        message(STATUS
+            "ksmbd MBT tests: corpus registered, tests disabled (no KVM guest "
+            "image; -DKVM_IMAGE_DIR=<dir with vmlinuz and rootfs.qcow2>)")
+    elseif(NOT KSMBD_QEMU_BIN)
+        set(KSMBD_CAN_RUN FALSE)
+        message(STATUS
+            "ksmbd MBT tests: corpus registered, tests disabled (qemu-system "
+            "not found)")
+    else()
+        message(STATUS "ksmbd MBT tests: enabled (guest ${KVM_IMAGE_DIR})")
+    endif()
+
+    # No CHANGE_NOTIFY cell: ksmbd answers the request inline instead of
+    # parking it, so there is nothing for the notify flavours to observe.
+    #
+    # batch | config stem | strict twin ("report": the cell itself is
+    # reporting-only, in the extended tier; see its config)
+    set(KSMBD_CELLS
+        "stepCore|core|yes"
+        "stepDir|dir|yes"
+        "stepInfo|info|report"
+        "stepNs|ns|yes")
+
+    foreach(c ${KSMBD_CELLS})
+        string(REPLACE "|" ";" parts "${c}")
+        list(GET parts 0 bname)
+        list(GET parts 1 cstem)
+        list(GET parts 2 hasdev)
+        set(kcfg ${KSMBD_HARNESS}/configs/${cstem}.json)
+
+        if(NOT "${hasdev}" STREQUAL "no" AND NOT "${hasdev}" STREQUAL "report")
+            specs_corpus(NAME    ksmbd/smb2/${bname}
+                         FAMILY  smb2
+                         CONFIG  ${kcfg}
+                         OUT_DIR KSMBD_TRACES
+                         STRICT_OUT_DIR KSMBD_STRICT)
+        else()
+            specs_corpus(NAME    ksmbd/smb2/${bname}
+                         FAMILY  smb2
+                         CONFIG  ${kcfg}
+                         OUT_DIR KSMBD_TRACES)
+            set(KSMBD_STRICT "")
+        endif()
+
+        add_test(NAME ksmbd/smb2/${bname}/devliveness
+                 COMMAND ${Python3_EXECUTABLE} ${SPECS_DEVLIVENESS}
+                         ${kcfg} ${KSMBD_TRACES})
+        set_tests_properties(ksmbd/smb2/${bname}/devliveness PROPERTIES
+            LABELS "ksmbd;smb2;devliveness"
+            TIMEOUT 120)
+
+        if(NOT KSMBD_CAN_RUN)
+            continue()
+        endif()
+
+        set(kenv "KVM_VMLINUZ=${KVM_IMAGE_DIR}/vmlinuz;KVM_ROOTFS=${KVM_IMAGE_DIR}/rootfs.qcow2")
+        if("${hasdev}" STREQUAL "report")
+            add_test(NAME ksmbd/smb2/${bname}
+                     CONFIGURATIONS extended
+                     COMMAND ${KSMBD_HARNESS}/run_ksmbd_mbt.sh ${KSMBD_TRACES})
+            set_tests_properties(ksmbd/smb2/${bname} PROPERTIES
+                LABELS "ksmbd;smb2;mbt;report"
+                TIMEOUT 1200
+                SKIP_RETURN_CODE 77
+                ENVIRONMENT "${kenv};SPECS_KSMBD_SURVEY=1")
+            continue()
+        endif()
+        add_test(NAME ksmbd/smb2/${bname}
+                 COMMAND ${KSMBD_HARNESS}/run_ksmbd_mbt.sh ${KSMBD_TRACES})
+        set_tests_properties(ksmbd/smb2/${bname} PROPERTIES
+            LABELS "ksmbd;smb2;mbt"
+            TIMEOUT 1200
+            SKIP_RETURN_CODE 77
+            ENVIRONMENT "${kenv}")
+
+        if(KSMBD_STRICT)
+            # The STRICT twin: every deviation forced off.  REPORTING, not
+            # gating -- its failures are ksmbd's conformance debt, re-measured
+            # on every run.  Extended tier.
+            add_test(NAME ksmbd/smb2/${bname}-strict
+                     CONFIGURATIONS extended
+                     COMMAND ${KSMBD_HARNESS}/run_ksmbd_mbt.sh ${KSMBD_STRICT})
+            set_tests_properties(ksmbd/smb2/${bname}-strict PROPERTIES
+                LABELS "ksmbd;smb2;mbt;strict"
+                TIMEOUT 1200
+                SKIP_RETURN_CODE 77
+                ENVIRONMENT "${kenv}")
+        endif()
+    endforeach()
+endif()
+
+# ---------------------------------------------------------------------------
 # Emit the build edges for every cell registered above (cmake/SpecsCorpus.cmake).
 #
 # A CONSUMER calls this itself, after its own specs_corpus() registrations; this

@@ -123,6 +123,11 @@ NOTIFY_TIMEOUT = 10
 # kills the whole batch with no output at all.
 RECV_TIMEOUT = 60
 
+# Whether a connection insists on signed replies and verifies them.  On unless
+# a runner turns it off for a server whose signatures cannot be trusted to
+# verify (smb2_replay.py --no-signing says which, and why).
+REQUIRE_SIGNING = True
+
 
 class WireError(Exception):
     """A harness-level failure: the transport broke, not the server disagreed."""
@@ -149,7 +154,8 @@ class Conn:
         self.port = port
         self.share = share
         self.client_guid = client_guid
-        self.conn = Connection(client_guid, server, port, require_signing=True)
+        self.conn = Connection(client_guid, server, port,
+                               require_signing=REQUIRE_SIGNING)
         self.conn.connect(dialect)
         self.session = Session(self.conn, user, password,
                                require_encryption=False)
