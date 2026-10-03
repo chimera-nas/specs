@@ -268,6 +268,20 @@ module s3 {
     // names it.  true: the source is resolved first (NoSuchKey).
     const P_COPY_SOURCE_FIRST: bool
 
+    // The service under test is handed ONE bucket that already exists, which
+    // the tester may neither create nor delete and may be SHARING with other
+    // runs -- an account in which the tester holds rights on a single bucket
+    // and nothing else.  true: the model starts with that bucket ("bk0") live
+    // and empty, never draws CreateBucket, DeleteBucket or ListBuckets, never
+    // names another bucket (so the NoSuchBucket paths and cross-bucket copies
+    // are not generated), and never touches the bucket's own tag set, the one
+    // piece of modeled state a key prefix cannot keep apart.  It narrows what
+    // a corpus CONTAINS; it changes nothing the model predicts.
+    const P_FIXED_BUCKET: bool
+
+    // The bucket names a request may carry.
+    val BKT_UNIVERSE = if (P_FIXED_BUCKET) Set("bk0") else BUCKETS
+
     pure def dev(id: str): bool = DEVS.contains(id)
 
     // The store: bucket name -> bucket.  Bucket existence is membership.
@@ -533,9 +547,10 @@ module s3 {
     // ------------------------------------------------------------------
 
     // The service starts with no buckets; traces create what they use
-    // (CreateBucket is part of the modeled surface).
+    // (CreateBucket is part of the modeled surface).  Under P_FIXED_BUCKET it
+    // starts with the one bucket it will ever have.
     action init = all {
-        bkts' = Map(),
+        bkts' = if (P_FIXED_BUCKET) Map("bk0" -> EMPTY_BKT) else Map(),
         nextUpl' = 1,
         devHits' = Set(),
         lastOp' = OInit,
@@ -562,9 +577,12 @@ module s3 {
                     else HTTP_OK }),
     }
 
-    action createBucket = {
-        nondet b = oneOf(BUCKETS)
-        applyCreateBucket(b)
+    action createBucket = all {
+        not(P_FIXED_BUCKET),
+        {
+            nondet b = oneOf(BKT_UNIVERSE)
+            applyCreateBucket(b)
+        },
     }
 
     // ------------------------------------------------------------------
@@ -581,7 +599,7 @@ module s3 {
     }
 
     action headBucket = {
-        nondet b = oneOf(BUCKETS)
+        nondet b = oneOf(BKT_UNIVERSE)
         applyHeadBucket(b)
     }
 
@@ -629,9 +647,12 @@ module s3 {
                 ODeleteBucket({ bucket: b, status: HTTP_NO_CONTENT, err: "" }),
     }
 
-    action deleteBucket = {
-        nondet b = oneOf(BUCKETS)
-        applyDeleteBucket(b)
+    action deleteBucket = all {
+        not(P_FIXED_BUCKET),
+        {
+            nondet b = oneOf(BKT_UNIVERSE)
+            applyDeleteBucket(b)
+        },
     }
 
     // ------------------------------------------------------------------
@@ -641,6 +662,7 @@ module s3 {
     // The response bucket list is compared as a set: AWS documents no
     // contractual ordering for ListBuckets.
     action listBuckets = all {
+        not(P_FIXED_BUCKET),
         bkts' = bkts,
         nextUpl' = nextUpl,
         devHits' = Set(),
@@ -686,7 +708,7 @@ module s3 {
     action putObjectAny = all {
         totalObjs < MAX_OBJECTS,
         {
-            nondet b = oneOf(BUCKETS)
+            nondet b = oneOf(BKT_UNIVERSE)
             nondet k = oneOf(KEYS)
             nondet d = oneOf(DATAS)
             applyPutObject(b, k, d, 0)
@@ -783,7 +805,7 @@ module s3 {
 
     // GET against any bucket name (NoSuchBucket coverage).
     action getObjectAny = {
-        nondet b = oneOf(BUCKETS)
+        nondet b = oneOf(BKT_UNIVERSE)
         nondet k = oneOf(KEYS)
         applyGetObject(b, k, RNone)
     }
@@ -885,7 +907,7 @@ module s3 {
 
     // Delete against any bucket name (NoSuchBucket coverage).
     action deleteObjectAny = {
-        nondet b = oneOf(BUCKETS)
+        nondet b = oneOf(BKT_UNIVERSE)
         nondet k = oneOf(KEYS)
         applyDeleteObject(b, k)
     }
@@ -944,7 +966,7 @@ module s3 {
     }
 
     action deleteObjectsAny = {
-        nondet b = oneOf(BUCKETS)
+        nondet b = oneOf(BKT_UNIVERSE)
         nondet ks = oneOf(DELETE_BATCHES)
         nondet q = oneOf(Set(false, true))
         applyDeleteObjects(b, ks, q)
@@ -1034,9 +1056,9 @@ module s3 {
     action copyObjectAny = all {
         totalObjs < MAX_OBJECTS,
         {
-            nondet sb = oneOf(BUCKETS)
+            nondet sb = oneOf(BKT_UNIVERSE)
             nondet sk = oneOf(KEYS)
-            nondet db = oneOf(BUCKETS)
+            nondet db = oneOf(BKT_UNIVERSE)
             nondet dk = oneOf(KEYS)
             applyCopyObject(sb, sk, db, dk)
         },
@@ -1263,10 +1285,17 @@ module s3 {
                 OPutBktTagging({ bucket: b, tags: ts, status: HTTP_OK, err: "" }),
     }
 
-    action putBktTagging = {
-        nondet b = oneOf(BUCKETS)
-        nondet ts = oneOf(TAGSETS)
-        applyPutBktTagging(b, ts)
+    // Not drawn under P_FIXED_BUCKET: a bucket's tag set is one value for the
+    // whole bucket, and a bucket the tester was handed may be shared with
+    // other runs at the same moment.  A key prefix partitions objects; nothing
+    // partitions this.
+    action putBktTagging = all {
+        not(P_FIXED_BUCKET),
+        {
+            nondet b = oneOf(BKT_UNIVERSE)
+            nondet ts = oneOf(TAGSETS)
+            applyPutBktTagging(b, ts)
+        },
     }
 
     // GetBucketTagging with no tags stored is 404 NoSuchTagSet (unlike the
@@ -1297,9 +1326,12 @@ module s3 {
                                  tags: bkts.get(b).btags }),
     }
 
-    action getBktTagging = {
-        nondet b = oneOf(BUCKETS)
-        applyGetBktTagging(b)
+    action getBktTagging = all {
+        not(P_FIXED_BUCKET),
+        {
+            nondet b = oneOf(BKT_UNIVERSE)
+            applyGetBktTagging(b)
+        },
     }
 
     action applyDelBktTagging(b: str): bool = all {
@@ -1322,9 +1354,12 @@ module s3 {
                 ODelBktTagging({ bucket: b, status: HTTP_NO_CONTENT, err: "" }),
     }
 
-    action delBktTagging = {
-        nondet b = oneOf(BUCKETS)
-        applyDelBktTagging(b)
+    action delBktTagging = all {
+        not(P_FIXED_BUCKET),
+        {
+            nondet b = oneOf(BKT_UNIVERSE)
+            applyDelBktTagging(b)
+        },
     }
 
     // ------------------------------------------------------------------
@@ -1514,7 +1549,7 @@ module s3 {
         uploadPairs.size() > 0,
         {
             nondet p = oneOf(uploadPairs)
-            nondet sb = oneOf(BUCKETS)
+            nondet sb = oneOf(BKT_UNIVERSE)
             // a genuinely absent source (bucket dead, or key not present),
             // so the copy always fails and never mints an oversized part
             nondet sk = oneOf(KEYS.filter(kk =>

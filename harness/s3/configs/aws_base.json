@@ -1,0 +1,14 @@
+{
+  "extends": "./_aws.json",
+  "family": "s3",
+  "description": "Amazon S3 over the modeled object surface at the default block size: objects, ranges, listings, copies, tagging and batch delete, in one existing bucket. The MinIO base cell's batches without stepBucket, which is the bucket lifecycle and cannot be drawn against a bucket the tester may not create or delete.",
+  "traceStem": "aws",
+
+  "batches": [
+    { "flavor": "step",     "steps": 128, "traces": 8, "seed": "0x1" },
+    { "flavor": "step",     "steps": 256, "traces": 3, "seed": "0x100" },
+    { "flavor": "stepData", "steps": 128, "traces": 5, "seed": "0x1" },
+    { "flavor": "stepList", "steps": 128, "traces": 5, "seed": "0x1" },
+    { "flavor": "stepTag",  "steps": 128, "traces": 4, "seed": "0x1" }
+  ]
+}

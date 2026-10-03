@@ -30,6 +30,13 @@
       "default": false,
       "doc": "CopyObject when the destination bucket and the source key are both missing: which 404 is reported. S3 documents no precedence between them. false: the destination bucket is resolved first and the reply is NoSuchBucket (the request URI names it). true: the source is resolved first and the reply is NoSuchKey. Same status, nothing written either way."
     },
+    "P_FIXED_BUCKET": {
+      "kind": "policy",
+      "key": "policies.fixedBucket",
+      "type": "bool",
+      "default": false,
+      "doc": "the service under test is handed ONE bucket that already exists, and the tester may neither create nor delete buckets -- a real account in which the credentials hold rights on a single bucket. true: the model starts with bucket bk0 live and empty; CreateBucket, DeleteBucket and ListBuckets are never drawn; no request names another bucket, so the NoSuchBucket paths and cross-bucket copies are not generated. The bucket may be SHARED with other runs at the same moment, so the bucket-level tagging calls are not drawn either: a bucket's tag set is one value for the whole bucket and nothing partitions it. This narrows what the corpus CONTAINS and changes nothing the model predicts, so a cell that sets it covers less, not something different. The replay harness maps bk0 onto the real bucket and isolates each trace under a key prefix of its own, which is what keeps concurrent runs apart."
+    },
     "DEVS": {
       "kind": "deviation",
       "key": "deviations",

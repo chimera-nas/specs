@@ -12,7 +12,8 @@ module s3Test {
     // separate from the generated corpus -- a config may describe a server that
     // gets something wrong, but the model's own tests always assert AWS.
     import s3(DEVS = Set(), P_CREATE_OWNED_CONFLICT = false,
-              P_COPY_SOURCE_FIRST = false).* from "./s3"
+              P_COPY_SOURCE_FIRST = false,
+              P_FIXED_BUCKET = false).* from "./s3"
 
     // Key shorthands (component lists).
     pure val kA: Key = ["a"]

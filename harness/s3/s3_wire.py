@@ -38,7 +38,6 @@ import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 
-REGION = "us-east-1"
 SERVICE = "s3"
 
 # A body at least this large is offered with "Expect: 100-continue".
@@ -96,9 +95,12 @@ class Response:
 
 
 class S3Client:
-    def __init__(self, host, port, access_key, secret_key, timeout=60.0):
+    def __init__(self, host, port, access_key, secret_key, timeout=60.0,
+                 region="us-east-1", tls=False):
         self.host = host
         self.port = port
+        self.region = region
+        self.tls = tls
         self.access_key = access_key
         self.secret_key = secret_key
         self.timeout = timeout
@@ -113,7 +115,11 @@ class S3Client:
         now = datetime.datetime.now(datetime.timezone.utc)
         amz_date = now.strftime("%Y%m%dT%H%M%SZ")
         date = amz_date[:8]
-        headers["host"] = f"{self.host}:{self.port}"
+        # A default port is left out of Host, as every HTTP client leaves it
+        # out; the signature covers the header exactly as sent.
+        default = 443 if self.tls else 80
+        headers["host"] = (self.host if self.port == default
+                           else f"{self.host}:{self.port}")
         headers["x-amz-date"] = amz_date
         headers["x-amz-content-sha256"] = payload_hash
 
@@ -128,13 +134,13 @@ class S3Client:
             ";".join(signed),
             payload_hash,
         ])
-        scope = f"{date}/{REGION}/{SERVICE}/aws4_request"
+        scope = f"{date}/{self.region}/{SERVICE}/aws4_request"
         to_sign = "\n".join([
             "AWS4-HMAC-SHA256", amz_date, scope,
             hashlib.sha256(canonical.encode()).hexdigest(),
         ])
         key = _hmac(("AWS4" + self.secret_key).encode(), date)
-        for part in (REGION, SERVICE, "aws4_request"):
+        for part in (self.region, SERVICE, "aws4_request"):
             key = _hmac(key, part)
         sig = hmac.new(key, to_sign.encode(), hashlib.sha256).hexdigest()
         headers["authorization"] = (
@@ -167,7 +173,8 @@ class S3Client:
         # a fresh connection is.
         for attempt in (0, 1):
             if self.conn is None:
-                self.conn = http.client.HTTPConnection(
+                self.conn = (http.client.HTTPSConnection if self.tls
+                             else http.client.HTTPConnection)(
                     self.host, self.port, timeout=self.timeout)
             try:
                 if len(body) >= EXPECT_THRESHOLD:
@@ -236,7 +243,7 @@ class S3Client:
         return r
 
 
-def wait_ready(host, port, access_key, secret_key, timeout=60.0):
+def wait_ready(host, port, access_key, secret_key, timeout=60.0, **kw):
     """Wait until the server answers S3, not merely until it listens.
 
     A server can accept connections before it can serve: MinIO opens its port
@@ -246,7 +253,7 @@ def wait_ready(host, port, access_key, secret_key, timeout=60.0):
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        c = S3Client(host, port, access_key, secret_key, timeout=5.0)
+        c = S3Client(host, port, access_key, secret_key, timeout=5.0, **kw)
         try:
             if c.call("GET", "/").status == 200:
                 return True

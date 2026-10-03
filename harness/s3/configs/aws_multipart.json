@@ -1,0 +1,15 @@
+{
+  "extends": "./_aws.json",
+  "family": "s3",
+  "description": "Amazon S3 driven through multipart upload, at the 5 MiB minimum part size the model's EntityTooSmall encoding assumes.",
+  "traceStem": "awsmp",
+
+  // The block size is a harness setting (SPECS_S3_BLOCK_SIZE, set by CMake);
+  // recorded here as the fact that distinguishes this corpus from the base one.
+  "blockSize": 5242880,
+
+  "batches": [
+    { "flavor": "stepMultipart", "steps": 64, "traces": 3, "seed": "0x1" },
+    { "flavor": "stepMultipart", "steps": 64, "traces": 2, "seed": "0x11" }
+  ]
+}

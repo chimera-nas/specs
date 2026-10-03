@@ -1,0 +1,23 @@
+{
+  // Amazon S3 itself, as harness/s3/run_aws_mbt.sh reaches it: one bucket
+  // that already exists, through credentials that hold rights on that bucket
+  // and nothing else.
+  //
+  // This file carries the SERVICE, not a corpus: it declares no batches and is
+  // never registered as a cell.  Each cell extends it and adds its batch list.
+  "family": "s3",
+  "description": "Amazon S3, one existing bucket.",
+
+  "policies": {
+    // The tester cannot create, delete or list buckets, and shares the one it
+    // has with other pipelines.  So the model starts with its one bucket live
+    // and never draws those calls, nor the bucket-level tagging calls, whose
+    // state no key prefix can keep apart.  This narrows what the corpus
+    // contains; it changes nothing the model predicts.
+    "fixedBucket": true
+  },
+
+  // AWS is what the model states.  A difference found here is a model bug
+  // until shown otherwise, and none is recorded.
+  "deviations": []
+}

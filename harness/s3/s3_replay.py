@@ -7,8 +7,10 @@
 HTTP, comparing every response against the model's expectation.
 
 Model-to-wire mapping:
-  - model bucket names are wire bucket names (path-style addressing);
-  - a model key (a list of path components) joins with '/' into the wire key;
+  - model bucket names are wire bucket names (path-style addressing), unless
+    --bucket maps one onto an existing bucket;
+  - a model key (a list of path components) joins with '/' into the wire key,
+    under --key-prefix when one is given;
   - content block symbol s at index i is block-size bytes of 0x40+s at offset
     i * block-size; range requests scale block units by the block size;
   - the model's `status` is the HTTP status line, its `err` the <Code> of the
@@ -138,15 +140,44 @@ class Oracle:
     that the model does not predict (ETags, wire upload ids), plus the
     mismatches of the step in hand."""
 
-    def __init__(self, client, block_size):
+    def __init__(self, client, block_size, buckets=None, key_prefix=""):
         self.c = client
         self.bs = block_size
+        # Where the model's names live on the wire.  By default they ARE the
+        # wire names.  Against a service that hands the tester one existing
+        # bucket (the fixedBucket policy) the model bucket is mapped onto it
+        # and every key goes under a prefix of this trace's own, so a trace
+        # starts on an empty namespace without anything having to be deleted
+        # and concurrent runs cannot see each other.
+        self.buckets = buckets or {}
+        self.kp = key_prefix
         self.etags = {}      # (bucket, key) -> ETag at the last write
         self.upls = {}       # model uplid -> wire UploadId
         self.petags = {}     # (uplid, partNum) -> part ETag
         self.m = []          # mismatches of the current step
         self.hits = ()       # deviations the model took at the current step
         self.status = 0      # status of the current step's reply
+
+    # -- model names to wire names and back --
+
+    def wb(self, bucket):
+        return self.buckets.get(bucket, bucket)
+
+    def wk(self, key):
+        return self.kp + key
+
+    def mk(self, wire_key):
+        """A key the server reported, as the model names it.  One from outside
+        this trace's prefix is returned as it came, so it shows up as the
+        mismatch it is."""
+        return (wire_key[len(self.kp):] if wire_key.startswith(self.kp)
+                else wire_key)
+
+    def bp(self, bucket):
+        return f"/{self.wb(bucket)}"
+
+    def op(self, bucket, key):
+        return f"/{self.wb(bucket)}/{self.wk(key)}"
 
     # -- plumbing --
 
@@ -255,7 +286,7 @@ class Oracle:
     # ---- buckets ----
 
     def OCreateBucket(self, op, post):
-        path = f"/{op['bucket']}"
+        path = self.bp(op["bucket"])
         res = self.call("PUT", path)
         if not self.check_status(op, res):
             return
@@ -270,13 +301,13 @@ class Oracle:
                       f"'{res.header('location')}'")
 
     def OHeadBucket(self, op, post):
-        res = self.call("HEAD", f"/{op['bucket']}")
+        res = self.call("HEAD", self.bp(op["bucket"]))
         self.check_status(op, res)
         if res.body:
             self.mism(f"HeadBucket returned a body ({len(res.body)} bytes)")
 
     def ODeleteBucket(self, op, post):
-        res = self.call("DELETE", f"/{op['bucket']}")
+        res = self.call("DELETE", self.bp(op["bucket"]))
         if self.check_status(op, res) and op["status"] != 204:
             self.check_error_code(op, res)
 
@@ -300,7 +331,7 @@ class Oracle:
         headers = {}
         if op["mtag"] in MTAG:
             headers["content-type"], headers["x-amz-meta-m"] = MTAG[op["mtag"]]
-        res = self.call("PUT", f"/{bucket}/{key}", headers=headers,
+        res = self.call("PUT", self.op(bucket, key), headers=headers,
                         body=self.blocks(op["data"]))
         ok = self.check_status(op, res)
         if ok and op["status"] == 200:
@@ -316,7 +347,7 @@ class Oracle:
         rng = self.range_header(op["range"])
         if rng:
             headers["range"] = rng
-        res = self.call("GET", f"/{bucket}/{key}", headers=headers)
+        res = self.call("GET", self.op(bucket, key), headers=headers)
         if not self.check_status(op, res):
             return
         expected = op["status"]
@@ -345,7 +376,7 @@ class Oracle:
 
     def OHeadObject(self, op, post):
         bucket, key = op["bucket"], key_str(op["key"])
-        res = self.call("HEAD", f"/{bucket}/{key}")
+        res = self.call("HEAD", self.op(bucket, key))
         if not self.check_status(op, res):
             return
         if res.body:
@@ -370,7 +401,7 @@ class Oracle:
 
     def ODeleteObject(self, op, post):
         bucket, key = op["bucket"], key_str(op["key"])
-        res = self.call("DELETE", f"/{bucket}/{key}")
+        res = self.call("DELETE", self.op(bucket, key))
         ok = self.check_status(op, res)
         # The object is gone (or never was) whenever the bucket existed.
         if op["err"] != "NoSuchBucket":
@@ -383,9 +414,10 @@ class Oracle:
         keys = [key_str(k) for k in op["keys"]]
         body = ("<Delete>" +
                 ("<Quiet>true</Quiet>" if op["quiet"] else "") +
-                "".join(f"<Object><Key>{k}</Key></Object>" for k in keys) +
+                "".join(f"<Object><Key>{self.wk(k)}</Key></Object>"
+                        for k in keys) +
                 "</Delete>").encode()
-        res = self.call("POST", f"/{bucket}", query=[("delete", "")],
+        res = self.call("POST", self.bp(bucket), query=[("delete", "")],
                         body=body, xml_body=True)
         if not self.check_status(op, res):
             return
@@ -399,7 +431,8 @@ class Oracle:
             return
         # non-quiet: one <Deleted><Key> per named key, in request order;
         # quiet: none.  Never an <Error>: every key is deletable.
-        got = [d.findtext("Key", "") for d in root.findall("Deleted")]
+        got = [self.mk(d.findtext("Key", ""))
+               for d in root.findall("Deleted")]
         want = [] if op["quiet"] else keys
         if self.hit("M-delete-objects-dup-empty"):
             # a repeated key comes back as an empty <Deleted/>
@@ -412,8 +445,8 @@ class Oracle:
     def OCopyObject(self, op, post):
         sb, sk = op["srcBucket"], key_str(op["srcKey"])
         db, dk = op["dstBucket"], key_str(op["dstKey"])
-        res = self.call("PUT", f"/{db}/{dk}",
-                        headers={"x-amz-copy-source": f"/{sb}/{sk}"})
+        res = self.call("PUT", self.op(db, dk),
+                        headers={"x-amz-copy-source": self.op(sb, sk)})
         ok = self.check_status(op, res)
         if ok and op["status"] == 200:
             # the destination was (re)written: its ETag is whatever
@@ -435,7 +468,7 @@ class Oracle:
         # x-amz-object-attributes is required by the API; ask for the fixed
         # set a filesystem-backed gateway can supply, which is what is checked.
         res = self.call(
-            "GET", f"/{bucket}/{key}", query=[("attributes", "")],
+            "GET", self.op(bucket, key), query=[("attributes", "")],
             headers={"x-amz-object-attributes": "ETag,StorageClass,ObjectSize"})
         if not self.check_status(op, res):
             return
@@ -475,16 +508,16 @@ class Oracle:
         query = [("max-keys", str(op["maxKeys"]))]
         if op["delim"]:
             query.append(("delimiter", "/"))
-        if pfx:
-            query.append(("prefix", pfx))
+        if pfx or self.kp:
+            query.append(("prefix", self.wk(pfx)))
         if mode == 2:
             query.append(("list-type", "2"))
         if mode == 3:
             query.append(("versions", ""))
         if sa:
             query.append(({1: "marker", 2: "start-after",
-                           3: "key-marker"}[mode], sa))
-        res = self.call("GET", f"/{bucket}", query=query)
+                           3: "key-marker"}[mode], self.wk(sa)))
+        res = self.call("GET", self.bp(bucket), query=query)
         if not self.check_status(op, res):
             return
         if op["status"] != 200:
@@ -498,7 +531,7 @@ class Oracle:
         objs = post.get(bucket, {}).get("objs", {})
         got_keys = []
         for ent in root.findall("Version" if mode == 3 else "Contents"):
-            k = ent.findtext("Key", "")
+            k = self.mk(ent.findtext("Key", ""))
             got_keys.append(k)
             # every listed object's Size and ETag must agree with the model
             # post-state / the ETag learned at its last write
@@ -515,7 +548,7 @@ class Oracle:
         if got_keys != want_keys:
             self.mism(f"ListObjects: keys {got_keys}, expected {want_keys}")
 
-        got_pfx = [p.findtext("Prefix", "")
+        got_pfx = [self.mk(p.findtext("Prefix", ""))
                    for p in root.findall("CommonPrefixes")]
         # a common prefix always renders with a trailing slash
         want_pfx = [key_str(p) + "/" for p in op["prefixes"]]
@@ -537,8 +570,8 @@ class Oracle:
     # ---- tagging ----
 
     def _tagging(self, op, what, method, has_key, send_tags):
-        path = f"/{op['bucket']}" + (f"/{key_str(op['key'])}" if has_key
-                                     else "")
+        path = (self.op(op["bucket"], key_str(op["key"])) if has_key
+                else self.bp(op["bucket"]))
         if send_tags:
             res = self.call(method, path, query=[("tagging", "")],
                             body=tagging_body(op["tags"]), xml_body=True)
@@ -582,7 +615,8 @@ class Oracle:
 
     def OCreateMpu(self, op, post):
         bucket, key = op["bucket"], key_str(op["key"])
-        res = self.call("POST", f"/{bucket}/{key}", query=[("uploads", "")])
+        res = self.call("POST", self.op(bucket, key),
+                        query=[("uploads", "")])
         if not self.check_status(op, res):
             return
         if op["status"] != 200:
@@ -596,7 +630,7 @@ class Oracle:
             self.mism("CreateMpu: missing <UploadId>")
             return
         self.upls[op["uplid"]] = wire
-        if root.findtext("Key") != key:
+        if self.mk(root.findtext("Key", "")) != key:
             self.mism(f"CreateMpu: <Key> {root.findtext('Key')!r}, expected "
                       f"'{key}'")
 
@@ -605,7 +639,7 @@ class Oracle:
                 ("uploadId", self.wire_upload(op["uplid"]))]
 
     def OUploadPart(self, op, post):
-        res = self.call("PUT", f"/{op['bucket']}/{key_str(op['key'])}",
+        res = self.call("PUT", self.op(op["bucket"], key_str(op["key"])),
                         query=self._part_query(op),
                         body=self.blocks(op["data"]))
         if not self.check_status(op, res):
@@ -621,10 +655,10 @@ class Oracle:
 
     def OUploadPartCopy(self, op, post):
         headers = {"x-amz-copy-source":
-                   f"/{op['srcBucket']}/{key_str(op['srcKey'])}"}
+                   self.op(op["srcBucket"], key_str(op["srcKey"]))}
         if op["range"]["tag"] == "RClosed":
             headers["x-amz-copy-source-range"] = self.range_header(op["range"])
-        res = self.call("PUT", f"/{op['bucket']}/{key_str(op['key'])}",
+        res = self.call("PUT", self.op(op["bucket"], key_str(op["key"])),
                         query=self._part_query(op), headers=headers)
         if not self.check_status(op, res):
             return
@@ -649,7 +683,7 @@ class Oracle:
             self.petags.get((uplid, pn), '"' + "0" * 32 + '"') +
             "</ETag></Part>" for pn in op["manifest"]) +
             "</CompleteMultipartUpload>").encode()
-        res = self.call("POST", f"/{bucket}/{key}",
+        res = self.call("POST", self.op(bucket, key),
                         query=[("uploadId", self.wire_upload(uplid))],
                         body=body, xml_body=True)
         if not self.check_status(op, res):
@@ -678,7 +712,7 @@ class Oracle:
         self.etag_check(bucket, key, quoted(etag), "CompleteMpu")
 
     def OAbortMpu(self, op, post):
-        res = self.call("DELETE", f"/{op['bucket']}/{key_str(op['key'])}",
+        res = self.call("DELETE", self.op(op["bucket"], key_str(op["key"])),
                         query=[("uploadId", self.wire_upload(op["uplid"]))])
         if not self.check_status(op, res):
             return
@@ -691,7 +725,7 @@ class Oracle:
 
     def OListParts(self, op, post):
         bucket, uplid = op["bucket"], op["uplid"]
-        res = self.call("GET", f"/{bucket}/{key_str(op['key'])}",
+        res = self.call("GET", self.op(bucket, key_str(op["key"])),
                         query=[("uploadId", self.wire_upload(uplid))])
         if not self.check_status(op, res):
             return
@@ -721,7 +755,10 @@ class Oracle:
             self.mism(f"ListParts: parts {got}, expected {op['partNums']}")
 
     def OListMpu(self, op, post):
-        res = self.call("GET", f"/{op['bucket']}", query=[("uploads", "")])
+        # the listing is bucket-wide; ask only for this trace's uploads
+        res = self.call("GET", self.bp(op["bucket"]),
+                        query=[("uploads", "")] +
+                              ([("prefix", self.kp)] if self.kp else []))
         if not self.check_status(op, res):
             return
         if op["status"] != 200:
@@ -740,7 +777,7 @@ class Oracle:
                 self.mism(f"ListMpu: unknown UploadId '{wire}' (key "
                           f"'{u.findtext('Key', '')}')")
                 return
-            got.append((u.findtext("Key", ""), by_wire[wire]))
+            got.append((self.mk(u.findtext("Key", "")), by_wire[wire]))
         want = sorted((key_str(u["key"]), u["uplid"]) for u in op["uploads"])
         if sorted(got) != want:
             self.mism(f"ListMpu: uploads {sorted(got)}, expected {want}")
@@ -758,8 +795,12 @@ def run_trace(path, args, tally):
         return 0
 
     client = S3Client(args.host, args.port, args.access_key, args.secret_key,
-                      timeout=args.timeout)
-    o = Oracle(client, args.block_size)
+                      timeout=args.timeout, region=args.region, tls=args.tls)
+    buckets = dict(b.split("=", 1) for b in args.bucket)
+    # One prefix per trace, so traces of a run are as isolated from each other
+    # as runs are.
+    kp = (f"{args.key_prefix.rstrip('/')}/{name}/" if args.key_prefix else "")
+    o = Oracle(client, args.block_size, buckets, kp)
     history = []
     diverged = 0
     try:
@@ -799,8 +840,24 @@ def main():
     ap.add_argument("--trace", action="append", required=True)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, required=True)
-    ap.add_argument("--access-key", required=True)
-    ap.add_argument("--secret-key", required=True)
+    ap.add_argument("--access-key",
+                    default=os.environ.get("AWS_ACCESS_KEY_ID"),
+                    help="default: $AWS_ACCESS_KEY_ID")
+    ap.add_argument("--secret-key",
+                    default=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+                    help="default: $AWS_SECRET_ACCESS_KEY (prefer the "
+                         "environment: an argument is visible in ps)")
+    ap.add_argument("--region", default="us-east-1",
+                    help="the SigV4 signing region")
+    ap.add_argument("--tls", action="store_true", help="speak HTTPS")
+    ap.add_argument("--bucket", action="append", default=[],
+                    metavar="MODEL=REAL",
+                    help="serve model bucket MODEL from the existing bucket "
+                         "REAL (the fixedBucket policy)")
+    ap.add_argument("--key-prefix", default="",
+                    help="put every key under <prefix>/<trace name>/, so a "
+                         "trace starts on an empty namespace in a bucket "
+                         "that is not empty")
     ap.add_argument("--block-size", type=int, default=8192,
                     help="bytes per model block (multipart traces need the "
                          "5 MiB minimum part size)")
@@ -814,6 +871,9 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
+    if not args.access_key or not args.secret_key:
+        ap.error("no credentials: give --access-key/--secret-key or set "
+                 "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY")
 
     tally = {}
     failed = 0
