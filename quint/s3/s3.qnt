@@ -264,8 +264,9 @@ module s3 {
 
     // CopyObject when the destination bucket AND the source key are both
     // missing.  S3 documents no precedence between the two 404s.  false: the
-    // destination bucket is resolved first (NoSuchBucket) -- the request URI
-    // names it.  true: the source is resolved first (NoSuchKey).
+    // destination bucket is resolved first (NoSuchBucket), which is what AWS
+    // does, measured.  true: the source is resolved first (NoSuchKey) -- a
+    // relaxation.
     const P_COPY_SOURCE_FIRST: bool
 
     // The service under test is handed ONE bucket that already exists, which

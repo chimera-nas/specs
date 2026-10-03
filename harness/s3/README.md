@@ -32,8 +32,8 @@ harness:
   strict twin that turns it off, and `tools/devliveness.py` fails a cell that
   claims one its corpus never reaches.
 * A **setup policy** describes the test arrangement rather than the service:
-  `fixedBucket`, and the two policies AWS's answer to which could not be
-  measured with one bucket.
+  `fixedBucket`, and `createOwnedBucketConflict`, where S3 itself gives two
+  answers depending on the region.
 
 Every branch is in the model and every setting is in
 `configs/_aws.json` or `configs/_minio.json`, each of which is therefore the
@@ -49,14 +49,19 @@ AWS_S3_BUCKET=<bucket> AWS_REGION=<region> \
     ctest --test-dir build -L aws
 ```
 
+There is no server to start. There are two kinds of cell, for two kinds of
+credential: one that holds rights on a single existing bucket, and one that may
+also create and delete buckets under a name prefix.
+
 Without those in the environment the tests report a SKIP, so a machine with no
 credentials — or a fork's pull request, which gets no secrets — is not a
 failure. In CI they are repository secrets and variables, and the `aws` job
 fails outright if they are missing in this repository itself.
 
-There is no server to start and no bucket to create. The credentials are an
-IAM user's with rights on **one existing bucket**, which other pipelines share
-at the same moment. Two things follow.
+### The shared-bucket cells
+
+`aws/s3/base` and `aws/s3/multipart` need nothing but rights on **one existing
+bucket**, which other pipelines share at the same moment. Two things follow.
 
 **The corpus is generated under `fixedBucket`.** The model starts with its one
 bucket live and empty; never draws CreateBucket, DeleteBucket or ListBuckets;
@@ -74,7 +79,43 @@ unfinished multipart uploads after a day. Listings are asked for under the
 prefix and the prefix is stripped from what comes back; a key from outside it
 would show up as the mismatch it is.
 
-A run is about 3,900 requests, and the multipart cell uploads 5 MiB parts.
+### The bucket cells
+
+One shared bucket cannot reach the bucket lifecycle, ListBuckets, bucket
+tagging, any `NoSuchBucket` path or a cross-bucket copy. `aws/s3/buckets` and
+`aws/s3/multipart_buckets` are generated with all of that in, and replayed in
+**real buckets the trace's own CreateBucket calls make**. They need credentials
+allowed to create and delete buckets named `<AWS_S3_BUCKET_PREFIX>-*` (default
+`chimera-ci-mbt`), and `s3:ListAllMyBuckets`.
+
+A model bucket is served by
+`<prefix>-<run>-<attempt>-<random>-t<trace>-<model name>-g<n>`, which no other
+run, cell or trace shares. `n` counts how many times the trace has deleted that
+model bucket: each incarnation gets a new name, because S3 says a deleted
+bucket's name may not be reusable at once, and a create refused for that reason
+would be a statement about S3's control plane, not about the API. While a model
+bucket does not exist, its requests go to the name its next incarnation will
+take — one that has never existed.
+
+**S3 gives a bucket no lifetime.** A lifecycle rule expires what is *in* a
+bucket, never the bucket. Four things stand in for one:
+
+1. the replayer empties and deletes a trace's buckets when the trace ends,
+   however it ends, including on the wall-clock cap;
+2. every bucket is given a one-day expiry rule the moment it is created, so a
+   bucket that outlives its run stops holding data within a day;
+3. the `aws` job removes every bucket of its own run in an `always()` step;
+4. `s3_sweep.py` removes any bucket under the prefix older than three hours —
+   at the start of each run, and from the scheduled `aws-sweep.yml` workflow.
+
+**One accommodation, and it is printed.** S3 documents ListBuckets as
+eventually consistent: a bucket just deleted may still be listed. The model is
+sequential, so the runner passes `--settle 30`: a listing that disagrees is
+asked again, for up to that long, and every such wait is printed. In the runs
+so far it has never been needed.
+
+A whole run is about 6,000 requests, and the multipart cells upload 5 MiB
+parts.
 
 ### What AWS taught the model
 
@@ -99,17 +140,29 @@ One more was not a relaxation but a comparison the harness made that the API
 never promised: DeleteObjects reports its entries in no particular order. The
 model now predicts the entries and the harness compares them as a multiset.
 
-With those in place both cells replay against AWS with **no deviation and no
-relaxation**: 25 of 25 and 5 of 5.
+The bucket cells then found a sixth:
 
-### What could not be measured
+| relaxation | what it accepts | what AWS does |
+|------------|-----------------|---------------|
+| `putBucketTaggingOk` | a successful PutBucketTagging answers 200 | answers 204 |
 
-One bucket and no right to create another leaves these unexercised against
-AWS: the bucket lifecycle, bucket tagging, every `NoSuchBucket` path, and
-cross-bucket copies. Two policies keep the defaults they had for that reason
-— `createOwnedBucketConflict` (200, the documented us-east-1 answer) and
-`copySourceFirst` — and MinIO's two bucket-tagging deviations are filed
-against the API Reference rather than against a measurement.
+and settled what one bucket could not:
+
+* `copySourceFirst` is a relaxation too. A CopyObject of a missing key into a
+  missing bucket is `NoSuchBucket` on AWS — the destination is resolved first,
+  which is the default.
+* `createOwnedBucketConflict` is 409 `BucketAlreadyOwnedByYou` in us-east-2, as
+  documented. `_aws.json` sets it; a run in us-east-1 would not.
+* GetBucketTagging and DeleteBucketTagging on a missing bucket are
+  `NoSuchBucket`, so MinIO's two bucket-tagging deviations are now measured.
+
+With those in place all four cells replay against AWS with **no deviation and
+no relaxation**: 25 of 25, 5 of 5, 16 of 16 and 3 of 3.
+
+### What is still not measured
+
+A *successful* UploadPartCopy from one bucket into another: the three
+`multipart_buckets` traces draw the cross-bucket call only where it fails.
 
 ## MinIO
 
@@ -192,8 +245,9 @@ Two things here are choices, and are stated rather than left implicit:
 | policy | MinIO | AWS |
 |--------|-------|-----|
 | `copySelfRejected` | `true`: a copy of an object onto itself is 400, as the API Reference describes | performs it |
-| `createOwnedBucketConflict` | `true`: CreateBucket on a bucket you own answers 409 `BucketAlreadyOwnedByYou` | 200 in us-east-1, 409 elsewhere (documented; not measured here) |
-| `copySourceFirst` | `true`: a CopyObject of a missing key into a missing bucket reports `NoSuchKey` | not measured |
+| `copySourceFirst` | `true`: a CopyObject of a missing key into a missing bucket reports `NoSuchKey` | `NoSuchBucket` |
+| `putBucketTaggingOk` | `true`: a successful PutBucketTagging answers 200 | 204 |
+| `createOwnedBucketConflict` | `true`: CreateBucket on a bucket you own answers 409 `BucketAlreadyOwnedByYou` | 200 in us-east-1, 409 elsewhere (measured in us-east-2) |
 
 On the other four relaxations MinIO does what AWS does. Two of them — the 416
 with no `Content-Range`, and the common prefix that is not returned — were
@@ -216,10 +270,9 @@ the same.
 | `M-complete-duplicate-part-accepted` | a manifest repeating a part number in place (1,2,2) is **accepted**, and the part is assembled once per occurrence | multipart |
 | `M-abort-unknown-upload-204` | AbortMultipartUpload of an upload that does not exist answers 204, not `NoSuchUpload` | multipart |
 
-Nine of the eleven are now confirmed against AWS rather than only against the
+All eleven are confirmed against AWS rather than only against the
 documentation: the AWS cells reach the same requests with every deviation off
-and AWS answers as the model says. The two bucket-tagging ones are the
-exception, for the reason given above.
+and AWS answers as the model says.
 
 `M-complete-duplicate-part-accepted` is worth singling out, because it is the
 one that changes state: AWS refuses the request and the upload stays open,
@@ -240,6 +293,8 @@ knowing which server it is talking to.
 |------|--------|--------|------------|-------------|
 | `aws/s3/base` | `aws_base.json` | 25 | 8 KiB | it *is* the strict corpus |
 | `aws/s3/multipart` | `aws_multipart.json` | 5 | 5 MiB | it *is* the strict corpus |
+| `aws/s3/buckets` | `aws_buckets.json` | 16 | 8 KiB | it *is* the strict corpus |
+| `aws/s3/multipart_buckets` | `aws_multipart_buckets.json` | 3 | 5 MiB | it *is* the strict corpus |
 | `minio/s3/base` | `base.json` | 29 | 8 KiB | yes |
 | `minio/s3/multipart` | `multipart.json` | 5 | 5 MiB | yes |
 

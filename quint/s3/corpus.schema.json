@@ -21,14 +21,14 @@
       "key": "policies.createOwnedBucketConflict",
       "type": "bool",
       "default": false,
-      "doc": "CreateBucket on a bucket the caller already owns. false: 200 OK, the legacy us-east-1 answer (S3 API Reference, CreateBucket: 'in the us-east-1 Region you will get 200 OK'). true: 409 BucketAlreadyOwnedByYou, what every other AWS region answers. Both are S3's own behaviour, so this is a policy a service picks and not a deviation: it records no hit and a strict twin leaves it alone."
+      "doc": "CreateBucket on a bucket the caller already owns. false: 200 OK, the legacy us-east-1 answer (S3 API Reference, CreateBucket: 'in the us-east-1 Region you will get 200 OK'). true: 409 BucketAlreadyOwnedByYou, what every other AWS region answers (measured, us-east-2). Both are S3's own behaviour, so this is a policy a service picks and not a deviation: it records no hit and a strict twin leaves it alone."
     },
     "P_COPY_SOURCE_FIRST": {
       "kind": "policy",
       "key": "policies.copySourceFirst",
       "type": "bool",
       "default": false,
-      "doc": "CopyObject when the destination bucket and the source key are both missing: which 404 is reported. S3 documents no precedence between them. false: the destination bucket is resolved first and the reply is NoSuchBucket (the request URI names it). true: the source is resolved first and the reply is NoSuchKey. Same status, nothing written either way."
+      "doc": "RELAXATION -- false is Amazon S3. CopyObject when the destination bucket and the source key are both missing: which 404 is reported. S3 documents no precedence between them. false: the destination bucket is resolved first and the reply is NoSuchBucket (measured, us-east-2). true: the source is resolved first and the reply is NoSuchKey. Same status, nothing written either way."
     },
     "P_FIXED_BUCKET": {
       "kind": "policy",
