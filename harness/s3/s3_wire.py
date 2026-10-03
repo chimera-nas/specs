@@ -105,6 +105,7 @@ class S3Client:
         self.secret_key = secret_key
         self.timeout = timeout
         self.conn = None
+        self.last_request = None
 
     def close(self):
         if self.conn is not None:
@@ -214,6 +215,9 @@ class S3Client:
         target = _enc(path, safe="/")
         if query:
             target += "?" + "&".join(f"{_enc(k)}={_enc(v)}" for k, v in query)
+        # kept for a failure report; the secret is in neither
+        self.last_request = (method, target, sorted(
+            (k, v) for k, v in headers.items() if k != "authorization"))
 
         # One reconnect: the server is entitled to drop an idle keep-alive
         # connection, and that is not a divergence.  A request that fails on

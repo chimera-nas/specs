@@ -355,6 +355,14 @@ class Oracle:
         code = res.error_code()
         self.mism(f"status: expected {op['status']}, got {res.status}" +
                   (f" ({code})" if code else ""))
+        if code == "SignatureDoesNotMatch":
+            # S3 says what it signed; next to what was sent, that is the
+            # whole diagnosis of a signing fault in this client
+            root = res.xml()
+            print("  the service's canonical request:\n    " +
+                  (root.findtext("CanonicalRequest") or "(none given)")
+                  .replace("\n", "\n    "))
+            print(f"  sent: {self.c.last_request}")
         return False
 
     def check_error_code(self, op, res):
