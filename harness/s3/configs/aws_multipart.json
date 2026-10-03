@@ -11,7 +11,10 @@
     // or the bucket-level tagging calls, whose state no key prefix can keep
     // apart.  This narrows what the corpus contains; it changes nothing the
     // model predicts.  The bucket cells cover what this leaves out.
-    "fixedBucket": true
+    "fixedBucket": true,
+    // THIS bucket performs a copy of an object onto itself; a bucket as AWS
+    // creates one refuses it.  See copySelfAccepted in the schema.
+    "copySelfAccepted": true
   },
 
   // The block size is a harness setting (SPECS_S3_BLOCK_SIZE, set by CMake);

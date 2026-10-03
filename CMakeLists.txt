@@ -929,9 +929,13 @@ else()
     # strict twin only when its config enables a deviation: one that enables
     # none already IS the strict corpus, and a byte-identical twin of it would
     # buy nothing.
+    # cell name | config stem | block size | strict twin | dressed keys
     set(MINIO_CELLS
-        "base|base|8192|yes"
-        "multipart|multipart|5242880|yes")
+        "base|base|8192|yes|0"
+        "multipart|multipart|5242880|yes|0"
+        "deep|deep|8192|yes|0"
+        "dressed|dressed|8192|yes|1"
+        "versioning|versioning|8192|report|0")
 
     foreach(c ${MINIO_CELLS})
         string(REPLACE "|" ";" parts "${c}")
@@ -939,6 +943,7 @@ else()
         list(GET parts 1 cstem)
         list(GET parts 2 bsize)
         list(GET parts 3 hasdev)
+        list(GET parts 4 dress)
         set(mcfg ${S3_HARNESS}/configs/${cstem}.json)
 
         if("${hasdev}" STREQUAL "yes")
@@ -971,13 +976,28 @@ else()
             continue()   # no minio to drive; the corpus above still exists
         endif()
 
+        if("${hasdev}" STREQUAL "report")
+            # A cell whose corpus states S3 with no MinIO deviation in it,
+            # over features where MinIO differs in more ways than are modelled
+            # yet.  REPORTING, not gating, like a strict twin: extended tier.
+            add_test(NAME ${tname}
+                     CONFIGURATIONS extended
+                     COMMAND ${S3_HARNESS}/run_minio_mbt.sh ${MINIO_TRACES})
+            set_tests_properties(${tname} PROPERTIES
+                LABELS "minio;s3;mbt;report"
+                TIMEOUT 1800
+                SKIP_RETURN_CODE 77
+                ENVIRONMENT "MINIO=${MINIO_BIN};SPECS_S3_BLOCK_SIZE=${bsize};SPECS_S3_KEY_DRESS=${dress};SPECS_MINIO_SURVEY=1")
+            continue()
+        endif()
+
         add_test(NAME ${tname}
                  COMMAND ${S3_HARNESS}/run_minio_mbt.sh ${MINIO_TRACES})
         set_tests_properties(${tname} PROPERTIES
             LABELS "minio;s3;mbt"
             TIMEOUT 1800
             SKIP_RETURN_CODE 77
-            ENVIRONMENT "MINIO=${MINIO_BIN};SPECS_S3_BLOCK_SIZE=${bsize}")
+            ENVIRONMENT "MINIO=${MINIO_BIN};SPECS_S3_BLOCK_SIZE=${bsize};SPECS_S3_KEY_DRESS=${dress}")
 
         if(MINIO_STRICT)
             # The STRICT twin: every deviation forced off, so the corpus states
@@ -991,7 +1011,7 @@ else()
                 LABELS "minio;s3;mbt;strict"
                 TIMEOUT 1800
                 SKIP_RETURN_CODE 77
-                ENVIRONMENT "MINIO=${MINIO_BIN};SPECS_S3_BLOCK_SIZE=${bsize}")
+                ENVIRONMENT "MINIO=${MINIO_BIN};SPECS_S3_BLOCK_SIZE=${bsize};SPECS_S3_KEY_DRESS=${dress}")
         endif()
     endforeach()
 endif()
@@ -1041,10 +1061,13 @@ else()
     # No strict twins: the cells enable no deviation, so each already IS the
     # strict corpus.
     set(AWS_CELLS
-        "base|aws_base|8192|fixed"
-        "multipart|aws_multipart|5242880|fixed"
-        "buckets|aws_buckets|8192|ephemeral"
-        "multipart_buckets|aws_multipart_buckets|5242880|ephemeral")
+        "base|aws_base|8192|fixed|0"
+        "multipart|aws_multipart|5242880|fixed|0"
+        "buckets|aws_buckets|8192|ephemeral|0"
+        "multipart_buckets|aws_multipart_buckets|5242880|ephemeral|0"
+        "deep|aws_deep|8192|fixed|0"
+        "dressed|aws_dressed|8192|fixed|1"
+        "versioning|aws_versioning|8192|ephemeral|0")
 
     foreach(c ${AWS_CELLS})
         string(REPLACE "|" ";" parts "${c}")
@@ -1052,6 +1075,7 @@ else()
         list(GET parts 1 cstem)
         list(GET parts 2 bsize)
         list(GET parts 3 bmode)
+        list(GET parts 4 dress)
         set(acfg ${S3_HARNESS}/configs/${cstem}.json)
 
         specs_corpus(NAME    aws/s3/${cname}
@@ -1072,7 +1096,7 @@ else()
             LABELS "aws;s3;mbt"
             TIMEOUT 1800
             SKIP_RETURN_CODE 77
-            ENVIRONMENT "SPECS_S3_BLOCK_SIZE=${bsize};SPECS_AWS_BUCKETS=${bmode}")
+            ENVIRONMENT "SPECS_S3_BLOCK_SIZE=${bsize};SPECS_AWS_BUCKETS=${bmode};SPECS_S3_KEY_DRESS=${dress}")
     endforeach()
 endif()
 

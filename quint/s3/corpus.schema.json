@@ -58,12 +58,12 @@
       "default": false,
       "doc": "RELAXATION -- false is Amazon S3. Listing with a delimiter from a start key (marker / start-after / key-marker) that lies INSIDE a common prefix: AWS never returns that prefix -- with d/a, d/c and d/e/c stored, start-after=d/a&delimiter=/ omits CommonPrefixes 'd/', and KeyCount and IsTruncated follow the shorter page (measured, us-east-2, on all three listing calls; MinIO agrees). true: the implementation rolls the later keys up into the prefix and returns it."
     },
-    "P_COPY_SELF_REJECTED": {
+    "P_COPY_SELF_ACCEPTED": {
       "kind": "policy",
-      "key": "policies.copySelfRejected",
+      "key": "policies.copySelfAccepted",
       "type": "bool",
       "default": false,
-      "doc": "RELAXATION -- false is Amazon S3. CopyObject of an object onto itself with no metadata directive: AWS performs the copy and answers 200 with a CopyObjectResult (measured, us-east-2, on a bucket with the default SSE-S3 encryption every bucket now has). true: the implementation answers 400 InvalidRequest, which is what the S3 API Reference describes ('This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes') and MinIO does. The older deviation id copy-self-200 predicts the AWS reply and is now redundant with the default."
+      "doc": "RELAXATION -- false is Amazon S3 in a bucket as it is created. CopyObject of an object onto itself with no directive that changes anything: 400 InvalidRequest, as the API Reference says (measured, us-east-2, in freshly created buckets, versioned and not). true: the copy is performed and answers 200. One long-lived AWS bucket was measured to do that too, consistently, for a reason in its configuration that was not established; the cells replayed in it set this. A copy under a REPLACE directive is legal either way."
     },
     "P_DELETE_REPORTS_DUPLICATES": {
       "kind": "policy",
@@ -71,6 +71,62 @@
       "type": "bool",
       "default": false,
       "doc": "RELAXATION -- false is Amazon S3. DeleteObjects naming the same key more than once: AWS reports that key in ONE <Deleted> entry (measured, us-east-2). true: the implementation reports one entry per occurrence. The label's `deleted` list is what is predicted, compared as a multiset because AWS does not keep the request's order either. (MinIO does a third thing, which is a fault: M-delete-objects-dup-empty.)"
+    },
+    "F_CONDITIONAL": {
+      "kind": "feature",
+      "key": "features.conditional",
+      "type": "bool",
+      "default": true,
+      "doc": "FEATURE -- AWS has it. Conditional requests: If-Match, If-None-Match, If-Modified-Since and If-Unmodified-Since on GET and HEAD; If-None-Match: * and If-Match on PutObject; x-amz-copy-source-if-match and -if-none-match on CopyObject. false: the server does not implement preconditions, and no request carrying one is drawn."
+    },
+    "F_PRESIGNED": {
+      "kind": "feature",
+      "key": "features.presigned",
+      "type": "bool",
+      "default": true,
+      "doc": "FEATURE -- AWS has it. Presigned URLs: PutObject and GetObject authenticated by a signature in the query string. false: none is drawn."
+    },
+    "F_CHECKSUMS": {
+      "kind": "feature",
+      "key": "features.checksums",
+      "type": "bool",
+      "default": true,
+      "doc": "FEATURE -- AWS has it. Flexible checksums: x-amz-checksum-crc32 as a request header (right, and wrong: 400 BadDigest), and as the trailer of an aws-chunked body sent with x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER, which is how current AWS SDKs upload by default. false: none is drawn."
+    },
+    "F_ACL": {
+      "kind": "feature",
+      "key": "features.acl",
+      "type": "bool",
+      "default": true,
+      "doc": "FEATURE -- AWS has it. GetBucketAcl and GetObjectAcl, each answering one grant: FULL_CONTROL to the owner. false: neither is drawn."
+    },
+    "F_VERSIONING": {
+      "kind": "feature",
+      "key": "features.versioning",
+      "type": "bool",
+      "default": true,
+      "doc": "FEATURE -- AWS has it. Object versioning: PutBucketVersioning and GetBucketVersioning, versionId on GET, HEAD and DELETE, delete markers, and ListObjectVersions over a history. false: no bucket's versioning is ever configured and no request names a version."
+    },
+    "F_BUCKET_POLICY": {
+      "kind": "feature",
+      "key": "features.bucketPolicy",
+      "type": "bool",
+      "default": true,
+      "doc": "FEATURE -- AWS has it. Bucket policy: PutBucketPolicy, GetBucketPolicy, DeleteBucketPolicy, GetBucketPolicyStatus, the policy enforced on the owner's own requests, and unsigned requests. false: none of those is drawn."
+    },
+    "P_PUBLIC_POLICY_ALLOWED": {
+      "kind": "policy",
+      "key": "policies.publicPolicyAllowed",
+      "type": "bool",
+      "default": false,
+      "doc": "RELAXATION -- false is Amazon S3. PutBucketPolicy with a policy that grants access to everyone. A bucket on AWS is created with Block Public Access on, which refuses it: 403 AccessDenied, the bucket's policy unchanged, and an unsigned request refused. true: the implementation accepts the policy and then serves an unsigned GetObject from that bucket."
+    },
+    "P_DEFAULT_CTYPE_APP_OCTET": {
+      "kind": "policy",
+      "key": "policies.defaultContentTypeAppOctet",
+      "type": "bool",
+      "default": false,
+      "doc": "RELAXATION -- false is Amazon S3. The Content-Type reported for an object stored with none: AWS answers binary/octet-stream (measured, us-east-2). true: application/octet-stream. The GET and HEAD labels carry the expected value in `ctype`."
     },
     "P_PUT_BUCKET_TAGGING_OK": {
       "kind": "policy",
@@ -94,6 +150,11 @@
         "M-delete-bucket-tagging-no-bucket-check": "MINIO. DeleteBucketTagging on a bucket that does not exist answers 204 No Content instead of 404 NoSuchBucket, for the same reason (PutBucketTagging does check, and answers NoSuchBucket). Nothing is created, so state stays in step. Fix: minio: check bucket existence in DeleteBucketTaggingHandler. Model: applyDelBktTagging.",
         "M-suffix-range-empty-206": "MINIO. A suffix range (bytes=-N) against a zero-length object answers 206 with an empty body and 'Content-Range: bytes 0--1/0', a header no byte range can mean. AWS answers 416 InvalidRange for any range against a zero-length object, and MinIO itself does for bytes=0- and bytes=0-N; only the suffix form slips through. Fix: minio: reject a suffix range when the object size is 0. Model: applyGetObject (getIsEmptySuffix).",
         "M-list-marker-outside-prefix-501": "MINIO. ListObjects (V1) with a marker, or ListObjectVersions with a key-marker, that does not begin with the request prefix is refused with 501 NotImplemented -- before the bucket is looked up, so a missing bucket reports 501 too. On AWS the marker is just an exclusive start key (S3 API Reference, ListObjects: 'Marker is where you want Amazon S3 to start listing from'), unrelated to the prefix, and the request lists whatever matches the prefix and sorts after it. ListObjectsV2's start-after is served correctly, so this is the V1/Versions argument check, not the walk. Fix: minio: drop the marker-has-prefix requirement in checkListObjsArgs. Model: applyListObjects (listMarkerOutside).",
+        "M-list-next-marker-cache-suffix": "MINIO. A truncated ListObjects (V1) or ListObjectVersions page names where the next one starts -- NextMarker, NextKeyMarker -- as the last entry of the page followed by the literal text '[minio_cache:v2,return:]', an internal listing-cache token that leaked into the reply; and V1 names a NextMarker whether or not a delimiter was given, where AWS names one only with a delimiter (S3 API Reference, ListObjects: 'This element is returned only if you have the delimiter request parameter specified'). MinIO accepts the suffixed value back as a marker, so its own paging works; a client that treats the marker as a key does not. The label is unchanged and the recorded hit tells the harness what to expect. Fix: minio: strip the cache token from the marker it returns. Model: applyListObjectsFrom.",
+        "M-part-numbers-kept": "MINIO. An object completed from a manifest that is not exactly parts 1..N keeps the numbers its parts were uploaded under: completed from parts 1 and 3, GET ?partNumber=3 answers the second part and ?partNumber=2 is 416 InvalidPartNumber. On AWS the parts of the completed object are numbered 1..N in manifest order (measured, us-east-2). The model does not follow MinIO into this: it marks such an object and draws no read by part number against it, so the deviation narrows the corpus rather than predicting the difference. Model: applyCompleteMpu.",
+        "M-complete-checks-by-kind": "MINIO. CompleteMultipartUpload validates a manifest kind by kind over the whole list -- every part's order, then every part's existence, then every part's size -- where AWS walks it once and reports the first offending index (measured, us-east-2). So a manifest with an undersized non-final part AHEAD of a never-uploaded one is EntityTooSmall on AWS and InvalidPart on MinIO. Same status, upload left open either way. Model: completeCheckByKind.",
+        "M-checksum-mismatch-code": "MINIO. A PutObject whose x-amz-checksum-crc32 is not the CRC32 of the body is refused 400 XAmzContentChecksumMismatch. AWS refuses it 400 BadDigest (measured, us-east-2). Same status, nothing written. Model: applyPutVia.",
+        "M-list-uploads-exact-prefix": "MINIO. ListMultipartUploads treats `prefix` as a whole object key: it lists the uploads of the object so named and no others, so a prefix that is a proper prefix of the keys ('d', 'd/') lists nothing; and it returns uploads in the order they were initiated where AWS orders them by key, which changes which upload a max-uploads=1 page holds. On AWS prefix is a string prefix, as for objects (S3 API Reference, ListMultipartUploads; measured, us-east-2). Model: listMpuPage.",
         "M-delete-objects-dup-empty": "MINIO. DeleteObjects naming the same key twice reports the first occurrence as <Deleted><Key>k</Key></Deleted> and every repeat as an EMPTY <Deleted/> element that names no key. AWS reports a repeated key once. The key is deleted either way and Quiet mode is unaffected; the label's `deleted` list carries the key-less entry as the empty key. Fix: minio: fill in the result entry for a de-duplicated key. Model: applyDeleteObjects.",
         "M-getattrs-zero-size-omitted": "MINIO. GetObjectAttributes on a zero-length object omits <ObjectSize> from the response instead of reporting 0, although ObjectSize was requested (S3 API Reference, GetObjectAttributes: ObjectSize is 'the size of the object in bytes'). A zero value falling out of an omit-if-empty encoder. ETag and StorageClass are present and correct; the label is unchanged and the recorded hit tells the harness to expect the element absent. Fix: minio: encode ObjectSize whenever it was requested. Model: applyGetAttrs.",
         "M-getattrs-root-lowercase": "MINIO. The GetObjectAttributes response document's root element is named getObjectAttributesResponse -- a lower-case g, a Go type name that leaked into the encoder -- where the S3 API Reference names it GetObjectAttributesResponse ('Root level tag for the GetObjectAttributesResponse parameters'). REST-XML clients do not read the root element's name, which is how it survives; the children are correct. The label is unchanged and the recorded hit tells the harness which name to expect. Fix: minio: give the response struct an XMLName. Model: applyGetAttrs.",

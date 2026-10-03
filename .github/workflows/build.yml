@@ -675,7 +675,7 @@ jobs:
             -e GITHUB_RUN_ID -e GITHUB_RUN_ATTEMPT \
             specs-dev:${{ github.sha }} \
             bash -c '
-              ctest --test-dir build -L aws -V --no-tests=error -j 4
+              ctest --test-dir build -L aws -V --no-tests=error -j 6
               rc=$?
               if [ "$rc" != 0 ]; then
                 echo "=== ctest exited $rc; LastTest.log ==="

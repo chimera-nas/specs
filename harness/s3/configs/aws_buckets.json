@@ -8,6 +8,7 @@
     { "flavor": "stepBucket", "steps": 64,  "traces": 6, "seed": "0x1" },
     { "flavor": "step",       "steps": 128, "traces": 4, "seed": "0x21" },
     { "flavor": "stepTag",    "steps": 128, "traces": 4, "seed": "0x21" },
-    { "flavor": "stepData",   "steps": 128, "traces": 2, "seed": "0x21" }
+    { "flavor": "stepData",   "steps": 128, "traces": 2, "seed": "0x21" },
+    { "flavor": "stepInvalid", "steps": 96,  "traces": 2, "seed": "0x21" }
   ]
 }

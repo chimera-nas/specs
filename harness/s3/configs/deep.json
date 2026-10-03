@@ -1,0 +1,32 @@
+{
+  "extends": "./_minio.json",
+  "family": "s3",
+  "description": "MinIO over the depth of the modeled calls: listings cut into pages and resumed by continuation token, the max-keys edges, and metadata and tags by every route an object can acquire them.",
+  "traceStem": "miniodeep",
+
+  // The deviations of the MinIO profile these flavours cannot reach; see
+  // base.json.
+  "deviationsOff": [
+    "M-part-numbers-kept",
+    "M-complete-checks-by-kind",
+    "M-list-uploads-exact-prefix",
+    "M-part-zero-invalidpart",
+    "M-complete-empty-manifest-invalidrequest",
+    "M-complete-duplicate-part-accepted",
+    "M-abort-unknown-upload-204",
+    "M-delete-bucket-tagging-no-bucket-check",
+    "M-delete-objects-dup-empty",
+    "M-get-bucket-tagging-no-bucket-check",
+    "M-getattrs-root-lowercase",
+    "M-getattrs-zero-size-omitted",
+    "M-suffix-range-empty-206"
+  ],
+
+  "batches": [
+    { "flavor": "stepPage", "steps": 128, "traces": 5, "seed": "0x1" },
+    { "flavor": "stepMeta", "steps": 128, "traces": 5, "seed": "0x1" },
+    { "flavor": "stepCond",    "steps": 128, "traces": 4, "seed": "0x1" },
+    { "flavor": "stepInvalid", "steps": 96,  "traces": 3, "seed": "0x1" },
+    { "flavor": "stepWire",    "steps": 128, "traces": 4, "seed": "0x1" }
+  ]
+}

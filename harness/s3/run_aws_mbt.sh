@@ -88,6 +88,9 @@ fi
 
 ARGS=()
 [ "${SPECS_AWS_SURVEY:-0}" = "1" ] && ARGS+=(--keep-going)
+# A cell replayed with every key component dressed in characters that need
+# encoding (set by CMake for the cells that are).
+[ "${SPECS_S3_KEY_DRESS:-0}" = "1" ] && ARGS+=(--key-dress)
 for t in "${TRACES[@]}"; do ARGS+=(--trace "$t"); done
 
 if [ "$MODE" = "ephemeral" ]; then

@@ -16,8 +16,13 @@ Model-to-wire mapping:
     i * block-size; range requests scale block units by the block size;
   - the model's `status` is the HTTP status line, its `err` the <Code> of the
     XML error body;
-  - mtag 1/2 select a fixed (Content-Type, x-amz-meta-m) pair, mtag 0 sends
-    neither; tag id i is the ("tk<i>", "tv<i>") pair;
+  - mtag 1/2 select a fixed set of metadata headers (Content-Type,
+    x-amz-meta-m, Cache-Control, Content-Disposition, Content-Language), mtag
+    0 sends none; tag id i is the ("tk<i>", "tv<i>") pair;
+  - with --key-dress every key component carries a suffix of characters that
+    need encoding on the wire, and listings are asked for with
+    encoding-type=url; the model's keys, their order and every answer are
+    unchanged;
   - a multipart upload's abstract id maps to the wire UploadId learned from
     the Initiate response; an id the model never minted goes out as an
     UploadId no server ever issued;
@@ -41,11 +46,14 @@ import os
 import signal
 import sys
 import time
+import urllib.parse
+from xml.sax.saxutils import escape as xml_escape
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from s3_wire import (EXPIRE_LIFECYCLE, S3Client,  # noqa: E402
-                     location_constraint, purge_bucket)
+                     crc32_b64, location_constraint, purge_bucket,
+                     trailer_body)
 
 HIST = 10
 
@@ -55,10 +63,37 @@ MODEL_BUCKETS = ("bk0", "bk1")
 # An UploadId no Initiate ever minted, for the model's unknown-upload requests.
 UNKNOWN_UPLOAD_ID = "ffffffffffffffffffffffffffffffff"
 
-# mtag -> (Content-Type, x-amz-meta-m); mtag 0 sends neither.
-MTAG = {1: ("text/plain", "v1"), 2: ("application/json", "v2")}
-# What S3 reports for an object stored with no Content-Type.
-DEFAULT_CONTENT_TYPE = "binary/octet-stream"
+# mtag -> the metadata headers an object is stored with; mtag 0 sends none.
+# The model names the Content-Type (the label's `ctype`); the rest are echoed
+# as stored.
+MTAG = {
+    1: {"content-type": "text/plain", "x-amz-meta-m": "v1",
+        "cache-control": "max-age=60",
+        "content-disposition": 'attachment; filename="m1"',
+        "content-language": "en"},
+    2: {"content-type": "application/json", "x-amz-meta-m": "v2",
+        "cache-control": "no-cache",
+        "content-disposition": "inline",
+        "content-language": "de"},
+}
+ECHOED = ("x-amz-meta-m", "cache-control", "content-disposition",
+          "content-language")
+
+# What M-list-next-marker-cache-suffix appends to a next marker.
+MINIO_CACHE_SUFFIX = "[minio_cache:v2,return:]"
+
+# For the conditional requests: an ETag no object has, and two dates no
+# object's Last-Modified lies beyond.
+NOT_AN_ETAG = '"00000000000000000000000000000000"'
+LONG_PAST = "Sat, 01 Jan 2000 00:00:00 GMT"
+FAR_AHEAD = "Fri, 01 Jan 2100 00:00:00 GMT"
+
+# --key-dress: what every key component is followed by.  A space, a plus, an
+# ampersand and a non-ASCII letter: each needs different handling in a path,
+# a query, a header and an XML body.  One suffix on every component leaves
+# the byte order of the keys exactly as the model has it.
+KEY_SUFFIX = ""
+DRESS = " +&\u00fc"
 
 
 class TraceFormatError(Exception):
@@ -119,12 +154,22 @@ def load_states(path):
 # ---- model-to-wire helpers ------------------------------------------------
 
 def key_str(key):
-    return "/".join(key)
+    return "/".join(c + KEY_SUFFIX for c in key)
+
+
+def key_comps(wire):
+    """A key string back to the model's components."""
+    return tuple(c[:-len(KEY_SUFFIX)] if KEY_SUFFIX and c.endswith(KEY_SUFFIX)
+                 else c for c in wire.split("/"))
 
 
 def prefix_str(pfx):
-    s = "".join(c + "/" for c in pfx["comps"])
+    s = "".join(c + KEY_SUFFIX + "/" for c in pfx["comps"])
     return s if pfx["slash"] else s[:-1]
+
+
+def tag_header(ids):
+    return "&".join(f"tk{i}=tv{i}" for i in sorted(ids))
 
 
 def quoted(etag):
@@ -177,6 +222,9 @@ class Oracle:
         self.etags = {}      # (bucket, key) -> ETag at the last write
         self.upls = {}       # model uplid -> wire UploadId
         self.petags = {}     # (uplid, partNum) -> part ETag
+        self.token = ""      # NextContinuationToken of the last V2 page
+        self.vids = {}       # (bucket, key tuple) -> {model vid: wire id}
+        self.res = None      # the reply to the current step's request
         self.m = []          # mismatches of the current step
         self.hits = ()       # deviations the model took at the current step
         self.status = 0      # status of the current step's reply
@@ -229,12 +277,74 @@ class Oracle:
     def op(self, bucket, key):
         return f"/{self.wb(bucket)}/{self.wk(key)}"
 
+    def src(self, bucket, key):
+        """x-amz-copy-source: the path, URL-encoded as the header requires."""
+        return urllib.parse.quote(self.op(bucket, key), safe="/")
+
     # -- plumbing --
 
     def call(self, *args, **kw):
         res = self.c.call(*args, **kw)
         self.status = res.status
+        self.res = res
         return res
+
+    # -- versions --
+
+    def wire_vid(self, bucket, key, vid):
+        """The wire VersionId of a model version.  The null version is
+        "null" everywhere; any other was learned from the reply that minted
+        it."""
+        if vid == 0:
+            return "null"
+        return self.vids.get((bucket, tuple(key)), {}).get(vid, "")
+
+    def learn_version(self, bucket, key, post, wire=None):
+        """After a write or a delete into a bucket with a history: the latest
+        version of the key is the one the reply just named."""
+        bk = post.get(bucket)
+        if not bk or bk["ver"] == 0:
+            return
+        h = bk["hist"].get(tuple(key))
+        if not h or h[-1]["vid"] == 0:
+            return
+        known = self.vids.setdefault((bucket, tuple(key)), {})
+        if h[-1]["vid"] in known:
+            return
+        if wire is None:
+            wire = self.res.header("x-amz-version-id")
+        if not wire or wire == "null":
+            self.mism(f"no version id in the reply for {bucket}/"
+                      f"{key_str(key)} (model version {h[-1]['vid']})")
+            return
+        known[h[-1]["vid"]] = wire
+
+    def learn_markers(self, bucket, keys, post):
+        """A quiet DeleteObjects names nothing it did, so the delete markers
+        it added are asked for: the latest version of each key."""
+        bk = post.get(bucket)
+        if not bk or bk["ver"] != 1:
+            return
+        for key in {tuple(k) for k in keys}:
+            h = bk["hist"].get(key)
+            known = self.vids.setdefault((bucket, key), {})
+            if not h or h[-1]["vid"] == 0 or h[-1]["vid"] in known:
+                continue
+            res = self.c.call("GET", self.bp(bucket), query=[
+                ("versions", ""), ("prefix", self.wk(key_str(key)))])
+            root = res.xml()
+            for ent in (root if root is not None else ()):
+                if ent.tag in ("Version", "DeleteMarker") and \
+                        ent.findtext("Key") == self.wk(key_str(key)) and \
+                        ent.findtext("IsLatest") == "true":
+                    known[h[-1]["vid"]] = ent.findtext("VersionId", "")
+
+    def latest_is_marker(self, bucket, key, post):
+        bk = post.get(bucket)
+        if not bk or bk["ver"] == 0:
+            return False
+        h = bk["hist"].get(tuple(key))
+        return bool(h) and h[-1]["dm"]
 
     def mism(self, msg):
         self.m.append(msg)
@@ -318,20 +428,21 @@ class Oracle:
                       f"{res.body[i]:#04x}, expected {want[i]:#04x})")
         return len(want)
 
-    def check_meta_echo(self, res, post, bucket, key, what):
-        """GET/HEAD echo the stored Content-Type (or the fallback) and the
-        x-amz-meta-m value, both from the post-state object's mtag."""
-        obj = post.get(bucket, {}).get("objs", {}).get(tuple(key.split("/")))
+    def check_meta_echo(self, res, post, bucket, key, what, ctype=None):
+        """GET/HEAD echo the Content-Type the model names and the metadata
+        headers the object was stored with (its post-state mtag)."""
+        obj = post.get(bucket, {}).get("objs", {}).get(key_comps(key))
         if obj is None:
             self.mism(f"{what}: {bucket}/{key} missing from model post-state")
             return
-        want_ct, want_meta = MTAG.get(obj["mtag"], (DEFAULT_CONTENT_TYPE, ""))
-        if res.header("content-type") != want_ct:
+        stored = MTAG.get(obj["mtag"], {})
+        if ctype is not None and res.header("content-type") != ctype:
             self.mism(f"{what}: Content-Type '{res.header('content-type')}', "
-                      f"expected '{want_ct}'")
-        if res.header("x-amz-meta-m") != want_meta:
-            self.mism(f"{what}: x-amz-meta-m '{res.header('x-amz-meta-m')}', "
-                      f"expected '{want_meta}'")
+                      f"expected '{ctype}'")
+        for h in ECHOED:
+            if res.header(h) != stored.get(h, ""):
+                self.mism(f"{what}: {h} '{res.header(h)}', expected "
+                          f"'{stored.get(h, '')}'")
 
     # ---- buckets ----
 
@@ -427,9 +538,9 @@ class Oracle:
 
     def OPutObject(self, op, post):
         bucket, key = op["bucket"], key_str(op["key"])
-        headers = {}
-        if op["mtag"] in MTAG:
-            headers["content-type"], headers["x-amz-meta-m"] = MTAG[op["mtag"]]
+        headers = dict(MTAG.get(op["mtag"], {}))
+        if op["tags"]:
+            headers["x-amz-tagging"] = tag_header(op["tags"])
         res = self.call("PUT", self.op(bucket, key), headers=headers,
                         body=self.blocks(op["data"]))
         ok = self.check_status(op, res)
@@ -437,6 +548,7 @@ class Oracle:
             # a successful write re-keys the ETag
             self.etag_forget(bucket, key)
             self.etag_check(bucket, key, res.header("etag"), "PutObject")
+            self.learn_version(bucket, op["key"], post)
         if ok and op["status"] == 404:
             self.check_error_code(op, res)
 
@@ -456,7 +568,8 @@ class Oracle:
                 self.mism("GetObject Content-Length "
                           f"'{res.header('content-length')}', body {n}")
             self.etag_check(bucket, key, res.header("etag"), "GetObject")
-            self.check_meta_echo(res, post, bucket, key, "GetObject")
+            self.check_meta_echo(res, post, bucket, key, "GetObject",
+                                 op["ctype"])
             if expected == 206:
                 first = op["first"] * self.bs
                 want = f"bytes {first}-{first + n - 1}/{op['total'] * self.bs}"
@@ -474,6 +587,13 @@ class Oracle:
             self.check_error_code(op, res)
         elif expected == 404:
             self.check_error_code(op, res)
+            # a key whose latest version is a delete marker says so
+            want = "true" if self.latest_is_marker(bucket, op["key"], post) \
+                else ""
+            if res.header("x-amz-delete-marker") != want:
+                self.mism("GetObject x-amz-delete-marker "
+                          f"'{res.header('x-amz-delete-marker')}', expected "
+                          f"'{want}'")
 
     def OHeadObject(self, op, post):
         bucket, key = op["bucket"], key_str(op["key"])
@@ -489,10 +609,11 @@ class Oracle:
             self.mism(f"HeadObject Content-Length: expected {want}, got "
                       f"'{res.header('content-length')}'")
         self.etag_check(bucket, key, res.header("etag"), "HeadObject")
-        self.check_meta_echo(res, post, bucket, key, "HeadObject")
+        self.check_meta_echo(res, post, bucket, key, "HeadObject",
+                             op["ctype"])
         # x-amz-tagging-count reports the object's tag count; with no tags AWS
         # omits the header, so the zero case accepts absent or "0".
-        obj = post.get(bucket, {}).get("objs", {}).get(tuple(op["key"]))
+        obj = post.get(bucket, {}).get("objs", {}).get(tuple(op["key"]))  # model key
         if obj is not None:
             ntags = len(obj["tags"])
             got = res.header("x-amz-tagging-count")
@@ -509,13 +630,22 @@ class Oracle:
             self.etag_forget(bucket, key)
         if ok and op["status"] == 404:
             self.check_error_code(op, res)
+        if ok and op["status"] == 204:
+            # in a bucket with a history the delete added a marker
+            self.learn_version(bucket, op["key"], post)
+            want = "true" if self.latest_is_marker(bucket, op["key"], post) \
+                else ""
+            if res.header("x-amz-delete-marker") != want:
+                self.mism("DeleteObject x-amz-delete-marker "
+                          f"'{res.header('x-amz-delete-marker')}', expected "
+                          f"'{want}'")
 
     def ODeleteObjects(self, op, post):
         bucket = op["bucket"]
         keys = [key_str(k) for k in op["keys"]]
         body = ("<Delete>" +
                 ("<Quiet>true</Quiet>" if op["quiet"] else "") +
-                "".join(f"<Object><Key>{self.wk(k)}</Key></Object>"
+                "".join(f"<Object><Key>{xml_escape(self.wk(k))}</Key></Object>"
                         for k in keys) +
                 "</Delete>").encode()
         res = self.call("POST", self.bp(bucket), query=[("delete", "")],
@@ -530,6 +660,8 @@ class Oracle:
         root = self.xml(res, "DeleteResult", "DeleteObjects")
         if root is None:
             return
+        if op["quiet"]:
+            self.learn_markers(bucket, op["keys"], post)
         # The model predicts the <Deleted> entries (`deleted`).  Never an
         # <Error>: every key is deletable.  Compared as a multiset: Amazon S3
         # does not keep the request's order, and the API promises none.
@@ -537,6 +669,11 @@ class Oracle:
         # model writes that entry too (the empty key)
         got = [self.mk(k) if k else ""
                for k in (d.findtext("Key", "") for d in root.findall("Deleted"))]
+        for d in root.findall("Deleted"):
+            if d.findtext("DeleteMarkerVersionId") and d.findtext("Key"):
+                self.learn_version(
+                    bucket, key_comps(self.mk(d.findtext("Key"))), post,
+                    d.findtext("DeleteMarkerVersionId"))
         want = [key_str(k) for k in op["deleted"]]
         if sorted(got) != sorted(want):
             self.mism(f"DeleteObjects: <Deleted> keys {got}, expected {want}")
@@ -546,8 +683,14 @@ class Oracle:
     def OCopyObject(self, op, post):
         sb, sk = op["srcBucket"], key_str(op["srcKey"])
         db, dk = op["dstBucket"], key_str(op["dstKey"])
-        res = self.call("PUT", self.op(db, dk),
-                        headers={"x-amz-copy-source": self.op(sb, sk)})
+        headers = {"x-amz-copy-source": self.src(sb, sk)}
+        if op["mdir"] >= 0:
+            headers["x-amz-metadata-directive"] = "REPLACE"
+            headers.update(MTAG.get(op["mdir"], {}))
+        if op["treplace"]:
+            headers["x-amz-tagging-directive"] = "REPLACE"
+            headers["x-amz-tagging"] = tag_header(op["tags"])
+        res = self.call("PUT", self.op(db, dk), headers=headers)
         ok = self.check_status(op, res)
         if ok and op["status"] == 200:
             # the destination was (re)written: its ETag is whatever
@@ -561,7 +704,425 @@ class Oracle:
                 self.mism("CopyObject: response lacks <ETag>")
             else:
                 self.etag_check(db, dk, etag, "CopyObject")
+            self.learn_version(db, op["dstKey"], post)
         if ok and op["status"] in (400, 404):
+            self.check_error_code(op, res)
+
+    def OGetObjectPart(self, op, post):
+        bucket, key = op["bucket"], key_str(op["key"])
+        res = self.call("HEAD" if op["head"] else "GET", self.op(bucket, key),
+                        query=[("partNumber", str(op["partNum"]))])
+        if not self.check_status(op, res):
+            return
+        if op["status"] != 206:
+            if not op["head"]:
+                self.check_error_code(op, res)
+            return
+        n = len(op["data"]) * self.bs
+        if op["head"]:
+            if res.body:
+                self.mism(f"HEAD returned a body ({len(res.body)} bytes)")
+        else:
+            self.expect_body(res, op["data"], "GetObjectPart")
+        if res.header("content-length") != str(n):
+            self.mism("GetObjectPart Content-Length "
+                      f"'{res.header('content-length')}', expected {n}")
+        first = op["first"] * self.bs
+        want = f"bytes {first}-{first + n - 1}/{op['total'] * self.bs}"
+        if res.header("content-range") != want:
+            self.mism(f"GetObjectPart Content-Range: expected '{want}', got "
+                      f"'{res.header('content-range')}'")
+        want = str(op["partsCount"]) if op["partsCount"] else ""
+        if res.header("x-amz-mp-parts-count") != want:
+            self.mism("GetObjectPart x-amz-mp-parts-count "
+                      f"'{res.header('x-amz-mp-parts-count')}', expected "
+                      f"'{want}'")
+        self.etag_check(bucket, key, res.header("etag"), "GetObjectPart")
+
+    # ---- conditional requests ----
+
+    def _etag(self, bucket, key, current):
+        """The object's ETag as learned at its last write, or one that is
+        not it."""
+        have = self.etags.get((bucket, key))
+        return have if (current and have) else NOT_AN_ETAG
+
+    def OCondGet(self, op, post):
+        bucket, key, c = op["bucket"], key_str(op["key"]), op["cond"]
+        headers = {
+            1: {"if-match": self._etag(bucket, key, True)},
+            2: {"if-match": self._etag(bucket, key, False)},
+            3: {"if-none-match": self._etag(bucket, key, True)},
+            4: {"if-none-match": self._etag(bucket, key, False)},
+            5: {"if-modified-since": LONG_PAST},
+            6: {"if-unmodified-since": LONG_PAST},
+            7: {"if-unmodified-since": FAR_AHEAD},
+        }[c]
+        res = self.call("HEAD" if op["head"] else "GET", self.op(bucket, key),
+                        headers=headers)
+        if not self.check_status(op, res):
+            return
+        if op["status"] == 200:
+            if op["head"]:
+                if res.body:
+                    self.mism(f"HEAD returned a body ({len(res.body)} bytes)")
+            else:
+                self.expect_body(res, op["data"], "GetObject")
+            self.etag_check(bucket, key, res.header("etag"), "GetObject")
+        elif op["status"] == 304:
+            if res.body:
+                self.mism(f"304 carried a body ({len(res.body)} bytes)")
+        elif not op["head"]:
+            self.check_error_code(op, res)
+
+    def OCondPut(self, op, post):
+        bucket, key, c = op["bucket"], key_str(op["key"]), op["cond"]
+        headers = {1: {"if-none-match": "*"},
+                   2: {"if-match": self._etag(bucket, key, True)},
+                   3: {"if-match": self._etag(bucket, key, False)}}[c]
+        res = self.call("PUT", self.op(bucket, key), headers=headers,
+                        body=self.blocks(op["data"]))
+        if not self.check_status(op, res):
+            return
+        if op["status"] == 200:
+            self.etag_forget(bucket, key)
+            self.etag_check(bucket, key, res.header("etag"), "PutObject")
+            self.learn_version(bucket, op["key"], post)
+        else:
+            self.check_error_code(op, res)
+
+    def OCondCopy(self, op, post):
+        sb, sk = op["srcBucket"], key_str(op["srcKey"])
+        db, dk = op["dstBucket"], key_str(op["dstKey"])
+        name = ("x-amz-copy-source-if-match" if op["cond"] in (1, 2)
+                else "x-amz-copy-source-if-none-match")
+        res = self.call("PUT", self.op(db, dk), headers={
+            "x-amz-copy-source": self.src(sb, sk),
+            name: self._etag(sb, sk, op["cond"] in (1, 3))})
+        if not self.check_status(op, res):
+            return
+        if op["status"] != 200:
+            self.check_error_code(op, res)
+            return
+        self.etag_forget(db, dk)
+        self.learn_version(db, op["dstKey"], post)
+        root = self.xml(res, "CopyObjectResult", "CopyObject")
+        if root is not None and root.findtext("ETag"):
+            self.etag_check(db, dk, root.findtext("ETag"), "CopyObject")
+
+    # ---- other routes to the wire ----
+
+    def OPutVia(self, op, post):
+        bucket, key, via = op["bucket"], key_str(op["key"]), op["via"]
+        path, body = self.op(bucket, key), self.blocks(op["data"])
+        if via == "presigned":
+            res = self.call("PUT", path, query=self.c.presign("PUT", path),
+                            body=body, anonymous=True)
+        elif via == "trailer-crc32":
+            res = self.call(
+                "PUT", path, body=trailer_body(body),
+                payload_hash="STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+                headers={"content-encoding": "aws-chunked",
+                         "x-amz-trailer": "x-amz-checksum-crc32",
+                         "x-amz-decoded-content-length": str(len(body))})
+        elif via in ("header-crc32", "header-crc32-bad"):
+            res = self.call("PUT", path, body=body, headers={
+                "x-amz-checksum-crc32": crc32_b64(
+                    body if via == "header-crc32" else body + b"x")})
+        else:
+            raise TraceFormatError(f"unknown OPutVia route '{via}'")
+        if not self.check_status(op, res):
+            return
+        if op["status"] != 200:
+            self.check_error_code(op, res)
+            return
+        self.etag_forget(bucket, key)
+        self.etag_check(bucket, key, res.header("etag"), "PutObject")
+        self.learn_version(bucket, op["key"], post)
+        if via != "presigned" and \
+                res.header("x-amz-checksum-crc32") != crc32_b64(body):
+            self.mism("PutObject x-amz-checksum-crc32 "
+                      f"'{res.header('x-amz-checksum-crc32')}', expected "
+                      f"'{crc32_b64(body)}'")
+
+    def OGetVia(self, op, post):
+        bucket, key, via = op["bucket"], key_str(op["key"]), op["via"]
+        path = self.op(bucket, key)
+        if via == "presigned":
+            res = self.call("GET", path, query=self.c.presign("GET", path),
+                            anonymous=True)
+        elif via == "bad-signature":
+            res = self.call("GET", path, creds=(self.c.access_key,
+                                                self.c.secret_key + "x"))
+        elif via == "unknown-key":
+            res = self.call("GET", path,
+                            creds=("AKIAXXXXXXXXXXXXXXXX", "x" * 40))
+        else:
+            raise TraceFormatError(f"unknown OGetVia route '{via}'")
+        if not self.check_status(op, res):
+            return
+        if op["status"] == 200:
+            self.expect_body(res, op["data"], "GetObject")
+        else:
+            self.check_error_code(op, res)
+
+    # ---- bucket location and ACLs ----
+
+    def OGetBktLocation(self, op, post):
+        res = self.call("GET", self.bp(op["bucket"]), query=[("location", "")])
+        if not self.check_status(op, res):
+            return
+        if op["status"] != 200:
+            self.check_error_code(op, res)
+            return
+        root = self.xml(res, "LocationConstraint", "GetBucketLocation")
+        if root is None:
+            return
+        # us-east-1 is the one region S3 reports as no constraint at all
+        want = "" if self.c.region == "us-east-1" else self.c.region
+        if (root.text or "") != want:
+            self.mism(f"GetBucketLocation: '{root.text}', expected '{want}'")
+
+    def OGetAcl(self, op, post):
+        path = (self.op(op["bucket"], key_str(op["key"])) if op["key"]
+                else self.bp(op["bucket"]))
+        res = self.call("GET", path, query=[("acl", "")])
+        if not self.check_status(op, res):
+            return
+        if op["status"] != 200:
+            self.check_error_code(op, res)
+            return
+        root = self.xml(res, "AccessControlPolicy", "GetAcl")
+        if root is None:
+            return
+        got = [g.findtext("Permission") for g in root.iter("Grant")]
+        if got != ["FULL_CONTROL"]:
+            self.mism(f"GetAcl: grants {got}, expected one FULL_CONTROL")
+
+    # ---- versioning ----
+
+    def OPutBktVersioning(self, op, post):
+        body = ("<VersioningConfiguration><Status>" +
+                {1: "Enabled", 2: "Suspended"}[op["state"]] +
+                "</Status></VersioningConfiguration>").encode()
+        res = self.call("PUT", self.bp(op["bucket"]),
+                        query=[("versioning", "")], body=body, xml_body=True)
+        if self.check_status(op, res) and op["status"] != 200:
+            self.check_error_code(op, res)
+
+    def OGetBktVersioning(self, op, post):
+        res = self.call("GET", self.bp(op["bucket"]),
+                        query=[("versioning", "")])
+        if not self.check_status(op, res):
+            return
+        if op["status"] != 200:
+            self.check_error_code(op, res)
+            return
+        root = self.xml(res, "VersioningConfiguration", "GetBucketVersioning")
+        if root is None:
+            return
+        # a bucket never configured reports no Status at all
+        want = {0: "", 1: "Enabled", 2: "Suspended"}[op["state"]]
+        if (root.findtext("Status") or "") != want:
+            self.mism(f"GetBucketVersioning: Status "
+                      f"{root.findtext('Status')!r}, expected '{want}'")
+
+    def OGetVersion(self, op, post):
+        bucket, key = op["bucket"], key_str(op["key"])
+        wire = self.wire_vid(bucket, op["key"], op["vid"])
+        if not wire:
+            self.mism(f"no wire id was learned for {bucket}/{key} version "
+                      f"{op['vid']}")
+            return
+        res = self.call("HEAD" if op["head"] else "GET", self.op(bucket, key),
+                        query=[("versionId", wire)])
+        if not self.check_status(op, res):
+            return
+        want = "true" if op["dm"] else ""
+        if res.header("x-amz-delete-marker") != want:
+            self.mism("GetVersion x-amz-delete-marker "
+                      f"'{res.header('x-amz-delete-marker')}', expected "
+                      f"'{want}'")
+        if op["status"] != 200:
+            if not op["head"]:
+                self.check_error_code(op, res)
+            return
+        if res.header("x-amz-version-id") != wire:
+            self.mism(f"GetVersion x-amz-version-id "
+                      f"'{res.header('x-amz-version-id')}', asked for "
+                      f"'{wire}'")
+        if op["head"]:
+            if res.body:
+                self.mism(f"HEAD returned a body ({len(res.body)} bytes)")
+        else:
+            self.expect_body(res, op["data"], "GetVersion")
+
+    def ODeleteVersion(self, op, post):
+        bucket, key = op["bucket"], key_str(op["key"])
+        wire = self.wire_vid(bucket, op["key"], op["vid"])
+        if not wire:
+            self.mism(f"no wire id was learned for {bucket}/{key} version "
+                      f"{op['vid']}")
+            return
+        res = self.call("DELETE", self.op(bucket, key),
+                        query=[("versionId", wire)])
+        # what a plain GET sees may have changed
+        self.etag_forget(bucket, key)
+        self.vids.get((bucket, tuple(op["key"])), {}).pop(op["vid"], None)
+        if not self.check_status(op, res):
+            return
+        want = "true" if op["dm"] else ""
+        if res.header("x-amz-delete-marker") != want:
+            self.mism("DeleteVersion x-amz-delete-marker "
+                      f"'{res.header('x-amz-delete-marker')}', expected "
+                      f"'{want}'")
+
+    def OListVersions(self, op, post):
+        bucket = op["bucket"]
+        res = self.call("GET", self.bp(bucket), query=[("versions", "")])
+        if not self.check_status(op, res):
+            return
+        root = self.xml(res, "ListVersionsResult", "ListVersions")
+        if root is None:
+            return
+        got = []
+        for ent in root:
+            if ent.tag not in ("Version", "DeleteMarker"):
+                continue
+            key = ent.findtext("Key", "")
+            wire = ent.findtext("VersionId", "")
+            known = self.vids.get((bucket, key_comps(key)), {})
+            vid = 0 if wire == "null" else next(
+                (v for v, w in known.items() if w == wire), wire)
+            got.append((key, vid, ent.tag == "DeleteMarker",
+                        ent.findtext("IsLatest") == "true"))
+        want = [(key_str(v["key"]), v["vid"], v["dm"], v["latest"])
+                for v in op["versions"]]
+        if got != want:
+            self.mism(f"ListVersions: (key, version, marker, latest) {got}, "
+                      f"expected {want}")
+
+    # ---- bucket policy ----
+
+    def policy_doc(self, bucket, pol):
+        res = f"arn:aws:s3:::{self.wb(bucket)}/*"
+        stmt = ({"Sid": "PublicRead", "Effect": "Allow", "Principal": "*",
+                 "Action": "s3:GetObject", "Resource": res} if pol == 1 else
+                {"Sid": "DenyTagRead", "Effect": "Deny", "Principal": "*",
+                 "Action": "s3:GetObjectTagging", "Resource": res})
+        return json.dumps({"Version": "2012-10-17",
+                           "Statement": [stmt]}).encode()
+
+    def OPutBktPolicy(self, op, post):
+        res = self.call("PUT", self.bp(op["bucket"]), query=[("policy", "")],
+                        body=self.policy_doc(op["bucket"], op["pol"]),
+                        xml_body=True)
+        if self.check_status(op, res) and op["status"] != 204:
+            self.check_error_code(op, res)
+
+    def OGetBktPolicy(self, op, post):
+        res = self.call("GET", self.bp(op["bucket"]), query=[("policy", "")])
+        if not self.check_status(op, res):
+            return
+        if op["status"] != 200:
+            self.check_error_code(op, res)
+            return
+        try:
+            stmt = json.loads(res.body)["Statement"][0]
+            got = 1 if stmt["Effect"] == "Allow" else 2
+        except (ValueError, KeyError, IndexError, TypeError):
+            self.mism("GetBucketPolicy: the body is not a policy document")
+            return
+        if got != op["pol"]:
+            self.mism(f"GetBucketPolicy: policy {got}, expected {op['pol']}")
+
+    def ODelBktPolicy(self, op, post):
+        res = self.call("DELETE", self.bp(op["bucket"]),
+                        query=[("policy", "")])
+        if self.check_status(op, res) and op["status"] != 204:
+            self.check_error_code(op, res)
+
+    def OGetPolicyStatus(self, op, post):
+        res = self.call("GET", self.bp(op["bucket"]),
+                        query=[("policyStatus", "")])
+        if not self.check_status(op, res):
+            return
+        if op["status"] != 200:
+            self.check_error_code(op, res)
+            return
+        root = self.xml(res, "PolicyStatus", "GetBucketPolicyStatus")
+        if root is None:
+            return
+        want = "true" if op["public"] else "false"
+        if (root.findtext("IsPublic") or "").lower() != want:
+            self.mism(f"GetBucketPolicyStatus: IsPublic "
+                      f"{root.findtext('IsPublic')!r}, expected {want}")
+
+    def OAnonGet(self, op, post):
+        bucket, key = op["bucket"], key_str(op["key"])
+        res = self.call("GET", self.op(bucket, key), anonymous=True)
+        if not self.check_status(op, res):
+            return
+        if op["status"] == 200:
+            self.expect_body(res, op["data"], "anonymous GetObject")
+        else:
+            self.check_error_code(op, res)
+
+    # ---- requests that are wrong in themselves ----
+
+    def OInvalid(self, op, post):
+        bucket, key, kind = op["bucket"], key_str(op["key"]), op["kind"]
+        bp, okey = self.bp(bucket), self.op(bucket, key)
+        tag = "<Tag><Key>{}</Key><Value>v</Value></Tag>"
+        if kind == "bucket-name-upper":
+            res = self.call("PUT", bp + "-UPPER",
+                            body=location_constraint(self.c.region))
+        elif kind == "bucket-name-long":
+            res = self.call("PUT", bp + "-" + "x" * 64,
+                            body=location_constraint(self.c.region))
+        elif kind == "key-too-long":
+            res = self.call("PUT", f"{bp}/{self.kp}{'k' * 1025}", body=b"x")
+        elif kind == "max-keys-negative":
+            res = self.call("GET", bp, query=[("list-type", "2"),
+                                              ("max-keys", "-1")])
+        elif kind == "max-keys-text":
+            res = self.call("GET", bp, query=[("list-type", "2"),
+                                              ("max-keys", "abc")])
+        elif kind == "tagging-11":
+            body = ("<Tagging><TagSet>" +
+                    "".join(tag.format(f"k{i}") for i in range(11)) +
+                    "</TagSet></Tagging>").encode()
+            res = self.call("PUT", okey, query=[("tagging", "")], body=body,
+                            xml_body=True)
+        elif kind == "tagging-dup-key":
+            body = ("<Tagging><TagSet>" + tag.format("k") + tag.format("k") +
+                    "</TagSet></Tagging>").encode()
+            res = self.call("PUT", okey, query=[("tagging", "")], body=body,
+                            xml_body=True)
+        elif kind == "tagging-malformed":
+            res = self.call("PUT", okey, query=[("tagging", "")],
+                            body=b"<Tagging><TagSet>", xml_body=True)
+        elif kind == "delete-empty":
+            res = self.call("POST", bp, query=[("delete", "")],
+                            body=b"<Delete></Delete>", xml_body=True)
+        elif kind == "delete-1001":
+            body = ("<Delete>" + "".join(
+                f"<Object><Key>{xml_escape(self.kp)}none{i}</Key></Object>"
+                for i in range(1001)) + "</Delete>").encode()
+            res = self.call("POST", bp, query=[("delete", "")], body=body,
+                            xml_body=True)
+        elif kind == "put-bad-digest":
+            res = self.call("PUT", okey, body=b"abc", headers={
+                "content-md5": "1B2M2Y8AsgTpgAmY7PhCfg=="})   # MD5 of ""
+        elif kind == "put-invalid-digest":
+            res = self.call("PUT", okey, body=b"abc",
+                            headers={"content-md5": "not base64!"})
+        else:
+            raise TraceFormatError(f"unknown OInvalid kind '{kind}'")
+        if self.eph and kind.startswith("bucket-name") and res.status == 200:
+            self.made.add(bp[1:] + ("-UPPER" if kind.endswith("upper")
+                                    else "-" + "x" * 64))
+        if self.check_status(op, res):
             self.check_error_code(op, res)
 
     def OGetAttrs(self, op, post):
@@ -618,6 +1179,11 @@ class Oracle:
         if sa:
             query.append(({1: "marker", 2: "start-after",
                            3: "key-marker"}[mode], self.wk(sa)))
+        if op["cont"]:
+            query.append(("continuation-token", self.token))
+        if KEY_SUFFIX:
+            query.append(("encoding-type", "url"))
+        self.token = ""
         res = self.call("GET", self.bp(bucket), query=query)
         if not self.check_status(op, res):
             return
@@ -629,14 +1195,17 @@ class Oracle:
         if root is None:
             return
 
+        # with encoding-type=url the names in the reply are URL-encoded
+        dec = urllib.parse.unquote_plus if KEY_SUFFIX else (lambda x: x)
+
         objs = post.get(bucket, {}).get("objs", {})
         got_keys = []
         for ent in root.findall("Version" if mode == 3 else "Contents"):
-            k = self.mk(ent.findtext("Key", ""))
+            k = self.mk(dec(ent.findtext("Key", "")))
             got_keys.append(k)
             # every listed object's Size and ETag must agree with the model
             # post-state / the ETag learned at its last write
-            obj = objs.get(tuple(k.split("/")))
+            obj = objs.get(key_comps(k))
             size = ent.findtext("Size")
             if obj is not None and size is not None and \
                     size != str(len(obj["data"]) * self.bs):
@@ -649,7 +1218,7 @@ class Oracle:
         if got_keys != want_keys:
             self.mism(f"ListObjects: keys {got_keys}, expected {want_keys}")
 
-        got_pfx = [self.mk(p.findtext("Prefix", ""))
+        got_pfx = [self.mk(dec(p.findtext("Prefix", "")))
                    for p in root.findall("CommonPrefixes")]
         # a common prefix always renders with a trailing slash
         want_pfx = [key_str(p) + "/" for p in op["prefixes"]]
@@ -667,6 +1236,60 @@ class Oracle:
             if root.findtext("KeyCount") != want:
                 self.mism(f"ListObjects: KeyCount "
                           f"{root.findtext('KeyCount')!r}, expected {want}")
+
+        # What the reply says about the request, and where the next page
+        # starts.
+        if root.findtext("Name") != self.wb(bucket):
+            self.mism(f"ListObjects: Name {root.findtext('Name')!r}, "
+                      f"expected '{self.wb(bucket)}'")
+        if root.findtext("MaxKeys") != str(op["maxKeysEcho"]):
+            self.mism(f"ListObjects: MaxKeys {root.findtext('MaxKeys')!r}, "
+                      f"expected {op['maxKeysEcho']}")
+        if dec(root.findtext("Prefix") or "") != (
+                self.wk(pfx) if (pfx or self.kp) else ""):
+            self.mism(f"ListObjects: Prefix {root.findtext('Prefix')!r}, "
+                      f"expected '{self.wk(pfx)}'")
+        if (root.findtext("Delimiter") or "") != ("/" if op["delim"] else ""):
+            self.mism(f"ListObjects: Delimiter "
+                      f"{root.findtext('Delimiter')!r}")
+        last = key_str(op["last"]) + ("/" if op["lastIsPfx"] else "")
+        if mode == 2:
+            # opaque, so only its presence is predicted: there is a token
+            # exactly when there is more
+            self.token = root.findtext("NextContinuationToken") or ""
+            if bool(self.token) != op["truncated"]:
+                self.mism("ListObjects: NextContinuationToken "
+                          f"{'present' if self.token else 'absent'} with "
+                          f"IsTruncated {want_trunc}")
+        elif self.hit("M-list-next-marker-cache-suffix"):
+            name = "NextMarker" if mode == 1 else "NextKeyMarker"
+            got = root.findtext(name)
+            got = self.mk(dec(got)) if got else ""
+            if mode == 1 and not op["delim"]:
+                # where AWS names no marker at all MinIO names one of its
+                # own choosing, not the page's last entry; only the suffix
+                # is predictable
+                if not got.endswith(MINIO_CACHE_SUFFIX):
+                    self.mism(f"ListObjects: {name} '{got}' lacks the "
+                              "cache suffix")
+            elif got != last + MINIO_CACHE_SUFFIX:
+                self.mism(f"ListObjects: {name} '{got}', expected "
+                          f"'{last + MINIO_CACHE_SUFFIX}'")
+        elif mode == 1:
+            # V1 names the next marker only when a delimiter was given
+            want = last if (op["truncated"] and op["delim"]) else ""
+            got = root.findtext("NextMarker")
+            got = self.mk(dec(got)) if got else ""
+            if got != want:
+                self.mism(f"ListObjects: NextMarker '{got}', expected "
+                          f"'{want}'")
+        else:
+            want = last if op["truncated"] else ""
+            got = root.findtext("NextKeyMarker")
+            got = self.mk(dec(got)) if got else ""
+            if got != want:
+                self.mism(f"ListObjects: NextKeyMarker '{got}', expected "
+                          f"'{want}'")
 
     # ---- tagging ----
 
@@ -716,8 +1339,11 @@ class Oracle:
 
     def OCreateMpu(self, op, post):
         bucket, key = op["bucket"], key_str(op["key"])
+        headers = dict(MTAG.get(op["mtag"], {}))
+        if op["tags"]:
+            headers["x-amz-tagging"] = tag_header(op["tags"])
         res = self.call("POST", self.op(bucket, key),
-                        query=[("uploads", "")])
+                        query=[("uploads", "")], headers=headers)
         if not self.check_status(op, res):
             return
         if op["status"] != 200:
@@ -756,7 +1382,7 @@ class Oracle:
 
     def OUploadPartCopy(self, op, post):
         headers = {"x-amz-copy-source":
-                   self.op(op["srcBucket"], key_str(op["srcKey"]))}
+                   self.src(op["srcBucket"], key_str(op["srcKey"]))}
         if op["range"]["tag"] == "RClosed":
             headers["x-amz-copy-source-range"] = self.range_header(op["range"])
         res = self.call("PUT", self.op(op["bucket"], key_str(op["key"])),
@@ -799,6 +1425,7 @@ class Oracle:
         self.upls.pop(uplid, None)
         self.petags = {k: v for k, v in self.petags.items() if k[0] != uplid}
         self.etag_forget(bucket, key)
+        self.learn_version(bucket, op["key"], post)
         root = self.xml(res, "CompleteMultipartUploadResult", "CompleteMpu")
         if root is None:
             return
@@ -826,8 +1453,13 @@ class Oracle:
 
     def OListParts(self, op, post):
         bucket, uplid = op["bucket"], op["uplid"]
+        query = [("uploadId", self.wire_upload(uplid))]
+        if op["maxParts"] != 1000:
+            query.append(("max-parts", str(op["maxParts"])))
+        if op["marker"]:
+            query.append(("part-number-marker", str(op["marker"])))
         res = self.call("GET", self.op(bucket, key_str(op["key"])),
-                        query=[("uploadId", self.wire_upload(uplid))])
+                        query=query)
         if not self.check_status(op, res):
             return
         if op["status"] != 200:
@@ -836,6 +1468,16 @@ class Oracle:
         root = self.xml(res, "ListPartsResult", "ListParts")
         if root is None:
             return
+        want_trunc = "true" if op["truncated"] else "false"
+        if root.findtext("IsTruncated") != want_trunc:
+            self.mism(f"ListParts: IsTruncated "
+                      f"{root.findtext('IsTruncated')!r}, expected "
+                      f"'{want_trunc}'")
+        if op["truncated"] and root.findtext("NextPartNumberMarker") != \
+                str(op["partNums"][-1]):
+            self.mism("ListParts: NextPartNumberMarker "
+                      f"{root.findtext('NextPartNumberMarker')!r}, expected "
+                      f"{op['partNums'][-1]}")
         parts = post.get(bucket, {}).get("mpu", {}).get(uplid, {}) \
                     .get("parts", {})
         got = []
@@ -857,9 +1499,13 @@ class Oracle:
 
     def OListMpu(self, op, post):
         # the listing is bucket-wide; ask only for this trace's uploads
-        res = self.call("GET", self.bp(op["bucket"]),
-                        query=[("uploads", "")] +
-                              ([("prefix", self.kp)] if self.kp else []))
+        pfx = self.wk(prefix_str(op["prefix"]))
+        query = [("uploads", "")]
+        if pfx:
+            query.append(("prefix", pfx))
+        if op["maxUploads"] != 1000:
+            query.append(("max-uploads", str(op["maxUploads"])))
+        res = self.call("GET", self.bp(op["bucket"]), query=query)
         if not self.check_status(op, res):
             return
         if op["status"] != 200:
@@ -882,6 +1528,11 @@ class Oracle:
         want = sorted((key_str(u["key"]), u["uplid"]) for u in op["uploads"])
         if sorted(got) != want:
             self.mism(f"ListMpu: uploads {sorted(got)}, expected {want}")
+        want_trunc = "true" if op["truncated"] else "false"
+        if root.findtext("IsTruncated") != want_trunc:
+            self.mism(f"ListMpu: IsTruncated "
+                      f"{root.findtext('IsTruncated')!r}, expected "
+                      f"'{want_trunc}'")
 
 
 # ---- trace driver ---------------------------------------------------------
@@ -973,6 +1624,9 @@ def main():
                     help="seconds a ListBuckets that disagrees with the "
                          "model may take to agree (S3 documents the listing "
                          "as eventually consistent); each wait is printed")
+    ap.add_argument("--key-dress", action="store_true",
+                    help="suffix every key component with characters that "
+                         "need encoding, and list with encoding-type=url")
     ap.add_argument("--block-size", type=int, default=8192,
                     help="bytes per model block (multipart traces need the "
                          "5 MiB minimum part size)")
@@ -996,6 +1650,9 @@ def main():
 
     tally = {}
     failed = 0
+    if args.key_dress:
+        global KEY_SUFFIX
+        KEY_SUFFIX = DRESS
     if args.ephemeral_buckets and (args.bucket or args.key_prefix):
         ap.error("--ephemeral-buckets excludes --bucket and --key-prefix")
     for seq, t in enumerate(args.trace):

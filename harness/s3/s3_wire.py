@@ -35,6 +35,7 @@ import select
 import sys
 import time
 import urllib.parse
+import zlib
 import xml.etree.ElementTree as ET
 
 SERVICE = "s3"
@@ -110,7 +111,48 @@ class S3Client:
             self.conn.close()
             self.conn = None
 
-    def _sign(self, method, path, query, headers, payload_hash):
+    def _key(self, date, secret=None):
+        key = _hmac(("AWS4" + (secret or self.secret_key)).encode(), date)
+        for part in (self.region, SERVICE, "aws4_request"):
+            key = _hmac(key, part)
+        return key
+
+    def presign(self, method, path, query=(), expires=300):
+        """The query of a presigned URL for this request: the signature goes
+        in the query string, and the request then carries no credentials in
+        its headers at all."""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+        date = amz_date[:8]
+        scope = f"{date}/{self.region}/{SERVICE}/aws4_request"
+        default = 443 if self.tls else 80
+        host = (self.host if self.port == default
+                else f"{self.host}:{self.port}")
+        query = list(query) + [
+            ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
+            ("X-Amz-Credential", f"{self.access_key}/{scope}"),
+            ("X-Amz-Date", amz_date),
+            ("X-Amz-Expires", str(expires)),
+            ("X-Amz-SignedHeaders", "host"),
+        ]
+        canonical = "\n".join([
+            method,
+            _enc(path, safe="/"),
+            "&".join(f"{_enc(k)}={_enc(v)}" for k, v in sorted(query)),
+            f"host:{host}\n",
+            "host",
+            "UNSIGNED-PAYLOAD",
+        ])
+        to_sign = "\n".join([
+            "AWS4-HMAC-SHA256", amz_date, scope,
+            hashlib.sha256(canonical.encode()).hexdigest(),
+        ])
+        sig = hmac.new(self._key(date), to_sign.encode(),
+                       hashlib.sha256).hexdigest()
+        return query + [("X-Amz-Signature", sig)]
+
+    def _sign(self, method, path, query, headers, payload_hash, creds=None):
+        access_key, secret_key = creds or (self.access_key, self.secret_key)
         now = datetime.datetime.now(datetime.timezone.utc)
         amz_date = now.strftime("%Y%m%dT%H%M%SZ")
         date = amz_date[:8]
@@ -138,17 +180,21 @@ class S3Client:
             "AWS4-HMAC-SHA256", amz_date, scope,
             hashlib.sha256(canonical.encode()).hexdigest(),
         ])
-        key = _hmac(("AWS4" + self.secret_key).encode(), date)
-        for part in (self.region, SERVICE, "aws4_request"):
-            key = _hmac(key, part)
+        key = self._key(date, secret_key)
         sig = hmac.new(key, to_sign.encode(), hashlib.sha256).hexdigest()
         headers["authorization"] = (
-            f"AWS4-HMAC-SHA256 Credential={self.access_key}/{scope}, "
+            f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, "
             f"SignedHeaders={';'.join(signed)}, Signature={sig}")
 
     def call(self, method, path, query=(), headers=None, body=b"",
-             xml_body=False):
-        """Issue one request.
+             xml_body=False, anonymous=False, creds=None,
+             payload_hash=None):
+        """Issue one request.  `anonymous` sends it with no credentials at
+        all: unsigned, as a stranger would (a presigned URL is sent this way:
+        its credentials are in `query`).  `creds` signs it as (access key,
+        secret) instead of the client's own.  `payload_hash` replaces the
+        body's SHA-256 in x-amz-content-sha256, for a body that is not the
+        payload itself.
 
         `query` is a sequence of (name, value) pairs; a bare subresource such
         as ?uploads is the pair ("uploads", "").  `headers` are extra request
@@ -160,8 +206,10 @@ class S3Client:
         if xml_body:
             headers["content-md5"] = base64.b64encode(
                 hashlib.md5(body).digest()).decode()
-        self._sign(method, path, query, headers,
-                   hashlib.sha256(body).hexdigest())
+        if not anonymous:
+            self._sign(method, path, query, headers,
+                       payload_hash or hashlib.sha256(body).hexdigest(),
+                       creds)
 
         target = _enc(path, safe="/")
         if query:
@@ -247,6 +295,24 @@ class _ExpectResponse(http.client.HTTPResponse):
         return super()._read_status()
 
 
+def crc32_b64(data):
+    """A body's CRC32 as S3 carries it: the four bytes, big-endian, base64."""
+    return base64.b64encode(zlib.crc32(data).to_bytes(4, "big")).decode()
+
+
+def trailer_body(data, chunk=1 << 16):
+    """`data` framed as aws-chunked with its CRC32 in a trailer, unsigned
+    (x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER) -- the framing
+    current AWS SDKs upload with by default."""
+    out = []
+    for i in range(0, len(data), chunk):
+        piece = data[i:i + chunk]
+        out.append(f"{len(piece):x}\r\n".encode() + piece + b"\r\n")
+    out.append(b"0\r\n" + f"x-amz-checksum-crc32:{crc32_b64(data)}\r\n"
+               .encode() + b"\r\n")
+    return b"".join(out)
+
+
 # The rule every bucket this suite creates carries from the moment it exists:
 # whatever is still in it after a day expires, and so does an upload nobody
 # finished.  A bucket has no lifetime of its own in S3 -- only its contents can
@@ -311,6 +377,22 @@ def purge_bucket(client, name):
             client.call("DELETE", f"{path}/{key}", query=[("uploadId", upl)])
         if root.findtext("IsTruncated") != "true":
             break
+    # every version and delete marker: in a bucket with a history, deleting a
+    # key by name removes nothing
+    for _ in range(1000):
+        res = client.call("GET", path, query=[("versions", "")])
+        if res.status == 404:
+            return ""
+        root = res.xml()
+        if res.status != 200 or root is None:
+            break       # a server without the call has no history to remove
+        vers = [(v.findtext("Key", ""), v.findtext("VersionId", ""))
+                for v in root if v.tag in ("Version", "DeleteMarker")]
+        if not vers:
+            break
+        for key, vid in vers:
+            client.call("DELETE", f"{path}/{key}",
+                        query=[("versionId", vid)] if vid else [])
     for _ in range(1000):
         res = client.call("GET", path, query=[("list-type", "2")])
         if res.status == 404:

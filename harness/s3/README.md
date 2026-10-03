@@ -128,13 +128,16 @@ relaxation:
 | `rangeErrorContentRange` | a 416 carries `Content-Range: bytes */<length>` | sends no such header |
 | `emptySuffixRangeUnsatisfiable` | `bytes=-N` against a zero-length object is 416 | ignores the range: 200, empty body |
 | `listReturnsMarkerPrefix` | with a delimiter, a common prefix the start key lies inside is returned | never returns it |
-| `copySelfRejected` | a copy of an object onto itself is 400 `InvalidRequest` | performs it: 200 |
+| `copySelfAccepted` | a copy of an object onto itself, nothing changed, is performed | 400 `InvalidRequest`, in a bucket as AWS creates it |
 | `deleteReportsDuplicates` | a key named twice in DeleteObjects is reported twice | reports it once |
 
-`copySelfRejected` is the one to read twice. 400 is what the S3 API Reference
-describes, and it is not what AWS answered — measured in us-east-2, on a bucket
-with the default SSE-S3 encryption every bucket now has. The model follows the
-service.
+`copySelfAccepted` is the one to read twice, because AWS gave both answers.
+The one shared bucket the first cells run in performs a self-copy, every time;
+buckets the bucket cells create refuse it with 400, every time, versioned or
+not. What in the shared bucket's configuration makes the difference was not
+established. The default is the fresh bucket's answer, which is also what the
+API Reference says, and the four cells replayed in the shared bucket set the
+relaxation with a comment saying why.
 
 One more was not a relaxation but a comparison the harness made that the API
 never promised: DeleteObjects reports its entries in no particular order. The
@@ -244,7 +247,6 @@ Two things here are choices, and are stated rather than left implicit:
 
 | policy | MinIO | AWS |
 |--------|-------|-----|
-| `copySelfRejected` | `true`: a copy of an object onto itself is 400, as the API Reference describes | performs it |
 | `copySourceFirst` | `true`: a CopyObject of a missing key into a missing bucket reports `NoSuchKey` | `NoSuchBucket` |
 | `putBucketTaggingOk` | `true`: a successful PutBucketTagging answers 200 | 204 |
 | `createOwnedBucketConflict` | `true`: CreateBucket on a bucket you own answers 409 `BucketAlreadyOwnedByYou` | 200 in us-east-1, 409 elsewhere (measured in us-east-2) |
@@ -270,7 +272,7 @@ the same.
 | `M-complete-duplicate-part-accepted` | a manifest repeating a part number in place (1,2,2) is **accepted**, and the part is assembled once per occurrence | multipart |
 | `M-abort-unknown-upload-204` | AbortMultipartUpload of an upload that does not exist answers 204, not `NoSuchUpload` | multipart |
 
-All eleven are confirmed against AWS rather than only against the
+The first eleven are confirmed against AWS rather than only against the
 documentation: the AWS cells reach the same requests with every deviation off
 and AWS answers as the model says.
 
@@ -287,16 +289,101 @@ those the model records the hit in `devHits` and the harness reads it from the
 trace, so the expectation still comes from the model and never from the harness
 knowing which server it is talking to.
 
+The deeper cells added five more:
+
+| id | what MinIO does | cell |
+|----|-----------------|------|
+| `M-list-next-marker-cache-suffix` | a truncated V1 or Versions page names the next marker with `[minio_cache:v2,return:]` appended, and V1 names one even with no delimiter | base, deep, dressed |
+| `M-part-numbers-kept` | an object completed from parts 1 and 3 has a part 3 and no part 2; AWS renumbers | multipart |
+| `M-complete-checks-by-kind` | a manifest is validated kind by kind, so an unknown part outranks an undersized one ahead of it | multipart |
+| `M-list-uploads-exact-prefix` | ListMultipartUploads treats `prefix` as a whole key, and orders by initiation, not by key | multipart |
+| `M-checksum-mismatch-code` | a wrong `x-amz-checksum-crc32` is `XAmzContentChecksumMismatch`, not `BadDigest` | deep |
+
+`M-part-numbers-kept` is the one the model does not follow: it marks such an
+object and stops drawing reads by part number against it, so the deviation
+narrows the corpus instead of predicting the difference.
+
+### Versioning and bucket policy: reported, not gated
+
+`minio/s3/versioning` states both features as AWS does them, with no MinIO
+deviation, and is registered in the extended tier as a reporting cell. MinIO
+differs there in more ways than are modelled yet. A run reports:
+
+* a DELETE of a key that never existed adds no delete marker (AWS adds one);
+* PutBucketVersioning on a bucket that does not exist answers 200;
+* a read of the null version returns no `x-amz-version-id`;
+* deleting a delete marker by id does not say `x-amz-delete-marker: true`;
+* a tagging call on a key whose latest version is a delete marker is 404
+  `NoSuchKey`, where AWS says 405;
+* a Deny in a bucket policy does not bind the root user;
+* GetBucketPolicyStatus answers 200 for a bucket with no policy, and reports
+  a bucket whose policy lets anyone read its objects as not public;
+* an unsigned GET of a missing key in a public bucket is 404, where the model
+  has 403 -- a prediction AWS never tested, because it refuses the public
+  policy in the first place.
+
+The first of these changes state, so later steps of a trace report its
+consequences too. Each is a candidate for a modelled deviation.
+
+## The S3 surface
+
+Every operation of the S3 API (the 2006-03-01 service model, 112 operations),
+and where it stands here. A **feature** is switched off in a config for a
+server that lacks it, and the requests that need it are then never drawn.
+
+| operations | status |
+|------------|--------|
+| CreateBucket, HeadBucket, DeleteBucket, ListBuckets, GetBucketLocation | modelled |
+| PutObject, GetObject (ranges, `partNumber`), HeadObject, DeleteObject, DeleteObjects, CopyObject (metadata and tagging directives), GetObjectAttributes | modelled |
+| ListObjects, ListObjectsV2 (continuation tokens), ListObjectVersions | modelled |
+| Put/Get/DeleteObjectTagging, Put/Get/DeleteBucketTagging | modelled |
+| CreateMultipartUpload, UploadPart, UploadPartCopy, CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads | modelled |
+| conditional GET, HEAD, PUT and copy | modelled; feature `conditional` |
+| presigned PutObject and GetObject | modelled; feature `presigned` |
+| `x-amz-checksum-crc32` as a header and as an aws-chunked trailer | modelled; feature `checksums` |
+| GetBucketAcl, GetObjectAcl | modelled; feature `acl` |
+| PutBucketVersioning, GetBucketVersioning, `versionId` on GET, HEAD and DELETE, delete markers, the history listing | modelled; feature `versioning` |
+| PutBucketPolicy, GetBucketPolicy, DeleteBucketPolicy, GetBucketPolicyStatus, a Deny enforced, unsigned requests | modelled; feature `bucketPolicy` |
+| PutBucketLifecycleConfiguration | sent by the harness on every bucket it creates; the reply is not modelled |
+| PutBucketAcl, PutObjectAcl | not modelled |
+| object lock: Put/GetObjectLockConfiguration, Put/GetObjectRetention, Put/GetObjectLegalHold | not modelled |
+| bucket configuration: CORS, encryption, lifecycle (Get, Delete), ownership controls, public access block, logging, notification, website, request payment, accelerate, replication | not modelled |
+| RenameObject, RestoreObject, SelectObjectContent, GetObjectTorrent, UpdateObjectEncryption | not modelled |
+| analytics, inventory, metrics and intelligent-tiering configurations; metadata tables; object annotations; ABAC; directory buckets and CreateSession; WriteGetObjectResponse | out of scope: services around the store, not the store |
+
+Requests that are wrong in themselves are modelled as twelve kinds
+(`OInvalid`): bucket names, an over-long key, `max-keys` that is not a count,
+tag sets that break the limits, malformed XML, and a `Content-MD5` that is
+wrong or not base64. So are two credentials that are wrong: a bad signature
+and an unknown access key.
+
+Not modelled within the calls above: SigV4 chunk-signed uploads (the unsigned
+trailer form is), virtual-hosted addressing, version-id markers in listings,
+and a flat namespace -- an object at both `d` and `d/a`, which no
+filesystem-backed server can hold.
+
+Three things the deeper AWS cells measured that the model had wrong:
+`<MaxKeys>` echoes the number asked for even above 1000; a tagging call on a
+key whose latest version is a delete marker is 405, not 404; and a Deny in a
+bucket policy does not hide a missing key from the bucket's owner, who is
+told `NoSuchKey`.
+
 ## The cells
 
 | cell | config | traces | block size | strict twin |
 |------|--------|--------|------------|-------------|
 | `aws/s3/base` | `aws_base.json` | 25 | 8 KiB | it *is* the strict corpus |
 | `aws/s3/multipart` | `aws_multipart.json` | 5 | 5 MiB | it *is* the strict corpus |
-| `aws/s3/buckets` | `aws_buckets.json` | 16 | 8 KiB | it *is* the strict corpus |
-| `aws/s3/multipart_buckets` | `aws_multipart_buckets.json` | 3 | 5 MiB | it *is* the strict corpus |
+| `aws/s3/buckets` | `aws_buckets.json` | 18 | 8 KiB | it *is* the strict corpus |
+| `aws/s3/multipart_buckets` | `aws_multipart_buckets.json` | 7 | 5 MiB | it *is* the strict corpus |
+| `aws/s3/deep` | `aws_deep.json` | 21 | 8 KiB | it *is* the strict corpus |
+| `aws/s3/dressed` | `aws_dressed.json` | 8 | 8 KiB | it *is* the strict corpus |
+| `aws/s3/versioning` | `aws_versioning.json` | 12 | 8 KiB | it *is* the strict corpus |
+| `minio/s3/deep` | `deep.json` | 21 | 8 KiB | yes |
+| `minio/s3/dressed` | `dressed.json` | 8 | 8 KiB | yes |
+| `minio/s3/versioning` | `versioning.json` | 10 | 8 KiB | reporting only |
 | `minio/s3/base` | `base.json` | 29 | 8 KiB | yes |
-| `minio/s3/multipart` | `multipart.json` | 5 | 5 MiB | yes |
+| `minio/s3/multipart` | `multipart.json` | 9 | 5 MiB | yes |
 
 The MinIO batch lists are the ones the consuming project replays against its
 own server, unchanged; the AWS base cell is the same list without `stepBucket`,

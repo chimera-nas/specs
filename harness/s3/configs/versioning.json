@@ -1,0 +1,41 @@
+{
+  "extends": "./_minio.json",
+  "family": "s3",
+  "description": "MinIO over the two optional features a bucket can be configured with: versioning (histories grown deep, every version read, deleted and listed, buckets switched between Enabled and Suspended) and bucket policy (set, read, removed and enforced, including on an unsigned request).",
+  "traceStem": "miniover",
+
+  "policies": {
+    // RELAXATION: a policy that makes a bucket public is accepted, and an
+    // unsigned GetObject is then served.  A bucket on Amazon S3 is created
+    // with Block Public Access on, which refuses the policy.
+    "publicPolicyAllowed": true
+  },
+
+  // No deviation is switched on: this cell states S3 over versioning and
+  // bucket policy as Amazon S3 does them, and MinIO differs there in more
+  // ways than are modelled yet (README.md lists what a run reports).  So it
+  // is a REPORTING cell, registered in the extended tier, not a gate.
+  "deviationsOff": [
+    "M-part-numbers-kept",
+    "M-complete-checks-by-kind",
+    "M-checksum-mismatch-code",
+    "M-list-uploads-exact-prefix",
+    "M-get-bucket-tagging-no-bucket-check",
+    "M-delete-bucket-tagging-no-bucket-check",
+    "M-suffix-range-empty-206",
+    "M-list-marker-outside-prefix-501",
+    "M-list-next-marker-cache-suffix",
+    "M-delete-objects-dup-empty",
+    "M-getattrs-zero-size-omitted",
+    "M-getattrs-root-lowercase",
+    "M-part-zero-invalidpart",
+    "M-complete-empty-manifest-invalidrequest",
+    "M-complete-duplicate-part-accepted",
+    "M-abort-unknown-upload-204"
+  ],
+
+  "batches": [
+    { "flavor": "stepVersion", "steps": 128, "traces": 6, "seed": "0x1" },
+    { "flavor": "stepPolicy",  "steps": 96,  "traces": 4, "seed": "0x1" }
+  ]
+}
