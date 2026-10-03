@@ -521,7 +521,13 @@ def req_set_rename(fid, new_name, replace_if_exists=False):
                       1 if replace_if_exists else 0,
                       0,                      # RootDirectory
                       len(name))
-    return _req_set(fid, FILE_RENAME_INFORMATION, buf + name)
+    # Windows refuses a buffer shorter than the fixed part of the structure
+    # as the C compiler lays it out -- 24 bytes, the 20 above plus a first
+    # character and alignment -- with STATUS_INFO_LENGTH_MISMATCH, so a name
+    # of one character (22 bytes in all) has to be padded.  FileNameLength
+    # still says where the name ends.  Samba accepts either.
+    return _req_set(fid, FILE_RENAME_INFORMATION,
+                    (buf + name).ljust(24, b"\0"))
 
 
 def req_change_notify(fid, watch_tree, output_buffer_length,

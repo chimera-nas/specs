@@ -828,13 +828,15 @@ else()
 
     # cell name | config stem | enables a deviation?
     #
-    # The seven flavours the replayer can drive.  The four caching/durable
-    # cells the Samba suite registers only to report as a SKIP are not
-    # repeated here: they would be the same traces, skipped for the same
-    # reason, by the same replayer.
+    # The flavours the replayer can drive against Windows.  The four
+    # caching/durable cells the Samba suite registers only to report as a SKIP
+    # are not repeated here: they would be the same traces, skipped for the
+    # same reason, by the same replayer.  stepReq joins them on this server.
+    # It puts oplock requests on the wire and relies on the server granting
+    # none; SMB2 oplocks cannot be turned off on Windows (EnableOplocks governs
+    # SMB1 only), so it grants them, and the replayer has no break lifecycle.
     set(WINDOWS_CELLS
         "stepCore|core|no"
-        "stepReq|req|no"
         "stepDir|dir|no"
         "stepInfo|info|no"
         "stepNs|ns|no"

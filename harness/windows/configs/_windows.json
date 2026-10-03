@@ -2,11 +2,17 @@
   // The Windows SMB server this suite configures (harness/windows/
   // run_windows_mbt.ps1): the in-box LanmanServer of the runner it executes on
   // -- Windows Server 2025 and Windows 11 in CI -- serving an NTFS directory,
-  // spoken to at SMB 3.0.0, with EnableOplocks and EnableLeasing both turned
-  // off.  Every caching grant is therefore off, which is the deterministic
-  // filesystem core: the CREATE disposition/type matrix, share arbitration,
-  // byte-range locks, I/O, delete-on-close, rename, compound threading and
-  // CHANGE_NOTIFY, with no oplock/lease break lifecycle interleaved with it.
+  // spoken to at SMB 3.0.0, with leasing turned off (EnableLeasing).
+  //
+  // Oplocks are a different matter: Windows cannot turn SMB2 oplocks off
+  // (EnableOplocks governs SMB1 only), so this server DOES grant one to a
+  // CREATE that asks.  "oplocks: unsupported" below is therefore true only of
+  // flavours that never ask, which is every flavour registered here -- the one
+  // that does ask, stepReq, is left out for exactly that reason.  What is
+  // exercised is the deterministic filesystem core: the CREATE
+  // disposition/type matrix, share arbitration, byte-range locks, I/O,
+  // delete-on-close, rename and CHANGE_NOTIFY, with no break lifecycle
+  // interleaved with it.
   //
   // The same profile harness/samba/configs/_smbd.json describes, on purpose:
   // the two servers are then asked exactly the same questions, and what
