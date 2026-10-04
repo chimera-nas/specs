@@ -25,9 +25,10 @@ on:
 # package permissions resolve there.  GHCR is left doing the one job it is
 # actually for here: holding the published trace bundles.
 env:
-  # The kvm-test-base guest the knfsd conformance job boots (it carries
-  # nfs-kernel-server as of v1.10.0).  amd64 only -- KVM needs a matching host.
-  KNFSD_IMAGE: ghcr.io/chimera-nas/kvm-test-base:ubuntu2404-v1.10.0-amd64
+  # The kvm-test-base guest the knfsd, ext4 and ksmbd conformance jobs boot
+  # (it carries nfs-kernel-server as of v1.10.0 and ksmbd-tools as of
+  # v1.11.0).  amd64 only -- KVM needs a matching host.
+  KNFSD_IMAGE: ghcr.io/chimera-nas/kvm-test-base:ubuntu2404-v1.11.0-amd64
 
 jobs:
   # Heavy: simulates every model to generate the corpus, then runs the coverage
@@ -435,26 +436,10 @@ jobs:
               cmake --build build -j"$(nproc)"
             '
 
-      # ksmbd's userspace half is in the guest image from kvm-test-base v1.11.0.
-      # Until KNFSD_IMAGE names such an image the runner installs it in the
-      # guest at boot from these packages (noble's release pocket, so the
-      # URLs do not move); with a newer image the directory is simply unused.
-      - name: Fetch ksmbd-tools for a guest image that lacks it
-        run: |
-          mkdir -p ksmbd-debs
-          base=http://archive.ubuntu.com/ubuntu/pool
-          for f in universe/k/ksmbd-tools/ksmbd-tools_3.5.1-1build2_amd64.deb \
-                   main/libn/libnl3/libnl-genl-3-200_3.7.0-0.3build1_amd64.deb \
-                   main/g/glib2.0/libglib2.0-0t64_2.80.0-6ubuntu1_amd64.deb; do
-            curl -fsSL --retry 3 -o "ksmbd-debs/$(basename "$f")" "$base/$f"
-          done
-          ls -l ksmbd-debs
-
       - name: Replay the corpus against ksmbd
         run: |
           docker run --rm --privileged \
             -v "$PWD:/specs" -v "$PWD/kvm-image:/kvm-image:ro" \
-            -e SPECS_KSMBD_DEBS=/specs/ksmbd-debs \
             -w /specs specs-dev:${{ github.sha }} \
             bash -c '
               cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
