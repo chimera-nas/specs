@@ -1,0 +1,17 @@
+{
+  "extends": "./_ksmbd.json",
+  "family": "smb2",
+  "description": "the CREATE disposition/type matrix, share arbitration, I/O and delete-on-close, against ksmbd.",
+  "traceStem": "smb2Base",
+
+  // FLUSH is drawn only by stepInfo, so the deviation that lives in it is
+  // switched off here: tools/devliveness.py fails a cell that enables one its
+  // own corpus never takes.
+  "deviationsOff": [
+    "KD-3"
+  ],
+
+  "batches": [
+    { "flavor": "stepCore", "steps": 500, "traces": 8, "seed": "0x7" }
+  ]
+}

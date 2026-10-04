@@ -1,0 +1,36 @@
+{
+  // ksmbd as harness/ksmbd/run_ksmbd_mbt.sh configures it in a KVM guest:
+  // leases and durable handles off, and no open in these cells asks for an
+  // oplock.
+  //
+  // This file carries the SERVER, not a corpus: it declares no batches and is
+  // never registered as a cell.  Each cell extends it and adds its batch list.
+  "family": "smb2",
+  "description": "ksmbd, the Linux kernel SMB server: SMB 3.0.0, leasing and durable handles off.",
+  "traceStem": "smb2Base",
+
+  "features": {
+    "oplocks": "unsupported",
+    "leases": "unsupported",
+    "dirLeases": "unsupported",
+    "durable": "unsupported"
+  },
+
+  "policies": {
+    "dialect": 768,
+    "leaseOpenBreak": true,
+    "forceLevel2": false,
+    "createTypeFirst": true,
+    // The LOCK access check of MS-SMB2 3.3.5.14 is not applied, as on
+    // Windows: a handle with no data access may lock and unlock.
+    "lockAccessCheck": false
+  },
+
+  // The ksmbd divergences the model is told to PREDICT.  Declared with their
+  // measurements in quint/smb2/corpus.schema.json.
+  "deviations": [
+    "KD-1",
+    "KD-2",
+    "KD-3"
+  ]
+}
