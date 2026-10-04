@@ -1,0 +1,20 @@
+{
+  "extends": "./_aws.json",
+  "family": "s3",
+  "description": "Amazon S3 with every key component dressed in characters that need encoding on the wire, and listings asked for with encoding-type=url. In the one shared bucket.",
+  "traceStem": "awsdr",
+
+  "keyDress": true,
+  "policies": {
+    "fixedBucket": true,
+    // THIS bucket performs a copy of an object onto itself; a bucket as AWS
+    // creates one refuses it.  See copySelfAccepted in the schema.
+    "copySelfAccepted": true
+  },
+
+  "batches": [
+    { "flavor": "step",     "steps": 128, "traces": 3, "seed": "0x31" },
+    { "flavor": "stepList", "steps": 128, "traces": 3, "seed": "0x31" },
+    { "flavor": "stepPage", "steps": 128, "traces": 2, "seed": "0x31" }
+  ]
+}

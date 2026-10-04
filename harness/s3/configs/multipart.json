@@ -16,11 +16,11 @@
   // delimiter listing could take but these five traces never do; see
   // base.json for why.
   "deviationsOff": [
+    "M-checksum-mismatch-code",
+    "M-list-next-marker-cache-suffix",
     "M-get-bucket-tagging-no-bucket-check",
     "M-delete-bucket-tagging-no-bucket-check",
-    "M-416-no-content-range",
     "M-suffix-range-empty-206",
-    "M-list-marker-inside-prefix-skipped",
     "M-delete-objects-dup-empty",
     "M-getattrs-zero-size-omitted",
     "M-getattrs-root-lowercase"
@@ -28,6 +28,7 @@
 
   "batches": [
     { "flavor": "stepMultipart", "steps": 64, "traces": 3, "seed": "0x1" },
-    { "flavor": "stepMultipart", "steps": 64, "traces": 2, "seed": "0x11" }
+    { "flavor": "stepMultipart", "steps": 64, "traces": 2, "seed": "0x11" },
+    { "flavor": "stepMultipartDeep", "steps": 64, "traces": 4, "seed": "0x41" }
   ]
 }
