@@ -204,9 +204,14 @@ class Oracle:
         # immediately available for reuse": the model is sequential, and a
         # create refused because the delete before it has not finished
         # propagating would be a statement about S3's control plane and not
-        # about the API.  While a model bucket is not live its requests go to
-        # the name its NEXT incarnation will take -- one that has never
-        # existed, which is exactly what the model means by a missing bucket.
+        # about the API.
+        #
+        # While a model bucket is not live its requests go to a name of their
+        # own, "...-g<n>x", which no create ever takes.  NOT to the name the
+        # next incarnation will take: S3 remembers, for a while and per front
+        # end, that a name it was asked about did not exist, so a bucket
+        # created under a name that was probed first can go on answering
+        # NoSuchBucket to some requests after its CreateBucket returned 200.
         self.eph = ephemeral
         self.settle = settle
         self.gen = {}        # model bucket -> incarnations deleted so far
@@ -231,9 +236,12 @@ class Oracle:
 
     # -- model names to wire names and back --
 
-    def wb(self, bucket):
+    def wb(self, bucket, create=False):
+        """The wire name of a model bucket; with `create`, the name its
+        current or next incarnation has, live or not."""
         if self.eph:
-            return f"{self.eph}-{bucket}-g{self.gen.get(bucket, 0)}"
+            name = f"{self.eph}-{bucket}-g{self.gen.get(bucket, 0)}"
+            return name if create or name in self.made else name + "x"
         return self.buckets.get(bucket, bucket)
 
     def mb(self, wire_bucket):
@@ -455,7 +463,7 @@ class Oracle:
     # ---- buckets ----
 
     def OCreateBucket(self, op, post):
-        path = self.bp(op["bucket"])
+        path = f"/{self.wb(op['bucket'], create=True)}"
         res = self.call("PUT", path, body=location_constraint(self.c.region))
         if self.eph and res.status == 200:
             # Owed to teardown from the moment it exists, whatever the model

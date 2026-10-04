@@ -94,8 +94,11 @@ run, cell or trace shares. `n` counts how many times the trace has deleted that
 model bucket: each incarnation gets a new name, because S3 says a deleted
 bucket's name may not be reusable at once, and a create refused for that reason
 would be a statement about S3's control plane, not about the API. While a model
-bucket does not exist, its requests go to the name its next incarnation will
-take — one that has never existed.
+bucket does not exist, its requests go to a name of their own (`...-g<n>x`)
+that no create ever takes — not to the name the next incarnation will take,
+because S3 remembers for a while that a name it was asked about did not exist,
+and a bucket created under a probed name can keep answering `NoSuchBucket`
+after its CreateBucket succeeded.
 
 **S3 gives a bucket no lifetime.** A lifecycle rule expires what is *in* a
 bucket, never the bucket. Four things stand in for one:
