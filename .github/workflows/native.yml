@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, macos-14, windows-2022, windows-11-arm]
+        runner: [ubuntu-24.04, macos-26, windows-2022, windows-11-arm]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
