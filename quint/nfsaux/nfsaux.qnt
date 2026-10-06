@@ -524,7 +524,7 @@ module nfsaux {
         all {
             services' = services,
             rmtab' = rmtab,
-            held' = if (runs) heldAfterLock(held, l, stat) else held,
+            held' = if (runs) heldAfterLock(held, l, stat, NLM_UPGRADE_IS_NOOP) else held,
             queue' = if (runs and stat == NLM4_BLOCKED)
                          queue.append({ lock: l, monitor: monitorable,
                                         msg: nproc == 7 })

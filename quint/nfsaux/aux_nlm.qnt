@@ -229,10 +229,10 @@ module nlmProto {
     /// queued instead (see `blockedAfterLock`), and an idempotent retry
     /// leaves the existing entry exactly as it was, mode included.
     pure def heldAfterLock(held: List[Lock], probe: Lock,
-                           status: int): List[Lock] =
+                           status: int, upgradeIsNoop: bool): List[Lock] =
         if (status != NLM4_GRANTED) held
-        else if (holdsExact(held, probe)) held
-        else held.append(probe)
+        else if (upgradeIsNoop and holdsExact(held, probe)) held
+        else dropWithin(held, probe).append(probe)
 
     // ------------------------------------------------------------------
     // The blocking queue
@@ -274,7 +274,7 @@ module nlmProto {
                               queue: acc.queue.append(q),
                               granted: acc.granted }
                         else
-                            { held: acc.held.append(q.lock),
+                            { held: dropWithin(acc.held, q.lock).append(q.lock),
                               queue: acc.queue,
                               granted: acc.granted.append(q) })
 
