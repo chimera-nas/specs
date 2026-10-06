@@ -29,6 +29,7 @@ module posixTestStd {
         P_STRICT_ATIME = FeatMandatory,
         P_STICKY_WRITE_ARM = FeatOff,
         P_STATELESS_IO_DAC = false,
+        P_STATELESS_DIR_DAC = false,
         P_CHOWN_SUPP_GROUP = FeatMandatory,
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
@@ -747,6 +748,30 @@ module posixTestStd {
         .then(runOp(1, RRead({ fd: 0, len: 1 })))
         .expect(lastE == OK and lastN == 1)
 
+    run statelessDirDacTest =
+        init
+        .then(runOp(0, RMkdir({ dfd: -1, pth: ap(["d"]), mode: 511 })))
+        .then(runOp(1, ROpendir({ pth: ap(["d"]) })))
+        .expect(lastE == OK)
+        .then(runOp(0, ROpendir({ pth: ap(["d"]) })))
+        .expect(lastE == OK)
+        .then(runOp(0, RChmod({ dfd: -1, pth: ap(["d"]), mode: 192 })))
+        // Over NFS a stream opened while readable stops listing once read
+        // is removed -- the owner's (sid 1, mode 0300) as well as another
+        // user's (sid 0).  The refusal changes no state.
+        .expect(errOf(opReaddir(fs, ps, caps.with("statelessDirDac", true),
+                               1, 0).res) == EACCES)
+        .expect(errOf(opReaddir(fs, ps, caps.with("statelessDirDac", true),
+                               0, 1).res) == EACCES)
+        .expect(opReaddir(fs, ps, caps.with("statelessDirDac", true),
+                          1, 0).fs2 == fs)
+        // Without the policy the stream keeps the rights it had at opendir.
+        .expect(errOf(opReaddir(fs, ps, caps, 1, 0).res) == OK)
+        // Restoring read restores the listing.
+        .then(runOp(0, RChmod({ dfd: -1, pth: ap(["d"]), mode: 493 })))
+        .expect(errOf(opReaddir(fs, ps, caps.with("statelessDirDac", true),
+                               1, 0).res) == OK)
+
     // chown(-1, -1) names neither id and moves neither, but XSH chown asks
     // for the setid bits of an executable regular file to be cleared "upon
     // successful return from chown()" without asking whether an id changed --
@@ -1041,6 +1066,7 @@ module posixTestRoot {
         P_STRICT_ATIME = FeatMandatory,
         P_STICKY_WRITE_ARM = FeatOff,
         P_STATELESS_IO_DAC = false,
+        P_STATELESS_DIR_DAC = false,
         P_CHOWN_SUPP_GROUP = FeatMandatory,
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,
@@ -1149,6 +1175,7 @@ module posixTestLinux {
         P_STRICT_ATIME = FeatMandatory,
         P_STICKY_WRITE_ARM = FeatOff,
         P_STATELESS_IO_DAC = false,
+        P_STATELESS_DIR_DAC = false,
         P_CHOWN_SUPP_GROUP = FeatMandatory,
         P_ERR_NOTEMPTY = FeatMandatory,
         P_ERR_STICKY_ACCES = FeatMandatory,

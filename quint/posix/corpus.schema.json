@@ -173,6 +173,14 @@
       "doc": "NFSv3 READ, WRITE and size-changing SETATTR RPCs recheck current DAC for non-owner openers; owners retain access through the server owner override. Failed operations preserve contents and offsets. Allocation emulation only sends a modifying RPC for extension or an in-file punch. Stateful and local profiles leave this transport policy false.",
       "citation": "Linux nfsd_permission() rechecks access and applies NFSD_MAY_OWNER_OVERRIDE to opened-file operations; nfsd_setattr() includes it for ATTR_SIZE: https://github.com/torvalds/linux/blob/v6.8/fs/nfsd/vfs.c"
     },
+    "P_STATELESS_DIR_DAC": {
+      "kind": "policy",
+      "key": "policies.statelessDirDac",
+      "type": "bool",
+      "default": false,
+      "doc": "NFSv3 and NFSv4 READDIR RPCs recheck read (list) permission on the directory against the caller and its current mode. Neither protocol opens a directory on the server, so a stream opened before a chmod that removes read stops listing, and readdir fails EACCES; there is no owner override for directories. Local, FUSE and SMB profiles bind a stream's rights at opendir and leave this transport policy false.",
+      "citation": "Linux nfsd_readdir() opens the directory with NFSD_MAY_READ on every READDIR, and nfsd_open() adds NFSD_MAY_OWNER_OVERRIDE only for S_IFREG: https://github.com/torvalds/linux/blob/69f80fef3153299d9c72c53d1d71eef6354b6926/fs/nfsd/vfs.c#L2509; NFS-Ganesha fsal_readdir() checks list permission on every READDIR: https://github.com/nfs-ganesha/nfs-ganesha/blob/581abb64230f0ccee75cf73e7b38a0d386e90826/src/FSAL/fsal_helper.c#L1491"
+    },
     "P_CHOWN_SUPP_GROUP": {
       "kind": "policy",
       "key": "policies.chownSuppGroup",
