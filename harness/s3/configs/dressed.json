@@ -1,0 +1,33 @@
+{
+  "extends": "./_minio.json",
+  "family": "s3",
+  "description": "MinIO with every key component dressed in characters that need encoding on the wire -- a space, a plus, an ampersand, a non-ASCII letter -- and listings asked for with encoding-type=url. The model's keys, their order and every answer are unchanged; what is under test is the path, query, header and XML handling of such names.",
+  "traceStem": "miniodr",
+
+  // The dressing is a harness setting (SPECS_S3_KEY_DRESS, set by CMake);
+  // recorded here as the fact that distinguishes this cell.
+  "keyDress": true,
+
+  // The deviations of the MinIO profile these flavours cannot reach; see
+  // base.json.
+  "deviationsOff": [
+    "M-part-numbers-kept",
+    "M-complete-checks-by-kind",
+    "M-checksum-mismatch-code",
+    "M-list-uploads-exact-prefix",
+    "M-part-zero-invalidpart",
+    "M-complete-empty-manifest-invalidrequest",
+    "M-complete-duplicate-part-accepted",
+    "M-abort-unknown-upload-204",
+    "M-delete-bucket-tagging-no-bucket-check",
+    "M-get-bucket-tagging-no-bucket-check",
+    "M-getattrs-zero-size-omitted",
+    "M-suffix-range-empty-206"
+  ],
+
+  "batches": [
+    { "flavor": "step",     "steps": 128, "traces": 3, "seed": "0x31" },
+    { "flavor": "stepList", "steps": 128, "traces": 3, "seed": "0x31" },
+    { "flavor": "stepPage", "steps": 128, "traces": 2, "seed": "0x31" }
+  ]
+}

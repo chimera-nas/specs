@@ -69,6 +69,13 @@ option(SPECS_CORPUS_PREBUILT
        "Replay the corpus already present at SPECS_CORPUS_ROOT; generate nothing"
        OFF)
 
+# Generation can also be cached per cell, the way ccache caches objects: set
+# SPECS_CORPUS_CACHE_DIR in the BUILD environment (not at configure time) and
+# tools/gen.js copies each cell whose inputs it has seen before out of that
+# store instead of simulating it.  It is read at build time, like CCACHE_DIR,
+# so one store can serve every build tree on a machine.  See "THE TRACE CACHE"
+# in tools/gen.js for what the key covers.
+
 # NOTE on scope: this file is include()d from ext/specs/CMakeLists.txt, i.e. in
 # the ext/specs DIRECTORY scope, while specs_corpus_finalize() is called from
 # the consumer's top-level CMakeLists.  A CMake function runs in its CALLER's

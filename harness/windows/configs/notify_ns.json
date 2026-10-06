@@ -1,0 +1,10 @@
+{
+  "extends": "./_windows.json",
+  "family": "smb2",
+  "description": "the NAMESPACE half of CHANGE_NOTIFY -- entries appearing, being renamed and disappearing, watched through the two name filters and nothing else -- against the Windows SMB server. The batch is the Samba cell's, unchanged.",
+  "traceStem": "smb2Base",
+
+  "batches": [
+    { "flavor": "stepNotifyNs", "steps": 400, "traces": 6, "seed": "0x71" }
+  ]
+}

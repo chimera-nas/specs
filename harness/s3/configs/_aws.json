@@ -1,0 +1,21 @@
+{
+  // Amazon S3 itself, as harness/s3/run_aws_mbt.sh reaches it.
+  //
+  // This file carries the SERVICE, not a corpus: it declares no batches and is
+  // never registered as a cell.  Each cell extends it and adds its batch list.
+  "family": "s3",
+  "description": "Amazon S3, a region other than us-east-1.",
+
+  "policies": {
+    // Not a relaxation: S3 itself gives two answers here, by region.  The
+    // cells run in a region other than us-east-1, where creating a bucket the
+    // caller already owns is 409 BucketAlreadyOwnedByYou.  (us-east-1 answers
+    // 200; a run there would set this false.)
+    "createOwnedBucketConflict": true
+  },
+
+  // AWS is what the model states: every other policy is left at its default,
+  // which IS Amazon S3's behaviour, and no deviation is recorded.  A
+  // difference found here is a model bug.
+  "deviations": []
+}

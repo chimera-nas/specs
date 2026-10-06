@@ -1,0 +1,10 @@
+{
+  "extends": "./_windows.json",
+  "family": "smb2",
+  "description": "QUERY_INFO, FLUSH, SET_EOF and the byte-range LOCK / UNLOCK surface against the Windows SMB server -- the only flavour that draws locks. The batch is the Samba cell's, unchanged.",
+  "traceStem": "smb2Base",
+
+  "batches": [
+    { "flavor": "stepInfo", "steps": 500, "traces": 8, "seed": "0x9" }
+  ]
+}

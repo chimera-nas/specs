@@ -1,0 +1,33 @@
+{
+  "extends": "./_minio.json",
+  "family": "s3",
+  "description": "MinIO (single node, single drive) over the modeled surface at the default block size: buckets, objects, listings, tagging and batch delete. The batch list is chimera's s3/base list unchanged -- the corpus is protocol-level and backend-agnostic, so what distinguishes this cell from chimera's is only which divergences the model is told to predict.",
+  "traceStem": "minio",
+
+  // Which of the MinIO profile's deviations these flavours can REACH.  The
+  // multipart calls are drawn only by stepMultipart, so the four deviations
+  // that live in them are switched off here: tools/devliveness.py fails a cell
+  // that enables one its own corpus never records having taken.  Switching a
+  // deviation off in a cell that never takes its branch changes not one byte of
+  // that cell's corpus -- it is a statement about coverage, not about the
+  // server.
+  "deviationsOff": [
+    "M-part-numbers-kept",
+    "M-complete-checks-by-kind",
+    "M-checksum-mismatch-code",
+    "M-list-uploads-exact-prefix",
+    "M-part-zero-invalidpart",
+    "M-complete-empty-manifest-invalidrequest",
+    "M-complete-duplicate-part-accepted",
+    "M-abort-unknown-upload-204"
+  ],
+
+  "batches": [
+    { "flavor": "step",       "steps": 128, "traces": 8, "seed": "0x1" },
+    { "flavor": "step",       "steps": 256, "traces": 3, "seed": "0x100" },
+    { "flavor": "stepData",   "steps": 128, "traces": 5, "seed": "0x1" },
+    { "flavor": "stepList",   "steps": 128, "traces": 5, "seed": "0x1" },
+    { "flavor": "stepBucket", "steps": 64,  "traces": 4, "seed": "0x1" },
+    { "flavor": "stepTag",    "steps": 128, "traces": 4, "seed": "0x1" }
+  ]
+}

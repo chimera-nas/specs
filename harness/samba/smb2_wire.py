@@ -123,6 +123,11 @@ NOTIFY_TIMEOUT = 10
 # kills the whole batch with no output at all.
 RECV_TIMEOUT = 60
 
+# Whether a connection insists on signed replies and verifies them.  On unless
+# a runner turns it off for a server whose signatures cannot be trusted to
+# verify (smb2_replay.py --no-signing says which, and why).
+REQUIRE_SIGNING = True
+
 
 class WireError(Exception):
     """A harness-level failure: the transport broke, not the server disagreed."""
@@ -149,7 +154,8 @@ class Conn:
         self.port = port
         self.share = share
         self.client_guid = client_guid
-        self.conn = Connection(client_guid, server, port, require_signing=True)
+        self.conn = Connection(client_guid, server, port,
+                               require_signing=REQUIRE_SIGNING)
         self.conn.connect(dialect)
         self.session = Session(self.conn, user, password,
                                require_encryption=False)
@@ -521,7 +527,13 @@ def req_set_rename(fid, new_name, replace_if_exists=False):
                       1 if replace_if_exists else 0,
                       0,                      # RootDirectory
                       len(name))
-    return _req_set(fid, FILE_RENAME_INFORMATION, buf + name)
+    # Windows refuses a buffer shorter than the fixed part of the structure
+    # as the C compiler lays it out -- 24 bytes, the 20 above plus a first
+    # character and alignment -- with STATUS_INFO_LENGTH_MISMATCH, so a name
+    # of one character (22 bytes in all) has to be padded.  FileNameLength
+    # still says where the name ends.  Samba accepts either.
+    return _req_set(fid, FILE_RENAME_INFORMATION,
+                    (buf + name).ljust(24, b"\0"))
 
 
 def req_change_notify(fid, watch_tree, output_buffer_length,

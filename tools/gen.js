@@ -46,7 +46,33 @@
 //     "batches": [ { "outdir": "...", "main": "-"|"name", "step": "...",
 //                    "maxSteps": N, "nTraces": N, "seed": "0x7",
 //                    "naming": "x_{seq}" } ] }
+//
+// THE TRACE CACHE
+//
+// When SPECS_CORPUS_CACHE_DIR is set, every cell's traces are also kept in a
+// content-addressed store there, the way ccache keeps objects under CCACHE_DIR.
+// A cell's key hashes everything its traces are a function of: the quint
+// release and backend, every model and tool source under quint/ and tools/,
+// the cell's rendered config module, and its batch list.  A cell whose key is
+// present is copied out of the store instead of simulated, and when every cell
+// of the family hits, the model is not even elaborated.  Unset, nothing
+// changes.
+//
+// That is sound because generation is a pure function of those inputs: batches
+// are seeded, the typescript simulator ignores nThreads (the key carries it for
+// rust), and a cell's traces do not depend on which other cells share the
+// elaboration -- one cell generated alone is byte-identical to the same cell
+// generated with its whole family, #meta's wall-clock fields aside.  The whole
+// model tree is hashed rather than the family's own dependency list, so a
+// missed import can cost a regeneration but never serve a stale trace.
+//
+// Self-tests run only when something is generated.  A cell reaches the store
+// only from a run whose self-tests passed on those same inputs.
+//
+// Each hit refreshes its entry's mtime, so a caller can trim the store to what
+// a run used by deleting entries older than the run's start.
 
+const crypto = require('crypto')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
@@ -65,6 +91,7 @@ const spec = JSON.parse(fs.readFileSync(specPath, 'utf8'))
 // see it from this file's location.  realpath because the bin entry is a
 // symlink into dist/src/cli.js.
 let cliCommands
+let quintPackage
 try {
   const cli = fs.realpathSync(spec.quintCli)
   // npm's Windows launcher is a .cmd file alongside node_modules, rather
@@ -79,6 +106,7 @@ try {
   const commands = candidates.find(candidate => fs.existsSync(candidate + '.js'))
   if (!commands) throw new Error('cannot locate the Quint package beside its launcher')
   cliCommands = require(commands)
+  quintPackage = path.join(path.dirname(commands), '..', '..', 'package.json')
 } catch (err) {
   die(`could not load quint's cliCommands from ${spec.quintCli}: ${err.message}\n` +
       `        this file depends on quint internals; see the caveat at the top`)
@@ -133,9 +161,141 @@ function argsFor(batch) {
   }
 }
 
+const CACHE_SCHEME = 'v1'
+const cacheRoot = process.env.SPECS_CORPUS_CACHE_DIR || ''
+
+// Line endings are normalised so a checkout with autocrlf keys the same as one
+// without; quint reads both alike.
+function hashFile(hash, file, name) {
+  hash.update(`${name}\0`)
+  hash.update(fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n'))
+  hash.update('\0')
+}
+
+function listSources(root, rel, out) {
+  for (const entry of fs.readdirSync(path.join(root, rel), { withFileTypes: true })) {
+    const child = rel ? `${rel}/${entry.name}` : entry.name
+    if (entry.isDirectory()) {
+      listSources(root, child, out)
+    } else if (/\.(qnt|json|js)$/.test(entry.name)) {
+      out.push(child)
+    }
+  }
+  return out
+}
+
+// Everything every cell's key shares.
+function baseKey() {
+  const hash = crypto.createHash('sha256')
+  hash.update(`specs-corpus-cache ${CACHE_SCHEME}\0`)
+  hashFile(hash, quintPackage, 'quint/package.json')
+  hash.update(`backend ${spec.backend ?? 'typescript'}\0`)
+  if (spec.backend === 'rust') hash.update(`threads ${os.cpus().length}\0`)
+  const sources = [...listSources(spec.specsRoot, 'quint', []),
+                   ...listSources(spec.specsRoot, 'tools', [])].sort()
+  for (const rel of sources) hashFile(hash, path.join(spec.specsRoot, rel), rel)
+  return hash.digest('hex')
+}
+
+function cellKey(base, dir, batches) {
+  const hash = crypto.createHash('sha256')
+  hash.update(`${base}\0cell ${dir.cell}\0`)
+  hashFile(hash, dir.module, 'module')
+  // Everything about a batch except where it is written.
+  hash.update(JSON.stringify(batches.map(({ outdir, ...batch }) => batch)))
+  return hash.digest('hex')
+}
+
+function cacheEntry(key) {
+  return path.join(cacheRoot, CACHE_SCHEME, key)
+}
+
+function restoreCell(dir, key) {
+  const entry = cacheEntry(key)
+  if (!fs.existsSync(path.join(entry, '.complete')) ||
+      !dir.traces.every(t => fs.existsSync(path.join(entry, t)))) {
+    return false
+  }
+  fs.mkdirSync(dir.path, { recursive: true })
+  // A copy, not a link: the output must be newer than its inputs for the build
+  // system, and a later regeneration must not write through into the store.
+  for (const t of dir.traces) {
+    fs.copyFileSync(path.join(entry, t), path.join(dir.path, t))
+  }
+  const now = new Date()
+  fs.utimesSync(entry, now, now)
+  return true
+}
+
+// Written under a temporary name and renamed into place, so a concurrent
+// reader or an interrupted run never sees a partial entry.
+function storeCell(dir, key) {
+  const entry = cacheEntry(key)
+  if (fs.existsSync(path.join(entry, '.complete'))) return
+  const tmp = `${entry}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`
+  fs.mkdirSync(tmp, { recursive: true })
+  try {
+    for (const t of dir.traces) {
+      fs.copyFileSync(path.join(dir.path, t), path.join(tmp, t))
+    }
+    fs.writeFileSync(path.join(tmp, '.complete'), `${dir.cell}\n`)
+    fs.renameSync(tmp, entry)
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// The store is an accelerator: any failure in it is a miss or a skipped
+// store, never a failed build.
+function tryCache(what, fn) {
+  try {
+    return fn()
+  } catch (err) {
+    console.error(`  trace cache: ${what} failed: ${err.message}`)
+    return false
+  }
+}
+
+// Replay and coverage both consume whole generated directories. Remove
+// obsolete generated traces only after every declared output succeeded, so
+// changing a batch/seed cannot leave an old trace satisfying a coverage gate.
+function removeObsoleteTraces() {
+  for (const { path: directory, traces } of spec.directories || []) {
+    const expected = new Set(traces)
+    for (const name of fs.readdirSync(directory)) {
+      if (name.endsWith('.itf.json') && !expected.has(name)) {
+        fs.unlinkSync(path.join(directory, name))
+      }
+    }
+  }
+}
+
 async function main() {
   const t0 = Date.now()
-  const loaded = await cliCommands.load(argsFor(spec.batches[0]))
+  const dirs = spec.directories ?? []
+  const keys = new Map()
+  const cached = new Set()
+  if (cacheRoot && spec.specsRoot && dirs.every(d => d.cell && d.module)) {
+    const base = tryCache('keying', baseKey)
+    for (const dir of base ? dirs : []) {
+      const key = tryCache(`keying ${dir.cell}`, () =>
+        cellKey(base, dir, spec.batches.filter(b => b.outdir === dir.path)))
+      if (!key) continue
+      keys.set(dir.path, key)
+      if (tryCache(`restoring ${dir.cell}`, () => restoreCell(dir, key))) {
+        cached.add(dir.path)
+      }
+    }
+    console.log(`  ${path.basename(spec.model)}: trace cache hit ${cached.size} ` +
+                `of ${dirs.length} cell(s)`)
+  }
+  const batches = spec.batches.filter(b => !cached.has(b.outdir))
+  if (batches.length === 0) {
+    removeObsoleteTraces()
+    return
+  }
+
+  const loaded = await cliCommands.load(argsFor(batches[0]))
   if (loaded.isLeft()) die(`load ${spec.model}: ${JSON.stringify(loaded.value.errors)}`)
   const parsed = await cliCommands.parse(loaded.value)
   if (parsed.isLeft()) die(`parse ${spec.model}: ${JSON.stringify(parsed.value.errors)}`)
@@ -145,7 +305,7 @@ async function main() {
   const elapsed = ((Date.now() - t0) / 1000).toFixed(1)
   const tests = spec.tests ?? []
   console.log(`  elaborated ${path.basename(spec.model)} in ${elapsed}s; ` +
-              `${tests.length} self-test(s), ${spec.batches.length} batch(es)`)
+              `${tests.length} self-test(s), ${batches.length} batch(es)`)
 
   // Self-tests first, and fatal: generating a corpus from a model that fails
   // its own invariant checks is worse than not generating one.
@@ -159,7 +319,7 @@ async function main() {
   }
 
   let failed = 0
-  for (const batch of spec.batches) {
+  for (const batch of batches) {
     fs.mkdirSync(batch.outdir, { recursive: true })
     for (let i = 0; i < batch.nTraces; i++) {
       fs.rmSync(path.join(batch.outdir,
@@ -187,19 +347,15 @@ async function main() {
     }
   }
   if (failed > 0) die(`${failed} batch(es) failed for ${spec.model}`)
-  // Replay and coverage both consume whole generated directories. Remove
-  // obsolete generated traces only after every declared output succeeded, so
-  // changing a batch/seed cannot leave an old trace satisfying a coverage gate.
-  for (const { path: directory, traces } of spec.directories || []) {
-    const expected = new Set(traces)
-    for (const name of fs.readdirSync(directory)) {
-      if (name.endsWith('.itf.json') && !expected.has(name)) {
-        fs.unlinkSync(path.join(directory, name))
-      }
+  removeObsoleteTraces()
+  for (const dir of dirs) {
+    const key = keys.get(dir.path)
+    if (key && !cached.has(dir.path)) {
+      tryCache(`storing ${dir.cell}`, () => storeCell(dir, key))
     }
   }
   console.log(`  ${path.basename(spec.model)}: ${tests.length} self-test(s) + ` +
-              `${spec.batches.length} batch(es) in ${((Date.now() - t0) / 1000).toFixed(1)}s`)
+              `${batches.length} batch(es) in ${((Date.now() - t0) / 1000).toFixed(1)}s`)
 }
 
 main().catch(err => die(err.stack || String(err)))

@@ -220,10 +220,10 @@ else()
     # second byte-identical corpus would be pure cost.
     #
     # A cell gets a STRICT twin and a liveness gate only when its config
-    # actually enables a deviation.  Three of the driveable flavours reach
+    # actually enables a deviation.  Five of the driveable flavours reach
     # none -- locks are drawn only by stepInfo and renames only by stepNs, so
-    # stepCore, stepReq and stepNotifyNs cannot take any of the branches -- and
-    # for those the cell already IS the strict corpus: it states the standard,
+    # stepCore, stepReq, stepDir, stepNotify and stepNotifyNs cannot take any
+    # of the branches -- and for those the cell already IS the strict corpus: it states the standard,
     # replay is an exact match, and it gates rather than reporting.  Generating
     # a byte-identical twin of it would buy nothing.
     #
@@ -231,14 +231,14 @@ else()
     set(SAMBA_CELLS
         "stepCore|core|yes|no"
         "stepReq|req|yes|no"
-        "stepDir|dir|yes|yes"
+        "stepDir|dir|yes|no"
         "stepInfo|info|yes|yes"
         "stepNs|ns|yes|yes"
         "leases|leases|no|no"
         "forceL2|force_l2|no|no"
         "durable|durable|no|no"
         "replay|replay|no|no"
-        "notify|notify|yes|yes"
+        "notify|notify|yes|no"
         "notifyNs|notify_ns|yes|no")
 
     foreach(c ${SAMBA_CELLS})
@@ -794,6 +794,430 @@ if(SPECS_EXT4_TESTS)
                 SKIP_RETURN_CODE 77
                 ENVIRONMENT "KVM_VMLINUZ=${KVM_IMAGE_DIR}/vmlinuz;KVM_ROOTFS=${KVM_IMAGE_DIR}/rootfs.qcow2")
         endforeach()
+    endforeach()
+endif()
+
+# ---------------------------------------------------------------------------
+# Windows SMB server conformance (harness/windows)
+#
+# The same SMB2 flavours the Samba suite replays, generated for the Windows
+# SMB server -- the implementation MS-SMB2 and MS-FSA describe -- and replayed
+# against the in-box server of a Windows Server and a Windows 11 machine by
+# harness/windows/run_windows_mbt.ps1, which drives the SAME replayer the Samba
+# suite does (harness/samba/smb2_replay.py).
+#
+# Only the CORPUS and its liveness gates are registered here.  The corpus is
+# generated wherever this project is built, which is Linux; the replay needs a
+# Windows machine and none of this build's toolchain, so CI runs the script
+# directly against the corpus the build job produced rather than through a
+# ctest that could never run where it was configured.
+# ---------------------------------------------------------------------------
+option(SPECS_WINDOWS_TESTS
+       "Register the Windows SMB server conformance corpus (default: on only \
+when specs is the top-level project)" ${_conformance_default})
+
+if(NOT SPECS_WINDOWS_TESTS)
+    message(STATUS
+        "windows MBT corpus: not registered (specs is a subdirectory of "
+        "${CMAKE_PROJECT_NAME}; -DSPECS_WINDOWS_TESTS=ON to register it)")
+else()
+    set(WINDOWS_HARNESS ${CMAKE_CURRENT_SOURCE_DIR}/harness/windows)
+    set(SPECS_DEVLIVENESS ${CMAKE_CURRENT_SOURCE_DIR}/tools/devliveness.py)
+    message(STATUS "windows MBT corpus: registered (replayed on Windows by "
+            "harness/windows/run_windows_mbt.ps1)")
+
+    # cell name | config stem | enables a deviation?
+    #
+    # The flavours the replayer can drive against Windows.  The four
+    # caching/durable cells the Samba suite registers only to report as a SKIP
+    # are not repeated here: they would be the same traces, skipped for the
+    # same reason, by the same replayer.  stepReq joins them on this server.
+    # It puts oplock requests on the wire and relies on the server granting
+    # none; SMB2 oplocks cannot be turned off on Windows (EnableOplocks governs
+    # SMB1 only), so it grants them, and the replayer has no break lifecycle.
+    #
+    # No cell enables a deviation: everything found so far that Windows does
+    # differently from the model's defaults is a POLICY its config sets
+    # (configs/_windows.json), which a strict twin would leave alone.
+    set(WINDOWS_CELLS
+        "stepCore|core|no"
+        "stepDir|dir|no"
+        "stepInfo|info|no"
+        "stepNs|ns|no"
+        "notify|notify|no"
+        "notifyNs|notify_ns|no")
+
+    foreach(c ${WINDOWS_CELLS})
+        string(REPLACE "|" ";" parts "${c}")
+        list(GET parts 0 bname)
+        list(GET parts 1 cstem)
+        list(GET parts 2 hasdev)
+        set(wcfg ${WINDOWS_HARNESS}/configs/${cstem}.json)
+
+        # A strict twin only where the config enables a deviation: a cell that
+        # enables none already IS the strict corpus.
+        if("${hasdev}" STREQUAL "yes")
+            specs_corpus(NAME    windows/smb2/${bname}
+                         FAMILY  smb2
+                         CONFIG  ${wcfg}
+                         OUT_DIR WINDOWS_TRACES
+                         STRICT_OUT_DIR WINDOWS_STRICT)
+        else()
+            specs_corpus(NAME    windows/smb2/${bname}
+                         FAMILY  smb2
+                         CONFIG  ${wcfg}
+                         OUT_DIR WINDOWS_TRACES)
+        endif()
+
+        add_test(NAME windows/smb2/${bname}/devliveness
+                 COMMAND ${Python3_EXECUTABLE} ${SPECS_DEVLIVENESS}
+                         ${wcfg} ${WINDOWS_TRACES})
+        set_tests_properties(windows/smb2/${bname}/devliveness PROPERTIES
+            LABELS "windows;smb2;devliveness"
+            TIMEOUT 120)
+    endforeach()
+endif()
+
+# ---------------------------------------------------------------------------
+# MinIO conformance (harness/s3)
+#
+# The S3 counterpart of the suites above: replay an S3 corpus generated FOR
+# THIS SERVER against a real MinIO -- an object store with a flat namespace of
+# its own, nothing like the filesystem-backed gateway the s3 model was written
+# alongside -- and compare every reply to the result the model baked into the
+# trace.  What MinIO does differently is stated in the MODEL, switched on by
+# the cell's config and declared with its citation in
+# quint/s3/corpus.schema.json, so the comparison is exact and a NEW divergence
+# turns the suite red.
+#
+# One config is one cell is one ctest.  Each test starts a fresh MinIO per
+# trace on a free loopback port of its own (harness/s3/run_minio_mbt.sh), so
+# the cells run concurrently with no namespace, no root and no RESOURCE_LOCK.
+#
+# The server is the last AGPLv3 community MinIO, built from source out of
+# chimera-nas/minio (upstream publishes no binaries and has archived the
+# repository); the devcontainer carries it.
+# ---------------------------------------------------------------------------
+option(SPECS_MINIO_TESTS
+       "Register the MinIO conformance suite (default: on only when specs is \
+the top-level project)" ${_conformance_default})
+
+if(NOT SPECS_MINIO_TESTS)
+    message(STATUS
+        "minio MBT tests: not registered (specs is a subdirectory of "
+        "${CMAKE_PROJECT_NAME}; -DSPECS_MINIO_TESTS=ON to register them)")
+else()
+    set(S3_HARNESS ${CMAKE_CURRENT_SOURCE_DIR}/harness/s3)
+    find_program(MINIO_BIN NAMES minio
+                 PATHS /usr/local/bin /usr/bin
+                 DOC "MinIO server, the server under test for the S3 MBT suite")
+    # Same rule as the other suites: the config determines the corpus, the
+    # machine determines only whether the tests run.
+    if(MINIO_BIN)
+        message(STATUS "minio MBT tests: enabled (${MINIO_BIN})")
+    else()
+        message(STATUS
+            "minio MBT tests: corpus registered, tests disabled (minio not found)")
+    endif()
+
+    set(SPECS_DEVLIVENESS ${CMAKE_CURRENT_SOURCE_DIR}/tools/devliveness.py)
+
+    # cell name | config stem | block size | enables a deviation?
+    #
+    # The multipart cell is replayed at 5 MiB, the S3 minimum part size, which
+    # is the scale the model's EntityTooSmall encoding assumes.  A cell gets a
+    # strict twin only when its config enables a deviation: one that enables
+    # none already IS the strict corpus, and a byte-identical twin of it would
+    # buy nothing.
+    # cell name | config stem | block size | strict twin | dressed keys
+    set(MINIO_CELLS
+        "base|base|8192|yes|0"
+        "multipart|multipart|5242880|yes|0"
+        "deep|deep|8192|yes|0"
+        "dressed|dressed|8192|yes|1"
+        "versioning|versioning|8192|report|0")
+
+    foreach(c ${MINIO_CELLS})
+        string(REPLACE "|" ";" parts "${c}")
+        list(GET parts 0 cname)
+        list(GET parts 1 cstem)
+        list(GET parts 2 bsize)
+        list(GET parts 3 hasdev)
+        list(GET parts 4 dress)
+        set(mcfg ${S3_HARNESS}/configs/${cstem}.json)
+
+        if("${hasdev}" STREQUAL "yes")
+            specs_corpus(NAME    minio/s3/${cname}
+                         FAMILY  s3
+                         CONFIG  ${mcfg}
+                         OUT_DIR MINIO_TRACES
+                         STRICT_OUT_DIR MINIO_STRICT)
+        else()
+            specs_corpus(NAME    minio/s3/${cname}
+                         FAMILY  s3
+                         CONFIG  ${mcfg}
+                         OUT_DIR MINIO_TRACES)
+            set(MINIO_STRICT "")
+        endif()
+
+        set(tname minio/s3/${cname})
+
+        # The liveness gate: a cell that enables a deviation no trace in its
+        # own corpus ever records having taken fails here.  It needs no server,
+        # so it runs everywhere the corpus is built.
+        add_test(NAME ${tname}/devliveness
+                 COMMAND ${Python3_EXECUTABLE} ${SPECS_DEVLIVENESS}
+                         ${mcfg} ${MINIO_TRACES})
+        set_tests_properties(${tname}/devliveness PROPERTIES
+            LABELS "minio;s3;devliveness"
+            TIMEOUT 120)
+
+        if(NOT MINIO_BIN)
+            continue()   # no minio to drive; the corpus above still exists
+        endif()
+
+        if("${hasdev}" STREQUAL "report")
+            # A cell whose corpus states S3 with no MinIO deviation in it,
+            # over features where MinIO differs in more ways than are modelled
+            # yet.  REPORTING, not gating, like a strict twin: extended tier.
+            add_test(NAME ${tname}
+                     CONFIGURATIONS extended
+                     COMMAND ${S3_HARNESS}/run_minio_mbt.sh ${MINIO_TRACES})
+            set_tests_properties(${tname} PROPERTIES
+                LABELS "minio;s3;mbt;report"
+                TIMEOUT 1800
+                SKIP_RETURN_CODE 77
+                ENVIRONMENT "MINIO=${MINIO_BIN};SPECS_S3_BLOCK_SIZE=${bsize};SPECS_S3_KEY_DRESS=${dress};SPECS_MINIO_SURVEY=1")
+            continue()
+        endif()
+
+        add_test(NAME ${tname}
+                 COMMAND ${S3_HARNESS}/run_minio_mbt.sh ${MINIO_TRACES})
+        set_tests_properties(${tname} PROPERTIES
+            LABELS "minio;s3;mbt"
+            TIMEOUT 1800
+            SKIP_RETURN_CODE 77
+            ENVIRONMENT "MINIO=${MINIO_BIN};SPECS_S3_BLOCK_SIZE=${bsize};SPECS_S3_KEY_DRESS=${dress}")
+
+        if(MINIO_STRICT)
+            # The STRICT twin: every deviation forced off, so the corpus states
+            # the S3 API and nothing else.  REPORTING, not gating -- its
+            # failures are exactly MinIO's conformance debt, re-measured on
+            # every run.  Extended tier.
+            add_test(NAME ${tname}-strict
+                     CONFIGURATIONS extended
+                     COMMAND ${S3_HARNESS}/run_minio_mbt.sh ${MINIO_STRICT})
+            set_tests_properties(${tname}-strict PROPERTIES
+                LABELS "minio;s3;mbt;strict"
+                TIMEOUT 1800
+                SKIP_RETURN_CODE 77
+                ENVIRONMENT "MINIO=${MINIO_BIN};SPECS_S3_BLOCK_SIZE=${bsize};SPECS_S3_KEY_DRESS=${dress}")
+        endif()
+    endforeach()
+endif()
+
+# ---------------------------------------------------------------------------
+# Amazon S3 conformance (harness/s3, run_aws_mbt.sh)
+#
+# The s3 model states the AWS S3 API Reference.  These cells replay it against
+# AWS itself, which is the only server that can say whether the model read the
+# reference correctly -- MinIO can only say whether MinIO did.
+#
+# There is no server to stand up.  Two kinds of cell:
+#
+#   fixed      generated under the fixedBucket policy and replayed in ONE
+#              existing bucket (AWS_S3_BUCKET), which may be shared with any
+#              number of other pipelines: every trace's keys go under a prefix
+#              unique to the run, the cell and the trace, and nothing
+#              bucket-wide is touched.
+#   ephemeral  generated with the bucket calls in, and replayed in real buckets
+#              the trace itself creates, named uniquely per run, cell and trace
+#              and removed when the trace ends.  Covers what one shared bucket
+#              cannot: the bucket lifecycle, ListBuckets, bucket tagging, the
+#              NoSuchBucket paths and cross-bucket copies.
+#
+# Either way no two tests share a name, so they need no lock and run
+# concurrently.  The tests need AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+# (and the fixed ones AWS_S3_BUCKET) in the environment at ctest time and
+# report a SKIP without them, so a machine (or a fork's pull request) that has
+# none is not a failure.
+# ---------------------------------------------------------------------------
+option(SPECS_AWS_TESTS
+       "Register the Amazon S3 conformance suite (default: on only when specs \
+is the top-level project)" ${_conformance_default})
+
+if(NOT SPECS_AWS_TESTS)
+    message(STATUS
+        "aws MBT tests: not registered (specs is a subdirectory of "
+        "${CMAKE_PROJECT_NAME}; -DSPECS_AWS_TESTS=ON to register them)")
+else()
+    set(S3_HARNESS ${CMAKE_CURRENT_SOURCE_DIR}/harness/s3)
+    set(SPECS_DEVLIVENESS ${CMAKE_CURRENT_SOURCE_DIR}/tools/devliveness.py)
+    message(STATUS "aws MBT tests: registered (they SKIP without AWS "
+            "credentials in the environment)")
+
+    # cell name | config stem | block size | buckets
+    #
+    # No strict twins: the cells enable no deviation, so each already IS the
+    # strict corpus.
+    set(AWS_CELLS
+        "base|aws_base|8192|fixed|0"
+        "multipart|aws_multipart|5242880|fixed|0"
+        "buckets|aws_buckets|8192|ephemeral|0"
+        "multipart_buckets|aws_multipart_buckets|5242880|ephemeral|0"
+        "deep|aws_deep|8192|fixed|0"
+        "dressed|aws_dressed|8192|fixed|1"
+        "versioning|aws_versioning|8192|ephemeral|0")
+
+    foreach(c ${AWS_CELLS})
+        string(REPLACE "|" ";" parts "${c}")
+        list(GET parts 0 cname)
+        list(GET parts 1 cstem)
+        list(GET parts 2 bsize)
+        list(GET parts 3 bmode)
+        list(GET parts 4 dress)
+        set(acfg ${S3_HARNESS}/configs/${cstem}.json)
+
+        specs_corpus(NAME    aws/s3/${cname}
+                     FAMILY  s3
+                     CONFIG  ${acfg}
+                     OUT_DIR AWS_TRACES)
+
+        add_test(NAME aws/s3/${cname}/devliveness
+                 COMMAND ${Python3_EXECUTABLE} ${SPECS_DEVLIVENESS}
+                         ${acfg} ${AWS_TRACES})
+        set_tests_properties(aws/s3/${cname}/devliveness PROPERTIES
+            LABELS "aws;s3;devliveness"
+            TIMEOUT 120)
+
+        add_test(NAME aws/s3/${cname}
+                 COMMAND ${S3_HARNESS}/run_aws_mbt.sh ${AWS_TRACES})
+        set_tests_properties(aws/s3/${cname} PROPERTIES
+            LABELS "aws;s3;mbt"
+            TIMEOUT 1800
+            SKIP_RETURN_CODE 77
+            ENVIRONMENT "SPECS_S3_BLOCK_SIZE=${bsize};SPECS_AWS_BUCKETS=${bmode};SPECS_S3_KEY_DRESS=${dress}")
+    endforeach()
+endif()
+
+# ---------------------------------------------------------------------------
+# ksmbd conformance (harness/ksmbd)
+#
+# The Samba suite's replayer against a third SMB server: ksmbd, the Linux
+# kernel's.  A kernel module needs a kernel, so the server is the KVM guest the
+# knfsd suite boots (KVM_IMAGE_DIR), driven over a TAP link from a network
+# namespace per test -- which is also what lets the cells run concurrently.
+#
+# Same rule as the other suites: the cells register on SPECS_KSMBD_TESTS alone,
+# so the job that generates the corpus emits these cells whether or not it can
+# boot a guest, and only add_test() waits on qemu and an image.
+# ---------------------------------------------------------------------------
+option(SPECS_KSMBD_TESTS
+       "Register the Linux kernel SMB server (ksmbd) conformance suite \
+(default: on only when specs is the top-level project)" ${_conformance_default})
+
+if(NOT SPECS_KSMBD_TESTS)
+    message(STATUS
+        "ksmbd MBT tests: not registered (specs is a subdirectory of "
+        "${CMAKE_PROJECT_NAME}; -DSPECS_KSMBD_TESTS=ON with -DKVM_IMAGE_DIR to "
+        "register them)")
+else()
+    set(KSMBD_HARNESS ${CMAKE_CURRENT_SOURCE_DIR}/harness/ksmbd)
+    set(SPECS_DEVLIVENESS ${CMAKE_CURRENT_SOURCE_DIR}/tools/devliveness.py)
+    find_program(KSMBD_QEMU_BIN NAMES qemu-system-x86_64 qemu-system-aarch64
+                 DOC "qemu, which boots the ksmbd guest")
+    set(KSMBD_CAN_RUN TRUE)
+    if(NOT KVM_IMAGE_DIR OR NOT EXISTS "${KVM_IMAGE_DIR}/vmlinuz"
+            OR NOT EXISTS "${KVM_IMAGE_DIR}/rootfs.qcow2")
+        set(KSMBD_CAN_RUN FALSE)
+        message(STATUS
+            "ksmbd MBT tests: corpus registered, tests disabled (no KVM guest "
+            "image; -DKVM_IMAGE_DIR=<dir with vmlinuz and rootfs.qcow2>)")
+    elseif(NOT KSMBD_QEMU_BIN)
+        set(KSMBD_CAN_RUN FALSE)
+        message(STATUS
+            "ksmbd MBT tests: corpus registered, tests disabled (qemu-system "
+            "not found)")
+    else()
+        message(STATUS "ksmbd MBT tests: enabled (guest ${KVM_IMAGE_DIR})")
+    endif()
+
+    # No CHANGE_NOTIFY cell: ksmbd answers the request inline instead of
+    # parking it, so there is nothing for the notify flavours to observe.
+    #
+    # batch | config stem | strict twin ("report": the cell itself is
+    # reporting-only, in the extended tier; see its config)
+    set(KSMBD_CELLS
+        "stepCore|core|yes"
+        "stepDir|dir|yes"
+        "stepInfo|info|report"
+        "stepNs|ns|yes")
+
+    foreach(c ${KSMBD_CELLS})
+        string(REPLACE "|" ";" parts "${c}")
+        list(GET parts 0 bname)
+        list(GET parts 1 cstem)
+        list(GET parts 2 hasdev)
+        set(kcfg ${KSMBD_HARNESS}/configs/${cstem}.json)
+
+        if(NOT "${hasdev}" STREQUAL "no" AND NOT "${hasdev}" STREQUAL "report")
+            specs_corpus(NAME    ksmbd/smb2/${bname}
+                         FAMILY  smb2
+                         CONFIG  ${kcfg}
+                         OUT_DIR KSMBD_TRACES
+                         STRICT_OUT_DIR KSMBD_STRICT)
+        else()
+            specs_corpus(NAME    ksmbd/smb2/${bname}
+                         FAMILY  smb2
+                         CONFIG  ${kcfg}
+                         OUT_DIR KSMBD_TRACES)
+            set(KSMBD_STRICT "")
+        endif()
+
+        add_test(NAME ksmbd/smb2/${bname}/devliveness
+                 COMMAND ${Python3_EXECUTABLE} ${SPECS_DEVLIVENESS}
+                         ${kcfg} ${KSMBD_TRACES})
+        set_tests_properties(ksmbd/smb2/${bname}/devliveness PROPERTIES
+            LABELS "ksmbd;smb2;devliveness"
+            TIMEOUT 120)
+
+        if(NOT KSMBD_CAN_RUN)
+            continue()
+        endif()
+
+        set(kenv "KVM_VMLINUZ=${KVM_IMAGE_DIR}/vmlinuz;KVM_ROOTFS=${KVM_IMAGE_DIR}/rootfs.qcow2")
+        if("${hasdev}" STREQUAL "report")
+            add_test(NAME ksmbd/smb2/${bname}
+                     CONFIGURATIONS extended
+                     COMMAND ${KSMBD_HARNESS}/run_ksmbd_mbt.sh ${KSMBD_TRACES})
+            set_tests_properties(ksmbd/smb2/${bname} PROPERTIES
+                LABELS "ksmbd;smb2;mbt;report"
+                TIMEOUT 1200
+                SKIP_RETURN_CODE 77
+                ENVIRONMENT "${kenv};SPECS_KSMBD_SURVEY=1")
+            continue()
+        endif()
+        add_test(NAME ksmbd/smb2/${bname}
+                 COMMAND ${KSMBD_HARNESS}/run_ksmbd_mbt.sh ${KSMBD_TRACES})
+        set_tests_properties(ksmbd/smb2/${bname} PROPERTIES
+            LABELS "ksmbd;smb2;mbt"
+            TIMEOUT 1200
+            SKIP_RETURN_CODE 77
+            ENVIRONMENT "${kenv}")
+
+        if(KSMBD_STRICT)
+            # The STRICT twin: every deviation forced off.  REPORTING, not
+            # gating -- its failures are ksmbd's conformance debt, re-measured
+            # on every run.  Extended tier.
+            add_test(NAME ksmbd/smb2/${bname}-strict
+                     CONFIGURATIONS extended
+                     COMMAND ${KSMBD_HARNESS}/run_ksmbd_mbt.sh ${KSMBD_STRICT})
+            set_tests_properties(ksmbd/smb2/${bname}-strict PROPERTIES
+                LABELS "ksmbd;smb2;mbt;strict"
+                TIMEOUT 1200
+                SKIP_RETURN_CODE 77
+                ENVIRONMENT "${kenv}")
+        endif()
     endforeach()
 endif()
 

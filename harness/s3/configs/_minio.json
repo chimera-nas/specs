@@ -1,0 +1,49 @@
+{
+  // The MinIO this suite stands up (harness/s3/run_minio_mbt.sh): the last
+  // AGPLv3 community MinIO, built from chimera-nas/minio, as a single node on
+  // a single drive -- a fresh one per trace, on an empty data directory.
+  //
+  // This file carries the SERVER, not a corpus: it declares no batches and is
+  // never registered as a cell.  Each cell extends it and adds its batch list.
+  "family": "s3",
+  "description": "the MinIO harness/s3 stands up: single node, single drive, default region.",
+
+  // Where S3 has more than one right answer, which one this server gives.
+  "policies": {
+    // Not a relaxation -- S3 itself gives both answers, by region: 409
+    // BucketAlreadyOwnedByYou for a bucket the caller already owns, as every
+    // AWS region but us-east-1 answers.
+    "createOwnedBucketConflict": true,
+    // RELAXATION: a copy of a missing key into a missing bucket reports
+    // NoSuchKey.  Amazon S3 reports NoSuchBucket.
+    "copySourceFirst": true,
+    // RELAXATION: a successful PutBucketTagging answers 200 OK.  Amazon S3
+    // answers 204 No Content.
+    "putBucketTaggingOk": true
+  },
+
+  // The MinIO divergences the model is told to PREDICT, so the trace's
+  // expectation is already what this server does and replay is an exact match.
+  // Declared with their measurements and citations in
+  // quint/s3/corpus.schema.json; a cell switches off the ones its own flavours
+  // cannot reach, because tools/devliveness.py fails a cell that enables a
+  // deviation its corpus never exercises.
+  "deviations": [
+    "M-get-bucket-tagging-no-bucket-check",
+    "M-delete-bucket-tagging-no-bucket-check",
+    "M-suffix-range-empty-206",
+    "M-list-marker-outside-prefix-501",
+    "M-list-next-marker-cache-suffix",
+    "M-part-numbers-kept",
+    "M-complete-checks-by-kind",
+    "M-checksum-mismatch-code",
+    "M-list-uploads-exact-prefix",
+    "M-delete-objects-dup-empty",
+    "M-getattrs-zero-size-omitted",
+    "M-getattrs-root-lowercase",
+    "M-part-zero-invalidpart",
+    "M-complete-empty-manifest-invalidrequest",
+    "M-complete-duplicate-part-accepted",
+    "M-abort-unknown-upload-204"
+  ]
+}

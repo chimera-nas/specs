@@ -1,0 +1,15 @@
+{
+  "extends": "./_ksmbd.json",
+  "family": "smb2",
+  "description": "QUERY_INFO and SET_INFO, end-of-file, and byte-range locks, against ksmbd.",
+  "traceStem": "smb2Base",
+
+  // A REPORTING cell (extended tier), not a gate.  ksmbd's byte-range locks
+  // differ from the model in more ways than are modelled yet -- README.md
+  // lists what was measured -- and a lock the two sides disagree about
+  // changes what every later read, write and truncate over that range does.
+
+  "batches": [
+    { "flavor": "stepInfo", "steps": 500, "traces": 8, "seed": "0x9" }
+  ]
+}

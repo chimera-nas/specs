@@ -48,6 +48,14 @@ module smb2 {
     // trace's LInit says so.
     const P_FORCE_LEVEL2: bool
 
+    // Policies of the FILESYSTEM CORE: places where implementations of the
+    // same documents are found doing different things, each defensibly.  The
+    // model carries both arms and an implementation's config says which it
+    // takes; see Caps in smb2_ops.qnt for what each one decides.
+    const P_LOCK_ACCESS_CHECK: bool
+    const P_SUPERSEDE_WANTS_DELETE: bool
+    const P_CREATE_TYPE_FIRST: bool
+
     // The KNOWN DEVIATIONS the implementation under test still carries.  This
     // model states MS-SMB2 / MS-FSA; where the server under test disagrees on
     // purpose -- a bug that is understood, cited and not yet fixed -- the cell
@@ -178,6 +186,9 @@ module smb2 {
             dirLeases: cDl and cLe,
             durable: cDu,
             forceLevel2: P_FORCE_LEVEL2,
+            lockAccessCheck: P_LOCK_ACCESS_CHECK,
+            supersedeWantsDelete: P_SUPERSEDE_WANTS_DELETE,
+            createTypeFirst: P_CREATE_TYPE_FIRST,
             leaseOpenBreak: P_LEASE_OPEN_BREAK
         }
         all {

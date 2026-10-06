@@ -1,0 +1,12 @@
+{
+  "extends": "./_aws.json",
+  "family": "s3",
+  "description": "Amazon S3 over versioning and bucket policy, in buckets of the trace's own making: both are settings of a whole bucket, which a shared bucket is not the tester's to change.",
+  "traceStem": "awsver",
+
+  "batches": [
+    { "flavor": "stepVersion", "steps": 128, "traces": 6, "seed": "0x1" },
+    { "flavor": "stepPolicy",  "steps": 96,  "traces": 4, "seed": "0x1" },
+    { "flavor": "stepWire",    "steps": 96,  "traces": 2, "seed": "0x21" }
+  ]
+}

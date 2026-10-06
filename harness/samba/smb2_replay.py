@@ -29,15 +29,17 @@ Exit codes: 0 clean, 1 mismatches, 2 harness error, 77 nothing to do (skip).
 
 import argparse
 import glob
+import importlib
 import json
 import os
-import shutil
+import stat
 import sys
+import time
 import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import samba_deviations as DEV
+import samba_deviations as DEV    # the default; main() rebinds it per --server-kind
 import smb2_wire as W
 
 
@@ -1031,16 +1033,58 @@ class Replayer:
         directory, so the harness clears it directly -- it runs on the same
         host, inside the same namespace, and owns the path.
         """
+        if self.args.reset_dir:
+            # The share is on another machine (a guest).  Whoever owns it
+            # watches this directory: a "go" marker asks for the share to be
+            # emptied, a "done" marker says it has been.
+            d = self.args.reset_dir
+            done = os.path.join(d, "done")
+            if os.path.exists(done):
+                os.unlink(done)
+            open(os.path.join(d, "go"), "w").close()
+            deadline = time.monotonic() + 30
+            while not os.path.exists(done):
+                if time.monotonic() > deadline:
+                    raise RuntimeError("the share's owner did not "
+                                       "acknowledge a reset")
+                time.sleep(0.02)
+            return
+
         p = self.args.share_path
-        for ent in os.listdir(p):
-            full = os.path.join(p, ent)
-            if os.path.isdir(full) and not os.path.islink(full):
-                shutil.rmtree(full, ignore_errors=True)
-            else:
+
+        def remove(path):
+            # Best effort, bottom up.  A read-only entry cannot be removed on
+            # Windows, so clear the bit and try once more; whatever still will
+            # not go is caught by the emptiness check below.
+            isdir = os.path.isdir(path) and not os.path.islink(path)
+            if isdir:
+                for ent in os.listdir(path):
+                    remove(os.path.join(path, ent))
+            fn = os.rmdir if isdir else os.unlink
+            try:
+                fn(path)
+            except OSError:
                 try:
-                    os.unlink(full)
+                    os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+                    fn(path)
                 except OSError:
                     pass
+
+        # More than one pass: a server that closes a dropped connection's
+        # handles asynchronously (Windows does) can still hold an entry open,
+        # or delete-pending, for a moment after the last trace disconnected.
+        deadline = time.monotonic() + 30
+        while True:
+            for ent in os.listdir(p):
+                remove(os.path.join(p, ent))
+            left = os.listdir(p)
+            if not left:
+                return
+            if time.monotonic() > deadline:
+                # The next trace would start on the last one's leftovers and
+                # report them as divergences.  That is a harness fault.
+                raise RuntimeError("share not empty after reset: %r" % left)
+            time.sleep(0.2)
 
     # Commands this harness has no implementation for.  The caching and
     # durable instances are already declined by their capability profile
@@ -1155,8 +1199,13 @@ def main():
     ap.add_argument("--server", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=445)
     ap.add_argument("--share", default="share")
-    ap.add_argument("--share-path", required=True,
-                    help="local path backing the share, reset between traces")
+    ap.add_argument("--share-path",
+                    help="the share's directory on THIS host, emptied "
+                         "between traces")
+    ap.add_argument("--reset-dir",
+                    help="for a share on another machine: a directory its "
+                         "owner watches, in which a 'go' marker asks for the "
+                         "share to be emptied and 'done' acknowledges it")
     ap.add_argument("--user", required=True)
     ap.add_argument("--password", required=True)
     ap.add_argument("--trace", action="append", default=[])
@@ -1167,10 +1216,27 @@ def main():
                     help="do not stop a trace at its first unrecorded "
                          "divergence; for surveying every distinct shape at "
                          "once, at the cost of cascade noise")
+    ap.add_argument("--server-kind", default="samba",
+                    help="which server is under test; selects the deviation "
+                         "registry <kind>_deviations.py found on the module "
+                         "search path (default: samba)")
+    ap.add_argument("--no-signing", action="store_true",
+                    help="do not require signed replies.  For a server that "
+                         "signs some reply wrongly: the client library drops "
+                         "the connection on a signature it cannot verify, "
+                         "which would end every trace at that reply")
     ap.add_argument("--no-check-identity", dest="check_identity",
                     action="store_false", default=True,
                     help="skip the ino<->IndexNumber bijection oracle")
     args = ap.parse_args()
+
+    if args.no_signing:
+        W.REQUIRE_SIGNING = False
+    if bool(args.share_path) == bool(args.reset_dir):
+        ap.error("give exactly one of --share-path and --reset-dir")
+
+    global DEV
+    DEV = importlib.import_module(args.server_kind + "_deviations")
 
     traces = list(args.trace)
     for d in args.trace_dir:
@@ -1187,7 +1253,8 @@ def main():
         try:
             r.run_trace(t)
         except Exception:
-            print("HARNESS ERROR replaying %s" % t, file=sys.stderr)
+            print("HARNESS ERROR replaying %s at step %s" % (t, r.step),
+                  file=sys.stderr)
             traceback.print_exc()
             r.drop_connections()
             return 2
@@ -1213,14 +1280,16 @@ def main():
         for k in sorted(r.deviations_seen):
             print("#   %-6s %-6s x%d"
                   % (k, r.deviation_verdict.get(k, "?"), r.deviations_seen[k]))
-        print("#   verdict 'model' = the model is wrong and samba is right; "
-              "'samba' = the reverse; 'both' = each is wrong differently.")
+        print("#   verdict 'model' = the model is wrong and the server is "
+              "right; '%s' = the reverse; 'both' = each is wrong differently."
+              % args.server_kind)
     if r.nmismatch:
         print("%d unrecorded divergence(s) across %d trace(s)"
               % (r.nmismatch, len(traces)))
         return 1
-    print("ok: %d trace(s) replayed against samba; every divergence is a "
-          "recorded, analyzed one" % (len(traces) - r.nskipped))
+    print("ok: %d trace(s) replayed against %s; every divergence is a "
+          "recorded, analyzed one"
+          % (len(traces) - r.nskipped, args.server_kind))
     return 0
 
 

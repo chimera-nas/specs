@@ -1,7 +1,7 @@
 {
   "extends": "./_smbd.json",
   "family": "smb2",
-  "description": "directory creation (FILE_DIRECTORY_FILE, exclusive and not) and the handles it produces, against Samba.",
+  "description": "directory creation (FILE_DIRECTORY_FILE, exclusive and not) and the handles it produces, against Samba. No deviation of this smbd is reachable from this flavour, so the cell states the standard exactly and is its own strict twin -- and it GATES, rather than reporting.",
   "traceStem": "smb2Base",
 
   // Which of the smbd profile's deviations this flavour can actually REACH.

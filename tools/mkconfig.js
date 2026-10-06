@@ -481,7 +481,10 @@ for (const cell of spec.cells) {
     genBatches.push({ outdir, main: scenario.module || modName, run: scenario.run,
       maxSamples: 1, nTraces: 1, seed: '0x1', naming })
   }
-  directories.push({ path: outdir, traces: traces.map(t => path.basename(t)) })
+  // One directory per cell.  cell and module are what gen.js keys its trace
+  // cache on: the rendered module carries every constant the config binds.
+  directories.push({ path: outdir, traces: traces.map(t => path.basename(t)),
+    cell: cell.name, module: path.join(famStage, `${modName}.qnt`) })
   const varName = cell.name.replace(/[^A-Za-z0-9]+/g, '_')
   cmakeLines.push(`set(SPECS_CELL_${varName}_DIR "${cmakePath(outdir)}")`)
   cmakeLines.push(`set(SPECS_CELL_${varName}_TRACES "${traces.map(cmakePath).join(';')}")`)
@@ -497,6 +500,8 @@ const genSpec = {
   // Which simulator backend gen.js drives.  See the note there: typescript is
   // the default because the rust evaluator will not run on every CI image.
   backend: spec.backend || 'typescript',
+  // The model tree, which gen.js hashes into its trace cache key.
+  specsRoot: spec.specsRoot,
   model: umbrella,
   tests: (schema.selfTests || []).map(t => ({
     name: t.name,

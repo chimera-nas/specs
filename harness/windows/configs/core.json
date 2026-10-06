@@ -1,0 +1,10 @@
+{
+  "extends": "./_windows.json",
+  "family": "smb2",
+  "description": "the CREATE disposition/type matrix, share arbitration, I/O and delete-on-close against the Windows SMB server. The batch is the Samba cell's, unchanged.",
+  "traceStem": "smb2Base",
+
+  "batches": [
+    { "flavor": "stepCore", "steps": 500, "traces": 8, "seed": "0x7" }
+  ]
+}

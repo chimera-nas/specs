@@ -40,6 +40,9 @@ module smb2Base {
         F_DURABLE = FeatOff,
         P_LEASE_OPEN_BREAK = true,
         P_FORCE_LEVEL2 = false,
+        P_LOCK_ACCESS_CHECK = true,
+        P_SUPERSEDE_WANTS_DELETE = false,
+        P_CREATE_TYPE_FIRST = false,
         // The self-tests / run instances assert the STANDARD: no deviations.
         DEVS = Set()
     ).* from "./smb2"
@@ -59,6 +62,9 @@ module smb2Leases {
         F_DURABLE = FeatOff,
         P_LEASE_OPEN_BREAK = true,
         P_FORCE_LEVEL2 = false,
+        P_LOCK_ACCESS_CHECK = true,
+        P_SUPERSEDE_WANTS_DELETE = false,
+        P_CREATE_TYPE_FIRST = false,
         // The self-tests / run instances assert the STANDARD: no deviations.
         DEVS = Set()
     ).* from "./smb2"
@@ -80,6 +86,9 @@ module smb2ForceL2 {
         F_DURABLE = FeatOff,
         P_LEASE_OPEN_BREAK = true,
         P_FORCE_LEVEL2 = true,
+        P_LOCK_ACCESS_CHECK = true,
+        P_SUPERSEDE_WANTS_DELETE = false,
+        P_CREATE_TYPE_FIRST = false,
         // The self-tests / run instances assert the STANDARD: no deviations.
         DEVS = Set()
     ).* from "./smb2"
@@ -107,6 +116,9 @@ module smb2Durable {
         F_DURABLE = FeatMandatory,
         P_LEASE_OPEN_BREAK = true,
         P_FORCE_LEVEL2 = false,
+        P_LOCK_ACCESS_CHECK = true,
+        P_SUPERSEDE_WANTS_DELETE = false,
+        P_CREATE_TYPE_FIRST = false,
         // The self-tests / run instances assert the STANDARD: no deviations.
         DEVS = Set()
     ).* from "./smb2"
@@ -136,6 +148,9 @@ module smb2Replay {
         F_DURABLE = FeatMandatory,
         P_LEASE_OPEN_BREAK = true,
         P_FORCE_LEVEL2 = false,
+        P_LOCK_ACCESS_CHECK = true,
+        P_SUPERSEDE_WANTS_DELETE = false,
+        P_CREATE_TYPE_FIRST = false,
         // The self-tests / run instances assert the STANDARD: no deviations.
         DEVS = Set()
     ).* from "./smb2"
