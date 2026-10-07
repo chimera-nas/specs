@@ -50,9 +50,6 @@ The remaining configuration constants are choices where more than one answer is
 legitimate. Each is documented at its declaration in `nfsaux.qnt`; the ones that
 bite hardest:
 
-* `NLM_UPGRADE_IS_NOOP` — whether a `LOCK` naming a range its own owner already
-  holds is answered as an idempotent retry without re-evaluating the mode, so a
-  shared-to-exclusive upgrade silently does not happen.
 * `NSM_ADDRS_DISTINCT` — whether monitored peers are distinguishable by source
   address. When they are not, `SM_NOTIFY`'s fallback match is indiscriminate and
   one peer's reboot drops everyone's locks.
