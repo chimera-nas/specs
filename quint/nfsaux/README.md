@@ -50,9 +50,6 @@ The remaining configuration constants are choices where more than one answer is
 legitimate. Each is documented at its declaration in `nfsaux.qnt`; the ones that
 bite hardest:
 
-* `NLM_UPGRADE_IS_NOOP` — whether a `LOCK` naming a range its own owner already
-  holds is answered as an idempotent retry without re-evaluating the mode, so a
-  shared-to-exclusive upgrade silently does not happen.
 * `NSM_ADDRS_DISTINCT` — whether monitored peers are distinguishable by source
   address. When they are not, `SM_NOTIFY`'s fallback match is indiscriminate and
   one peer's reboot drops everyone's locks.
@@ -108,3 +105,12 @@ settled by measuring a live server:
   the locks go one at a time with a pump after each, so a waiter whose range is
   satisfied by a partial release is granted ahead of a wider waiter that is
   still blocked — and the wider one then finds the narrow one in its way.
+* A `LOCK` over bytes its owner already holds **replaces** the owner's coverage
+  of exactly those bytes, the way `fcntl` does: the parts of older locks outside
+  the range keep their mode and their place, other owners see the new mode, and
+  only a same-range, same-mode re-`LOCK` is an idempotent retry. A grant can
+  therefore free bytes, and the wait queue is pumped after it as after an
+  `UNLOCK`.
+* That pump runs to a **fixpoint**: a promoted re-lock carves too, and the bytes
+  it frees may belong to a waiter queued ahead of it, which a single pass in
+  arrival order would have passed over.

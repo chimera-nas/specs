@@ -23,9 +23,17 @@ What it requires, and why:
     into a regular file.
   * The portmap LOOKUP outcomes: a served triple and an unserved one, over
     both the version and the transport axis.
+  * The RE-LOCK: a granted LOCK over bytes its owner already held in
+    another mode or over another range, which replaces the owner's
+    coverage of those bytes rather than sitting beside the old lock.  A
+    live server got this wrong (chimera-nas/chimera#1767), and a corpus
+    with no re-lock in it would have replayed green against it.
   * The cross-protocol SEAMS: a monitored host, a notify that drops locks,
-    a FREE_ALL, and a queue promotion.  These are the behaviours that only
-    exist because the protocols are modeled together.
+    a FREE_ALL, and a queue promotion -- by an UNLOCK, and by a LOCK whose
+    grant freed the bytes a waiter was queued on (a downgrade).  A server
+    that carves on a re-lock but does not pump afterwards replays green
+    against a corpus with no LOCK-side promotion in it.  These are the
+    behaviours that only exist because the protocols are modeled together.
 
 Coverage is required over the corpus as a whole rather than per flavour: the
 flavours are deliberately narrow (a portmap-only trace has no locks in it),
@@ -91,13 +99,55 @@ def var(state, name):
     return None
 
 
+def posix_len(wire_len):
+    """The model's posixLen: every to-EOF spelling is 0."""
+    return 0 if big(wire_len) <= 0 else big(wire_len)
+
+
+def ranges_overlap(a_off, a_len, b_off, b_len):
+    """The model's rangesOverlap: half-open, 0 meaning to-EOF."""
+    if a_len == 0 and b_len == 0:
+        return True
+    if a_len == 0:
+        return b_off + b_len > a_off
+    if b_len == 0:
+        return a_off + a_len > b_off
+    return b_off + b_len > a_off and a_off + a_len > b_off
+
+
+def same_owner(a, b):
+    return (a["caller"] == b["caller"] and big(a["oh"]) == big(b["oh"])
+            and big(a["svid"]) == big(b["svid"]))
+
+
+def relocks(held, probe):
+    """Whether granting `probe` replaces some of its owner's coverage: the
+    owner already holds an overlapping lock on the file that is not the
+    very same range in the very same mode (that one is a retry)."""
+    for l in held:
+        if big(l["file"]) != big(probe["file"]):
+            continue
+        if not same_owner(l["owner"], probe["owner"]):
+            continue
+        if not ranges_overlap(big(l["offset"]), posix_len(l["wireLen"]),
+                              big(probe["offset"]),
+                              posix_len(probe["wireLen"])):
+            continue
+        if (big(l["offset"]) == big(probe["offset"])
+                and posix_len(l["wireLen"]) == posix_len(probe["wireLen"])
+                and l["excl"] == probe["excl"]):
+            continue
+        return True
+    return False
+
+
 def scan(path, buckets):
     with open(path) as fh:
         trace = json.load(fh)
 
     prev_monitors = set()
     prev_queue_len = 0
-    prev_held_len = 0
+    prev_held = []
 
     for state in trace["states"]:
         op = var(state, "lastOp")
@@ -149,6 +199,17 @@ def scan(path, buckets):
             if val.get("reclaim") is True:
                 buckets.add("nlm:reclaim-request")
             buckets.add("nlm:lock-proc-%d" % big(val.get("nproc")))
+            # The status of a synchronous LOCK is its reply; a LOCK_MSG
+            # answers void and reports it in the LOCK_RES it provokes.
+            st = None
+            if reply.get("tag") == "RNlm":
+                st = big(reply.get("value"))
+            else:
+                for a in seq(val.get("asyncs", [])):
+                    if big(a.get("proc")) == 12:
+                        st = big(a.get("stat"))
+            if st == 0 and lock and relocks(prev_held, lock):
+                buckets.add("nlm:relock-replaced")
 
         # ---- MOUNT -------------------------------------------------------
         if reply.get("tag") == "RMntOk":
@@ -181,23 +242,25 @@ def scan(path, buckets):
         # ---- the cross-protocol seams ------------------------------------
         monitors = set(seq(var(state, "monitors") or []))
         queue_len = len(seq(var(state, "queue") or []))
-        held_len = len(seq(var(state, "held") or []))
+        held = seq(var(state, "held") or [])
         if monitors:
             buckets.add("seam:host-monitored")
         if prev_monitors and not monitors and tag == "OSmNotify":
             buckets.add("seam:notify-cleared-monitors")
         if tag == "OSmNotify" and seq(val.get("granted", [])):
             buckets.add("seam:notify-promoted-a-waiter")
-        if tag == "ONlmFreeAll" and prev_held_len > held_len:
+        if tag == "ONlmFreeAll" and len(prev_held) > len(held):
             buckets.add("seam:free-all-released-locks")
         if tag == "ONlmUnlock" and seq(val.get("granted", [])):
             buckets.add("seam:unlock-promoted-a-waiter")
+        if tag == "ONlmLock" and seq(val.get("granted", [])):
+            buckets.add("seam:lock-promoted-a-waiter")
         if queue_len > prev_queue_len:
             buckets.add("seam:request-queued")
 
         prev_monitors = monitors
         prev_queue_len = queue_len
-        prev_held_len = held_len
+        prev_held = held
 
 
 def required():
@@ -206,7 +269,7 @@ def required():
     req += ["nlm:" + n for n in NLM_STATUSES.values()]
     req += ["nlm:holder-reported", "nlm:to-eof-range", "nlm:exclusive",
             "nlm:shared", "nlm:blocking-request", "nlm:reclaim-request",
-            "nlm:two-async-messages"]
+            "nlm:two-async-messages", "nlm:relock-replaced"]
     req += ["nlm:lock-proc-%d" % p for p in (2, 7, 22)]
     req += ["nlm:async-proc-%d" % p for p in (11, 12, 13, 14)]
     req += ["mnt:" + n for n in MNT_STATUSES.values()]
@@ -216,7 +279,7 @@ def required():
             "pm:unserved-transport"]
     req += ["seam:host-monitored", "seam:notify-cleared-monitors",
             "seam:free-all-released-locks", "seam:request-queued",
-            "seam:unlock-promoted-a-waiter"]
+            "seam:unlock-promoted-a-waiter", "seam:lock-promoted-a-waiter"]
     return req
 
 
