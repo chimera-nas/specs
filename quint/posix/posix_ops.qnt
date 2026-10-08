@@ -88,6 +88,7 @@ module posixops {
         sgidInherit: bool,   // new subdir inherits parent's S_ISGID
         // Setid clearing / divergence policies:
         statelessIoDac: bool,   // NFSv3 rechecks read/write DAC on every RPC
+        statelessDirDac: bool,  // NFS rechecks list (read) DAC on every READDIR
         writeClearsSets: bool,  // write/truncate by unprivileged clears setids
         pwriteAppends: bool,    // pwrite honors O_APPEND (Linux divergence;
                                 // POSIX: writes at the given offset)
@@ -952,6 +953,15 @@ module posixops {
 
     pure def rpcWriteDenied(caps: Caps, cr: Cred, nd: Inode): bool =
         caps.statelessIoDac and cr.euid != nd.uid and not(mayWrite(cr, nd))
+
+    // Neither NFSv3 nor NFSv4 opens a directory on the server: a READDIR
+    // names the directory by handle and cookie alone, so the server cannot
+    // tell a stream opened earlier from a new listing, and it rechecks read
+    // (list) permission on every RPC.  A stream opened before a chmod that
+    // removes read stops listing.  Linux nfsd applies no owner override to
+    // directories, so this holds for the owner too.
+    pure def rpcReaddirDenied(caps: Caps, cr: Cred, nd: Inode): bool =
+        caps.statelessDirDac and not(mayRead(cr, nd))
 
     pure def opRead(fs: Fs, ps: Pstate, caps: Caps, p: Pid, fd: Fd,
                     len: int): Out =
@@ -1882,8 +1892,11 @@ module posixops {
     // harness), which is sound because no mutation interleaves within a
     // model step.  A sweep of a stream whose directory was removed returns
     // the empty set (POSIX leaves it unspecified; acceptance noted).
-    // Reading the directory marks its atime.
-    pure def opReaddir(fs: Fs, ps: Pstate, sid: StreamId): Out =
+    // Reading the directory marks its atime.  Over a stateless transport
+    // (statelessDirDac) a sweep of a live directory the caller may no longer
+    // read is refused.
+    pure def opReaddir(fs: Fs, ps: Pstate, caps: Caps, p: Pid,
+                       sid: StreamId): Out =
         if (not(ps.streams.keys().contains(sid)))
             out(fs, ps, SNamesR({ e: EBADF, names: Set() }))
         else {
@@ -1891,6 +1904,8 @@ module posixops {
             val nd = fs.inodes.get(i)
             if (fsOrphans(fs).contains(i))
                 out(fs, ps, SNamesR({ e: OK, names: Set() }))
+            else if (rpcReaddirDenied(caps, psCred(ps, p), nd))
+                out(fs, ps, SNamesR({ e: EACCES, names: Set() }))
             else
                 out(fsMark(fs, i, true, false, false), ps,
                     SNamesR({ e: OK, names: nd.ents.keys() }))
@@ -2319,7 +2334,7 @@ module posixops {
                                      a.dfdNew, a.pthNew)
             | RReadlink(a) => opReadlink(fs, ps, caps, p, a.dfd, a.pth)
             | ROpendir(a) => opOpendir(fs, ps, caps, p, a.pth)
-            | RReaddir(a) => opReaddir(fs, ps, a.sid)
+            | RReaddir(a) => opReaddir(fs, ps, caps, p, a.sid)
             | RRewinddir(a) => opRewinddir(fs, ps, a.sid)
             | RTelldir(a) => opTelldir(fs, ps, a.sid)
             | RSeekdir(a) => opSeekdir(fs, ps, a.sid)
