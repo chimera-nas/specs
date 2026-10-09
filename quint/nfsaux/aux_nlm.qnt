@@ -138,26 +138,22 @@ module nlmProto {
         conflictsWith(held, probe).length() > 0
 
     /**
-     * The exact lock a request names: owner + file + exact offset and
-     * length.  A repeat LOCK uses this to recognize an idempotent retry: a
-     * client holding two non-overlapping ranges on one file with one owner
-     * needs the range to pick the right one.
+     * The exact lock a request names: owner + file + exact offset, length
+     * and mode.  A repeat LOCK of a lock already held is an idempotent
+     * retry and changes nothing; the lock keeps its place in the held list.
      *
-     * The mode is NOT part of the match -- a repeat LOCK carries no
-     * meaningful one for this purpose -- which has a consequence worth
-     * naming: a LOCK that names a range this owner already holds is
-     * answered GRANTED as an idempotent retry even when it asks for a
-     * DIFFERENT mode, so an upgrade from shared to exclusive is a silent
-     * no-op rather than a conflict test.  `upgradeIsNoop` says whether the
-     * server under test behaves that way; a server that instead re-evaluates
-     * the request can conflict and deny.
+     * The mode IS part of the match.  A LOCK naming a range its owner holds
+     * in the other mode is not a retry but a downgrade or an upgrade: it is
+     * decided like any other request and, once granted, replaces the old
+     * lock (see replaceWithin).
      */
     pure def findExact(held: List[Lock], probe: Lock): List[Lock] =
         held.select(l =>
             l.file == probe.file and
             sameOwner(l.owner, probe.owner) and
             l.offset == probe.offset and
-            posixLen(l.wireLen) == posixLen(probe.wireLen))
+            posixLen(l.wireLen) == posixLen(probe.wireLen) and
+            l.excl == probe.excl)
 
     pure def holdsExact(held: List[Lock], probe: Lock): bool =
         findExact(held, probe).length() > 0
@@ -199,6 +195,18 @@ module nlmProto {
                 acc.concat(below).concat(above)
             })
 
+    /**
+     * A granted LOCK takes over its range from whatever else its owner
+     * held there (POSIX fcntl semantics, which Linux lockd assumes for
+     * every re-lock).  The owner's overlapping locks are carved exactly as
+     * UNLOCK carves them -- the parts outside the new range keep their mode
+     * and their place in the held list -- and the new lock goes on the end.
+     * So an exclusive re-locked as shared is a downgrade another owner can
+     * then share, and a shared re-locked as exclusive is an upgrade.
+     */
+    pure def replaceWithin(held: List[Lock], probe: Lock): List[Lock] =
+        dropWithin(held, probe).append(probe)
+
     // ------------------------------------------------------------------
     // LOCK
     // ------------------------------------------------------------------
@@ -208,31 +216,30 @@ module nlmProto {
      *
      *   inGrace         the server is in its post-restart grace window and
      *                   only reclaim requests are admitted
-     *   upgradeIsNoop   see findExact
      *
      * Order matters and mirrors what a server does: the file handle is
-     * validated first, then grace, then the idempotent retry, and only then
-     * is the conflict test reached.
+     * validated first, then grace, and only then is the conflict test
+     * reached.  An idempotent retry (findExact) needs no short-circuit of
+     * its own: no other owner can hold a conflicting lock over a lock its
+     * owner already holds in that mode, so the test grants it.
      */
     pure def lockStatus(held: List[Lock], probe: Lock, block: bool,
-                        reclaim: bool, inGrace: bool,
-                        upgradeIsNoop: bool): int =
+                        reclaim: bool, inGrace: bool): int =
         if (probe.file == STALE_FILE) NLM4_STALE_FH
         else if (inGrace and not(reclaim)) NLM4_DENIED_GRACE_PERIOD
-        else if (upgradeIsNoop and holdsExact(held, probe)) NLM4_GRANTED
         else if (not(hasConflict(held, probe))) NLM4_GRANTED
         else if (block) NLM4_BLOCKED
         else NLM4_DENIED
 
-    /// The lock set after a LOCK.  Only an outright grant of a range this
-    /// owner does not already hold inserts anything; a BLOCKED request is
-    /// queued instead (see `blockedAfterLock`), and an idempotent retry
-    /// leaves the existing entry exactly as it was, mode included.
+    /// The lock set after a LOCK.  A refused request changes nothing and a
+    /// BLOCKED one is queued instead (see `promoteBlocked`); an idempotent
+    /// retry leaves its lock exactly where it was, and any other grant
+    /// replaces its owner's coverage of the range (see `replaceWithin`).
     pure def heldAfterLock(held: List[Lock], probe: Lock,
                            status: int): List[Lock] =
         if (status != NLM4_GRANTED) held
         else if (holdsExact(held, probe)) held
-        else held.append(probe)
+        else replaceWithin(held, probe)
 
     // ------------------------------------------------------------------
     // The blocking queue
@@ -262,6 +269,9 @@ module nlmProto {
      * The queue is drained in arrival order, and a queued request is
      * promoted only when nothing conflicts with it any more -- promoting one
      * can leave a later one still blocked, so this is a fold, not a filter.
+     * A promoted request replaces its owner's coverage of its range, as an
+     * immediate grant does: a blocked upgrade takes over the shared lock it
+     * was upgrading.
      */
     pure def promoteBlocked(held: List[Lock],
                             queue: List[Queued]): { held: List[Lock],
@@ -274,7 +284,7 @@ module nlmProto {
                               queue: acc.queue.append(q),
                               granted: acc.granted }
                         else
-                            { held: acc.held.append(q.lock),
+                            { held: replaceWithin(acc.held, q.lock),
                               queue: acc.queue,
                               granted: acc.granted.append(q) })
 
