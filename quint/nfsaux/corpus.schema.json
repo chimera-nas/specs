@@ -88,13 +88,6 @@
       "default": 1,
       "doc": "the state number a freshly started server reports."
     },
-    "NLM_UPGRADE_IS_NOOP": {
-      "kind": "policy",
-      "key": "policies.nlmUpgradeIsNoop",
-      "type": "bool",
-      "default": true,
-      "doc": "a LOCK naming a range its own owner already holds is answered as an idempotent retry without re-evaluating the mode, so a shared-to-exclusive upgrade is a silent no-op."
-    },
     "NLM_SHARE_ENFORCED": {
       "kind": "policy",
       "key": "policies.nlmShareEnforced",

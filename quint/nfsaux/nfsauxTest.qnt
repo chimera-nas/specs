@@ -37,7 +37,6 @@ module nfsauxTestRef {
         NSM_MON_FROM_LOCKS = true,
         NSM_ADDRS_DISTINCT = false,
         NSM_INITIAL_STATE = 1,
-        NLM_UPGRADE_IS_NOOP = true,
         NLM_SHARE_ENFORCED = false,
         NLM_IN_GRACE = false,
         NLM_BLOCKING = true,
@@ -49,6 +48,7 @@ module nfsauxTestRef {
     def ownerA: Owner = { caller: "c1", oh: 1, svid: 1 }
     def ownerA2: Owner = { caller: "c1", oh: 1, svid: 2 }
     def ownerB: Owner = { caller: "c2", oh: 1, svid: 1 }
+    def ownerB2: Owner = { caller: "c2", oh: 1, svid: 2 }
 
     def lk(o: Owner, off: int, len: int, x: bool): Lock =
         { file: 0, owner: o, offset: off, wireLen: len, excl: x }
@@ -222,18 +222,21 @@ module nfsauxTestRef {
             .expect(lastOp == ONlmLock({ nproc: 2,
                                          lock: lk(ownerA, 0, 16, true),
                                          block: false, reclaim: false,
+                                         granted: List(),
                                          asyncs: List(),
                                          reply: RNlm(NLM4_GRANTED) }))
             .then(nlmLock(2, lk(ownerB, 8, 16, true), false, false))
             .expect(lastOp == ONlmLock({ nproc: 2,
                                          lock: lk(ownerB, 8, 16, true),
                                          block: false, reclaim: false,
+                                         granted: List(),
                                          asyncs: List(),
                                          reply: RNlm(NLM4_DENIED) }))
             .then(nlmLock(2, lk(ownerB, 16, 8, true), false, false))
             .expect(lastOp == ONlmLock({ nproc: 2,
                                          lock: lk(ownerB, 16, 8, true),
                                          block: false, reclaim: false,
+                                         granted: List(),
                                          asyncs: List(),
                                          reply: RNlm(NLM4_GRANTED) }))
 
@@ -244,6 +247,7 @@ module nfsauxTestRef {
             .expect(lastOp == ONlmLock({ nproc: 2,
                                          lock: lk(ownerB, 0, 16, false),
                                          block: false, reclaim: false,
+                                         granted: List(),
                                          asyncs: List(),
                                          reply: RNlm(NLM4_GRANTED) }))
             .then(nlmLock(2, lkOn(0, { caller: "c2", oh: 2, svid: 2 },
@@ -252,6 +256,7 @@ module nfsauxTestRef {
                 nproc: 2,
                 lock: lkOn(0, { caller: "c2", oh: 2, svid: 2 }, 0, 16, true),
                 block: false, reclaim: false,
+                granted: List(),
                 asyncs: List(),
                 reply: RNlm(NLM4_DENIED) }))
 
@@ -264,25 +269,244 @@ module nfsauxTestRef {
             .expect(lastOp == ONlmLock({ nproc: 2,
                                          lock: lk(ownerA2, 0, 16, true),
                                          block: false, reclaim: false,
+                                         granted: List(),
                                          asyncs: List(),
                                          reply: RNlm(NLM4_DENIED) }))
 
-    /// Under this profile a re-LOCK of a range the owner already holds is
-    /// an idempotent retry, mode included: an upgrade request is answered
-    /// GRANTED and changes nothing, so the shared lock still stands and a
-    /// third party's exclusive request is still denied rather than
-    /// blocked behind an exclusive.
-    run upgradeIsNoopTest =
+    /// A re-LOCK of a held range in the other mode replaces the lock: an
+    /// upgrade with nobody else on the range leaves one exclusive lock, and
+    /// the downgrade back leaves one shared lock that another owner can
+    /// then share.
+    run relockReplacesTest =
         init
             .then(nlmLock(2, lk(ownerA, 0, 16, false), false, false))
+            .then(nlmLock(2, lk(ownerA, 0, 16, true), false, false))
+            .expect(held == List(lk(ownerA, 0, 16, true)))
+            .then(nlmLock(2, lk(ownerA, 0, 16, false), false, false))
+            .expect(held == List(lk(ownerA, 0, 16, false)))
+            .then(nlmLock(2, lk(ownerB, 0, 16, false), false, false))
+            .expect(lastOp == ONlmLock({ nproc: 2,
+                                         lock: lk(ownerB, 0, 16, false),
+                                         block: false, reclaim: false,
+                                         granted: List(),
+                                         asyncs: List(),
+                                         reply: RNlm(NLM4_GRANTED) }))
+
+    /// A re-lock carves the owner's overlapping locks the way UNLOCK does:
+    /// downgrading the middle of an exclusive lock keeps exclusive head and
+    /// tail remainders where the lock was, the shared middle goes on the
+    /// end, and an idempotent retry of a remainder moves nothing.
+    run relockCarvesTest =
+        init
+            .then(nlmLock(2, lk(ownerA, 0, 30, true), false, false))
+            .then(nlmLock(2, lk(ownerA, 10, 10, false), false, false))
+            .expect(held == List(lk(ownerA, 0, 10, true),
+                                 lk(ownerA, 20, 10, true),
+                                 lk(ownerA, 10, 10, false)))
+            .then(nlmLock(2, lk(ownerA, 0, 10, true), false, false))
+            .expect(held == List(lk(ownerA, 0, 10, true),
+                                 lk(ownerA, 20, 10, true),
+                                 lk(ownerA, 10, 10, false)))
+
+    /// The carve is UNLOCK's, so a re-lock over one edge of a held lock
+    /// trims that edge: the bytes outside the new range keep their mode in
+    /// place, and another owner meets the new mode on the re-locked bytes
+    /// and the old one on the remainder.  The head edge on one file, the
+    /// tail edge on the other.
+    run relockTrimsEdgeTest =
+        init
+            .then(nlmLock(2, lk(ownerA, 8, 16, true), false, false))
+            .then(nlmLock(2, lk(ownerA, 0, 16, false), false, false))
+            .expect(held == List(lk(ownerA, 16, 8, true),
+                                 lk(ownerA, 0, 16, false)))
+            .then(nlmLock(2, lk(ownerB, 0, 16, false), false, false))
+            .expect(lastOp == ONlmLock({ nproc: 2,
+                                         lock: lk(ownerB, 0, 16, false),
+                                         block: false, reclaim: false,
+                                         granted: List(),
+                                         asyncs: List(),
+                                         reply: RNlm(NLM4_GRANTED) }))
+            .then(nlmLock(2, lk(ownerB, 16, 8, false), false, false))
+            .expect(lastOp == ONlmLock({ nproc: 2,
+                                         lock: lk(ownerB, 16, 8, false),
+                                         block: false, reclaim: false,
+                                         granted: List(),
+                                         asyncs: List(),
+                                         reply: RNlm(NLM4_DENIED) }))
+            .then(nlmLock(2, lkOn(1, ownerA, 0, 16, true), false, false))
+            .then(nlmLock(2, lkOn(1, ownerA, 8, 16, false), false, false))
+            .expect(held == List(lk(ownerA, 16, 8, true),
+                                 lk(ownerA, 0, 16, false),
+                                 lk(ownerB, 0, 16, false),
+                                 lkOn(1, ownerA, 0, 8, true),
+                                 lkOn(1, ownerA, 8, 16, false)))
+            .expect(inv)
+
+    /// A re-lock spanning several of the owner's locks replaces them all,
+    /// and one inside a to-EOF lock leaves a to-EOF tail.  The remainders
+    /// keep their mode: another owner's shared request is granted over the
+    /// shared head and refused over the exclusive middle.
+    run relockSpansLocksTest =
+        init
+            .then(nlmLock(2, lk(ownerA, 0, 8, true), false, false))
+            .then(nlmLock(2, lk(ownerA, 16, 8, true), false, false))
+            .then(nlmLock(2, lk(ownerA, 0, 0, false), false, false))
+            .expect(held == List(lk(ownerA, 0, 0, false)))
+            .then(nlmLock(2, lk(ownerA, 8, 8, true), false, false))
+            .expect(held == List(lk(ownerA, 0, 8, false),
+                                 lk(ownerA, 16, 0, false),
+                                 lk(ownerA, 8, 8, true)))
+            .then(nlmLock(2, lk(ownerB, 0, 8, false), false, false))
+            .expect(lastOp == ONlmLock({ nproc: 2,
+                                         lock: lk(ownerB, 0, 8, false),
+                                         block: false, reclaim: false,
+                                         granted: List(),
+                                         asyncs: List(),
+                                         reply: RNlm(NLM4_GRANTED) }))
+            .then(nlmLock(2, lk(ownerB, 8, 8, false), false, false))
+            .expect(lastOp == ONlmLock({ nproc: 2,
+                                         lock: lk(ownerB, 8, 8, false),
+                                         block: false, reclaim: false,
+                                         granted: List(),
+                                         asyncs: List(),
+                                         reply: RNlm(NLM4_DENIED) }))
+            .expect(inv)
+
+    /// Both to-EOF spellings name the same bytes for a re-lock too: one
+    /// spelling carves the owner's locks from its offset on, and a retry
+    /// in the other spelling is the same lock and moves nothing.
+    run relockToEofSpellingTest =
+        init
+            .then(nlmLock(2, lk(ownerA, 0, 0, true), false, false))
+            .then(nlmLock(2, lk(ownerA, 8, EOF_LEN, false), false, false))
+            .expect(held == List(lk(ownerA, 0, 8, true),
+                                 lk(ownerA, 8, EOF_LEN, false)))
+            .then(nlmLock(2, lk(ownerA, 8, 0, false), false, false))
+            .expect(lastOp == ONlmLock({ nproc: 2,
+                                         lock: lk(ownerA, 8, 0, false),
+                                         block: false, reclaim: false,
+                                         granted: List(),
+                                         asyncs: List(),
+                                         reply: RNlm(NLM4_GRANTED) }))
+            .expect(held == List(lk(ownerA, 0, 8, true),
+                                 lk(ownerA, 8, EOF_LEN, false)))
+            .expect(inv)
+
+    /// An upgrade over another owner's shared lock is a genuine conflict:
+    /// refused when it may not wait, and when it may, queued and then
+    /// granted once the other owner lets go -- replacing the shared lock it
+    /// upgraded and keeping the part outside the upgraded range shared.
+    run blockedUpgradeReplacesTest =
+        init
+            .then(nlmLock(2, lk(ownerA, 0, 32, false), false, false))
+            .then(nlmLock(2, lk(ownerB, 0, 16, false), false, false))
             .then(nlmLock(2, lk(ownerA, 0, 16, true), false, false))
             .expect(lastOp == ONlmLock({ nproc: 2,
                                          lock: lk(ownerA, 0, 16, true),
                                          block: false, reclaim: false,
+                                         granted: List(),
+                                         asyncs: List(),
+                                         reply: RNlm(NLM4_DENIED) }))
+            .then(nlmLock(2, lk(ownerA, 0, 16, true), true, false))
+            .expect(lastOp == ONlmLock({ nproc: 2,
+                                         lock: lk(ownerA, 0, 16, true),
+                                         block: true, reclaim: false,
+                                         granted: List(),
+                                         asyncs: List(),
+                                         reply: RNlm(NLM4_BLOCKED) }))
+            .then(nlmUnlock(false, lk(ownerB, 0, 16, false)))
+            .expect(queue.length() == 0)
+            .expect(held == List(lk(ownerA, 16, 16, false),
+                                 lk(ownerA, 0, 16, true)))
+
+    /// A grant can free bytes as well as take them.  Shared requests queued
+    /// behind an exclusive lock are promoted when that lock's owner re-locks
+    /// their bytes shared: the downgrade wakes them, not somebody's later
+    /// UNLOCK.  Downgrading only the tail promotes only the waiter on the
+    /// tail (and monitors its host, as any grant does); the one on the head
+    /// stays queued until the head is downgraded too.
+    run downgradeWakesWaiterTest =
+        init
+            .then(nlmLock(2, lk(ownerB, 0, 32, true), false, false))
+            .then(nlmLock(2, lk(ownerA, 0, 16, false), true, false))
+            .then(nlmLock(2, lk(ownerA2, 16, 16, false), true, false))
+            .expect(queue.length() == 2)
+            .expect(monitors == Set("c2"))
+            .then(nlmLock(2, lk(ownerB, 16, 16, false), false, false))
+            .expect(lastOp == ONlmLock({ nproc: 2,
+                                         lock: lk(ownerB, 16, 16, false),
+                                         block: false, reclaim: false,
+                                         granted: List(lk(ownerA2, 16, 16,
+                                                          false)),
                                          asyncs: List(),
                                          reply: RNlm(NLM4_GRANTED) }))
-            .expect(held.length() == 1)
-            .expect(held[0].excl == false)
+            .expect(queue.length() == 1)
+            .expect(held == List(lk(ownerB, 0, 16, true),
+                                 lk(ownerB, 16, 16, false),
+                                 lk(ownerA2, 16, 16, false)))
+            .expect(monitors == Set("c2", "c1"))
+            .expect(inv)
+            .then(nlmLock(2, lk(ownerB, 0, 16, false), false, false))
+            .expect(queue.length() == 0)
+            .expect(held == List(lk(ownerB, 16, 16, false),
+                                 lk(ownerA2, 16, 16, false),
+                                 lk(ownerB, 0, 16, false),
+                                 lk(ownerA, 0, 16, false)))
+            .expect(inv)
+
+    /// A promotion can free bytes as a direct grant can, so the pump runs
+    /// to a fixpoint: a waiter queued AHEAD of a re-lock whose promotion
+    /// carves away its only blocker is granted in the same pump, not left
+    /// queued until somebody's next release.  Held: A exclusive on the
+    /// head, B exclusive on the tail.  Queued: another owner's shared
+    /// request on the head (behind A), then A's own to-EOF downgrade
+    /// (behind B).  B's UNLOCK promotes A's downgrade, which carves A's
+    /// exclusive lock away -- and the shared request, which a single pass
+    /// had already visited, now has nothing in its way.
+    run promotionWakesEarlierWaiterTest =
+        init
+            .then(nlmLock(2, lk(ownerA, 0, 16, true), false, false))
+            .then(nlmLock(2, lk(ownerB, 16, 16, true), false, false))
+            .then(nlmLock(2, lk(ownerB2, 0, 16, false), true, false))
+            .then(nlmLock(2, lk(ownerA, 0, 0, false), true, false))
+            .expect(queue.length() == 2)
+            .expect(inv)
+            .then(nlmUnlock(false, lk(ownerB, 16, 16, true)))
+            .expect(lastOp == ONlmUnlock({
+                msg: false, lock: lk(ownerB, 16, 16, true),
+                granted: List(lk(ownerA, 0, 0, false),
+                              lk(ownerB2, 0, 16, false)),
+                asyncs: List(),
+                reply: RNlm(NLM4_GRANTED) }))
+            .expect(queue.length() == 0)
+            .expect(held == List(lk(ownerA, 0, 0, false),
+                                 lk(ownerB2, 0, 16, false)))
+            .expect(inv)
+
+    /// The same through a grant's own pump: B downgrades its tail lock
+    /// instead of releasing it.  The downgrade promotes A's to-EOF
+    /// re-lock, whose carve frees the shared request queued ahead of it.
+    run downgradeWakesEarlierWaiterTest =
+        init
+            .then(nlmLock(2, lk(ownerA, 0, 16, true), false, false))
+            .then(nlmLock(2, lk(ownerB, 16, 16, true), false, false))
+            .then(nlmLock(2, lk(ownerB2, 0, 16, false), true, false))
+            .then(nlmLock(2, lk(ownerA, 0, 0, false), true, false))
+            .expect(queue.length() == 2)
+            .then(nlmLock(2, lk(ownerB, 16, 16, false), false, false))
+            .expect(lastOp == ONlmLock({ nproc: 2,
+                                         lock: lk(ownerB, 16, 16, false),
+                                         block: false, reclaim: false,
+                                         granted: List(lk(ownerA, 0, 0, false),
+                                                       lk(ownerB2, 0, 16,
+                                                          false)),
+                                         asyncs: List(),
+                                         reply: RNlm(NLM4_GRANTED) }))
+            .expect(queue.length() == 0)
+            .expect(held == List(lk(ownerB, 16, 16, false),
+                                 lk(ownerA, 0, 0, false),
+                                 lk(ownerB2, 0, 16, false)))
+            .expect(inv)
 
     /// Both wire spellings of to-EOF mean the same range, so a lock taken
     /// with one is released by the other.
@@ -294,6 +518,7 @@ module nfsauxTestRef {
             .expect(lastOp == ONlmLock({ nproc: 2,
                                          lock: lk(ownerB, 16, 8, true),
                                          block: false, reclaim: false,
+                                         granted: List(),
                                          asyncs: List(),
                                          reply: RNlm(NLM4_DENIED) }))
             .then(nlmUnlock(false, lk(ownerA, 0, EOF_LEN, true)))
@@ -339,6 +564,7 @@ module nfsauxTestRef {
             .expect(lastOp == ONlmLock({
                 nproc: 2, lock: lkOn(STALE_FILE, ownerA, 0, 16, true),
                 block: false, reclaim: false,
+                granted: List(),
                 asyncs: List(),
                 reply: RNlm(NLM4_STALE_FH) }))
             .expect(held.length() == 0)
@@ -371,6 +597,7 @@ module nfsauxTestRef {
             .expect(lastOp == ONlmLock({ nproc: 2,
                                          lock: lk(ownerB, 0, 16, true),
                                          block: true, reclaim: false,
+                                         granted: List(),
                                          asyncs: List(),
                                          reply: RNlm(NLM4_BLOCKED) }))
             .expect(queue.length() == 1)
@@ -409,6 +636,7 @@ module nfsauxTestRef {
             .expect(lastOp == ONlmLock({ nproc: 7,
                                          lock: lk(ownerA, 0, 16, true),
                                          block: false, reclaim: false,
+                                         granted: List(),
                                          asyncs: List({ proc: 12,
                                                         stat: NLM4_GRANTED }),
                                          reply: RVoid }))
@@ -576,7 +804,6 @@ module nfsauxTestFull {
         NSM_MON_FROM_LOCKS = false,
         NSM_ADDRS_DISTINCT = true,
         NSM_INITIAL_STATE = 1,
-        NLM_UPGRADE_IS_NOOP = false,
         NLM_SHARE_ENFORCED = true,
         NLM_IN_GRACE = false,
         NLM_BLOCKING = true,
@@ -647,9 +874,9 @@ module nfsauxTestFull {
                 prog: 100005, vers: 3, netid: NetTcp,
                 reply: RUaddr({ host: "127.0.0.1", port: 20048 }) }))
 
-    /// With upgrades re-evaluated rather than short-circuited, a
-    /// shared-to-exclusive upgrade over another owner's shared lock is a
-    /// genuine conflict.
+    /// The re-lock rule is not a profile choice: here too a
+    /// shared-to-exclusive upgrade over another owner's shared lock is
+    /// decided by the conflict test, and refused.
     run upgradeIsEvaluatedTest =
         init
             .then(nlmLock(2, lk(ownerA, 0, 16, false), false, false))
@@ -658,6 +885,7 @@ module nfsauxTestFull {
             .expect(lastOp == ONlmLock({ nproc: 2,
                                          lock: lk(ownerA, 0, 16, true),
                                          block: false, reclaim: false,
+                                         granted: List(),
                                          asyncs: List(),
                                          reply: RNlm(NLM4_DENIED) }))
 
@@ -735,7 +963,6 @@ module nfsauxTestGrace {
         NSM_MON_FROM_LOCKS = true,
         NSM_ADDRS_DISTINCT = false,
         NSM_INITIAL_STATE = 1,
-        NLM_UPGRADE_IS_NOOP = true,
         NLM_SHARE_ENFORCED = false,
         NLM_IN_GRACE = true,
         NLM_BLOCKING = false,
@@ -757,13 +984,16 @@ module nfsauxTestGrace {
             .expect(lastOp == ONlmLock({
                 nproc: 2, lock: lk(ownerA, 0, 16, true), block: false,
                 reclaim: false,
+                granted: List(),
                 asyncs: List(),
                 reply: RNlm(NLM4_DENIED_GRACE_PERIOD) }))
             .expect(held.length() == 0)
             .then(nlmLock(2, lk(ownerA, 0, 16, true), false, true))
             .expect(lastOp == ONlmLock({
                 nproc: 2, lock: lk(ownerA, 0, 16, true), block: false,
-                reclaim: true, asyncs: List(),
+                reclaim: true,
+                granted: List(),
+                asyncs: List(),
                 reply: RNlm(NLM4_GRANTED) }))
             .expect(held.length() == 1)
 }

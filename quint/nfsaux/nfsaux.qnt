@@ -86,11 +86,6 @@ module nfsaux {
     /// The state number a freshly started server reports.
     const NSM_INITIAL_STATE: int
 
-    /// Whether a LOCK naming a range its own owner already holds is
-    /// answered as an idempotent retry without re-evaluating the mode (so a
-    /// shared-to-exclusive upgrade is a silent no-op).  See findExact.
-    const NLM_UPGRADE_IS_NOOP: bool
-
     /// Whether NLM DOS share reservations are enforced or merely accepted.
     const NLM_SHARE_ENFORCED: bool
 
@@ -243,7 +238,8 @@ module nfsaux {
         | ONlmTestOp({ msg: bool, lock: Lock, asyncs: List[AsyncMsg],
                        reply: Reply })
         | ONlmLock({ nproc: int, lock: Lock, block: bool, reclaim: bool,
-                     asyncs: List[AsyncMsg], reply: Reply })
+                     granted: List[Lock], asyncs: List[AsyncMsg],
+                     reply: Reply })
         | ONlmCancel({ msg: bool, lock: Lock, asyncs: List[AsyncMsg],
                        reply: Reply })
         | ONlmUnlock({ msg: bool, lock: Lock, granted: List[Lock],
@@ -513,8 +509,17 @@ module nfsaux {
                    else if (nproc == 22) "NLMPROC4_NM_LOCK"
                    else "NLMPROC4_LOCK"
         val runs = isRun(name)
-        val stat = lockStatus(held, l, block, reclaim, NLM_IN_GRACE,
-                              NLM_UPGRADE_IS_NOOP)
+        val stat = lockStatus(held, l, block, reclaim, NLM_IN_GRACE)
+        val after = if (runs) heldAfterLock(held, l, stat) else held
+        /* A grant can FREE bytes as well as take them: an exclusive lock
+         * re-locked as shared no longer excludes a queued shared request
+         * for the same bytes, and a re-lock of a narrower range gives the
+         * rest of the old lock back.  A server carves and then pumps its
+         * wait queue exactly as UNLOCK does, so a waiter the grant
+         * satisfied is promoted here, not at somebody's next release. */
+        val pumped = if (runs and stat == NLM4_GRANTED)
+                         promoteBlocked(after, queue)
+                     else { held: after, queue: queue, granted: List() }
         /* NM_LOCK is the non-monitored form; every other LOCK puts its
          * holder on the monitor list once -- and only once -- the lock is
          * actually held, which for a blocking request is when the queue
@@ -524,11 +529,11 @@ module nfsaux {
         all {
             services' = services,
             rmtab' = rmtab,
-            held' = if (runs) heldAfterLock(held, l, stat) else held,
+            held' = pumped.held,
             queue' = if (runs and stat == NLM4_BLOCKED)
                          queue.append({ lock: l, monitor: monitorable,
                                         msg: nproc == 7 })
-                     else queue,
+                     else pumped.queue,
             shares' = shares,
             /* A client entry is created by the attempt, not by the grant,
              * and a server keeps it after the client's last lock is gone --
@@ -537,12 +542,14 @@ module nfsaux {
             nlmClients' = if (runs and l.file != STALE_FILE)
                               nlmClients.union(Set(l.owner.caller))
                           else nlmClients,
-            monitors' = if (runs and monitored)
-                            monitors.union(Set(l.owner.caller))
-                        else monitors,
+            monitors' = (if (runs and monitored)
+                             monitors.union(Set(l.owner.caller))
+                         else monitors)
+                        .union(promotedMonitors(pumped.granted)),
             nsmState' = nsmState,
             lastOp' = ONlmLock({
                 nproc: nproc, lock: l, block: block, reclaim: reclaim,
+                granted: grantedLocks(pumped.granted),
                 asyncs: if (nproc == 7 and runs)
                             List({ proc: 12, stat: stat })
                         else List(),
@@ -968,6 +975,31 @@ module nfsaux {
                 false, false)
     }
 
+    /**
+     * A LOCK by the holder of a lock already held, over a range of its own
+     * choosing on the same file and in either mode: the downgrade, upgrade
+     * and narrowing shapes that replace the owner's coverage
+     * (replaceWithin) and can free bytes a request is queued on, which is
+     * the only way a LOCK rather than an UNLOCK promotes a waiter.  The
+     * owner and file are drawn from the held list because the blind
+     * generators coincide with a held lock too rarely to reach those
+     * shapes under queue pressure.
+     */
+    action anyNlmRelock = all {
+        held.length() > 0,
+        {
+            nondet i = held.indices().oneOf()
+            nondet nproc = Set(2, 7).oneOf()
+            nondet blockPick = Set(false, true).oneOf()
+            nondet offset = OFFSETS.oneOf()
+            nondet wireLen = LENGTHS.oneOf()
+            nondet excl = Set(false, true).oneOf()
+            nlmLock(nproc, { file: held[i].file, owner: held[i].owner,
+                             offset: offset, wireLen: wireLen, excl: excl },
+                    blockPick and NLM_BLOCKING, false)
+        }
+    }
+
     action anyNlmCancel = {
         nondet msg = Set(false, true).oneOf()
         nondet caller = CALLERS.oneOf()
@@ -1085,8 +1117,9 @@ module nfsaux {
         pmNull, anyPmGetport, pmDump, anyPmSet, anyPmCallit,
         anyRbGetaddr, anyRbDump, anyRbGettime, anyRbGetversaddr,
         mntNull, anyMnt, mntDump, anyUmnt, mntUmntAll, mntExport,
-        nlmNull, anyNlmTestOp, anyNlmLock, anyNlmCancel, anyNlmUnlock,
-        anyNlmGranted, anyNlmRes, anyNlmReserved, anyNlmShare, anyNlmFreeAll,
+        nlmNull, anyNlmTestOp, anyNlmLock, anyNlmRelock, anyNlmCancel,
+        anyNlmUnlock, anyNlmGranted, anyNlmRes, anyNlmReserved, anyNlmShare,
+        anyNlmFreeAll,
         smNull, anySmStat, anySmMon, anySmUnmon, anySmUnmonAll,
         anySmNotify, anySmSimuCrash,
     }
@@ -1113,8 +1146,8 @@ module nfsaux {
     /// Byte-range locking proper: no portmap or mount noise.
     action stepLocks = any {
         nlmNull, anyNlmTestOp, anyNlmTestOp, anyNlmPlainLock, anyNlmPlainLock,
-        anyNlmPlainLock, anyNlmUnlock, anyNlmUnlock, anyNlmCancel,
-        anyNlmFreeAll,
+        anyNlmPlainLock, anyNlmRelock, anyNlmUnlock, anyNlmUnlock,
+        anyNlmCancel, anyNlmFreeAll,
     }
 
     /// The asynchronous half: _MSG requests, _RES reports, GRANTED, and the
@@ -1124,8 +1157,10 @@ module nfsaux {
         anyNlmGranted, anyNlmRes, anyNlmRes, anyNlmReserved,
     }
 
-    /// Blocking locks: enough queue pressure that requests are queued,
-    /// promoted when the blocker releases, and cancelled while waiting.
+    /// Blocking locks, in both modes: enough queue pressure that requests
+    /// are queued, promoted when the blocker releases or downgrades, and
+    /// cancelled while waiting.  A shared request is what a downgrade can
+    /// let through; an exclusive one waits for a release.
     action anyNlmBlockingLock = {
         nondet nproc = Set(2, 7).oneOf()
         nondet caller = CALLERS.oneOf()
@@ -1134,14 +1169,16 @@ module nfsaux {
         nondet file = FILES.oneOf()
         nondet offset = OFFSETS.oneOf()
         nondet wireLen = LENGTHS.oneOf()
+        nondet excl = Set(false, true).oneOf()
         nlmLock(nproc, { file: file,
                          owner: { caller: caller, oh: oh, svid: svid },
-                         offset: offset, wireLen: wireLen, excl: true },
+                         offset: offset, wireLen: wireLen, excl: excl },
                 NLM_BLOCKING, false)
     }
 
     action stepBlocking = any {
         anyNlmBlockingLock, anyNlmBlockingLock, anyNlmBlockingLock,
+        anyNlmRelock, anyNlmRelock,
         anyNlmUnlock, anyNlmUnlock, anyNlmUnlock,
         anyNlmCancel, anyNlmTestOp, anyNlmFreeAll,
     }
@@ -1179,6 +1216,17 @@ module nfsaux {
     val queueJustified = queue.indices().forall(i =>
         hasConflict(held, queue[i].lock))
 
+    /// One owner never holds two locks over the same byte.  A grant
+    /// replaces its owner's coverage of the range it spans (replaceWithin),
+    /// so the owner's locks stay pairwise disjoint; restated here
+    /// independently of the carve that maintains it, the way
+    /// `locksCompatible` restates the admission rule.
+    val ownerLocksDisjoint = held.indices().forall(i =>
+        held.indices().forall(j =>
+            i == j or not(
+                locksOverlap(held[i], held[j]) and
+                sameOwner(held[i].owner, held[j].owner))))
+
     /// Nothing is granted for a handle that does not decode.
     val noStaleLocks = held.indices().forall(i =>
         held[i].file != STALE_FILE)
@@ -1199,6 +1247,7 @@ module nfsaux {
     val inv = and {
         locksCompatible,
         queueJustified,
+        ownerLocksDisjoint,
         noStaleLocks,
         rmtabDistinct,
         stateOdd,
