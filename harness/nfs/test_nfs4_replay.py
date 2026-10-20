@@ -18,10 +18,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import nfs4_replay as r4  # noqa: E402
 import ganesha_deviations as gd  # noqa: E402
+import knfsd_deviations as kd  # noqa: E402
 from deviations import (Finding, NFS4_OK, NFS4ERR_BAD_STATEID,  # noqa: E402
                         NFS4ERR_OPENMODE, NFS4ERR_EXPIRED,
                         NFS4ERR_STALE_STATEID, NFS4ERR_STALE_CLIENTID,
-                        NFS4ERR_BADNAME)
+                        NFS4ERR_BADNAME, NFS4ERR_OLD_STATEID)
 from itf import Divergence, TraceFormatError  # noqa: E402
 
 
@@ -325,6 +326,25 @@ class LockStateidSeqid(unittest.TestCase):
                              "newOwner": False, "openSid": -1, "lockSid": 9,
                              "lockOwner": 6, "oseq": 0, "lseq": 1})
         self.assertEqual(kw["lock_sid"][0], 0)
+
+
+class KN11Scope(unittest.TestCase):
+    """KN-11 forgives READ and WRITE status-only; a LOCK one side granted and
+    the other refused parts the lock table, so that arm stops the trace."""
+
+    def test_a_refused_lock_is_not_reconcilable(self):
+        f = Finding("SLock", "status", NFS4_OK, NFS4ERR_OLD_STATEID)
+        ctx = registry_ctx([], make_replayer(), minor=0)
+        dev = kd.NFS4.lookup(f, ctx)
+        self.assertIs(dev, kd.KN_11_OPENMODE)
+        self.assertFalse(dev.is_reconcilable(f, ctx))
+
+    def test_a_read_openmode_disagreement_still_is(self):
+        f = Finding("SRead", "status", NFS4ERR_OPENMODE, NFS4_OK)
+        ctx = registry_ctx([], make_replayer(), minor=0)
+        dev = kd.NFS4.lookup(f, ctx)
+        self.assertIs(dev, kd.KN_11_OPENMODE)
+        self.assertTrue(dev.is_reconcilable(f, ctx))
 
 
 class ExitCode(unittest.TestCase):

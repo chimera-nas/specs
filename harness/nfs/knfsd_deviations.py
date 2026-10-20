@@ -131,7 +131,13 @@ KN_10_SHARE = Deviation(
 # KN-11: open-mode vs lock/IO enforcement -- the knfsd side of GD-15.  A READ or
 # WRITE through a stateid whose open the model thinks lacks the matching access
 # is OPENMODE/LOCKED to the model but allowed by knfsd, or the reverse.  RFC 8881
-# 9.1.2 leaves the exact match under-specified.  Status-only.
+# 9.1.2 leaves the exact match under-specified.  Status-only for READ and
+# WRITE.  Not for LOCK: a lock the model granted and knfsd refused (or the
+# reverse) parts the lock table, and every later op on it -- LOCKU,
+# RELEASE_LOCKOWNER, FREE_STATEID, I/O through it -- compares against state
+# only one side holds (knfsd40_stepState_80_0x7_2: the LOCK at step 32 refused,
+# RELEASE_LOCKOWNER at step 34 LOCKS_HELD to the model and OK to knfsd).  The
+# trace stops at the LOCK, as GD-15 does for ganesha.
 KN_11_OPENMODE = Deviation(
     id="KN-11-openmode-lock-vs-io",
     verdict=BOTH,
@@ -146,6 +152,7 @@ KN_11_OPENMODE = Deviation(
     expected_status=(NFS4_OK, NFS4ERR_OPENMODE, NFS4ERR_LOCKED),
     actual_status=(NFS4ERR_OPENMODE, NFS4_OK, NFS4ERR_BAD_STATEID,
                    NFS4ERR_OLD_STATEID),
+    reconcilable=lambda f, ctx: f.op != "SLock",
 )
 
 
