@@ -524,6 +524,7 @@ modprobe nfsd 2>/dev/null; \
 mount -t nfsd nfsd /proc/fs/nfsd 2>/dev/null || true; \
 echo ${GRACE} > /proc/fs/nfsd/nfsv4leasetime 2>/dev/null || true; \
 echo ${GRACE} > /proc/fs/nfsd/nfsv4gracetime 2>/dev/null || true; \
+echo knfsd-grace: kernel=\$(uname -r) nfsv4gracetime=\$(cat /proc/fs/nfsd/nfsv4gracetime 2>/dev/null) nfsv4leasetime=\$(cat /proc/fs/nfsd/nfsv4leasetime 2>/dev/null) nlm_grace_period=\$(cat /proc/sys/fs/nfs/nlm_grace_period 2>/dev/null) nlm_timeout=\$(cat /proc/sys/fs/nfs/nlm_timeout 2>/dev/null); \
 rpcbind || true; sleep 0.3; \
 exportfs -o rw,no_root_squash,insecure,no_subtree_check,fsid=0,sync ${GUEST_IP%.*}.0/24:/export; \
 rpc.nfsd 8; rpc.mountd; exportfs -a; \
@@ -591,6 +592,11 @@ done"
     }
 
     echo "=== knfsd (guest $(basename "$ROOTFS")) | $SUITE | traces ${TRACE_GLOB} ==="
+    # The grace and lease windows the guest actually runs with: a 4.0 client
+    # that waits out a grace window longer than its lease loses the lease, and
+    # lockd's grace (nlm_grace_period, or 5 x nlm_timeout) is a window of its
+    # own that nfsv4gracetime does not touch.
+    grep -m1 -o 'knfsd-grace: .*' "$QEMU_LOG" 2>/dev/null || echo "knfsd-grace: (not reported by the guest)"
 
     if [ -n "${SPECS_NFS_EXEC:-}" ]; then
         knfsd_reset || true
