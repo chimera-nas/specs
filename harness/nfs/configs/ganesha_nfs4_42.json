@@ -2,6 +2,8 @@
   "family": "nfs4",
   "description": "NFS-Ganesha at NFSv4.2 over FSAL_VFS on a loop-mounted ext4 image. The feature and policy knobs mirror chimera's nfs4_memfs42 cell exactly -- same minor version, same optional surface asserted, same discretionary policies -- so that a difference between the two corpora is a difference in what the two SERVERS do and nothing else. Everything below the batch list is what ganesha does differently.",
   "traceStem": "ganesha42",
+  "scenarios": [{"run": "openExclusiveOverDirRegression", "flavor": "step"},
+                {"run": "compoundTagTooLongRegression", "flavor": "step"}],
 
   // xattr, readPlus and writeSame were asserted here because this cell mirrors
   // chimera's nfs4_memfs42 -- but a feature knob describes the SERVER, not the
@@ -37,6 +39,11 @@
   // enabling it would be a claim the corpus cannot prove.  It is on in the 4.0
   // cell instead.
   "deviations": [
+    // The 256-byte NLONG compound tag is a rare draw of nsCompoundTag in
+    // every minor version's walk; the compoundTagTooLongRegression
+    // scenario pins the shape so the liveness claim does not depend on
+    // the seed.
+    "G4-compound-tag-length-limit",
     "G4-compound-shape-no-result",
     "S4-change-is-coarse-ctime",
     "G4-open-type-before-exist",

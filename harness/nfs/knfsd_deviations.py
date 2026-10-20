@@ -315,8 +315,31 @@ KN_22_ACCESS = Deviation(
     field="access",
 )
 
+# KN-24: an EXCLUSIVE4 OPEN of an existing file whose share reservation
+# conflicts with the request.  RFC 8881 18.16.4 lists NFS4ERR_EXIST (the name
+# exists and the verifier does not match) and NFS4ERR_SHARE_DENIED without
+# ordering them; the model answers the share conflict first, the Linux server
+# the existence check (knfsd40_stepState_80_0x7_5 step 15).  Both refuse and
+# neither creates or opens anything: status-only.
+KN_24_EXCL_EXIST_BEFORE_SHARE = Deviation(
+    id="KN-24-open-exist-before-share-denied",
+    verdict=BOTH,
+    spec="RFC 8881 18.16.4 (NFS4ERR_EXIST and NFS4ERR_SHARE_DENIED are both "
+         "listed for OPEN; their precedence is unstated)",
+    summary="an EXCLUSIVE4 OPEN of an existing file with a conflicting deny is "
+            "EXIST to knfsd where the model says SHARE_DENIED",
+    root_cause="knfsd resolves the exclusive-create disposition before the "
+               "share reservation; the model the reverse",
+    candidate_fix="carry both answers in the model's stAccept when both "
+                  "conditions hold",
+    ops=("SOpen",),
+    expected_status=(NFS4ERR_SHARE_DENIED,),
+    actual_status=(NFS4ERR_EXIST,),
+)
+
 
 NFS4 = Registry("knfsd/nfs4", [
+    KN_24_EXCL_EXIST_BEFORE_SHARE,
     KN_1_NAME_HANDLING,
     KN_7_UNCONFIRMED_OPEN_LOST,
     KN_10_SHARE,

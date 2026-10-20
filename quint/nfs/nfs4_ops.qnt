@@ -2556,8 +2556,11 @@ module nfs4ops {
                         }
                     | IoState(s) =>
                         // discretion: READ via a write-only open is a MAY
-                        // (RFC 8881 9.1.2); the model predicts OPENMODE
-                        // and the generator avoids the case.
+                        // (RFC 8881 9.1.2); the model predicts OPENMODE.
+                        // The random draws in ioRead reach it through open
+                        // and lock stateids (lockIo does not), and a
+                        // reference server that takes the MAY is forgiven
+                        // by its registry (KN-11, GD-15).
                         if (not(bitsOverlap(ioMode(a, io), 1)))
                             emit(a, SRead(nores.with("st", E_OPENMODE)))
                         else {

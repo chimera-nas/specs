@@ -247,6 +247,8 @@ class Replayer:
         self.sid_owner = {}           # model Sid -> (client, owner)
         self.sid_client = {}          # model Sid -> wire clientid
         self.sid_seq = {}             # model Sid -> wire stateid seqid
+        self.last_hit = None          # (deviation, step, finding) last forgiven
+        self.cur_step = 0             # step being encoded or compared
         self.chg = {}                 # ino -> {abstract change -> wire}
         self.replay_cache = {}        # (model sess, slot) -> raw reply
         self.deviceid = None
@@ -270,8 +272,10 @@ class Replayer:
 
     # -- bookkeeping --------------------------------------------------------
 
-    def hit(self, dev):
+    def hit(self, dev, step=None, finding=None):
         self.deviations_hit[dev.id] = self.deviations_hit.get(dev.id, 0) + 1
+        if step is not None:
+            self.last_hit = (dev, step, finding)
 
     def fnd(self, mism, op, kind, expected, actual, detail=""):
         mism.append(Finding(op, kind, expected, actual, detail))
@@ -281,6 +285,22 @@ class Replayer:
         if fh is None:
             if self.dry:
                 return b"\x7f" * 16
+            # The model holds an object the server never handed us: an
+            # earlier reply parted from the model on the path that created
+            # it.  When a recorded deviation forgave that reply as
+            # reconcilable, the forgiveness was wrong for this shape -- the
+            # state DID part -- and the honest outcome is the one a
+            # non-reconcilable hit gets: stop comparing, and say which entry
+            # let the trace run on, so the entry can be tightened.  Without
+            # any forgiven deviation behind it the trace itself is
+            # malformed, which stays an error.
+            if self.last_hit is not None:
+                dev, step, _ = self.last_hit
+                raise Abandon(self.cur_step, dev,
+                              Finding("compound", "filehandle",
+                                      f"ino {ino}", "none",
+                                      f"no filehandle for model ino {ino}; "
+                                      f"last forgiven at step {step}"))
             raise TraceFormatError(f"model ino {ino} has no learned "
                                    f"filehandle (earlier divergence?)")
         return fh
@@ -1186,7 +1206,7 @@ class Replayer:
             if dev is None:
                 unmatched.append(f)
                 continue
-            self.hit(dev)
+            self.hit(dev, idx, f)
             if abandon is None and not dev.is_reconcilable(f, ctx):
                 abandon = (dev, f)
         if unmatched:
@@ -1218,6 +1238,7 @@ class Replayer:
                 raise TraceFormatError(f"step {idx}: unexpected "
                                        f"{lab['tag']}")
             lab = lab["value"]
+            self.cur_step = idx
             rep = self.run_compound(idx, lab)
             self.history.append((idx, lab, rep))
             if self.verbose:

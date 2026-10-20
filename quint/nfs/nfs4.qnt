@@ -628,6 +628,46 @@ module nfs4 {
     def openSel(s: Sid): SidSel =
         SelRef({ sid: s, kind: KOpen, argSeq: 0 })
 
+    def lockSel(s: Sid): SidSel =
+        SelRef({ sid: s, kind: KLock, argSeq: 0 })
+
+    def delegSel(s: Sid): SidSel =
+        SelRef({ sid: s, kind: KDeleg, argSeq: 0 })
+
+    // The stateid an I/O-class op is sent through, with the client it
+    // belongs to (-1 for the anonymous stateid, which any ready client may
+    // send).
+    type IoVia = { sel: SidSel, cid: ClientId }
+
+    // The largest of a set of stateids, -1 for none: the "newest" one, which
+    // is what the I/O draw has always picked among a file's opens.
+    pure def newestSid(ss: Set[Sid]): Sid =
+        ss.fold(-1, (acc, s) => imax(acc, s))
+
+    // The stateids an I/O-class op on file f may be sent through: the
+    // anonymous stateid, plus the file's newest usable open, lock and
+    // delegation stateid, each paired with the client that owns it.  The
+    // lock stateid is what a Linux client sends while a process holds a
+    // POSIX lock on the file (nfs4_select_rw_stateid() prefers it to the
+    // open stateid), and the delegation stateid is what it falls back to
+    // when it holds a delegation and no lock.  A kind the file has no state
+    // of contributes nothing, so a file with no state keeps drawing the
+    // anonymous stateid and a file with only an open keeps the even
+    // anonymous/open split the draw had before locks and delegations
+    // joined it.
+    def ioVias(f: Ino): Set[IoVia] = {
+        val o = newestSid(usableOpens.filter(s => sdb.opens.get(s).file == f))
+        val l = newestSid(usableLocks.filter(s => sdb.locks.get(s).file == f))
+        val d = newestSid(usableDelegs.filter(s => sdb.delegs.get(s).file == f))
+        Set({ sel: SelAnon, cid: -1 })
+            .union(if (o == -1) Set() else
+                   Set({ sel: openSel(o), cid: sdb.opens.get(o).client }))
+            .union(if (l == -1) Set() else
+                   Set({ sel: lockSel(l), cid: sdb.locks.get(l).client }))
+            .union(if (d == -1) Set() else
+                   Set({ sel: delegSel(d), cid: sdb.delegs.get(d).client }))
+    }
+
     // Files a usable client currently holds a delegation on, plus who
     // holds each, and the ready clients that could break it (any ready
     // client other than the holder).  These drive the deleg-break
@@ -1383,15 +1423,9 @@ module nfs4 {
             nondet f = oneOf(wide(files, wm, wt))
             nondet off = oneOf(0.to(MAX_BLOCKS))
             nondet len = oneOf(1.to(2))
-            val opensOfF = usableOpens.filter(s => sdb.opens.get(s).file == f)
-            nondet useOpen = oneOf(Set(false, true))
-            val sel = if (useOpen and opensOfF.size() > 0)
-                          openSel(opensOfF.fold(-1, (a2, s) => imax(a2, s)))
-                      else SelAnon
-            val cid = if (useOpen and opensOfF.size() > 0)
-                          sdb.opens.get(opensOfF.fold(-1, (a2, s) =>
-                              imax(a2, s))).client
-                      else anyReady
+            nondet via = oneOf(ioVias(f))
+            val sel = via.sel
+            val cid = if (via.cid == -1) anyReady else via.cid
             val rcid = if (MINOR == 0) -1 else
                        (if (cid == -1) anyReady else cid)
             if (delegOtherWrite(f, if (rcid == -1) anyReady else rcid))
@@ -1413,12 +1447,9 @@ module nfs4 {
             nondet len = oneOf(1.to(2))
             nondet pat = oneOf(BLOCK_SYMS)
             nondet stable = oneOf(STABLE_LEVELS)
-            val opensOfF = usableOpens.filter(s => sdb.opens.get(s).file == f)
-            nondet useOpen = oneOf(Set(false, true))
-            val sid = opensOfF.fold(-1, (a2, s) => imax(a2, s))
-            val sel = if (useOpen and sid != -1) openSel(sid) else SelAnon
-            val cid = if (useOpen and sid != -1) sdb.opens.get(sid).client
-                      else anyReady
+            nondet via = oneOf(ioVias(f))
+            val sel = via.sel
+            val cid = if (via.cid == -1) anyReady else via.cid
             val wcid = if (MINOR == 0) -1 else
                        (if (cid == -1) anyReady else cid)
             if (delegOther(f, if (wcid == -1) anyReady else wcid))
@@ -1451,10 +1482,13 @@ module nfs4 {
             nondet wt = oneOf(FTYPES)
             nondet f = oneOf(wide(files, wm, wt))
             nondet sz = oneOf(0.to(MAX_BLOCKS))
-            val opensOfF = usableOpens.filter(s => sdb.opens.get(s).file == f)
-            nondet useOpen = oneOf(Set(false, true))
-            val sid = opensOfF.fold(-1, (a2, s) => imax(a2, s))
-            val sel = if (useOpen and sid != -1) openSel(sid) else SelAnon
+            nondet via = oneOf(ioVias(f))
+            val sel = via.sel
+            // Sent under the newest ready client rather than the stateid's
+            // owner, on purpose: on 4.1+ that is how the cross-client
+            // NFS4ERR_BAD_STATEID answer gets generated (the stateid names
+            // no state of the sending client), and lockIo supplies the
+            // same-client case.
             if (delegOther(f, anyReady))
                 runC(withSess(anyReady, [ RPutfh(f), RGetattr ]))
             else
@@ -1591,6 +1625,49 @@ module nfs4 {
             val l = sdb.locks.get(s)
             runC([ RReleaseLockowner({ client: l.client,
                                        lockOwner: l.owner }) ])
+        },
+    }
+
+    // I/O through a byte-range lock stateid, sent by the client that holds
+    // the lock: READ, WRITE or a size-changing SETATTR.  This is what a
+    // Linux client sends while a process holds a POSIX lock on the file
+    // (nfs4_select_rw_stateid() prefers the lock stateid to the open
+    // stateid), and the random draw in ioRead / ioWrite / ioSetattrSize
+    // reaches it only when the file it happened to pick is locked.
+    // Starting from the lock makes every flavour that creates locks also
+    // send I/O through them.  READ is drawn only under an open with read
+    // access: READ via a write-only open is a MAY (RFC 8881 9.1.2) that this
+    // action leaves to the random draw in ioRead, where a lock inherits its
+    // open's mode and the model predicts NFS4ERR_OPENMODE, and a reference
+    // server that takes the MAY is forgiven by its registry (KN-11, GD-15)
+    // rather than by the model.  WRITE and SETATTR under a read-only open
+    // draw NFS4ERR_OPENMODE, a MUST, and stay generated.
+    action lockIo = all {
+        genReady,
+        usableLocks.size() > 0,
+        {
+            nondet s = oneOf(usableLocks)
+            val l = sdb.locks.get(s)
+            val o = sdb.opens.get(l.openSid)
+            nondet which = oneOf(if (bitsOverlap(o.access, 1)) Set(0, 1, 2)
+                                 else Set(1, 2))
+            nondet off = oneOf(0.to(MAX_BLOCKS - 1))
+            nondet len = oneOf(1.to(2))
+            nondet pat = oneOf(BLOCK_SYMS)
+            nondet stable = oneOf(STABLE_LEVELS)
+            nondet sz = oneOf(0.to(MAX_BLOCKS))
+            val op = if (which == 0)
+                         RRead({ sel: lockSel(s), off: off, len: len })
+                     else if (which == 1)
+                         RWrite({ sel: lockSel(s), off: off,
+                                  len: imin(len, MAX_BLOCKS - off), pat: pat,
+                                  stable: stable })
+                     else
+                         RSetattr({ mode: -1, sizeBlocks: sz, sel: lockSel(s) })
+            if (delegOther(l.file, l.client))
+                runC(withSess(l.client, [ RPutfh(l.file), RGetattr ]))
+            else
+                runC(withSess(l.client, [ RPutfh(l.file), op ]))
         },
     }
 
@@ -2113,6 +2190,7 @@ module nfs4 {
         lockFree,
         freeStateidOpen,
         lockReleaseOwner,
+        lockIo,
         delegReturn,
         pnfsLayoutget,
         pnfsLayoutreturn,
@@ -2140,7 +2218,7 @@ module nfs4 {
         openOddName, openOddName,
         lockNew, lockNew, lockExist, lockCheck, lockUnlock, lockUnlock,
         lockFree, freeStateidOpen, lockReleaseOwner, delegReturn,
-        ioRead, ioWrite,
+        lockIo, lockIo, ioRead, ioWrite,
         nsGetattr,
     }
 
@@ -2167,7 +2245,9 @@ module nfs4 {
     // through delegated files (how cached writes and recall flushes
     // reconcile with the model's block map) is a deeper coherency layer
     // left to a follow-on; nsGetattr is the one read here, and it only
-    // observes the change attribute the lifecycle already tracks.
+    // observes the change attribute the lifecycle already tracks.  I/O
+    // through delegation stateids (the delegation arm of ioVias) is part of
+    // that follow-on and is not generated here.
     action stepDelegBody = any {
         setupSetclientid, setupSetclientidConfirm,
         setupExchangeId, setupCreateSession,
@@ -2366,5 +2446,40 @@ module nfs4 {
             .then(runC(withSess(0, [RPutfh(1), RSavefh, RPutfh(2),
                 RCopy({srcSel: SelAnon, dstSel: SelAnon, srcOff: 0, dstOff: 1, cnt: 2})])))
             .then(runC(withSess(0, [RPutfh(2), RRead({sel: SelAnon, off: 0, len: 3})])))
+
+    // SECINFO of an over-long name.  The random walk reaches it only when
+    // nsBadName draws both its SECINFO arm and NLONG (one draw in 133), which
+    // the old corpus did twice and a corpus with lockIo in the mix did not
+    // at all; a bucket that comes and goes with the seed is no gate, so the
+    // shape is exported deterministically instead of re-rolling the walk.
+    run secinfoNameTooLongRegression =
+        coverageBootRun
+            .then(runC(withSess(0, [RPutfh(ROOT), RSecinfo("NLONG")])))
+
+    // EXCLUSIVE4 OPEN of a name that is a directory.  RFC 7530 16.16.4 lists
+    // NFS4ERR_EXIST and the target's own type error for a create that must
+    // not clobber, without ordering them, and the servers split: this is the
+    // one shape that exercises G4-open-type-before-exist (ganesha answers
+    // the type error on the exclusive arm; the model's reading is EXIST).
+    // The random walk reaches it only when openNew draws EXCLUSIVE4 against
+    // a name that currently holds a directory, which a cell's corpus can
+    // stop doing from one seed to the next -- and a cell that enables the
+    // deviation without exercising it fails devliveness.
+    run openExclusiveOverDirRegression =
+        coverageBootRun
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                RCreate({ctype: FDir, name: "dir", mode: 493, target: ""})])))
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 1, oseq: 1, claim: OCNull("dir"),
+                       how: HExclusive({verf: 1}), access: 1, deny: 0})])))
+
+    // A COMPOUND carrying the 256-byte NLONG tag.  Whether a server caps the
+    // tag length is a recorded deviation (G4-compound-tag-length-limit, see
+    // tagStatus); which walks send the tag is one rare draw of nsCompoundTag
+    // per trace, so the cells that enable the deviation export the shape and
+    // the liveness gate stops depending on the seed.
+    run compoundTagTooLongRegression =
+        coverageBootRun
+            .then(runTagged("NLONG", withSess(0, [RPutrootfh])))
 
 }

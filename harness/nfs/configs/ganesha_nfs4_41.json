@@ -2,6 +2,8 @@
   "family": "nfs4",
   "description": "The same ganesha spoken to at NFSv4.1: sessions and the slot replay discipline, with none of the 4.2 data operations (the model gates every one of them on MINOR >= 2). Mirrors chimera's nfs4_memfs41 cell for features and policies.",
   "traceStem": "ganesha41",
+  "scenarios": [{"run": "openExclusiveOverDirRegression", "flavor": "step"},
+                {"run": "compoundTagTooLongRegression", "flavor": "step"}],
 
   "features": {
     "pnfs": "unsupported",
@@ -30,6 +32,11 @@
   // (which claims neither reference server polices the tag) is not enabled on
   // this side; it stays on for knfsd, which does accept them.
   "deviations": [
+    // The 256-byte NLONG compound tag is a rare draw of nsCompoundTag in
+    // every minor version's walk; the compoundTagTooLongRegression
+    // scenario pins the shape so the liveness claim does not depend on
+    // the seed.
+    "G4-compound-tag-length-limit",
     "G4-compound-shape-no-result",
     "S4-change-is-coarse-ctime",
     "G4-open-type-before-exist",
