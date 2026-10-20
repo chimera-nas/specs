@@ -627,19 +627,27 @@ class Replayer:
         if tag == "RCommit":
             return c4.enc_commit()
         if tag == "RLock":
+            # Both stateids a LOCK names go out with the seqid the server
+            # last handed us (wire_seq), as LOCKU's and every SelRef already
+            # do.  A literal 0 is not the all-zeros wildcard on a real
+            # stateid: a strict 4.0 server reads it as seqid 0, which is OLD
+            # the moment OPEN_CONFIRM has moved the open stateid to 2 -- and
+            # knfsd answered every new-owner LOCK that way.
             off, length = lock_range(v["lo"], v["hi"])
             if v["newOwner"]:
                 return c4.enc_lock(
                     v["wr"], False, off, length, True,
                     open_seqid=v["oseq"],
-                    open_sid=(0, self.sid_of(v["openSid"])),
+                    open_sid=(self.wire_seq(v["openSid"], 0),
+                              self.sid_of(v["openSid"])),
                     lock_seqid=v["lseq"],
                     clientid=self.clientid_of_sid(v),
                     owner=owner_bytes("lo", v["lockOwner"]))
             return c4.enc_lock(
                 v["wr"], False, off, length, False,
                 lock_seqid=v["lseq"],
-                lock_sid=(0, self.sid_of(v["lockSid"])))
+                lock_sid=(self.wire_seq(v["lockSid"], 0),
+                          self.sid_of(v["lockSid"])))
         if tag == "RLockt":
             off, length = lock_range(v["lo"], v["hi"])
             return c4.enc_lockt(v["wr"], off, length,

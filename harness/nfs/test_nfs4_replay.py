@@ -281,6 +281,52 @@ class LeaseLapse(unittest.TestCase):
         self.assertEqual(mism, [])
 
 
+class LockStateidSeqid(unittest.TestCase):
+    """A LOCK names an open stateid (new owner) or a lock stateid (existing
+    owner).  Both go out with the seqid the server last handed us, as every
+    other stateid the replayer sends does: a literal 0 is not the wildcard
+    on a real stateid, and a strict 4.0 server answers OLD_STATEID once
+    OPEN_CONFIRM has advanced the open stateid."""
+
+    def encode(self, r, value):
+        captured = {}
+
+        def fake_enc_lock(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return b""
+        real = r4.c4.enc_lock
+        r4.c4.enc_lock = fake_enc_lock
+        try:
+            r.encode_op({"tag": "RLock", "value": value})
+        finally:
+            r4.c4.enc_lock = real
+        return captured["kwargs"]
+
+    def test_a_new_owner_lock_names_the_open_stateid_at_its_current_seqid(self):
+        r = make_replayer(sid_seq={1: 2}, sid_other={1: b"o" * 12},
+                          sid_client={1: 0x77}, clientid={})
+        kw = self.encode(r, {"wr": True, "lo": 0, "hi": 2, "newOwner": True,
+                             "openSid": 1, "lockSid": -1, "lockOwner": 6,
+                             "oseq": 3, "lseq": 0})
+        self.assertEqual(kw["open_sid"], (2, b"o" * 12))
+        self.assertEqual(kw["open_seqid"], 3)
+
+    def test_an_existing_owner_lock_names_the_lock_stateid_at_its_seqid(self):
+        r = make_replayer(sid_seq={2: 4}, sid_other={2: b"l" * 12})
+        kw = self.encode(r, {"wr": False, "lo": 0, "hi": 2,
+                             "newOwner": False, "openSid": -1, "lockSid": 2,
+                             "lockOwner": 6, "oseq": 0, "lseq": 5})
+        self.assertEqual(kw["lock_sid"], (4, b"l" * 12))
+
+    def test_an_unlearned_stateid_still_goes_out_with_seqid_0(self):
+        r = make_replayer(sid_seq={}, sid_other={})
+        kw = self.encode(r, {"wr": False, "lo": 0, "hi": 2,
+                             "newOwner": False, "openSid": -1, "lockSid": 9,
+                             "lockOwner": 6, "oseq": 0, "lseq": 1})
+        self.assertEqual(kw["lock_sid"][0], 0)
+
+
 class ExitCode(unittest.TestCase):
     """A lapsed trace is not a failure and not a pass: like a capability
     SKIP it leaves the batch's verdict to the other traces, and a batch of
