@@ -482,6 +482,35 @@ def classify_compound4(lab, names, buckets, lock_bytes):
                 and v.get("hi", 0) >= lock_bytes:
             buckets.add("v4:x:locku-whole-file")
 
+    # I/O through a byte-range lock stateid.  A client holding a POSIX lock
+    # on the file sends the LOCK stateid, not the open stateid, in READ,
+    # WRITE and a size-changing SETATTR (Linux nfs4_select_rw_stateid()
+    # prefers it), and for a long time the generator could not reach that
+    # shape at all: a server that refused the lock stateid in SETATTR(size)
+    # with NFS4ERR_BAD_STATEID replayed green.  The -ok twins pin the case
+    # where the model expects the op to SUCCEED -- a lock anchored to a
+    # write-capable open of the current file, used by its own client --
+    # which is the shape that refusal broke; without them a corpus whose
+    # every lock-stateid I/O happened to be refused for another reason
+    # (another client's session, a read-only open) would still count.
+    IO_VIA_LOCK = {"RRead": "read", "RWrite": "write", "RSetattr": "setattr-size"}
+    for i, o in enumerate(lab["ops"]):
+        name = IO_VIA_LOCK.get(o.get("tag"))
+        v = o.get("value")
+        if name is None or not isinstance(v, dict):
+            continue
+        if name == "setattr-size" and v.get("sizeBlocks", -1) < 0:
+            continue
+        sel = v.get("sel")
+        if not (isinstance(sel, dict) and sel.get("tag") == "SelRef"
+                and sel["value"]["kind"]["tag"] == "KLock"):
+            continue
+        buckets.add(f"v4:x:{name}-via-lock-stateid")
+        if i < len(lab["results"]):
+            r = lab["results"][i]["value"]
+            if isinstance(r, dict) and r.get("st", 0) == 0:
+                buckets.add(f"v4:x:{name}-via-lock-stateid-ok")
+
 
 def analyze4(trace_files, model_dir):
     names = load_status_names(model_dir)

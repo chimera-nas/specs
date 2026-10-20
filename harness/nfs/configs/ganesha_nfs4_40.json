@@ -12,8 +12,8 @@
     "G4-compound-shape-no-result"
   ],
   "deviations": [
-    // Only the 4.0 walk sends the 256-byte NLONG compound tag (measured with
-    // tools/devliveness.py), so this is the one profile that can prove it.
+    // Inherited from the 4.1 base, which lists it with the scenario that
+    // pins it; restated here because this profile proved it first.
     "G4-compound-tag-length-limit"
   ],
 

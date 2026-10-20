@@ -3,6 +3,13 @@
   "description": "The 4.1 ganesha standing as a pNFS METADATA server: LAYOUTGET, LAYOUTCOMMIT, LAYOUTRETURN and GETDEVICEINFO are required rather than explored, so failing to advertise EXCHGID4_FLAG_USE_PNFS_MDS is a failure and not a skip. A single-node ganesha over a local filesystem is not a metadata server, so in practice this cell reports a ctest SKIP -- which is the point: the gap stays visible and attributable.",
   "traceStem": "ganeshaPnfs41",
 
+  // No scenarios: the parent's two pin G4-open-type-before-exist and
+  // G4-compound-tag-length-limit; the latter is switched off below, and a
+  // scenario trace replayed against a cell whose model does not carry the
+  // deviation would mismatch.  "scenarios" is inherited like "batches", so
+  // the empty list is explicit.
+  "scenarios": [],
+
   "features": {
     "pnfs": "supported"
   },

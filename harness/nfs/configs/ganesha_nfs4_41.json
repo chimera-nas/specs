@@ -2,6 +2,8 @@
   "family": "nfs4",
   "description": "The same ganesha spoken to at NFSv4.1: sessions and the slot replay discipline, with none of the 4.2 data operations (the model gates every one of them on MINOR >= 2). Mirrors chimera's nfs4_memfs41 cell for features and policies.",
   "traceStem": "ganesha41",
+  "scenarios": [{"run": "openExclusiveOverDirRegression", "flavor": "step"},
+                {"run": "compoundTagTooLongRegression", "flavor": "step"}],
 
   "features": {
     "pnfs": "unsupported",
@@ -19,17 +21,17 @@
   // As at 4.2 minus the two that need RFC 7862 operations to exist:
   // G4-seek-at-eof-not-nxio (SEEK is 4.2) has nothing to fire on here, and
   // holeTracking with it.
-  // G4-compound-tag-length-limit is NOT enabled here even though ganesha has
-  // it: measured with tools/devliveness.py, no trace this profile generates
-  // ever sends the 256-byte NLONG compound tag -- only the 4.0 walk does -- so
-  // enabling it would be a claim the corpus cannot prove.  It is on in the 4.0
-  // cell instead.
   // The compound tag: this ganesha DOES validate it.  Measured across the 4.0
   // corpus -- 8 malformed tags reached it, 8 were refused with NFS4ERR_INVAL
   // and an empty result array, none accepted -- so S4-compound-tag-unvalidated
   // (which claims neither reference server polices the tag) is not enabled on
   // this side; it stays on for knfsd, which does accept them.
   "deviations": [
+    // The 256-byte NLONG compound tag is a rare draw of nsCompoundTag in
+    // every minor version's walk; the compoundTagTooLongRegression
+    // scenario pins the shape so the liveness claim does not depend on
+    // the seed.
+    "G4-compound-tag-length-limit",
     "G4-compound-shape-no-result",
     "S4-change-is-coarse-ctime",
     "G4-open-type-before-exist",

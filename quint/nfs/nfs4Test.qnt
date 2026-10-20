@@ -562,6 +562,133 @@ module nfs4Test42 {
                                                  argSeq: 0 }) ]))
             .expect(lastStatus == OK and sdb.locks.keys().size() == 0)
 
+    // --- I/O through lock and delegation stateids ---------------------
+
+    // A lock stateid carries its open's access (RFC 7530 16.32.4 / RFC 8881
+    // 18.30.4: a size change "has the same locking requirements as a
+    // corresponding WRITE"), with seqid 0 as the current-seqid wildcard.
+    run lockStateidIoTest =
+        openCreateRun
+            .then(runC([ seq0(2), RPutfh(1),
+                         RDelegreturn({ sid: 1, kind: KDeleg, argSeq: 0 }) ]))
+            .expect(lastStatus == OK)
+            .then(runC([ seq0(3), RPutfh(1),
+                         RLock({ wr: true, lo: 0, hi: 6, newOwner: true,
+                                 openSid: 0, lockSid: -1, lockOwner: 6,
+                                 oseq: 0, lseq: 0 }) ]))
+            .expect(lastStatus == OK and asLock(resAt(2)).sid == 2)
+            // WRITE, SETATTR(size) and READ through the lock on a BOTH open.
+            .then(runC([ seq0(4), RPutfh(1),
+                         RWrite({ sel: SelRef({ sid: 2, kind: KLock, argSeq: 0 }),
+                                  off: 0, len: 2, pat: 3, stable: 0 }) ]))
+            .expect(lastStatus == OK and fsGet(fs, 1).sizeBlocks == 2)
+            .then(runC([ seq0(5), RPutfh(1),
+                         RSetattr({ mode: -1, sizeBlocks: 1,
+                                    sel: SelRef({ sid: 2, kind: KLock, argSeq: 0 }) }) ]))
+            .expect(lastStatus == OK and fsGet(fs, 1).sizeBlocks == 1)
+            .then(runC([ seq0(6), RPutfh(1),
+                         RRead({ sel: SelRef({ sid: 2, kind: KLock, argSeq: 0 }),
+                                 off: 0, len: 2 }) ]))
+            .expect(lastStatus == OK and asRead(resAt(2)).blocks == [ 3 ] and
+                    asRead(resAt(2)).eof)
+            // A lock under a read-only open does not widen it: the writes
+            // draw OPENMODE, READ is fine.
+            .then(runC([ seq0(7), RPutrootfh,
+                         ROpen({ client: 0, owner: 2, oseq: 0,
+                                 claim: OCNull("f"), how: HNoCreate,
+                                 access: 1, deny: 0 }), RGetfh ]))
+            .expect(lastStatus == OK and asOpen(resAt(2)).sid == 3)
+            .then(runC([ seq0(8), RPutfh(1),
+                         RLock({ wr: false, lo: 6, hi: 8, newOwner: true,
+                                 openSid: 3, lockSid: -1, lockOwner: 7,
+                                 oseq: 0, lseq: 0 }) ]))
+            .expect(lastStatus == OK and asLock(resAt(2)).sid == 5)
+            .then(runC([ seq0(9), RPutfh(1),
+                         RSetattr({ mode: -1, sizeBlocks: 0,
+                                    sel: SelRef({ sid: 5, kind: KLock, argSeq: 0 }) }) ]))
+            .expect(lastStatus == E_OPENMODE)
+            .then(runC([ seq0(10), RPutfh(1),
+                         RWrite({ sel: SelRef({ sid: 5, kind: KLock, argSeq: 0 }),
+                                  off: 0, len: 1, pat: 1, stable: 0 }) ]))
+            .expect(lastStatus == E_OPENMODE)
+            .then(runC([ seq0(11), RPutfh(1),
+                         RRead({ sel: SelRef({ sid: 5, kind: KLock, argSeq: 0 }),
+                                 off: 0, len: 1 }) ]))
+            .expect(lastStatus == OK)
+            // Another file's lock stateid designates no state of this file.
+            .then(runC([ seq0(12), RPutrootfh,
+                         ROpen({ client: 0, owner: 3, oseq: 0,
+                                 claim: OCNull("g"),
+                                 how: HGuarded({ mode: 420 }),
+                                 access: 3, deny: 0 }), RGetfh ]))
+            .expect(lastStatus == OK and asOpen(resAt(2)).sid == 6)
+            .then(runC([ seq0(13), RPutfh(2),
+                         RSetattr({ mode: -1, sizeBlocks: 1,
+                                    sel: SelRef({ sid: 2, kind: KLock, argSeq: 0 }) }) ]))
+            .expect(lastStatus == E_BAD_STATEID)
+            // Every byte unlocked: the stateid lives until FREE_STATEID and
+            // still carries its open's access.
+            .then(runC([ seq0(14), RPutfh(1),
+                         RLocku({ sid: 2, argSeq: 0, lseq: 0, lo: 0, hi: 6 }) ]))
+            .expect(lastStatus == OK)
+            .then(runC([ seq0(15), RPutfh(1),
+                         RSetattr({ mode: -1, sizeBlocks: 2,
+                                    sel: SelRef({ sid: 2, kind: KLock, argSeq: 0 }) }) ]))
+            .expect(lastStatus == OK and fsGet(fs, 1).sizeBlocks == 2)
+            // Another client's session: the stateid designates no state of
+            // client 1 (RFC 8881 15.1.5.2).
+            .then(runC([ RExchangeId({ ownerSym: 2, verfSym: 1 }) ]))
+            .then(runC([ RCreateSession({ client: 1, csaSeq: 1,
+                                          backChan: true }) ]))
+            .then(runC([ RSequence({ sess: 1, slot: 1, seq: 1,
+                                     cacheThis: false }),
+                         RReclaimComplete ]))
+            .expect(lastStatus == OK)
+            .then(runC([ RSequence({ sess: 1, slot: 0, seq: 1,
+                                     cacheThis: true }), RPutfh(1),
+                         RSetattr({ mode: -1, sizeBlocks: 1,
+                                    sel: SelRef({ sid: 2, kind: KLock, argSeq: 0 }) }) ]))
+            .expect(lastStatus == E_BAD_STATEID)
+
+    // A delegation stateid carries the delegation's mode: a write delegation
+    // authorises the data path, a read delegation only READ.  Generation of
+    // this shape waits on the delegation flavour growing I/O.
+    run delegStateidIoTest =
+        openCreateRun
+            .then(runC([ seq0(2), RPutfh(1),
+                         RSetattr({ mode: -1, sizeBlocks: 2,
+                                    sel: SelRef({ sid: 1, kind: KDeleg, argSeq: 0 }) }) ]))
+            .expect(lastStatus == OK and fsGet(fs, 1).sizeBlocks == 2)
+            .then(runC([ seq0(3), RPutfh(1),
+                         RWrite({ sel: SelRef({ sid: 1, kind: KDeleg, argSeq: 0 }),
+                                  off: 0, len: 1, pat: 2, stable: 0 }) ]))
+            .expect(lastStatus == OK)
+            .then(runC([ seq0(4), RPutfh(1),
+                         RRead({ sel: SelRef({ sid: 1, kind: KDeleg, argSeq: 0 }),
+                                 off: 0, len: 1 }) ]))
+            .expect(lastStatus == OK and asRead(resAt(2)).blocks == [ 2 ])
+            .then(runC([ seq0(5), RPutrootfh,
+                         ROpen({ client: 0, owner: 2, oseq: 0,
+                                 claim: OCNull("g"),
+                                 how: HGuarded({ mode: 420 }),
+                                 access: 1, deny: 0 }), RGetfh ]))
+            .expect(lastStatus == OK and asOpen(resAt(2)).sid == 2)
+            .expect(match asOpen(resAt(2)).deleg {
+                | DRead(x) => true
+                | _ => false })
+            .then(runC([ seq0(6), RPutfh(2),
+                         RSetattr({ mode: -1, sizeBlocks: 1,
+                                    sel: SelRef({ sid: 3, kind: KDeleg, argSeq: 0 }) }) ]))
+            .expect(lastStatus == E_OPENMODE)
+            .then(runC([ seq0(7), RPutfh(2),
+                         RRead({ sel: SelRef({ sid: 3, kind: KDeleg, argSeq: 0 }),
+                                 off: 0, len: 1 }) ]))
+            .expect(lastStatus == OK)
+            .then(runC([ seq0(8), RPutfh(2),
+                         RSetattr({ mode: -1, sizeBlocks: 1,
+                                    sel: SelRef({ sid: 1, kind: KDeleg, argSeq: 0 }) }) ]))
+            .expect(lastStatus == E_BAD_STATEID)
+
     // --- pNFS ---------------------------------------------------------
 
     run layoutLifecycleTest =

@@ -105,7 +105,12 @@ GD_6_NAME_HANDLING = Deviation(
 # under-specified.  The model and ganesha draw the line differently in both
 # directions: a READ_LT lock on a write-only open is OPENMODE to ganesha but
 # allowed by the model, and a READ through a stateid the model thinks lacks
-# READ is OPENMODE to the model but allowed by ganesha.  Status-only.
+# READ is OPENMODE to the model but allowed by ganesha.  Status-only for READ
+# and WRITE.  Not for LOCK: a lock the model granted and ganesha refused (or
+# the reverse) parts the lock table, and every later op on that stateid --
+# LOCKU, FREE_STATEID, I/O through it -- compares against state only one side
+# holds (ganesha42_stepState_80_0x7_1 step 21: LOCKU of a stateid ganesha never
+# issued, answered BAD_STATEID).  The trace stops at the LOCK.
 GD_15_OPENMODE = Deviation(
     id="GD-15-openmode-lock-vs-io",
     verdict=BOTH,
@@ -119,6 +124,7 @@ GD_15_OPENMODE = Deviation(
     ops=("SLock", "SRead", "SWrite"),
     expected_status=(NFS4_OK, NFS4ERR_OPENMODE, NFS4ERR_LOCKED),
     actual_status=(NFS4ERR_OPENMODE, NFS4_OK),
+    reconcilable=lambda f, ctx: f.op != "SLock",
 )
 
 # GD-16: EXCLUSIVE open verifier lifecycle and share-vs-create precedence.  The
@@ -343,11 +349,12 @@ GD_19_OWNER_SEQID_GAP = Deviation(
             "sometimes; the other times it is answered on its merits",
     root_cause="ganesha's open-owner sequence check does not fire uniformly",
     candidate_fix="ganesha: police the gap on every OPEN, or on none",
-    # CLOSE, OPEN_CONFIRM and OPEN_DOWNGRADE ride the same owner sequence, so
-    # once it has parted they answer BAD_SEQID too; the guard below keeps the
-    # entry to exactly that -- a finding with BAD_SEQID on one side or the
-    # other, at 4.0, where the sequence exists at all.
-    ops=("SOpen", "SClose", "SOpenConfirm", "SOpenDowngrade"),
+    # CLOSE, OPEN_CONFIRM, OPEN_DOWNGRADE and a LOCK with new_lock_owner (it
+    # carries the open-owner seqid, RFC 7530 16.10.1) ride the same owner
+    # sequence, so once it has parted they answer BAD_SEQID too; the guard
+    # below keeps the entry to exactly that -- a finding with BAD_SEQID on one
+    # side or the other, at 4.0, where the sequence exists at all.
+    ops=("SOpen", "SClose", "SOpenConfirm", "SOpenDowngrade", "SLock"),
     context=lambda f, ctx: ctx.get("minor") == 0 and f.kind == "status" and
                            (f.expected == NFS4ERR_BAD_SEQID or
                             f.actual == NFS4ERR_BAD_SEQID),
@@ -484,8 +491,104 @@ GD_17B_RFLAGS_CONFIRM_40 = Deviation(
     reconcilable=False,
 )
 
+# GD-39: SETATTR(size) through a lock stateid whose lock is a READ lock.  RFC
+# 7530 16.32.4 / RFC 8881 18.30.4 give a size-changing SETATTR the locking
+# requirements of a WRITE and make the stateid supply them, and the model --
+# like chimera and the Linux server -- takes them from the OPEN the lock
+# stateid is anchored to: a read lock under a write-capable open truncates.
+# NFS-Ganesha V6.5 answers NFS4ERR_BAD_STATEID for that stateid (not OPENMODE)
+# while it accepts the same SETATTR through a write-lock stateid: measured on
+# the 4.1 and 4.2 stepState corpora, four refusals, every one a READ_LT lock
+# (ganesha42_stepState_80_0x7_0 step 9, _3 step 39), and the WRITE_LT one at
+# ganesha42_stepState_80_0x7_1 step 19 succeeds.  Where the model expected the
+# truncation to happen the two part on the file's size, so the trace stops;
+# where the model expected OPENMODE both sides refused and replay goes on.
+#
+# The entry is scoped to exactly what was measured: the SETATTR changes the
+# size and names a lock stateid (SelRef, KLock) whose last LOCK was a read
+# lock.  A BAD_STATEID for the same SETATTR through an open, delegation or
+# write-lock stateid is unexplained and stays a MISMATCH -- that shape is
+# chimera-nas/chimera#1728, the bug lock-stateid I/O exists to catch, and
+# this entry must not be what lets it replay green.
+def _setattr_size_via_read_lock(f, ctx):
+    sid_wr = ctx["replayer"].sid_wr
+    for op in ctx["ops"]:
+        if op["tag"] != "RSetattr" or op["value"]["sizeBlocks"] < 0:
+            continue
+        sel = op["value"]["sel"]
+        if sel["tag"] != "SelRef":
+            continue
+        kind = sel["value"]["kind"]
+        kind = kind["tag"] if isinstance(kind, dict) else kind
+        if kind == "KLock" and sid_wr.get(sel["value"]["sid"]) is False:
+            return True
+    return False
+
+
+GD_39_SETATTR_READ_LOCK = Deviation(
+    id="GD-39-setattr-read-lock-stateid",
+    verdict=SERVER,
+    spec="RFC 7530 16.32.4 / RFC 8881 18.30.4 (a size-changing SETATTR has the "
+         "locking requirements of a WRITE; the stateid's open supplies them)",
+    summary="SETATTR(size) through a read-lock stateid under a write-capable "
+            "open is refused NFS4ERR_BAD_STATEID; through a write-lock stateid "
+            "it succeeds",
+    root_cause="ganesha derives a lock stateid's SETATTR authorisation from the "
+               "lock type rather than from the anchoring open's share access",
+    candidate_fix="ganesha: resolve a lock stateid in SETATTR to its open, as "
+                  "WRITE does",
+    ops=("SSetattr",),
+    expected_status=(NFS4_OK, NFS4ERR_OPENMODE),
+    actual_status=(NFS4ERR_BAD_STATEID,),
+    context=_setattr_size_via_read_lock,
+    reconcilable=lambda f, ctx: f.expected == NFS4ERR_OPENMODE,
+)
+
+# GD-40: two refusals, two orders.  A SETATTR(size) through another client's
+# stateid of a read-only open is NFS4ERR_BAD_STATEID to the model (RFC 8881
+# 15.1.5.2: the stateid designates no state of the sending client) and
+# NFS4ERR_OPENMODE to ganesha (9.1.2: the open lacks WRITE), which checks the
+# access mode before the owner.  Neither RFC orders the two, both refuse, and
+# nothing changes on either side: status-only.
+GD_40_SETATTR_OPENMODE_FIRST = Deviation(
+    id="GD-40-setattr-openmode-before-owner",
+    verdict=BOTH,
+    spec="RFC 8881 15.1.5.2 (BAD_STATEID for another client's stateid) / "
+         "9.1.2 (OPENMODE); their precedence is unstated",
+    summary="SETATTR(size) through another client's read-only open stateid is "
+            "OPENMODE to ganesha where the model says BAD_STATEID",
+    root_cause="ganesha checks the open's access mode before the stateid's "
+               "owner",
+    candidate_fix="carry both answers in the model's stAccept when both "
+                  "conditions hold",
+    ops=("SSetattr",),
+    expected_status=(NFS4ERR_BAD_STATEID,),
+    actual_status=(NFS4ERR_OPENMODE,),
+)
+
+# GD-41: DESTROY_CLIENTID sent alongside other operations.  RFC 8881 18.50.3
+# makes that NFS4ERR_NOT_ONLY_OP; ganesha first asks whether the client id is
+# still busy and answers NFS4ERR_CLIENTID_BUSY when it is.  Both refuse and
+# neither destroys anything, so the two stay in step: status-only.
+GD_41_DESTROY_CLIENTID_BUSY_FIRST = Deviation(
+    id="GD-41-destroy-clientid-busy-before-shape",
+    verdict=SERVER,
+    spec="RFC 8881 18.50.3 (DESTROY_CLIENTID with other operations is "
+         "NFS4ERR_NOT_ONLY_OP)",
+    summary="DESTROY_CLIENTID in a multi-op compound is CLIENTID_BUSY where the "
+            "model says NOT_ONLY_OP",
+    root_cause="ganesha checks the client's state before the compound's shape",
+    candidate_fix="ganesha: refuse the shape before looking at the client",
+    ops=("SDestroyClientid",),
+    expected_status=(NFS4ERR_NOT_ONLY_OP,),
+    actual_status=(NFS4ERR_CLIENTID_BUSY,),
+)
+
 
 NFS4 = Registry("ganesha/nfs4", [
+    GD_39_SETATTR_READ_LOCK,
+    GD_40_SETATTR_OPENMODE_FIRST,
+    GD_41_DESTROY_CLIENTID_BUSY_FIRST,
     GD_17B_RFLAGS_CONFIRM_40,
     GD_36_CLIENTID_LIFECYCLE,
     GD_37_DOWNGRADE_SERVERFAULT,
