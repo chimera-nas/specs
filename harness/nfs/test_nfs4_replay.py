@@ -19,7 +19,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import nfs4_replay as r4  # noqa: E402
 import ganesha_deviations as gd  # noqa: E402
 from deviations import (Finding, NFS4_OK, NFS4ERR_BAD_STATEID,  # noqa: E402
-                        NFS4ERR_OPENMODE)
+                        NFS4ERR_OPENMODE, NFS4ERR_EXPIRED,
+                        NFS4ERR_STALE_STATEID, NFS4ERR_STALE_CLIENTID,
+                        NFS4ERR_BADNAME)
 from itf import Divergence, TraceFormatError  # noqa: E402
 
 
@@ -43,6 +45,10 @@ def make_replayer(cls=r4.Replayer, **attrs):
     r = cls.__new__(cls)
     r.fh = {}
     r.dry = False
+    r.minor = 0
+    r.caps = {}
+    r.status_dev = 0
+    r.tol_status = 0
     r.sid_seq = {}
     r.sid_other = {}
     r.sid_wr = {}
@@ -145,7 +151,7 @@ class MissingFilehandle(unittest.TestCase):
     MISMATCH that names the entry -- never an abandoned-and-green trace.
     With no forgiven deviation behind it the trace itself is malformed."""
 
-    def test_after_a_forgiven_deviation_it_is_a_mismatch_naming_the_entry(self):
+    def test_after_a_forgiven_deviation_it_is_a_mismatch_naming_it(self):
         dev = gd.GD_40_SETATTR_OPENMODE_FIRST
         forgiven = Finding("SSetattr", "status", NFS4ERR_BAD_STATEID,
                            NFS4ERR_OPENMODE)
@@ -184,6 +190,117 @@ class MissingFilehandle(unittest.TestCase):
         r.replay([{"tag": "LInit", "value": {}},
                   {"tag": "LCompound", "value": lab}])
         self.assertEqual(seen, [(1, lab)])
+
+
+class LeaseLapse(unittest.TestCase):
+    """Under the T_RENEW_LAPSED tolerance the model declares that a server
+    may answer NFS4ERR_EXPIRED (or STALE_STATEID, or STALE_CLIENTID to a
+    RENEW) wherever the model, which carries no clock, predicted something
+    else.  The model walks on along its own prediction, so from that reply
+    on the two sides hold different state: the replayer stops comparing
+    there, as a lapse, instead of running on into the parted state."""
+
+    def result(self, r, tag, expected, actual, accept=None):
+        v = {"st": expected}
+        if accept is not None:
+            v["stAccept"] = accept
+        if tag == "SOpen":
+            v.update(sid=-1, seq=0, needConfirm=False, deleg={"tag": "DNone"},
+                     recalls=[], cinfo=None)
+        mism = []
+        r.check_result({"tag": tag, "value": v}, {"status": actual},
+                       {"cur": None, "saved": None}, mism, None)
+        return mism
+
+    def test_expired_where_the_model_predicted_success_is_a_lapse(self):
+        r = make_replayer(caps={"tolRenewLapsed": True}, cur_step=27)
+        with self.assertRaises(r4.LeaseLapsed) as cm:
+            self.result(r, "SLockt", NFS4_OK, NFS4ERR_EXPIRED,
+                        accept=[NFS4ERR_EXPIRED, NFS4ERR_STALE_STATEID])
+        self.assertEqual(cm.exception.step, 27)
+        self.assertEqual(cm.exception.op, "SLockt")
+        self.assertEqual(cm.exception.actual, NFS4ERR_EXPIRED)
+
+    def test_an_accepted_lapse_status_still_stops_the_trace(self):
+        # The model's own lapseAccept lists EXPIRED beside an OK OPEN that
+        # creates a file: accepting it and running on is how a filehandle
+        # the server never issued ends up in a later PUTFH.
+        r = make_replayer(caps={"tolRenewLapsed": True}, cur_step=30)
+        with self.assertRaises(r4.LeaseLapsed):
+            self.result(r, "SOpen", NFS4_OK, NFS4ERR_EXPIRED,
+                        accept=[NFS4ERR_EXPIRED, NFS4ERR_STALE_STATEID])
+
+    def test_stale_clientid_to_a_renew_is_a_lapse(self):
+        r = make_replayer(caps={"tolRenewLapsed": True}, cur_step=57)
+        with self.assertRaises(r4.LeaseLapsed):
+            self.result(r, "SRenew", NFS4_OK, NFS4ERR_STALE_CLIENTID,
+                        accept=[NFS4_OK])
+
+    def test_a_lapse_status_where_the_model_also_refused_parts_nothing(self):
+        # Both sides refused the OPEN of a bad name; the server's reason is
+        # the lease, the model's the name.  The model's lapseAccept lists
+        # the alternative and the trace goes on (knfsd40_step_80_0x7_0
+        # step 53, which precedes the RENEW that is the real lapse).
+        r = make_replayer(caps={"tolRenewLapsed": True})
+        mism = self.result(r, "SOpen", NFS4ERR_BADNAME, NFS4ERR_EXPIRED,
+                           accept=[NFS4ERR_EXPIRED, NFS4ERR_STALE_STATEID])
+        self.assertEqual(mism, [])
+        self.assertEqual(r.tol_status, 1)
+
+    def test_a_renew_the_model_refused_is_compared_by_its_accept_set(self):
+        # ganesha answers EXPIRED to a RENEW of an unconfirmed client where
+        # the model says STALE_CLIENTID and lists EXPIRED beside it (RFC
+        # 7530 16.30.4 allows both): not a lapse, the two agree to refuse.
+        r = make_replayer(caps={"tolRenewLapsed": True})
+        mism = self.result(r, "SRenew", NFS4ERR_STALE_CLIENTID,
+                           NFS4ERR_EXPIRED,
+                           accept=[NFS4ERR_STALE_CLIENTID, NFS4ERR_EXPIRED,
+                                   NFS4_OK])
+        self.assertEqual(mism, [])
+
+    def test_stale_clientid_elsewhere_is_not_a_lapse(self):
+        # SETCLIENTID_CONFIRM answered STALE_CLIENTID belongs to the knfsd
+        # registry (KN-17), not to the lapse rule.
+        r = make_replayer(caps={"tolRenewLapsed": True})
+        mism = self.result(r, "SSetclientidConfirm", NFS4_OK,
+                           NFS4ERR_STALE_CLIENTID)
+        self.assertEqual([(f.op, f.kind, f.expected, f.actual) for f in mism],
+                         [("SSetclientidConfirm", "status", NFS4_OK,
+                           NFS4ERR_STALE_CLIENTID)])
+
+    def test_without_the_tolerance_expired_is_an_ordinary_finding(self):
+        r = make_replayer(caps={"tolRenewLapsed": False})
+        mism = self.result(r, "SOpen", NFS4_OK, NFS4ERR_EXPIRED)
+        self.assertEqual([(f.op, f.expected, f.actual) for f in mism],
+                         [("SOpen", NFS4_OK, NFS4ERR_EXPIRED)])
+
+    def test_a_predicted_expired_is_compared_as_usual(self):
+        r = make_replayer(caps={"tolRenewLapsed": True})
+        mism = self.result(r, "SRenew", NFS4ERR_EXPIRED, NFS4ERR_EXPIRED,
+                           accept=[NFS4ERR_EXPIRED])
+        self.assertEqual(mism, [])
+
+
+class ExitCode(unittest.TestCase):
+    """A lapsed trace is not a failure and not a pass: like a capability
+    SKIP it leaves the batch's verdict to the other traces, and a batch of
+    nothing but skips and lapses is a SKIP (77)."""
+
+    def test_a_single_lapsed_trace_is_a_skip(self):
+        self.assertEqual(r4.exit_code({"lapsed": 1}, 1), 77)
+
+    def test_a_lapse_beside_passing_traces_is_a_pass(self):
+        self.assertEqual(r4.exit_code({"ok": 7, "lapsed": 1}, 8), 0)
+
+    def test_skips_and_lapses_together_are_a_skip(self):
+        self.assertEqual(r4.exit_code({"skip": 1, "lapsed": 1}, 2), 77)
+
+    def test_a_mismatch_fails_whatever_else_happened(self):
+        self.assertEqual(r4.exit_code({"ok": 6, "lapsed": 1, "mismatch": 1},
+                                      8), 1)
+
+    def test_an_error_fails(self):
+        self.assertEqual(r4.exit_code({"error": 1, "skip": 1}, 2), 1)
 
 
 if __name__ == "__main__":

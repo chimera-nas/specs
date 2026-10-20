@@ -42,6 +42,20 @@ the trace not applicable to this server and it is reported as a SKIP,
 never a failure: a third-party server owes the model nothing about which
 optional features it implements.
 
+Lease reconciliation is lazy in the same way.  The model carries no clock;
+a 4.0 cell that enables the T_RENEW_LAPSED tolerance declares that the
+server's lease on a client may lapse in wall time the model cannot see
+(retries through a grace window, a slow guest), and that NFS4ERR_EXPIRED,
+NFS4ERR_STALE_STATEID, or NFS4ERR_STALE_CLIENTID to a RENEW, may then
+answer wherever the model predicted something else.  Where the model
+predicted a refusal too, both sides refused and nothing parted: the
+model's own `stAccept` decides, as for any other status.  Where the model
+predicted SUCCESS it walked on along that prediction -- an OPEN that
+created a file, a lease the RENEW kept alive -- so from that reply on the
+two sides hold different state and nothing later in the trace compares:
+that reply ends the trace as LAPSED, which counts as a SKIP, never as a
+pass and never as a failure.
+
 Every other reply is compared EXACTLY against what the model predicted: what
 a server does differently is stated in the MODEL, switched on by the cell's
 config and declared with its citation in quint/nfs4/corpus.schema.json, so
@@ -161,6 +175,27 @@ class CapsSkip(Exception):
         self.feature = feature
         self.detail = detail
         super().__init__(f"capability mismatch [{feature}]: {detail}")
+
+
+class LeaseLapsed(Exception):
+    """The server's lease lapsed in wall time the model cannot see
+    (T_RENEW_LAPSED): from here on the trace compares state only one side
+    holds, so stop."""
+
+    def __init__(self, step, op, expected, actual):
+        self.step = step
+        self.op = op
+        self.expected = expected
+        self.actual = actual
+        super().__init__(f"step {step}: {op}: expected {expected}, got "
+                         f"{actual}: the lease lapsed")
+
+
+# What a lapsed lease answers (RFC 7530 9.6.3 / 16.30.4; the model's
+# lapseAccept in nfs4_ops.qnt), on any op.  STALE_CLIENTID is a lapse only
+# to a RENEW: on SETCLIENTID_CONFIRM it is a client-id lifecycle question
+# the knfsd registry owns (KN-17).
+LAPSE_STATUSES = {dv.NFS4ERR_EXPIRED, dv.NFS4ERR_STALE_STATEID}
 
 
 class Abandon(Exception):
@@ -704,6 +739,13 @@ class Replayer:
         ast = wire["status"]
 
         if est != ast:
+            # A lapsed lease where the model succeeded ends the comparison,
+            # whether or not the model's lapseAccept lists the status for
+            # this op: accepting it and running on is how an OPEN the server
+            # refused leaves the model holding a file whose filehandle was
+            # never learned.
+            if self.lease_lapsed(tag, est, ast):
+                raise LeaseLapsed(self.cur_step, tag, est, ast)
             # A status the model itself said was one of several conformant
             # answers.  It can still end the compound where the model ran on,
             # so the OK-path checks below are skipped exactly as they are for
@@ -1040,6 +1082,16 @@ class Replayer:
         if got == nmodel and wire["eof"] != v["eof"]:
             self.fnd(mism, tag, "eof", v["eof"], wire["eof"])
 
+    def lease_lapsed(self, tag, est, ast):
+        """Whether a refusal where the model predicted success is the
+        server telling us the client's lease lapsed (see the module
+        docstring).  A refusal where the model predicted another refusal
+        parts nothing and is left to the model's `stAccept`."""
+        if est != NFS4_OK or not self.caps.get("tolRenewLapsed"):
+            return False
+        return ast in LAPSE_STATUSES or \
+            (tag == "SRenew" and ast == dv.NFS4ERR_STALE_CLIENTID)
+
     def classify_status_mismatch(self, tag, v, est, ast, wire, mism, req):
         """Divergence in status: capability reconciliation or a finding."""
         pair = {est, ast}
@@ -1317,7 +1369,8 @@ def resolve_export(client, export):
 class TraceOutcome:
     def __init__(self, path):
         self.path = path
-        self.status = "ok"        # ok | skip | abandoned | mismatch | error
+        self.status = "ok"        # ok | skip | lapsed | abandoned | mismatch
+                                  # | error
         self.detail = ""
         self.deviations = {}
         self.compounds = 0
@@ -1363,6 +1416,9 @@ def run_trace(trace_path, args, registry, epoch):
         except CapsSkip as skip:
             out.status = "skip"
             out.detail = str(skip)
+        except LeaseLapsed as lapse:
+            out.status = "lapsed"
+            out.detail = str(lapse)
         except Abandon as ab:
             out.status = "abandoned"
             out.detail = f"step {ab.step}: {ab.dev.id}: {ab.finding}"
@@ -1405,6 +1461,9 @@ def run_trace(trace_path, args, registry, epoch):
         print(f"{name}: OK ({out.steps} compounds, minor {minor}{devs})")
     elif out.status == "skip":
         print(f"{name}: SKIP (not applicable): {out.detail}{devs}")
+    elif out.status == "lapsed":
+        print(f"{name}: LAPSED after {out.compounds}/{out.steps} compounds: "
+              f"{out.detail}{devs}")
     elif out.status == "abandoned":
         print(f"{name}: ABANDONED after {out.compounds}/{out.steps} "
               f"compounds: {out.detail}{devs}")
@@ -1413,6 +1472,18 @@ def run_trace(trace_path, args, registry, epoch):
     else:
         print(f"{name}: ERROR {out.detail}{devs}")
     return out
+
+
+def exit_code(by, n):
+    """The process exit status for `n` traces whose outcomes tally as
+    `by` (status -> count): 1 on any mismatch or error, 77 (ctest's SKIP)
+    when nothing was comparable -- every trace skipped on a capability or
+    lapsed on its lease -- and 0 otherwise."""
+    if by.get("mismatch") or by.get("error"):
+        return 1
+    if by.get("skip", 0) + by.get("lapsed", 0) == n:
+        return 77
+    return 0
 
 
 def load_registry(kind, suite="NFS4"):
@@ -1463,11 +1534,7 @@ def main():
     if tally:
         print("deviations: " + ", ".join(f"{k} x{v}"
                                          for k, v in sorted(tally.items())))
-    if by.get("mismatch") or by.get("error"):
-        return 1
-    if by.get("skip", 0) == n:
-        return 77
-    return 0
+    return exit_code(by, n)
 
 
 if __name__ == "__main__":
