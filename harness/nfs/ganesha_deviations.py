@@ -503,6 +503,28 @@ GD_17B_RFLAGS_CONFIRM_40 = Deviation(
 # ganesha42_stepState_80_0x7_1 step 19 succeeds.  Where the model expected the
 # truncation to happen the two part on the file's size, so the trace stops;
 # where the model expected OPENMODE both sides refused and replay goes on.
+#
+# The entry is scoped to exactly what was measured: the SETATTR changes the
+# size and names a lock stateid (SelRef, KLock) whose last LOCK was a read
+# lock.  A BAD_STATEID for the same SETATTR through an open, delegation or
+# write-lock stateid is unexplained and stays a MISMATCH -- that shape is
+# chimera-nas/chimera#1728, the bug lock-stateid I/O exists to catch, and
+# this entry must not be what lets it replay green.
+def _setattr_size_via_read_lock(f, ctx):
+    sid_wr = ctx["replayer"].sid_wr
+    for op in ctx["ops"]:
+        if op["tag"] != "RSetattr" or op["value"]["sizeBlocks"] < 0:
+            continue
+        sel = op["value"]["sel"]
+        if sel["tag"] != "SelRef":
+            continue
+        kind = sel["value"]["kind"]
+        kind = kind["tag"] if isinstance(kind, dict) else kind
+        if kind == "KLock" and sid_wr.get(sel["value"]["sid"]) is False:
+            return True
+    return False
+
+
 GD_39_SETATTR_READ_LOCK = Deviation(
     id="GD-39-setattr-read-lock-stateid",
     verdict=SERVER,
@@ -518,6 +540,7 @@ GD_39_SETATTR_READ_LOCK = Deviation(
     ops=("SSetattr",),
     expected_status=(NFS4_OK, NFS4ERR_OPENMODE),
     actual_status=(NFS4ERR_BAD_STATEID,),
+    context=_setattr_size_via_read_lock,
     reconcilable=lambda f, ctx: f.expected == NFS4ERR_OPENMODE,
 )
 

@@ -33,11 +33,6 @@
   // replaces, in ext/specs/quint/nfs4/corpus.schema.json.  The strict twin
   // regenerates this cell with all of them off; its failures are ganesha's
   // conformance debt against the RFCs, re-measured on every run.
-  // G4-compound-tag-length-limit is NOT enabled here even though ganesha has
-  // it: measured with tools/devliveness.py, no trace this profile generates
-  // ever sends the 256-byte NLONG compound tag -- only the 4.0 walk does -- so
-  // enabling it would be a claim the corpus cannot prove.  It is on in the 4.0
-  // cell instead.
   "deviations": [
     // The 256-byte NLONG compound tag is a rare draw of nsCompoundTag in
     // every minor version's walk; the compoundTagTooLongRegression

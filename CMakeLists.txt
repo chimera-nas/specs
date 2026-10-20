@@ -423,12 +423,20 @@ else()
     # carving this pass exists to delete.
     #
     # cell dir var | strict dir var | config | suite | test-name prefix |
-    # batch names (each is <stem>_<flavor>_<steps>) | extra environment
+    # batch names (each is <stem>_<flavor>_<steps>, or <stem>_<flavor>_scenario
+    # for the config's "scenarios": the named runs tools/mkconfig.js exports as
+    # <stem>_<flavor>_scenario_<run>_0.itf.json) | extra environment
+    #
+    # A scenario batch is listed wherever the config (or the base it extends)
+    # declares scenarios: the liveness gate below counts every trace in the
+    # cell's directory, so a scenario that is generated but never replayed
+    # would let a deviation pass devliveness on a prediction no server has
+    # answered.
     set(GANESHA_CELLS
         "nfs3|ganesha_nfs3|ganesha3|step_128,step_256,stepChurn_128,stepChurn_256,stepDir_128,stepExcl_128|"
-        "nfs4|ganesha_nfs4_42|ganesha42|step_80,stepState_80,stepNamespace_80,stepData_80,stepTypes_80,stepData42_80|"
-        "nfs4|ganesha_nfs4_41|ganesha41|step_80,stepState_80,stepNamespace_80,stepData_80,stepTypes_80|"
-        "nfs4|ganesha_nfs4_40|ganesha40|step_80,stepState_80,stepNamespace_80,stepData_80,stepTypes_80|"
+        "nfs4|ganesha_nfs4_42|ganesha42|step_80,stepState_80,stepNamespace_80,stepData_80,stepTypes_80,stepData42_80,step_scenario|"
+        "nfs4|ganesha_nfs4_41|ganesha41|step_80,stepState_80,stepNamespace_80,stepData_80,stepTypes_80,step_scenario|"
+        "nfs4|ganesha_nfs4_40|ganesha40|step_80,stepState_80,stepNamespace_80,stepData_80,stepTypes_80,step_scenario|"
         "nfs4|ganesha_nfs4_42_deleg|ganesha42Deleg|stepDeleg_80|SPECS_NFS_DELEG=1"
         "nfs4|ganesha_nfs4_41_deleg|ganesha41Deleg|stepDeleg_80|SPECS_NFS_DELEG=1"
         "nfs4|ganesha_pnfs42|ganeshaPnfs42|stepPnfs_80,stepData_80|"

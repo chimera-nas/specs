@@ -247,8 +247,10 @@ class Replayer:
         self.sid_owner = {}           # model Sid -> (client, owner)
         self.sid_client = {}          # model Sid -> wire clientid
         self.sid_seq = {}             # model Sid -> wire stateid seqid
+        self.sid_wr = {}              # model lock Sid -> last LOCK was a write
         self.last_hit = None          # (deviation, step, finding) last forgiven
         self.cur_step = 0             # step being encoded or compared
+        self.cur_lab = None           # that step's LCompound
         self.chg = {}                 # ino -> {abstract change -> wire}
         self.replay_cache = {}        # (model sess, slot) -> raw reply
         self.deviceid = None
@@ -289,18 +291,21 @@ class Replayer:
             # earlier reply parted from the model on the path that created
             # it.  When a recorded deviation forgave that reply as
             # reconcilable, the forgiveness was wrong for this shape -- the
-            # state DID part -- and the honest outcome is the one a
-            # non-reconcilable hit gets: stop comparing, and say which entry
-            # let the trace run on, so the entry can be tightened.  Without
+            # state DID part -- which is a divergence the registry does not
+            # cover: a MISMATCH naming the entry that let the trace run on,
+            # so the entry can be tightened.  Not an Abandon: that is the
+            # outcome of a NON-reconcilable hit and exits 0, and a
+            # mis-scoped reconcilable entry must not replay green.  Without
             # any forgiven deviation behind it the trace itself is
             # malformed, which stays an error.
             if self.last_hit is not None:
-                dev, step, _ = self.last_hit
-                raise Abandon(self.cur_step, dev,
-                              Finding("compound", "filehandle",
-                                      f"ino {ino}", "none",
-                                      f"no filehandle for model ino {ino}; "
-                                      f"last forgiven at step {step}"))
+                dev, step, forgiven = self.last_hit
+                raise Divergence(
+                    self.cur_step, ("LCompound", self.cur_lab),
+                    [Finding("compound", "filehandle", f"ino {ino}", "none",
+                             f"no filehandle for model ino {ino}; the last "
+                             f"forgiven divergence was {dev.id} at step "
+                             f"{step} ({forgiven})")])
             raise TraceFormatError(f"model ino {ino} has no learned "
                                    f"filehandle (earlier divergence?)")
         return fh
@@ -861,6 +866,10 @@ class Replayer:
         elif tag == "SLock":
             self.learn_sid(v["sid"], wire["stateid"], mism,
                            expect_seq=v["seq"], what=tag)
+            # Which lock type the stateid last carried: a registry entry
+            # scoped to read locks (GD-39) asks for it.
+            if req is not None:
+                self.sid_wr[v["sid"]] = req["value"]["wr"]
         elif tag == "SLocku":
             self.check_seq_only(tag, wire["stateid"], v["seq"], mism)
             self.relearn_seq(req, wire)
@@ -1239,6 +1248,7 @@ class Replayer:
                                        f"{lab['tag']}")
             lab = lab["value"]
             self.cur_step = idx
+            self.cur_lab = lab
             rep = self.run_compound(idx, lab)
             self.history.append((idx, lab, rep))
             if self.verbose:
