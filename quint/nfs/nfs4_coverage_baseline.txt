@@ -226,9 +226,15 @@ v4:compound:nops:5
 v4:compound:nops:6
 v4:compound:tagged
 v4:x:locku-whole-file
+v4:x:read-via-deleg-stateid
+v4:x:read-via-deleg-stateid-ok
 v4:x:read-via-lock-stateid
 v4:x:read-via-lock-stateid-ok
+v4:x:setattr-size-via-deleg-stateid
+v4:x:setattr-size-via-deleg-stateid-ok
 v4:x:setattr-size-via-lock-stateid
 v4:x:setattr-size-via-lock-stateid-ok
+v4:x:write-via-deleg-stateid
+v4:x:write-via-deleg-stateid-ok
 v4:x:write-via-lock-stateid
 v4:x:write-via-lock-stateid-ok
