@@ -493,23 +493,29 @@ def classify_compound4(lab, names, buckets, lock_bytes):
     # which is the shape that refusal broke; without them a corpus whose
     # every lock-stateid I/O happened to be refused for another reason
     # (another client's session, a read-only open) would still count.
-    IO_VIA_LOCK = {"RRead": "read", "RWrite": "write", "RSetattr": "setattr-size"}
+    # The delegation stateid gets the same treatment: it is what a Linux
+    # client sends under a delegation with no POSIX lock, and a server that
+    # refuses it in SETATTR(size) livelocks the client the same way.
+    IO_VIA = {"RRead": "read", "RWrite": "write", "RSetattr": "setattr-size"}
+    VIA_KIND = {"KLock": "lock", "KDeleg": "deleg"}
     for i, o in enumerate(lab["ops"]):
-        name = IO_VIA_LOCK.get(o.get("tag"))
+        name = IO_VIA.get(o.get("tag"))
         v = o.get("value")
         if name is None or not isinstance(v, dict):
             continue
         if name == "setattr-size" and v.get("sizeBlocks", -1) < 0:
             continue
         sel = v.get("sel")
-        if not (isinstance(sel, dict) and sel.get("tag") == "SelRef"
-                and sel["value"]["kind"]["tag"] == "KLock"):
+        if not (isinstance(sel, dict) and sel.get("tag") == "SelRef"):
             continue
-        buckets.add(f"v4:x:{name}-via-lock-stateid")
+        via = VIA_KIND.get(sel["value"]["kind"]["tag"])
+        if via is None:
+            continue
+        buckets.add(f"v4:x:{name}-via-{via}-stateid")
         if i < len(lab["results"]):
             r = lab["results"][i]["value"]
             if isinstance(r, dict) and r.get("st", 0) == 0:
-                buckets.add(f"v4:x:{name}-via-lock-stateid-ok")
+                buckets.add(f"v4:x:{name}-via-{via}-stateid-ok")
 
 
 def analyze4(trace_files, model_dir):

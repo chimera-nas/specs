@@ -651,8 +651,8 @@ module nfs4Test42 {
             .expect(lastStatus == E_BAD_STATEID)
 
     // A delegation stateid carries the delegation's mode: a write delegation
-    // authorises the data path, a read delegation only READ.  Generation of
-    // this shape waits on the delegation flavour growing I/O.
+    // authorises the data path, a read delegation only READ.  delegIo
+    // generates the shape in the delegation flavour.
     run delegStateidIoTest =
         openCreateRun
             .then(runC([ seq0(2), RPutfh(1),
@@ -685,6 +685,20 @@ module nfs4Test42 {
                                  off: 0, len: 1 }) ]))
             .expect(lastStatus == OK)
             .then(runC([ seq0(8), RPutfh(2),
+                         RSetattr({ mode: -1, sizeBlocks: 1,
+                                    sel: SelRef({ sid: 1, kind: KDeleg, argSeq: 0 }) }) ]))
+            .expect(lastStatus == E_BAD_STATEID)
+            // Another client's session: the delegation stateid designates
+            // no state of client 1 (RFC 8881 15.1.5.2).
+            .then(runC([ RExchangeId({ ownerSym: 2, verfSym: 1 }) ]))
+            .then(runC([ RCreateSession({ client: 1, csaSeq: 1,
+                                          backChan: true }) ]))
+            .then(runC([ RSequence({ sess: 1, slot: 1, seq: 1,
+                                     cacheThis: false }),
+                         RReclaimComplete ]))
+            .expect(lastStatus == OK)
+            .then(runC([ RSequence({ sess: 1, slot: 0, seq: 1,
+                                     cacheThis: true }), RPutfh(1),
                          RSetattr({ mode: -1, sizeBlocks: 1,
                                     sel: SelRef({ sid: 1, kind: KDeleg, argSeq: 0 }) }) ]))
             .expect(lastStatus == E_BAD_STATEID)

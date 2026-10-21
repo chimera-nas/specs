@@ -1671,6 +1671,43 @@ module nfs4 {
         },
     }
 
+    // I/O through a delegation stateid, sent by the client that holds the
+    // delegation: READ, WRITE or a size-changing SETATTR.  This is what a
+    // Linux client sends while it holds a delegation on the file and no
+    // POSIX lock (nfs4_select_rw_stateid() falls back to the delegation
+    // stateid before the open stateid; truncate(2) with no open context
+    // tries nfs4_copy_delegation_stateid() before the anonymous one).  The
+    // random draw in ioRead / ioWrite / ioSetattrSize reaches the
+    // delegation arm of ioVias only when the file it picked is delegated,
+    // and the delegation flavour runs none of those actions, so this is
+    // what generates the shape there.  Unlike lockIo nothing is diverted:
+    // a read delegation grants READ and answers NFS4ERR_OPENMODE to WRITE
+    // and SETATTR(size), a MUST either way, and no other client can hold a
+    // write delegation on a file the sender holds a delegation on.
+    action delegIo = all {
+        genReady,
+        usableDelegs.size() > 0,
+        {
+            nondet s = oneOf(usableDelegs)
+            val d = sdb.delegs.get(s)
+            nondet which = oneOf(Set(0, 1, 2))
+            nondet off = oneOf(0.to(MAX_BLOCKS - 1))
+            nondet len = oneOf(1.to(2))
+            nondet pat = oneOf(BLOCK_SYMS)
+            nondet stable = oneOf(STABLE_LEVELS)
+            nondet sz = oneOf(0.to(MAX_BLOCKS))
+            val op = if (which == 0)
+                         RRead({ sel: delegSel(s), off: off, len: len })
+                     else if (which == 1)
+                         RWrite({ sel: delegSel(s), off: off,
+                                  len: imin(len, MAX_BLOCKS - off), pat: pat,
+                                  stable: stable })
+                     else
+                         RSetattr({ mode: -1, sizeBlocks: sz, sel: delegSel(s) })
+            runC(withSess(d.client, [ RPutfh(d.file), op ]))
+        },
+    }
+
     // ------------------------------------------------------------------
     // Delegations
     // ------------------------------------------------------------------
@@ -2240,14 +2277,13 @@ module nfs4 {
     // the small NAMES set, so A-holds/B-breaks sequences arise routinely;
     // delegReturn is weighted up so DELAYed victims get unblocked and the
     // retried OPEN's grant path is reached.
-    // Delegation lifecycle only: grants, cross-client open/remove breaks
-    // (recall + NFS4ERR_DELAY), returns and retried opens.  Data-path I/O
-    // through delegated files (how cached writes and recall flushes
-    // reconcile with the model's block map) is a deeper coherency layer
-    // left to a follow-on; nsGetattr is the one read here, and it only
-    // observes the change attribute the lifecycle already tracks.  I/O
-    // through delegation stateids (the delegation arm of ioVias) is part of
-    // that follow-on and is not generated here.
+    // Delegation lifecycle: grants, cross-client open/remove breaks
+    // (recall + NFS4ERR_DELAY), returns and retried opens, plus the
+    // holder's own I/O through its delegation stateid (delegIo), which is
+    // what a Linux client sends under a delegation.  Data-path coherency of
+    // cached writes and recall flushes against the model's block map is a
+    // deeper layer left to a follow-on; nsGetattr is the one read here, and
+    // it only observes the change attribute the lifecycle already tracks.
     action stepDelegBody = any {
         setupSetclientid, setupSetclientidConfirm,
         setupExchangeId, setupCreateSession,
@@ -2255,6 +2291,7 @@ module nfs4 {
         delegBreakOpen, delegBreakOpen, delegBreakOpen,
         delegBreakRemove, delegBreakRemove,
         delegReturn, delegReturn, delegReturn, delegReturn,
+        delegIo, delegIo,
         closeOpen, closeOpen,
         nsGetattr, nsGetattr,
     }
