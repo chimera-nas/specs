@@ -33,7 +33,10 @@
     "G4-compound-tag-length-limit",
     "G4-verify-wide-trivial-match",
     "G4-setattr-share-denied",
-    "G4-exchange-id-no-confirmed-r",
+    // G4-exchange-id-no-confirmed-r stays ON: with delegIo in the mix the
+    // walk re-identifies a confirmed client (EXCHANGE_ID, new verifier) in
+    // two of its traces, and ganesha answers without EXCHGID4_FLAG_CONFIRMED_R
+    // here as everywhere else.
     "G4-bindconn-direction-accepted",
     "G4-seek-at-eof-not-nxio"
   ],
