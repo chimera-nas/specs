@@ -446,8 +446,10 @@ server_version() {
 #   KVM_VMLINUZ / KVM_ROOTFS   guest kernel + rootfs (CMake resolves them from
 #                              the fetched image; required)
 #   SPECS_KVM_GRACE            knfsd grace/lease seconds in the guest (default
-#                              10; the replayer's GRACE retry covers the first
-#                              trace's wait)
+#                              10): nfsd's grace window, lockd's grace window
+#                              and the NFSv4 lease.  The replayer's GRACE retry
+#                              covers the first trace's wait; a window longer
+#                              than the lease would outlive it.
 if [ "$SERVER" = "knfsd" ]; then
     VMLINUZ=${KVM_VMLINUZ:-}
     ROOTFS=${KVM_ROOTFS:-}
@@ -512,9 +514,16 @@ if [ "$SERVER" = "knfsd" ]; then
     ip netns exec "${NETNS_NAME}" ip link set "$TAP_NAME" up
 
     # The in-guest server bring-up + per-trace reset loop, passed on the kernel
-    # command line.  NFSv4 grace/lease are lowered so the one grace window this
-    # batch pays is short; the export is fsid=0 so PUTROOTFH lands on it (the
-    # model's root), and `insecure` admits the replayer's high source ports.
+    # command line.  The NFSv4 lease and BOTH grace windows are lowered so the
+    # one grace window this batch pays is short: nfsd's (nfsv4gracetime), which
+    # refuses non-reclaim OPEN, RENAME and REMOVE, and lockd's
+    # (nlm_grace_period, else 5 x nlm_timeout = 50 s), which refuses LOCK and
+    # LOCKT through the same in-grace check and starts with rpc.nfsd.  With
+    # lockd's left at its default a 4.0 trace waited up to 30 s on a LOCKT and
+    # its 10 s lease ran out meanwhile (EXPIRED, STALE_CLIENTID, STALE on an
+    # unlinked-but-open file).  The export is fsid=0 so PUTROOTFH lands on it
+    # (the model's root), and `insecure` admits the replayer's high source
+    # ports.
     GUEST_CMD="\
 set -x; \
 mkdir -p /export /reset; chmod 0777 /export; \
@@ -524,6 +533,8 @@ modprobe nfsd 2>/dev/null; \
 mount -t nfsd nfsd /proc/fs/nfsd 2>/dev/null || true; \
 echo ${GRACE} > /proc/fs/nfsd/nfsv4leasetime 2>/dev/null || true; \
 echo ${GRACE} > /proc/fs/nfsd/nfsv4gracetime 2>/dev/null || true; \
+echo ${GRACE} > /proc/sys/fs/nfs/nlm_grace_period 2>/dev/null || true; \
+echo knfsd-grace: kernel=\$(uname -r) nfsv4gracetime=\$(cat /proc/fs/nfsd/nfsv4gracetime 2>/dev/null) nfsv4leasetime=\$(cat /proc/fs/nfsd/nfsv4leasetime 2>/dev/null) nlm_grace_period=\$(cat /proc/sys/fs/nfs/nlm_grace_period 2>/dev/null) nlm_timeout=\$(cat /proc/sys/fs/nfs/nlm_timeout 2>/dev/null); \
 rpcbind || true; sleep 0.3; \
 exportfs -o rw,no_root_squash,insecure,no_subtree_check,fsid=0,sync ${GUEST_IP%.*}.0/24:/export; \
 rpc.nfsd 8; rpc.mountd; exportfs -a; \
@@ -591,6 +602,14 @@ done"
     }
 
     echo "=== knfsd (guest $(basename "$ROOTFS")) | $SUITE | traces ${TRACE_GLOB} ==="
+    # The grace and lease windows the guest actually runs with: a 4.0 client
+    # that waits out a grace window longer than its lease loses the lease, and
+    # lockd's grace (nlm_grace_period, or 5 x nlm_timeout) is a window of its
+    # own that nfsv4gracetime does not touch.
+    # Anchored on a real kernel version: the serial log also carries the kernel
+    # command line, which quotes the unexpanded command.
+    grep -m1 -o 'knfsd-grace: kernel=[0-9].*' "$QEMU_LOG" 2>/dev/null \
+        || echo "knfsd-grace: (not reported by the guest)"
 
     if [ -n "${SPECS_NFS_EXEC:-}" ]; then
         knfsd_reset || true

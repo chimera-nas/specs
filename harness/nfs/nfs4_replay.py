@@ -627,19 +627,27 @@ class Replayer:
         if tag == "RCommit":
             return c4.enc_commit()
         if tag == "RLock":
+            # Both stateids a LOCK names go out with the seqid the server
+            # last handed us (wire_seq), as LOCKU's and every SelRef already
+            # do.  A literal 0 is not the all-zeros wildcard on a real
+            # stateid: a strict 4.0 server reads it as seqid 0, which is OLD
+            # the moment OPEN_CONFIRM has moved the open stateid to 2 -- and
+            # knfsd answered every new-owner LOCK that way.
             off, length = lock_range(v["lo"], v["hi"])
             if v["newOwner"]:
                 return c4.enc_lock(
                     v["wr"], False, off, length, True,
                     open_seqid=v["oseq"],
-                    open_sid=(0, self.sid_of(v["openSid"])),
+                    open_sid=(self.wire_seq(v["openSid"], 0),
+                              self.sid_of(v["openSid"])),
                     lock_seqid=v["lseq"],
                     clientid=self.clientid_of_sid(v),
                     owner=owner_bytes("lo", v["lockOwner"]))
             return c4.enc_lock(
                 v["wr"], False, off, length, False,
                 lock_seqid=v["lseq"],
-                lock_sid=(0, self.sid_of(v["lockSid"])))
+                lock_sid=(self.wire_seq(v["lockSid"], 0),
+                          self.sid_of(v["lockSid"])))
         if tag == "RLockt":
             off, length = lock_range(v["lo"], v["hi"])
             return c4.enc_lockt(v["wr"], off, length,
@@ -1142,6 +1150,7 @@ class Replayer:
         expected_st = {i: r["value"]["st"] for i, r in enumerate(exp_results)}
         delays = 0
         graces = 0
+        sent_at = time.monotonic()
         while True:
             try:
                 rep = self.c.compound(self.minor, encoded, tag=tag_bytes)
@@ -1175,6 +1184,15 @@ class Replayer:
                 time.sleep(0.5)
                 continue
             break
+        if delays or graces:
+            # Retries are where a 4.0 client's lease silently runs down, so
+            # say which compound waited, on what, and for how long.
+            opl = ",".join(o["tag"][1:] for o in ops)
+            waited = time.monotonic() - sent_at
+            print(f"  [{idx:4d}] {opl}: retried through"
+                  f"{' GRACE x%d' % graces if graces else ''}"
+                  f"{' DELAY x%d' % delays if delays else ''}"
+                  f" over {waited:.1f}s, then {rep['status']}")
         if delays >= self.RETRY_DELAY_MAX:
             self.fnd(mism, "compound", "status", "!= DELAY", E_DELAY,
                      f"still NFS4ERR_DELAY after {delays} retries")
@@ -1379,6 +1397,7 @@ class TraceOutcome:
 
 def run_trace(trace_path, args, registry, epoch):
     out = TraceOutcome(trace_path)
+    started = time.monotonic()
     steps = load_trace_v4(trace_path)
     out.steps = len(steps) - 1
     init = steps[0]["value"]
@@ -1457,18 +1476,21 @@ def run_trace(trace_path, args, registry, epoch):
         devs = "; deviations: " + ", ".join(
             f"{k} x{v}" for k, v in sorted(out.deviations.items()))
     name = os.path.basename(trace_path)
+    # Wall time, because a 4.0 lease is a wall-clock budget: a trace that
+    # took longer than the guest's lease is the one to look at.
+    secs = f", {time.monotonic() - started:.1f}s"
     if out.status == "ok":
-        print(f"{name}: OK ({out.steps} compounds, minor {minor}{devs})")
+        print(f"{name}: OK ({out.steps} compounds, minor {minor}{secs}{devs})")
     elif out.status == "skip":
         print(f"{name}: SKIP (not applicable): {out.detail}{devs}")
     elif out.status == "lapsed":
-        print(f"{name}: LAPSED after {out.compounds}/{out.steps} compounds: "
-              f"{out.detail}{devs}")
+        print(f"{name}: LAPSED after {out.compounds}/{out.steps} compounds"
+              f"{secs}: {out.detail}{devs}")
     elif out.status == "abandoned":
         print(f"{name}: ABANDONED after {out.compounds}/{out.steps} "
-              f"compounds: {out.detail}{devs}")
+              f"compounds{secs}: {out.detail}{devs}")
     elif out.status == "mismatch":
-        print(f"{name}: MISMATCH ({out.detail}){devs}")
+        print(f"{name}: MISMATCH ({out.detail}{secs}){devs}")
     else:
         print(f"{name}: ERROR {out.detail}{devs}")
     return out

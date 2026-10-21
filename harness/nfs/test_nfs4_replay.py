@@ -18,10 +18,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import nfs4_replay as r4  # noqa: E402
 import ganesha_deviations as gd  # noqa: E402
+import knfsd_deviations as kd  # noqa: E402
 from deviations import (Finding, NFS4_OK, NFS4ERR_BAD_STATEID,  # noqa: E402
                         NFS4ERR_OPENMODE, NFS4ERR_EXPIRED,
                         NFS4ERR_STALE_STATEID, NFS4ERR_STALE_CLIENTID,
-                        NFS4ERR_BADNAME)
+                        NFS4ERR_BADNAME, NFS4ERR_OLD_STATEID)
 from itf import Divergence, TraceFormatError  # noqa: E402
 
 
@@ -279,6 +280,71 @@ class LeaseLapse(unittest.TestCase):
         mism = self.result(r, "SRenew", NFS4ERR_EXPIRED, NFS4ERR_EXPIRED,
                            accept=[NFS4ERR_EXPIRED])
         self.assertEqual(mism, [])
+
+
+class LockStateidSeqid(unittest.TestCase):
+    """A LOCK names an open stateid (new owner) or a lock stateid (existing
+    owner).  Both go out with the seqid the server last handed us, as every
+    other stateid the replayer sends does: a literal 0 is not the wildcard
+    on a real stateid, and a strict 4.0 server answers OLD_STATEID once
+    OPEN_CONFIRM has advanced the open stateid."""
+
+    def encode(self, r, value):
+        captured = {}
+
+        def fake_enc_lock(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return b""
+        real = r4.c4.enc_lock
+        r4.c4.enc_lock = fake_enc_lock
+        try:
+            r.encode_op({"tag": "RLock", "value": value})
+        finally:
+            r4.c4.enc_lock = real
+        return captured["kwargs"]
+
+    def test_a_new_owner_lock_names_the_open_stateid_at_its_current_seqid(self):
+        r = make_replayer(sid_seq={1: 2}, sid_other={1: b"o" * 12},
+                          sid_client={1: 0x77}, clientid={})
+        kw = self.encode(r, {"wr": True, "lo": 0, "hi": 2, "newOwner": True,
+                             "openSid": 1, "lockSid": -1, "lockOwner": 6,
+                             "oseq": 3, "lseq": 0})
+        self.assertEqual(kw["open_sid"], (2, b"o" * 12))
+        self.assertEqual(kw["open_seqid"], 3)
+
+    def test_an_existing_owner_lock_names_the_lock_stateid_at_its_seqid(self):
+        r = make_replayer(sid_seq={2: 4}, sid_other={2: b"l" * 12})
+        kw = self.encode(r, {"wr": False, "lo": 0, "hi": 2,
+                             "newOwner": False, "openSid": -1, "lockSid": 2,
+                             "lockOwner": 6, "oseq": 0, "lseq": 5})
+        self.assertEqual(kw["lock_sid"], (4, b"l" * 12))
+
+    def test_an_unlearned_stateid_still_goes_out_with_seqid_0(self):
+        r = make_replayer(sid_seq={}, sid_other={})
+        kw = self.encode(r, {"wr": False, "lo": 0, "hi": 2,
+                             "newOwner": False, "openSid": -1, "lockSid": 9,
+                             "lockOwner": 6, "oseq": 0, "lseq": 1})
+        self.assertEqual(kw["lock_sid"][0], 0)
+
+
+class KN11Scope(unittest.TestCase):
+    """KN-11 forgives READ and WRITE status-only; a LOCK one side granted and
+    the other refused parts the lock table, so that arm stops the trace."""
+
+    def test_a_refused_lock_is_not_reconcilable(self):
+        f = Finding("SLock", "status", NFS4_OK, NFS4ERR_OLD_STATEID)
+        ctx = registry_ctx([], make_replayer(), minor=0)
+        dev = kd.NFS4.lookup(f, ctx)
+        self.assertIs(dev, kd.KN_11_OPENMODE)
+        self.assertFalse(dev.is_reconcilable(f, ctx))
+
+    def test_a_read_openmode_disagreement_still_is(self):
+        f = Finding("SRead", "status", NFS4ERR_OPENMODE, NFS4_OK)
+        ctx = registry_ctx([], make_replayer(), minor=0)
+        dev = kd.NFS4.lookup(f, ctx)
+        self.assertIs(dev, kd.KN_11_OPENMODE)
+        self.assertTrue(dev.is_reconcilable(f, ctx))
 
 
 class ExitCode(unittest.TestCase):
