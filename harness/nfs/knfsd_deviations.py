@@ -309,6 +309,38 @@ KN_23_OWNER_STATEID_LIFECYCLE = Deviation(
 )
 
 
+# KN-23b: the field twin of KN-23 (one Deviation matches either statuses or a
+# field, never both).  At 4.0 knfsd answers an OPEN with OPEN4_RESULT_CONFIRM
+# for an open-owner the model still holds as confirmed, once that owner has
+# closed its last open: RFC 7530 9.1.10 lets the server release an idle
+# owner's sequence state, and 9.1.9 then requires OPEN_CONFIRM for the owner
+# it no longer knows.  Measured on knfsd40_stepState_80_0x7_3 (seed 0x7,
+# specs#50): the owner's only open is closed at step 16, an OPEN of it fails
+# at step 21, and the gapped OPEN at step 22 -- accepted, since knfsd starts
+# the owner afresh -- comes back with the flag set.  When the server lets go
+# is its own choice and the model has no clock (KN-23's reason), so the model
+# keeps the owner.  NFS-Ganesha records the same observable as GD-17b.
+# reconcilable=False: the OPEN_CONFIRM handshake has parted.
+KN_23B_IDLE_OPEN_OWNER_RECONFIRM = Deviation(
+    id="KN-23b-idle-open-owner-reconfirm",
+    verdict=SERVER,
+    spec="RFC 7530 9.1.10 (an idle state-owner's sequence state may be "
+         "released) / 9.1.9 (an OPEN by an owner the server does not know "
+         "requires OPEN_CONFIRM)",
+    summary="a 4.0 OPEN sets OPEN4_RESULT_CONFIRM for an owner whose opens "
+            "were all closed, where the model still holds it confirmed",
+    root_cause="knfsd released the idle open-owner and treats it as new",
+    candidate_fix="none within a trace (the model has no lease clock); the "
+                  "model could drop a 4.0 owner's record with its last open",
+    ops=("SOpen",),
+    field="rflags_confirm",
+    expected_value=False,
+    actual_value=True,
+    context=lambda f, ctx: ctx.get("minor") == 0,
+    reconcilable=False,
+)
+
+
 # KN-22: the ACCESS granted-mask differs from the model's type-masking, as
 # GD-22 records for ganesha.  Field-only.
 KN_22_ACCESS = Deviation(
@@ -357,6 +389,7 @@ NFS4 = Registry("knfsd/nfs4", [
     KN_16_ATTR_AFTER_LENIENT_NAME,
     KN_18_READDIR_NAMES,
     KN_23_OWNER_STATEID_LIFECYCLE,
+    KN_23B_IDLE_OPEN_OWNER_RECONFIRM,
     KN_19_CREATE_SETATTR,
     KN_22_ACCESS,
 ])

@@ -282,6 +282,7 @@ class Replayer:
         self.sid_owner = {}           # model Sid -> (client, owner)
         self.sid_client = {}          # model Sid -> wire clientid
         self.sid_seq = {}             # model Sid -> wire stateid seqid
+        self.sid_mseq = {}            # model Sid -> the model's seqid for it
         self.sid_wr = {}              # model lock Sid -> last LOCK was a write
         self.last_hit = None          # (deviation, step, finding) last forgiven
         self.cur_step = 0             # step being encoded or compared
@@ -368,9 +369,10 @@ class Replayer:
         # A SelRef names a real (open/lock) stateid.  The model's argSeq 0
         # means "the current seqid", but (0, real_other) is NOT the all-zeros
         # wildcard -- a strict server reads it as literal seqid 0, which is
-        # OLD once OPEN_CONFIRM/LOCK have advanced the stateid.  Send the seqid
-        # the server last handed us for this Sid, as a conforming client does.
-        return (self.sid_seq.get(r["sid"], r["argSeq"]), self.sid_of(r["sid"]))
+        # OLD once OPEN_CONFIRM/LOCK have advanced the stateid.  wire_seq maps
+        # it onto the seqid the server last handed us for this Sid, as a
+        # conforming client does, and keeps a stale argSeq stale.
+        return (self.wire_seq(r["sid"], r["argSeq"]), self.sid_of(r["sid"]))
 
     def sid_of(self, sid):
         other = self.sid_other.get(sid)
@@ -390,6 +392,8 @@ class Replayer:
         # Remember it so ROpenConfirm sends the real seqid rather than a
         # forced 0, which a strict server (knfsd) rejects as OLD_STATEID.
         self.sid_seq[sid] = seq
+        if expect_seq is not None:
+            self.sid_mseq[sid] = expect_seq
         known = self.sid_other.get(sid)
         if known is None:
             for osid, oother in self.sid_other.items():
@@ -410,25 +414,40 @@ class Replayer:
             self.fnd(mism, op, "seqid", expect_seq, wire_sid[0])
 
     def wire_seq(self, sid, arg_seq):
-        """Seqid to put in a request stateid for a *sequenced* op.
+        """Seqid to put in a request stateid for a sequenced op or a SelRef.
 
-        The model predicts it exactly (arg_seq), but its absolute seqid
-        numbering can drift from the server's once OPEN_CONFIRM / DOWNGRADE
-        / LOCKU have bumped the live stateid, so send the seqid the server
-        last handed us for this Sid.  arg_seq 0 on a real stateid is the
-        model's "current seqid", not the all-zeros wildcard, so it too maps to
-        the tracked seqid (a strict server rejects a literal 0 as OLD).  Falls
-        back to arg_seq for a Sid we have not learned a wire seqid for.
+        The model's absolute seqid numbering can drift from the server's
+        (GD-38b: ganesha's open seqid runs one ahead), so what carries over
+        is the DISTANCE between the model's arg_seq and the model's own
+        current seqid for the Sid, applied to the seqid the server last
+        handed us.  arg_seq 0 on a real stateid is the model's "current
+        seqid", not the all-zeros wildcard, so it maps to the server's
+        current too (a strict server rejects a literal 0 as OLD).  A stale
+        arg_seq stays stale -- sending the server's current seqid in its
+        place turns the question the model asks into an ordinary request --
+        and never becomes 0: when the server is behind the model and has no
+        older seqid, the oldest real one, 1, is sent.  Falls back to the
+        server's seqid without the model's, and to arg_seq for a Sid with
+        no wire seqid at all.
         """
-        return self.sid_seq.get(sid, arg_seq)
+        wire = self.sid_seq.get(sid)
+        if wire is None:
+            return arg_seq
+        model = self.sid_mseq.get(sid)
+        if arg_seq == 0 or model is None:
+            return wire
+        seq = wire + (arg_seq - model)
+        return max(seq, 1) if arg_seq < model else seq
 
-    def relearn_seq(self, req, wire):
-        """Track the seqid the server bumped a stateid to.  Called from the
-        OPEN_CONFIRM / OPEN_DOWNGRADE / LOCKU reply handlers, which run only
-        on matched success, so wire['stateid'] is the fresh confirmed value.
+    def relearn_seq(self, req, wire, model_seq):
+        """Track the seqid the server bumped a stateid to, and the model's.
+        Called from the OPEN_CONFIRM / OPEN_DOWNGRADE / LOCKU reply handlers,
+        which run only on matched success, so wire['stateid'] is the fresh
+        confirmed value and model_seq the model's prediction of it.
         """
         if req is not None and "sid" in req.get("value", {}):
             self.sid_seq[req["value"]["sid"]] = wire["stateid"][0]
+            self.sid_mseq[req["value"]["sid"]] = model_seq
 
     def check_change(self, op, ino, abstract, wire, mism, what, opaque=False):
         """Per-ino change-attribute consistency (never predict values).
@@ -884,10 +903,10 @@ class Replayer:
             self.check_deleg(v["deleg"], wire, mism)
         elif tag == "SOpenConfirm":
             self.check_seq_only(tag, wire["stateid"], v["seq"], mism)
-            self.relearn_seq(req, wire)
+            self.relearn_seq(req, wire, v["seq"])
         elif tag == "SOpenDowngrade":
             self.check_seq_only(tag, wire["stateid"], v["seq"], mism)
-            self.relearn_seq(req, wire)
+            self.relearn_seq(req, wire, v["seq"])
         elif tag == "SRead":
             data = expand(v["blocks"])
             if wire["eof"] != v["eof"]:
@@ -922,7 +941,7 @@ class Replayer:
                 self.sid_wr[v["sid"]] = req["value"]["wr"]
         elif tag == "SLocku":
             self.check_seq_only(tag, wire["stateid"], v["seq"], mism)
-            self.relearn_seq(req, wire)
+            self.relearn_seq(req, wire, v["seq"])
         elif tag == "SLayoutget":
             self.learn_sid(v["sid"], wire["stateid"], mism,
                            expect_seq=v["seq"], what=tag)

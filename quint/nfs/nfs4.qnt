@@ -1360,10 +1360,19 @@ module nfs4 {
         {
             nondet s = oneOf(usableOpens.exclude(fencedOpens))
             val o = sdb.opens.get(s)
-            nondet exact = oneOf(Set(false, true))
+            // The exact seqid, the wildcard, or -- once the open's seqid has
+            // advanced (an OPEN upgrade, OPEN_CONFIRM or OPEN_DOWNGRADE) --
+            // the one before it.  A client that pipelines CLOSE behind a
+            // re-OPEN presents exactly that, and the server must refuse it
+            // (OLD_STATEID) rather than destroy the open the client is
+            // still using.
+            nondet pick = oneOf(Set(0, 1, 2))
+            val argSeq = if (pick == 1) o.seq
+                         else if (pick == 2 and o.seq > 1) o.seq - 1
+                         else 0
             runC(withSess(o.client,
                 [ RPutfh(o.file),
-                  RClose({ sid: s, argSeq: if (exact) o.seq else 0,
+                  RClose({ sid: s, argSeq: argSeq,
                            oseq: oseqFor(o.client, o.owner) }) ]))
         },
     }

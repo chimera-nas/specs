@@ -281,6 +281,34 @@ module nfs4Test42 {
                                           deny: 0, oseq: 0 }) ]))
             .expect(lastStatus == E_INVAL)
 
+    // CLOSE presenting a seqid an OPEN upgrade has superseded is refused
+    // with OLD_STATEID and the open survives (RFC 8881 8.2.2); the current
+    // seqid closes it.  A client that pipelines CLOSE behind a re-OPEN of
+    // the same file loses the open -- and its locks -- if the stale CLOSE
+    // is honored instead.
+    run closeStaleSeqidTest =
+        bootRcRun
+            .then(runC([ seq0(1), RPutrootfh,
+                         ROpen({ client: 0, owner: 1, oseq: 0,
+                                 claim: OCNull("f"),
+                                 how: HUnchecked({ mode: 420, truncate: false }),
+                                 access: 1, deny: 0 }), RGetfh ]))
+            .expect(lastStatus == OK and asOpen(resAt(2)).seq == 1)
+            .then(runC([ seq0(2), RPutrootfh,
+                         ROpen({ client: 0, owner: 1, oseq: 0,
+                                 claim: OCNull("f"),
+                                 how: HNoCreate,
+                                 access: 2, deny: 0 }), RGetfh ]))
+            .expect(lastStatus == OK and asOpen(resAt(2)).seq == 2)
+            .then(runC([ seq0(3), RPutfh(1),
+                         RClose({ sid: 0, argSeq: 1, oseq: 0 }) ]))
+            .expect(lastStatus == E_OLD_STATEID)
+            .expect(sdb.opens.keys().contains(0))
+            .then(runC([ seq0(4), RPutfh(1),
+                         RClose({ sid: 0, argSeq: 2, oseq: 0 }) ]))
+            .expect(lastStatus == OK)
+            .expect(not(sdb.opens.keys().contains(0)))
+
     // One OPEN(BOTH) can never be downgraded to READ (the historical-
     // events rule, RFC 7530 16.19.4 / RFC 8881 18.18.3).
     run openDowngradeHistoryTest =
@@ -1132,6 +1160,29 @@ module nfs4Test40 {
                                  claim: OCNull("f"), how: HNoCreate,
                                  access: 1, deny: 0 }) ]))
             .expect(lastStatus == OK and not(asOpen(resAt(1)).needConfirm))
+
+    // A 4.0 CLOSE presenting a superseded stateid seqid is refused with
+    // OLD_STATEID and the open survives -- and the refusal CONSUMES the
+    // owner seqid: RFC 7530 9.1.7 exempts BAD_STATEID from advancing it,
+    // not OLD_STATEID, so the owner's next request carries the following
+    // seqid and a server that does not advance it answers that request
+    // BAD_SEQID.
+    run closeStaleSeqidConsumesTest =
+        boot40
+            .then(runC([ RPutrootfh,
+                         ROpen({ client: 0, owner: 1, oseq: 1,
+                                 claim: OCNull("f"),
+                                 how: HGuarded({ mode: 420 }),
+                                 access: 3, deny: 0 }), RGetfh ]))
+            .then(runC([ RPutfh(1), ROpenConfirm({ sid: 0, oseq: 2 }) ]))
+            .expect(lastStatus == OK and sdb.opens.get(0).seq == 2)
+            .then(runC([ RPutfh(1), RClose({ sid: 0, argSeq: 1, oseq: 3 }) ]))
+            .expect(lastStatus == E_OLD_STATEID)
+            .expect(sdb.opens.keys().contains(0))
+            // Owner seqid 4, not 3: the refused CLOSE consumed 3.
+            .then(runC([ RPutfh(1), RClose({ sid: 0, argSeq: 2, oseq: 4 }) ]))
+            .expect(lastStatus == OK)
+            .expect(not(sdb.opens.keys().contains(0)))
 
     run badSeqidTest =
         boot40
