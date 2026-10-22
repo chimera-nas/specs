@@ -424,6 +424,33 @@ class KN11Scope(unittest.TestCase):
         self.assertTrue(dev.is_reconcilable(f, ctx))
 
 
+class KN23bScope(unittest.TestCase):
+    """KN-23b forgives a 4.0 OPEN that knfsd answers with OPEN4_RESULT_CONFIRM
+    where the model's owner is still confirmed -- knfsd released the idle
+    open-owner (RFC 7530 9.1.10) and treats it as new (9.1.9) -- and stops
+    the trace there, since the OPEN_CONFIRM handshake has parted."""
+
+    def finding(self, expected, actual):
+        return Finding("SOpen", "rflags_confirm", expected, actual)
+
+    def test_a_40_open_demanding_confirmation_stops_the_trace(self):
+        f = self.finding(False, True)
+        ctx = registry_ctx([], make_replayer(), minor=0)
+        dev = kd.NFS4.lookup(f, ctx)
+        self.assertIs(dev, kd.KN_23B_IDLE_OPEN_OWNER_RECONFIRM)
+        self.assertFalse(dev.is_reconcilable(f, ctx))
+
+    def test_not_above_40(self):
+        f = self.finding(False, True)
+        self.assertIsNone(kd.NFS4.lookup(
+            f, registry_ctx([], make_replayer(), minor=1)))
+
+    def test_not_a_server_that_skips_a_confirmation_the_model_wants(self):
+        f = self.finding(True, False)
+        self.assertIsNone(kd.NFS4.lookup(
+            f, registry_ctx([], make_replayer(), minor=0)))
+
+
 class ExitCode(unittest.TestCase):
     """A lapsed trace is not a failure and not a pass: like a capability
     SKIP it leaves the batch's verdict to the other traces, and a batch of
