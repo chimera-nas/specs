@@ -51,6 +51,7 @@ def make_replayer(cls=r4.Replayer, **attrs):
     r.status_dev = 0
     r.tol_status = 0
     r.sid_seq = {}
+    r.sid_mseq = {}
     r.sid_other = {}
     r.sid_wr = {}
     r.last_hit = None
@@ -326,6 +327,82 @@ class LockStateidSeqid(unittest.TestCase):
                              "newOwner": False, "openSid": -1, "lockSid": 9,
                              "lockOwner": 6, "oseq": 0, "lseq": 1})
         self.assertEqual(kw["lock_sid"][0], 0)
+
+
+class StaleStateidSeqidOnTheWire(unittest.TestCase):
+    """A sequenced op's stateid goes out at the server's seqid for that Sid,
+    because the two sides' numbering can drift (GD-38b: ganesha's open
+    seqid runs one ahead of the model's).  What the model asks about is the
+    DISTANCE from the current seqid: 0 or the exact seqid means "current",
+    and a stale argSeq must stay stale on the wire.  Sending the server's
+    current seqid instead turned every stale-seqid CLOSE into an ordinary
+    CLOSE, which the server rightly honored -- and that read as the server
+    honoring a stale CLOSE."""
+
+    OTHER = b"o" * 12
+
+    def close_seqid(self, r, arg_seq):
+        captured = {}
+
+        def fake_enc_close(oseq, sid):
+            captured["sid"] = sid
+            return b""
+        real = r4.c4.enc_close
+        r4.c4.enc_close = fake_enc_close
+        try:
+            r.encode_op({"tag": "RClose",
+                         "value": {"sid": 0, "argSeq": arg_seq, "oseq": 4}})
+        finally:
+            r4.c4.enc_close = real
+        self.assertEqual(captured["sid"][1], self.OTHER)
+        return captured["sid"][0]
+
+    def replayer(self, wire, model):
+        return make_replayer(sid_seq={0: wire}, sid_mseq={0: model},
+                             sid_other={0: self.OTHER})
+
+    def test_a_stale_seqid_goes_out_stale(self):
+        self.assertEqual(self.close_seqid(self.replayer(2, 2), 1), 1)
+
+    def test_the_exact_seqid_goes_out_as_the_servers_current(self):
+        self.assertEqual(self.close_seqid(self.replayer(2, 2), 2), 2)
+
+    def test_zero_goes_out_as_the_servers_current(self):
+        self.assertEqual(self.close_seqid(self.replayer(2, 2), 0), 2)
+
+    def test_the_distance_survives_a_server_running_ahead(self):
+        r = self.replayer(3, 2)
+        self.assertEqual(self.close_seqid(r, 2), 3)
+        self.assertEqual(self.close_seqid(r, 1), 2)
+
+    def test_a_stale_seqid_never_becomes_the_wildcard(self):
+        # The server is behind the model: there is no older seqid to send,
+        # and 0 would mean "current".  The oldest real one is the answer.
+        self.assertEqual(self.close_seqid(self.replayer(1, 2), 1), 1)
+
+    def test_without_the_models_seqid_it_falls_back_to_the_servers(self):
+        r = make_replayer(sid_seq={0: 2}, sid_other={0: self.OTHER})
+        self.assertEqual(self.close_seqid(r, 1), 2)
+
+    def test_learning_a_stateid_records_both_seqids(self):
+        r = make_replayer()
+        mism = []
+        r.learn_sid(0, (3, self.OTHER), mism, expect_seq=2, what="SOpen")
+        self.assertEqual((r.sid_seq[0], r.sid_mseq[0]), (3, 2))
+        self.assertEqual(len(mism), 1)      # the seqid finding, as before
+
+    def test_a_seqid_bump_records_both_seqids(self):
+        r = self.replayer(2, 2)
+        r.relearn_seq({"tag": "ROpenDowngrade", "value": {"sid": 0}},
+                      {"stateid": (3, self.OTHER)}, 3)
+        self.assertEqual((r.sid_seq[0], r.sid_mseq[0]), (3, 3))
+
+    def test_a_stale_selref_goes_out_stale(self):
+        r = self.replayer(2, 2)
+        sel = {"tag": "SelRef",
+               "value": {"sid": 0, "argSeq": 1,
+                         "kind": {"tag": "KOpen", "value": ()}}}
+        self.assertEqual(r.resolve_sel(sel), (1, self.OTHER))
 
 
 class KN11Scope(unittest.TestCase):
