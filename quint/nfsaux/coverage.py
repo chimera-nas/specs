@@ -41,6 +41,10 @@ What it requires, and why:
     CANCEL every grant it ever deferred.  And a CANCEL whose release
     promotes a waiter: a server that releases on CANCEL but does not pump
     afterwards replays green against a corpus with none in it.
+  * The RE-SEND of a blocked request: a client re-polls its LOCK while it
+    waits, and the re-send joins the request already queued.  A server
+    that queues it beside the original grants the copy after the client
+    has cancelled, and replays green against a corpus with no re-send.
 
 Coverage is required over the corpus as a whole rather than per flavour: the
 flavours are deliberately narrow (a portmap-only trace has no locks in it),
@@ -162,6 +166,7 @@ def scan(path, buckets):
 
     prev_monitors = set()
     prev_queue_len = 0
+    prev_queue_keys = set()
     prev_held = []
     prev_unconfirmed = set()
     confirmed = set()       # held tuples a re-poll confirmed
@@ -258,7 +263,9 @@ def scan(path, buckets):
 
         # ---- the cross-protocol seams ------------------------------------
         monitors = set(seq(var(state, "monitors") or []))
-        queue_len = len(seq(var(state, "queue") or []))
+        queue = seq(var(state, "queue") or [])
+        queue_len = len(queue)
+        queue_keys = set(lock_key(q["lock"]) for q in queue)
         held = seq(var(state, "held") or [])
         unconfirmed = set(lock_key(l)
                           for l in seq(var(state, "unconfirmed") or []))
@@ -293,9 +300,17 @@ def scan(path, buckets):
             buckets.add("seam:lock-promoted-a-waiter")
         if queue_len > prev_queue_len:
             buckets.add("seam:request-queued")
+        # A blocking LOCK answered BLOCKED for a request its owner already
+        # had queued is a waiting client's re-send, and must leave the
+        # queue as it was.
+        if (tag == "ONlmLock" and st == 3 and lock
+                and lock_key(lock) in prev_queue_keys
+                and queue_len == prev_queue_len):
+            buckets.add("seam:repoll-joined-queued-request")
 
         prev_monitors = monitors
         prev_queue_len = queue_len
+        prev_queue_keys = queue_keys
         prev_held = held
         prev_unconfirmed = unconfirmed
         if tag == "ONlmLock":
@@ -322,7 +337,8 @@ def required():
             "seam:unlock-promoted-a-waiter", "seam:lock-promoted-a-waiter",
             "seam:cancel-released-a-hold", "seam:cancel-promoted-a-waiter",
             "seam:relock-confirmed-a-grant",
-            "seam:cancel-kept-a-confirmed-grant"]
+            "seam:cancel-kept-a-confirmed-grant",
+            "seam:repoll-joined-queued-request"]
     return req
 
 

@@ -579,7 +579,10 @@ module nfsaux {
             held' = pumped.held,
             unconfirmed' = unconfirmedAfter(unconfirmed.exclude(confirmed), pumped.held,
                                      pumped.fresh),
-            queue' = if (runs and stat == NLM4_BLOCKED)
+            /* A re-sent blocking LOCK joins the request already queued and
+             * leaves it as it was (queuedExact). */
+            queue' = if (runs and stat == NLM4_BLOCKED and
+                         not(queuedExact(queue, l)))
                          queue.append({ lock: l, monitor: monitorable,
                                         msg: nproc == 7 })
                      else pumped.queue,
@@ -611,9 +614,10 @@ module nfsaux {
         val name = if (msg) "NLMPROC4_CANCEL_MSG" else "NLMPROC4_CANCEL"
         val runs = isRun(name)
         val cancels = runs and (not(msg) or NLM_CANCEL_MSG_CANCELS)
-        /* Each withdrawn request that arrived asynchronously is owed a
-         * final LOCK_RES saying its blocked LOCK is gone.  The synchronous
-         * form has nothing left to answer on. */
+        /* A CANCEL withdraws at most one request.  If it arrived
+         * asynchronously it is owed a final LOCK_RES saying its blocked
+         * LOCK is gone; the synchronous form has nothing left to answer
+         * on. */
         val taken = if (cancels) cancelTaken(queue, l) else List()
         val lockRes = taken.foldl(List(), (acc, q) =>
             if (q.msg) acc.append({ proc: 12, stat: NLM4_DENIED }) else acc)
@@ -1104,17 +1108,24 @@ module nfsaux {
         nlmCancel(msg, held[i]),
     }
 
-    /// CANCEL aimed at a queued request that nothing else queued matches: a
-    /// blind draw seldom names one, and a CANCEL_MSG that does is what owes
-    /// two asynchronous messages.
+    /// CANCEL aimed at a queued request: a blind draw seldom names one, and
+    /// a CANCEL_MSG that does is what owes two asynchronous messages.
     action anyNlmCancelQueued = all {
         queue.length() > 0,
         nondet i = queue.indices().oneOf()
         nondet msg = Set(false, true).oneOf()
-        all {
-            cancelTaken(queue, queue[i].lock).length() == 1,
-            nlmCancel(msg, queue[i].lock),
-        }
+        nlmCancel(msg, queue[i].lock),
+    }
+
+    /// The re-send of a blocked request: its owner's LOCK of the exact
+    /// tuple it has queued, as a client re-polls while it waits.  It joins
+    /// the request already queued (queuedExact); a blind draw seldom
+    /// repeats one exactly.
+    action anyNlmRepollQueued = all {
+        queue.length() > 0,
+        nondet i = queue.indices().oneOf()
+        nondet nproc = Set(2, 7).oneOf()
+        nlmLock(nproc, queue[i].lock, NLM_BLOCKING, false),
     }
 
     action anyNlmCancel = {
@@ -1299,7 +1310,7 @@ module nfsaux {
         anyNlmRelock, anyNlmRelock, anyNlmRepoll, anyNlmRepoll,
         anyNlmUnlock, anyNlmUnlock, anyNlmUnlock,
         anyNlmCancel, anyNlmCancelHeld, anyNlmCancelHeld, anyNlmCancelQueued,
-        anyNlmTestOp, anyNlmFreeAll,
+        anyNlmRepollQueued, anyNlmTestOp, anyNlmFreeAll,
     }
 
     /// The lock-manager / status-monitor seam: grants put holders on the
@@ -1335,6 +1346,19 @@ module nfsaux {
     val queueJustified = queue.indices().forall(i =>
         hasConflict(held, queue[i].lock))
 
+    /// An owner's request is queued at most once: a re-sent blocking LOCK
+    /// joins the request already waiting rather than queueing beside it.
+    /// Restated field by field, independently of queuedExact.
+    val queueDistinct = queue.indices().forall(i =>
+        queue.indices().forall(j =>
+            i == j or not(
+                queue[i].lock.file == queue[j].lock.file and
+                sameOwner(queue[i].lock.owner, queue[j].lock.owner) and
+                queue[i].lock.offset == queue[j].lock.offset and
+                posixLen(queue[i].lock.wireLen) ==
+                    posixLen(queue[j].lock.wireLen) and
+                queue[i].lock.excl == queue[j].lock.excl)))
+
     /// One owner never holds two locks over the same byte.  A grant
     /// replaces its owner's coverage of the range it spans (replaceWithin),
     /// so the owner's locks stay pairwise disjoint; restated here
@@ -1369,6 +1393,7 @@ module nfsaux {
     val inv = and {
         locksCompatible,
         queueJustified,
+        queueDistinct,
         ownerLocksDisjoint,
         noStaleLocks,
         unconfirmedHeld,

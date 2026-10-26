@@ -377,13 +377,35 @@ module nlmProto {
         posixLen(q.lock.wireLen) == posixLen(probe.wireLen) and
         q.lock.excl == probe.excl
 
-    pure def cancelQueued(queue: List[Queued], probe: Lock): List[Queued] =
-        queue.select(q => not(cancelMatches(q, probe)))
+    /// Index of the earliest queued request the probe matches, or -1.  The
+    /// queue is in arrival order.
+    pure def cancelIndex(queue: List[Queued], probe: Lock): int =
+        range(0, queue.length()).foldl(-1, (acc, i) =>
+            if (acc < 0 and cancelMatches(queue[i], probe)) i else acc)
 
-    /// The requests a CANCEL withdrew, which are the ones owed a final
-    /// NLMPROC4_LOCK_RES if they arrived asynchronously.
+    /// Whether the probe is a request its owner already has queued.  A
+    /// blocked client re-sends its LOCK while it waits (Linux every 30s),
+    /// and knfsd (nlmsvc_lookup_block) and ganesha (state_lock) both take
+    /// the re-send for the request already waiting: it is answered BLOCKED
+    /// again and nothing is queued beside it.  The match is CANCEL's.
+    pure def queuedExact(queue: List[Queued], probe: Lock): bool =
+        cancelIndex(queue, probe) >= 0
+
+    /// A CANCEL withdraws ONE outstanding request, however many match.  RFC
+    /// 1813 keys CANCEL by owner, range and mode, which does not say which of
+    /// two identical requests; knfsd and ganesha both take the first match,
+    /// and so does the model.  A re-sent LOCK joins the request already
+    /// queued (queuedExact), so at most one ever matches.
+    pure def cancelQueued(queue: List[Queued], probe: Lock): List[Queued] =
+        val i = cancelIndex(queue, probe)
+        if (i < 0) queue
+        else queue.slice(0, i).concat(queue.slice(i + 1, queue.length()))
+
+    /// The request a CANCEL withdrew (none, or the earliest match), which is
+    /// owed a final NLMPROC4_LOCK_RES if it arrived asynchronously.
     pure def cancelTaken(queue: List[Queued], probe: Lock): List[Queued] =
-        queue.select(q => cancelMatches(q, probe))
+        val i = cancelIndex(queue, probe)
+        if (i < 0) List() else List(queue[i])
 
     // ------------------------------------------------------------------
     // TEST
