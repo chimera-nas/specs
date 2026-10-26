@@ -111,6 +111,20 @@ module nfsaux {
     /// acting on it.
     const NLM_CANCEL_MSG_CANCELS: bool
 
+    /// Whether CANCEL hands back a deferred grant its client never
+    /// confirmed.  A hold the blocking queue promoted is UNCONFIRMED until
+    /// its owner sends a LOCK with the same tuple (file, owner, offset,
+    /// stored length, mode) and is answered NLM4_GRANTED: until then the
+    /// client may never have received the out-of-band NLMPROC4_GRANTED,
+    /// and a CANCEL for that exact tuple says the waiter gave up.  With
+    /// the policy on, such a CANCEL -- when nothing matching is still
+    /// queued, which takes precedence -- releases the hold and pumps the
+    /// queue as UNLOCK does.  A promotion that replaced bytes its owner
+    /// already held (a blocked upgrade, a re-lock over held bytes) is never
+    /// unconfirmed: releasing it would free bytes the client never gave
+    /// up.  Off, CANCEL only ever withdraws a queued request.
+    const NLM_CANCEL_RELEASES_UNCONFIRMED_GRANT: bool
+
     // ==================================================================
     // Bounded universes
     // ==================================================================
@@ -192,6 +206,18 @@ module nfsaux {
         g.foldl(Set(), (acc, q) =>
             if (q.monitor) acc.union(Set(q.lock.owner.caller)) else acc)
 
+    /// The unconfirmed holds that survive a step leaving `h` held: a hold
+    /// that is unlocked, carved, freed or notified away loses the mark,
+    /// and a carve remainder never had it.
+    pure def stillHeld(u: Set[Lock], h: List[Lock]): Set[Lock] =
+        u.intersect(h.toSet())
+
+    /// The fresh promotions (see promoteBlocked) a step marks unconfirmed:
+    /// all of them under NLM_CANCEL_RELEASES_UNCONFIRMED_GRANT, none
+    /// otherwise.
+    pure def marked(fresh: List[Lock]): Set[Lock] =
+        if (NLM_CANCEL_RELEASES_UNCONFIRMED_GRANT) fresh.toSet() else Set()
+
     /// Fold the IMPLEMENTED gate over a protocol-level reply.
     pure def gated(name: str, r: Reply): Reply =
         if (IMPLEMENTED.contains(name)) r else RUnavail
@@ -240,8 +266,8 @@ module nfsaux {
         | ONlmLock({ nproc: int, lock: Lock, block: bool, reclaim: bool,
                      granted: List[Lock], asyncs: List[AsyncMsg],
                      reply: Reply })
-        | ONlmCancel({ msg: bool, lock: Lock, asyncs: List[AsyncMsg],
-                       reply: Reply })
+        | ONlmCancel({ msg: bool, lock: Lock, granted: List[Lock],
+                       asyncs: List[AsyncMsg], reply: Reply })
         | ONlmUnlock({ msg: bool, lock: Lock, granted: List[Lock],
                        asyncs: List[AsyncMsg], reply: Reply })
         | ONlmGranted({ msg: bool, lock: Lock, asyncs: List[AsyncMsg],
@@ -263,6 +289,7 @@ module nfsaux {
     var services: List[Mapping]      // portmap registry
     var rmtab: List[MountEnt]        // MOUNT table, most recent first
     var held: List[Lock]             // granted NLM byte-range locks
+    var unconfirmed: Set[Lock]       // held deferred grants not yet re-polled
     var queue: List[Queued]            // blocking LOCKs awaiting their range
     var shares: List[ShareEnt]       // NLM DOS share reservations
     var nlmClients: Set[str]         // caller_names NLM has ever seen
@@ -274,6 +301,7 @@ module nfsaux {
         services' = SERVICES,
         rmtab' = List(),
         held' = List(),
+        unconfirmed' = Set(),
         queue' = List(),
         shares' = List(),
         nlmClients' = Set(),
@@ -288,6 +316,7 @@ module nfsaux {
         services' = services,
         rmtab' = rmtab,
         held' = held,
+        unconfirmed' = unconfirmed,
         queue' = queue,
         shares' = shares,
         nlmClients' = nlmClients,
@@ -329,6 +358,7 @@ module nfsaux {
                 else registrySet(services, m),
             rmtab' = rmtab,
             held' = held,
+            unconfirmed' = unconfirmed,
             queue' = queue,
             shares' = shares,
             nlmClients' = nlmClients,
@@ -419,6 +449,7 @@ module nfsaux {
                          mountRecord(rmtab, MOUNT_HOST, path)
                      else rmtab,
             held' = held,
+            unconfirmed' = unconfirmed,
             queue' = queue,
             shares' = shares,
             nlmClients' = nlmClients,
@@ -444,6 +475,7 @@ module nfsaux {
             services' = services,
             rmtab' = if (runs) mountRemove(rmtab, MOUNT_HOST, path) else rmtab,
             held' = held,
+            unconfirmed' = unconfirmed,
             queue' = queue,
             shares' = shares,
             nlmClients' = nlmClients,
@@ -461,6 +493,7 @@ module nfsaux {
             services' = services,
             rmtab' = if (runs) mountRemoveHost(rmtab, MOUNT_HOST) else rmtab,
             held' = held,
+            unconfirmed' = unconfirmed,
             queue' = queue,
             shares' = shares,
             nlmClients' = nlmClients,
@@ -519,7 +552,15 @@ module nfsaux {
          * satisfied is promoted here, not at somebody's next release. */
         val pumped = if (runs and stat == NLM4_GRANTED)
                          promoteBlocked(after, queue)
-                     else { held: after, queue: queue, granted: List() }
+                     else { held: after, queue: queue, granted: List(),
+                            fresh: List() }
+        /* A granted LOCK of a tuple its owner already holds is the
+         * idempotent re-poll, and its answer is what tells the client it
+         * holds the lock: the hold is confirmed, and CANCEL can no longer
+         * hand it back.  The match is findExact's, on the stored length. */
+        val confirmed = if (runs and stat == NLM4_GRANTED)
+                            findExact(held, l).toSet()
+                        else Set()
         /* NM_LOCK is the non-monitored form; every other LOCK puts its
          * holder on the monitor list once -- and only once -- the lock is
          * actually held, which for a blocking request is when the queue
@@ -530,6 +571,9 @@ module nfsaux {
             services' = services,
             rmtab' = rmtab,
             held' = pumped.held,
+            unconfirmed' = stillHeld(unconfirmed.exclude(confirmed)
+                                         .union(marked(pumped.fresh)),
+                                     pumped.held),
             queue' = if (runs and stat == NLM4_BLOCKED)
                          queue.append({ lock: l, monitor: monitorable,
                                         msg: nproc == 7 })
@@ -568,19 +612,38 @@ module nfsaux {
         val taken = if (cancels) cancelTaken(queue, l) else List()
         val lockRes = taken.foldl(List(), (acc, q) =>
             if (q.msg) acc.append({ proc: 12, stat: NLM4_DENIED }) else acc)
+        /* With nothing matching still queued, the CANCEL may name a
+         * deferred grant its owner never confirmed (see
+         * NLM_CANCEL_RELEASES_UNCONFIRMED_GRANT).  That hold is released
+         * and the queue pumped, as UNLOCK does.  The tuple is matched on
+         * the stored length, as a queued CANCEL is.  A queued match wins:
+         * it releases nothing held. */
+        val queuedHit = taken.length() > 0
+        val hit = findExact(held, l).toSet().intersect(unconfirmed)
+        val releases = cancels and not(queuedHit) and
+                       NLM_CANCEL_RELEASES_UNCONFIRMED_GRANT and hit.size() > 0
+        val queueAfter = if (cancels) cancelQueued(queue, l) else queue
+        val after = if (releases) held.select(x => not(hit.contains(x)))
+                    else held
+        val pumped = if (releases) promoteBlocked(after, queueAfter)
+                     else { held: held, queue: queueAfter, granted: List(),
+                            fresh: List() }
         all {
             services' = services,
             rmtab' = rmtab,
-            held' = held,
-            queue' = if (cancels) cancelQueued(queue, l) else queue,
+            held' = pumped.held,
+            unconfirmed' = stillHeld(unconfirmed.union(marked(pumped.fresh)),
+                                     pumped.held),
+            queue' = pumped.queue,
             shares' = shares,
             nlmClients' = nlmClients,
-            monitors' = monitors,
+            monitors' = monitors.union(promotedMonitors(pumped.granted)),
             nsmState' = nsmState,
             /* CANCEL answers GRANTED whether or not it found anything: the
              * client is being told the request is no longer outstanding. */
             lastOp' = ONlmCancel({
                 msg: msg, lock: l,
+                granted: grantedLocks(pumped.granted),
                 asyncs: if (not(runs)) List()
                         else if (msg)
                             List({ proc: 13, stat: NLM4_GRANTED })
@@ -605,6 +668,11 @@ module nfsaux {
             services' = services,
             rmtab' = rmtab,
             held' = if (runs) pumped.held else held,
+            unconfirmed' = if (runs)
+                               stillHeld(unconfirmed
+                                             .union(marked(pumped.fresh)),
+                                         pumped.held)
+                           else unconfirmed,
             queue' = if (runs) pumped.queue else queue,
             shares' = shares,
             nlmClients' = nlmClients,
@@ -671,6 +739,7 @@ module nfsaux {
             services' = services,
             rmtab' = rmtab,
             held' = held,
+            unconfirmed' = unconfirmed,
             queue' = queue,
             shares' = if (not(runs)) shares
                       else if (unshare) sharesAfterUnshare(shares, sh)
@@ -702,11 +771,17 @@ module nfsaux {
         val q = if (runs) queue.select(e => e.lock.owner.caller != name)
                 else queue
         val pumped = if (runs) releaseClient(held, q, name)
-                     else { held: held, queue: q, granted: List() }
+                     else { held: held, queue: q, granted: List(),
+                            fresh: List() }
         all {
             services' = services,
             rmtab' = rmtab,
             held' = if (runs) pumped.held else held,
+            unconfirmed' = if (runs)
+                               stillHeld(unconfirmed
+                                             .union(marked(pumped.fresh)),
+                                         pumped.held)
+                           else unconfirmed,
             queue' = if (runs) pumped.queue else queue,
             shares' = if (runs) shares.select(s => s.caller != name)
                       else shares,
@@ -748,6 +823,7 @@ module nfsaux {
             services' = services,
             rmtab' = rmtab,
             held' = held,
+            unconfirmed' = unconfirmed,
             queue' = queue,
             shares' = shares,
             nlmClients' = nlmClients,
@@ -769,6 +845,7 @@ module nfsaux {
             services' = services,
             rmtab' = rmtab,
             held' = held,
+            unconfirmed' = unconfirmed,
             queue' = queue,
             shares' = shares,
             nlmClients' = nlmClients,
@@ -787,6 +864,7 @@ module nfsaux {
             services' = services,
             rmtab' = rmtab,
             held' = held,
+            unconfirmed' = unconfirmed,
             queue' = queue,
             shares' = shares,
             nlmClients' = nlmClients,
@@ -813,6 +891,7 @@ module nfsaux {
             services' = services,
             rmtab' = rmtab,
             held' = held,
+            unconfirmed' = unconfirmed,
             queue' = queue,
             shares' = shares,
             nlmClients' = nlmClients,
@@ -838,16 +917,20 @@ module nfsaux {
          * releases one: queued requests withdrawn, then held locks one at a
          * time with a pump after each. */
         val q0 = queue.select(e => not(victims.contains(e.lock.owner.caller)))
-        val pumped = victims.fold({ held: held, queue: q0, granted: List() },
+        val pumped = victims.fold({ held: held, queue: q0, granted: List(),
+                                    fresh: List() },
                                   (acc, v) => {
             val r = releaseClient(acc.held, acc.queue, v)
             { held: r.held, queue: r.queue,
-              granted: acc.granted.concat(r.granted) }
+              granted: acc.granted.concat(r.granted),
+              fresh: acc.fresh.concat(r.fresh) }
         })
         all {
             services' = services,
             rmtab' = rmtab,
             held' = pumped.held,
+            unconfirmed' = stillHeld(unconfirmed.union(marked(pumped.fresh)),
+                                     pumped.held),
             queue' = pumped.queue,
             shares' = shares.select(s => not(victims.contains(s.caller))),
             nlmClients' = nlmClients,
@@ -1231,6 +1314,9 @@ module nfsaux {
     val noStaleLocks = held.indices().forall(i =>
         held[i].file != STALE_FILE)
 
+    /// Only a held lock is unconfirmed: the mark leaves with the hold.
+    val unconfirmedHeld = unconfirmed.subseteq(held.toSet())
+
     /// The mount table holds no duplicates.
     val rmtabDistinct = rmtab.indices().forall(i =>
         rmtab.indices().forall(j =>
@@ -1249,6 +1335,7 @@ module nfsaux {
         queueJustified,
         ownerLocksDisjoint,
         noStaleLocks,
+        unconfirmedHeld,
         rmtabDistinct,
         stateOdd,
         monitorsAreClients,

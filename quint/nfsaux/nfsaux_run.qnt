@@ -141,7 +141,10 @@ module nfsauxRef {
         // the replay harness is not; the grant still happens and is visible
         // through TEST, but the callback itself is not observed.
         NLM_GRANT_CALLBACK_OBSERVABLE = false,
-        NLM_CANCEL_MSG_CANCELS = true
+        NLM_CANCEL_MSG_CANCELS = true,
+        // A CANCEL for a deferred grant the client never re-polled hands
+        // it back, so a waiter that gave up does not orphan the lock.
+        NLM_CANCEL_RELEASES_UNCONFIRMED_GRANT = true
     ).* from "./nfsaux"
 }
 
@@ -173,7 +176,8 @@ module nfsauxFull {
         NLM_IN_GRACE = false,
         NLM_BLOCKING = true,
         NLM_GRANT_CALLBACK_OBSERVABLE = true,
-        NLM_CANCEL_MSG_CANCELS = true
+        NLM_CANCEL_MSG_CANCELS = true,
+        NLM_CANCEL_RELEASES_UNCONFIRMED_GRANT = false
     ).* from "./nfsaux"
 }
 
@@ -206,6 +210,7 @@ module nfsauxGrace {
         NLM_IN_GRACE = true,
         NLM_BLOCKING = false,
         NLM_GRANT_CALLBACK_OBSERVABLE = false,
-        NLM_CANCEL_MSG_CANCELS = true
+        NLM_CANCEL_MSG_CANCELS = true,
+        NLM_CANCEL_RELEASES_UNCONFIRMED_GRANT = false
     ).* from "./nfsaux"
 }

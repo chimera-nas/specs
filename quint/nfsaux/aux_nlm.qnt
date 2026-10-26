@@ -116,6 +116,10 @@ module nlmProto {
     pure def sameOwner(a: Owner, b: Owner): bool =
         a.caller == b.caller and a.oh == b.oh and a.svid == b.svid
 
+    /// The members of a list, as a set: Quint's List has no `contains`.
+    pure def toSet(l: List[a]): Set[a] =
+        l.foldl(Set(), (acc, x) => acc.union(Set(x)))
+
     // ------------------------------------------------------------------
     // Conflict
     // ------------------------------------------------------------------
@@ -293,23 +297,40 @@ module nlmProto {
      * stays blocked, and the promotions come in arrival order exactly as
      * one pass would make them.  Each request is promoted at most once, so
      * queue.length() scans are enough to reach the fixpoint.
+     *
+     * `fresh` is the promoted locks that took nothing over: the carve found
+     * none of the owner's own bytes in the range, so giving the lock back
+     * would release only what the promotion handed out.  A promotion that
+     * did carve (a blocked upgrade, a re-lock over held bytes) is not
+     * fresh, and a fresh lock that a later promotion of the same owner
+     * carves away stops being fresh with it -- including when that later
+     * request names the identical tuple, whose grant re-appends an equal
+     * record in place of the first.
      */
     pure def promoteBlocked(held: List[Lock],
                             queue: List[Queued]): { held: List[Lock],
                                                     queue: List[Queued],
-                                                    granted: List[Queued] } =
+                                                    granted: List[Queued],
+                                                    fresh: List[Lock] } =
         range(0, queue.length()).foldl(
-            { held: held, queue: queue, granted: List() },
+            { held: held, queue: queue, granted: List(), fresh: List() },
             (acc, _) => {
                 val i = firstPromotable(acc.held, acc.queue)
                 if (i < 0) acc
                 else {
                     val q = acc.queue[i]
-                    { held: replaceWithin(acc.held, q.lock),
+                    /* replaceWithin, with the carve kept to tell whether
+                     * the promotion took anything over. */
+                    val kept = dropWithin(acc.held, q.lock)
+                    val keptSet = kept.toSet()
+                    { held: kept.append(q.lock),
                       queue: acc.queue.slice(0, i)
                                 .concat(acc.queue.slice(i + 1,
                                                         acc.queue.length())),
-                      granted: acc.granted.append(q) }
+                      granted: acc.granted.append(q),
+                      fresh: acc.fresh.select(l => keptSet.contains(l))
+                                .concat(if (kept == acc.held) List(q.lock)
+                                        else List()) }
                 }
             })
 
@@ -332,14 +353,17 @@ module nlmProto {
     pure def releaseClient(held: List[Lock], queue: List[Queued],
                            caller: str): { held: List[Lock],
                                            queue: List[Queued],
-                                           granted: List[Queued] } =
+                                           granted: List[Queued],
+                                           fresh: List[Lock] } =
         held.select(l => l.owner.caller == caller)
-            .foldl({ held: held, queue: queue, granted: List() }, (acc, d) => {
+            .foldl({ held: held, queue: queue, granted: List(),
+                     fresh: List() }, (acc, d) => {
                 val remaining = acc.held.select(l => not(l == d))
                 val pumped = promoteBlocked(remaining, acc.queue)
                 { held: pumped.held,
                   queue: pumped.queue,
-                  granted: acc.granted.concat(pumped.granted) }
+                  granted: acc.granted.concat(pumped.granted),
+                  fresh: acc.fresh.concat(pumped.fresh) }
             })
 
     /// CANCEL withdraws a queued blocking request.  RFC 1813 keys it by the

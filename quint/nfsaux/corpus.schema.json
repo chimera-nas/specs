@@ -122,6 +122,13 @@
       "type": "bool",
       "default": true,
       "doc": "NLMPROC4_CANCEL_MSG withdraws a queued blocking request the way NLMPROC4_CANCEL does. RFC 1813 gives the two the same meaning; a server may nonetheless acknowledge the asynchronous form without acting on it."
+    },
+    "NLM_CANCEL_RELEASES_UNCONFIRMED_GRANT": {
+      "kind": "policy",
+      "key": "policies.nlmCancelReleasesUnconfirmedGrant",
+      "type": "bool",
+      "default": true,
+      "doc": "a CANCEL hands back a deferred grant its client never confirmed. A hold the blocking queue promoted is unconfirmed until its owner sends a LOCK with the same tuple (file, owner, offset, stored length, mode) and is answered NLM4_GRANTED; a CANCEL of that exact tuple, with nothing matching still queued, releases it and pumps the queue as UNLOCK does. A promotion that replaced bytes its owner already held (a blocked upgrade) is never unconfirmed. Off is RFC 1813's text, under which CANCEL only withdraws queued requests and the grant stays held by a waiter that no longer exists."
     }
   }
 }
