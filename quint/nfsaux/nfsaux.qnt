@@ -218,6 +218,12 @@ module nfsaux {
     pure def marked(fresh: List[Lock]): Set[Lock] =
         if (NLM_CANCEL_RELEASES_UNCONFIRMED_GRANT) fresh.toSet() else Set()
 
+    /// The unconfirmed set after a step that pumped the queue: `u` plus the
+    /// fresh promotions, kept only where still held.
+    pure def unconfirmedAfter(u: Set[Lock], h: List[Lock],
+                              fresh: List[Lock]): Set[Lock] =
+        stillHeld(u.union(marked(fresh)), h)
+
     /// Fold the IMPLEMENTED gate over a protocol-level reply.
     pure def gated(name: str, r: Reply): Reply =
         if (IMPLEMENTED.contains(name)) r else RUnavail
@@ -571,9 +577,8 @@ module nfsaux {
             services' = services,
             rmtab' = rmtab,
             held' = pumped.held,
-            unconfirmed' = stillHeld(unconfirmed.exclude(confirmed)
-                                         .union(marked(pumped.fresh)),
-                                     pumped.held),
+            unconfirmed' = unconfirmedAfter(unconfirmed.exclude(confirmed), pumped.held,
+                                     pumped.fresh),
             queue' = if (runs and stat == NLM4_BLOCKED)
                          queue.append({ lock: l, monitor: monitorable,
                                         msg: nproc == 7 })
@@ -632,8 +637,7 @@ module nfsaux {
             services' = services,
             rmtab' = rmtab,
             held' = pumped.held,
-            unconfirmed' = stillHeld(unconfirmed.union(marked(pumped.fresh)),
-                                     pumped.held),
+            unconfirmed' = unconfirmedAfter(unconfirmed, pumped.held, pumped.fresh),
             queue' = pumped.queue,
             shares' = shares,
             nlmClients' = nlmClients,
@@ -669,9 +673,7 @@ module nfsaux {
             rmtab' = rmtab,
             held' = if (runs) pumped.held else held,
             unconfirmed' = if (runs)
-                               stillHeld(unconfirmed
-                                             .union(marked(pumped.fresh)),
-                                         pumped.held)
+                               unconfirmedAfter(unconfirmed, pumped.held, pumped.fresh)
                            else unconfirmed,
             queue' = if (runs) pumped.queue else queue,
             shares' = shares,
@@ -778,9 +780,7 @@ module nfsaux {
             rmtab' = rmtab,
             held' = if (runs) pumped.held else held,
             unconfirmed' = if (runs)
-                               stillHeld(unconfirmed
-                                             .union(marked(pumped.fresh)),
-                                         pumped.held)
+                               unconfirmedAfter(unconfirmed, pumped.held, pumped.fresh)
                            else unconfirmed,
             queue' = if (runs) pumped.queue else queue,
             shares' = if (runs) shares.select(s => s.caller != name)
@@ -929,8 +929,7 @@ module nfsaux {
             services' = services,
             rmtab' = rmtab,
             held' = pumped.held,
-            unconfirmed' = stillHeld(unconfirmed.union(marked(pumped.fresh)),
-                                     pumped.held),
+            unconfirmed' = unconfirmedAfter(unconfirmed, pumped.held, pumped.fresh),
             queue' = pumped.queue,
             shares' = shares.select(s => not(victims.contains(s.caller))),
             nlmClients' = nlmClients,
@@ -1083,6 +1082,41 @@ module nfsaux {
         }
     }
 
+    /// The re-poll of an unconfirmed grant: its owner's LOCK with the exact
+    /// tuple, which is answered NLM4_GRANTED and confirms the hold.  A blind
+    /// or held-drawn LOCK seldom repeats a promoted tuple exactly, so without
+    /// this the corpus would never confirm a grant, nor CANCEL a confirmed
+    /// one.
+    action anyNlmRepoll = all {
+        unconfirmed.size() > 0,
+        nondet l = unconfirmed.oneOf()
+        nondet nproc = Set(2, 7, 22).oneOf()
+        nondet blockPick = Set(false, true).oneOf()
+        nlmLock(nproc, l, blockPick and NLM_BLOCKING, false),
+    }
+
+    /// CANCEL aimed at a lock that is held: a blind draw seldom names one,
+    /// and so seldom an unconfirmed grant.
+    action anyNlmCancelHeld = all {
+        held.length() > 0,
+        nondet i = held.indices().oneOf()
+        nondet msg = Set(false, true).oneOf()
+        nlmCancel(msg, held[i]),
+    }
+
+    /// CANCEL aimed at a queued request that nothing else queued matches: a
+    /// blind draw seldom names one, and a CANCEL_MSG that does is what owes
+    /// two asynchronous messages.
+    action anyNlmCancelQueued = all {
+        queue.length() > 0,
+        nondet i = queue.indices().oneOf()
+        nondet msg = Set(false, true).oneOf()
+        all {
+            cancelTaken(queue, queue[i].lock).length() == 1,
+            nlmCancel(msg, queue[i].lock),
+        }
+    }
+
     action anyNlmCancel = {
         nondet msg = Set(false, true).oneOf()
         nondet caller = CALLERS.oneOf()
@@ -1201,6 +1235,7 @@ module nfsaux {
         anyRbGetaddr, anyRbDump, anyRbGettime, anyRbGetversaddr,
         mntNull, anyMnt, mntDump, anyUmnt, mntUmntAll, mntExport,
         nlmNull, anyNlmTestOp, anyNlmLock, anyNlmRelock, anyNlmCancel,
+        anyNlmCancelHeld, anyNlmRepoll,
         anyNlmUnlock, anyNlmGranted, anyNlmRes, anyNlmReserved, anyNlmShare,
         anyNlmFreeAll,
         smNull, anySmStat, anySmMon, anySmUnmon, anySmUnmonAll,
@@ -1230,7 +1265,7 @@ module nfsaux {
     action stepLocks = any {
         nlmNull, anyNlmTestOp, anyNlmTestOp, anyNlmPlainLock, anyNlmPlainLock,
         anyNlmPlainLock, anyNlmRelock, anyNlmUnlock, anyNlmUnlock,
-        anyNlmCancel, anyNlmFreeAll,
+        anyNlmCancel, anyNlmCancelHeld, anyNlmFreeAll,
     }
 
     /// The asynchronous half: _MSG requests, _RES reports, GRANTED, and the
@@ -1261,9 +1296,10 @@ module nfsaux {
 
     action stepBlocking = any {
         anyNlmBlockingLock, anyNlmBlockingLock, anyNlmBlockingLock,
-        anyNlmRelock, anyNlmRelock,
+        anyNlmRelock, anyNlmRelock, anyNlmRepoll, anyNlmRepoll,
         anyNlmUnlock, anyNlmUnlock, anyNlmUnlock,
-        anyNlmCancel, anyNlmTestOp, anyNlmFreeAll,
+        anyNlmCancel, anyNlmCancelHeld, anyNlmCancelHeld, anyNlmCancelQueued,
+        anyNlmTestOp, anyNlmFreeAll,
     }
 
     /// The lock-manager / status-monitor seam: grants put holders on the

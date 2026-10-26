@@ -784,11 +784,23 @@ module nfsauxTestRef {
             .expect(held == List(lkOn(1, ownerB, 0, 0, true)))
             .expect(unconfirmed == Set())
 
-    /// unconfirmed never names a lock that is not held (checked on random
-    /// runs).
+    /// The invariants, unconfirmedHeld (unconfirmed is a subset of held)
+    /// among them, hold after every step of a random run.
     run unconfirmedSubsetTest =
-        init.then(50.reps(_ => all { stepBlocking,
-                                     unconfirmed.subseteq(held.toSet()) }))
+        init.then(20.reps(_ => stepBlocking.expect(inv)))
+
+    /// A later promotion of the same tuple in one pump carves the earlier
+    /// one, so only the survivor could be marked -- and it replaced held
+    /// bytes, so nothing is unconfirmed.
+    run freshDroppedByLaterPromotionTest =
+        init
+            .then(nlmLock(2, lk(ownerA, 0, 16, true), false, false))
+            .then(nlmLock(2, lk(ownerB, 0, 16, true), true, false))
+            .then(nlmLock(2, lk(ownerB, 0, 16, true), true, false))
+            .expect(queue.length() == 2)
+            .then(nlmUnlock(false, lk(ownerA, 0, 16, true)))
+            .expect(held.length() == 1)
+            .expect(unconfirmed == Set())
 
     /// NM_LOCK takes the lock without putting its holder on the monitor
     /// list; a plain LOCK does both.
