@@ -33,14 +33,18 @@ ENV DEBIAN_FRONTEND=noninteractive
 # APT_MIRROR=<url> replaces the sources list outright.  The public CI has no
 # such mirror, but private forks do, and this is what they set.
 #
-# UBUNTU_MIRROR=azure instead swaps the archive hosts for Azure's, which is
-# what the public CI passes: the GitHub-hosted runners are Azure VMs -- their
-# own host apt is pointed there for the same reason -- and the public mirrors
-# are periodically caught mid-sync, serving an index whose size disagrees with
-# its Release file, which fails the whole image build.  A host swap rather than
-# a rewritten sources list, so the suites, components and Signed-By the base
-# image chose all survive; archive and security are amd64's two hosts, ports is
-# arm64's, and each keeps its path under the Azure name.
+# UBUNTU_MIRROR=azure instead swaps the archive hosts for Azure's, where the
+# GitHub-hosted runners live.  The public CI passed it for a while, because
+# the public mirrors are periodically caught mid-sync, serving an index whose
+# size disagrees with its Release file, which fails the whole image build;
+# it stopped once the Azure hosts themselves began timing out mid-download
+# (a package fetch stalling for an hour and then "Remote end closed
+# connection"), which fails the build just as surely and far more slowly.
+# The knob stays for a runner that has the opposite experience.  A host swap
+# rather than a rewritten sources list, so the suites, components and
+# Signed-By the base image chose all survive; archive and security are
+# amd64's two hosts, ports is arm64's, and each keeps its path under the
+# Azure name.
 #
 # APT_MIRROR wins if both are set: a fork that has stood one up means it.
 RUN if [ -n "$APT_MIRROR" ]; then \
