@@ -2573,4 +2573,52 @@ module nfs4 {
             .expect(fsLive(fs, 1) ==
                     not(DEVS.contains("K4-open-replaces-unconfirmed-owner")))
 
+    // K4-lock-new-owner-reuses-state, pinned without the random walk.  Lock
+    // owner 6 holds a read lock on "a" through open 0 and owner 7 a write
+    // lock beside it; owner 6 then sends new_lock_owner=TRUE again, both
+    // seqids in sequence.  The standard refuses that with NFS4ERR_BAD_SEQID;
+    // the Linux server hands back owner 6's lock stateid with the new range
+    // merged in.  Its next such LOCK runs into owner 7's lock, and the
+    // NFS4ERR_DENIED consumes the lock-owner seqid as well as the open-owner
+    // one, so the LOCK through the lock stateid that follows carries seqid 4.
+    run lockNewOwnerReusesStateRegression = {
+        val reuses = DEVS.contains("K4-lock-new-owner-reuses-state")
+        coverageBootRun
+            .then(runC([RPutfh(ROOT),
+                ROpen({client: 0, owner: 1, oseq: 1, claim: OCNull("a"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}),
+                RGetfh]))
+            .then(runC([RPutfh(1), ROpenConfirm({sid: 0, oseq: 2})]))
+            .then(runC([RPutfh(1),
+                RLock({wr: false, lo: 0, hi: 2, newOwner: true, openSid: 0,
+                       lockSid: -1, lockOwner: 6, oseq: 3, lseq: 1})]))
+            .then(runC([RPutfh(1),
+                RLock({wr: true, lo: 4, hi: 6, newOwner: true, openSid: 0,
+                       lockSid: -1, lockOwner: 7, oseq: 4, lseq: 1})]))
+            .then(runC([RPutfh(1),
+                RLock({wr: false, lo: 2, hi: 4, newOwner: true, openSid: 0,
+                       lockSid: -1, lockOwner: 6, oseq: 5, lseq: 2})]))
+            .expect(match lastOp {
+                        | LCompound(l) =>
+                            l.status == (if (reuses) OK else E_BAD_SEQID)
+                        | LInit(x) => false
+                    })
+            .then(runC([RPutfh(1),
+                RLock({wr: false, lo: 4, hi: 5, newOwner: true, openSid: 0,
+                       lockSid: -1, lockOwner: 6, oseq: 6, lseq: 3})]))
+            .expect(match lastOp {
+                        | LCompound(l) =>
+                            l.status == (if (reuses) E_DENIED else E_BAD_SEQID)
+                        | LInit(x) => false
+                    })
+            .then(runC([RPutfh(1),
+                RLock({wr: false, lo: 0, hi: 1, newOwner: false, openSid: -1,
+                       lockSid: 1, lockOwner: 6, oseq: 0, lseq: 4})]))
+            .expect(match lastOp {
+                        | LCompound(l) =>
+                            l.status == (if (reuses) OK else E_BAD_SEQID)
+                        | LInit(x) => false
+                    })
+    }
+
 }

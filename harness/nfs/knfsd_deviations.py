@@ -21,8 +21,9 @@ rather than of one server's bug:
   KN-20, KN-21  -> S4-compound-tag-unvalidated   (shared with ganesha)
   KN3-2         -> K3-exclusive-mode-zero, and its NFSv4 twin
                    K4-exclusive-create-mode-zero
-  (none)        -> K4-open-replaces-unconfirmed-owner, which never had a
-                   registry entry: it went straight into the model
+  (none)        -> K4-open-replaces-unconfirmed-owner and
+                   K4-lock-new-owner-reuses-state, which never had a
+                   registry entry: they went straight into the model
   KN3-3         -> the existing T_ERROR_PRECEDENCE tolerance (shared with
                    ganesha AND with chimera, which already had it)
 

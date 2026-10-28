@@ -1246,6 +1246,34 @@ module nfs4Test40 {
                                  access: 1, deny: 0 }) ]))
             .expect(lastStatus == OK)
 
+    // RFC 7530 16.10.5: new_lock_owner=TRUE from a lock-owner that already
+    // holds locks on the file is BAD_SEQID, even with both seqids in
+    // sequence, and the refusal consumes neither: the lock-owner's next
+    // request through its lock stateid still carries seqid 2.
+    run lockNewOwnerWhileHoldingTest =
+        boot40
+            .then(runC([ RPutrootfh,
+                         ROpen({ client: 0, owner: 1, oseq: 1,
+                                 claim: OCNull("f"),
+                                 how: HGuarded({ mode: 420 }),
+                                 access: 3, deny: 0 }), RGetfh ]))
+            .then(runC([ RPutfh(1), ROpenConfirm({ sid: 0, oseq: 2 }) ]))
+            .then(runC([ RPutfh(1),
+                         RLock({ wr: false, lo: 0, hi: 2, newOwner: true,
+                                 openSid: 0, lockSid: -1, lockOwner: 6,
+                                 oseq: 3, lseq: 1 }) ]))
+            .expect(lastStatus == OK and sdb.locks.keys().contains(1))
+            .then(runC([ RPutfh(1),
+                         RLock({ wr: false, lo: 2, hi: 4, newOwner: true,
+                                 openSid: 0, lockSid: -1, lockOwner: 6,
+                                 oseq: 4, lseq: 2 }) ]))
+            .expect(lastStatus == E_BAD_SEQID)
+            .then(runC([ RPutfh(1),
+                         RLock({ wr: false, lo: 2, hi: 4, newOwner: false,
+                                 openSid: -1, lockSid: 1, lockOwner: 6,
+                                 oseq: 0, lseq: 2 }) ]))
+            .expect(lastStatus == OK)
+
     // 4.1-only ops inside a 4.0 compound are unknown opcodes.
     run minorGateTest =
         boot40

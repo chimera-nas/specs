@@ -2707,6 +2707,22 @@ module nfs4ops {
     // Byte-range locks
     // ------------------------------------------------------------------
 
+    // K4-lock-new-owner-reuses-state: does a 4.0 new_lock_owner=TRUE request
+    // from a lock-owner that still holds locks on file f get processed on
+    // that lock state?  The Linux server (lookup_or_create_lock_state) only
+    // checks an existing lock-owner's lock seqid, then finds the lock stateid
+    // hanging off the open stateid the request names (find_lock_stateid);
+    // RFC 7530 16.10.5 refuses the request with BAD_SEQID.
+    pure def reusesLockState(a: Acc, cid: ClientId, f: Ino, openSid: Sid,
+                             lockOwner: int, lseq: int): bool = {
+        val l = lockByOwner(a.sdb, cid, lockOwner, f)
+        a.minor == 0 and
+        hasDev(a.caps, "K4-lock-new-owner-reuses-state") and
+        lockHeldByOwner(a.sdb, cid, lockOwner, f) and
+        loGateOk(a.sdb, cid, lockOwner, lseq) and
+        (if (l == -1) false else a.sdb.locks.get(l).openSid == openSid)
+    }
+
     pure def opLock(a: Acc, ar: { wr: bool, lo: int, hi: int, newOwner: bool,
                                   openSid: Sid, lockSid: Sid, lockOwner: int,
                                   oseq: int, lseq: int }): Acc = {
@@ -2731,33 +2747,56 @@ module nfs4ops {
                          not(ooGateOk(a.caps, a.sdb, o.client, o.owner, ar.oseq)))
                     emit(a, SLock(nores.with("st", E_BAD_SEQID)))
                 else if (a.minor == 0 and
-                         lockHeldByOwner(a.sdb, o.client, ar.lockOwner, o.file))
+                         lockHeldByOwner(a.sdb, o.client, ar.lockOwner,
+                                         o.file) and
+                         not(reusesLockState(a, o.client, o.file, ar.openSid,
+                                             ar.lockOwner, ar.lseq)))
                     // 4.0: new_lock_owner=TRUE while this lock-owner still
                     // *holds* byte-range locks on the file is BAD_SEQID (RFC
                     // 7530 16.10.5); a fully-LOCKU'd stateid may be
                     // re-established, and 4.1 reuses the state (falls through
                     // to the merge in doLock).
                     emit(a, SLock(nores.with("st", E_BAD_SEQID)))
-                else if (lockConflict(a.sdb, o.client, ar.lockOwner, o.file,
-                                      ar.lo, ar.hi, ar.wr)) {
-                    val who = lockConflictOwner(a.sdb, o.client, ar.lockOwner,
-                                                o.file, ar.lo, ar.hi, ar.wr)
-                    val a1 = emit(a, SLock(nores.with("st", E_DENIED)
-                                                .with("deniedOwner", who)))
-                    if (a.minor == 0)
-                        a1.with("sdb", ooSettle(a1.sdb, o.client, o.owner,
-                                                ar.oseq, E_DENIED, false))
-                    else a1
-                } else {
-                    val r = doLock(a.sdb, o.client, ar.lockOwner, o.file,
-                                   ar.openSid, ar.lo, ar.hi, ar.wr)
-                    val sdb2 = if (a.minor == 0)
-                                   loSettle(ooSettle(r.sdb2, o.client, o.owner,
-                                                     ar.oseq, OK, false),
-                                            o.client, ar.lockOwner, ar.lseq, OK)
-                               else r.sdb2
-                    emit(a.with("sdb", sdb2),
-                         SLock(nores.with("sid", r.sid).with("seq", r.seq)))
+                else {
+                    // Under K4-lock-new-owner-reuses-state the request runs
+                    // on the held state, and a DENIED consumes the lock-owner
+                    // seqid too: the server bumps it whenever the open-owner
+                    // is the one the compound sequences.
+                    val reuse = reusesLockState(a, o.client, o.file, ar.openSid,
+                                                ar.lockOwner, ar.lseq)
+                    val b = if (reuse)
+                                hitDev(a, "K4-lock-new-owner-reuses-state")
+                            else a
+                    if (lockConflict(b.sdb, o.client, ar.lockOwner, o.file,
+                                     ar.lo, ar.hi, ar.wr)) {
+                        val who = lockConflictOwner(b.sdb, o.client,
+                                                    ar.lockOwner, o.file,
+                                                    ar.lo, ar.hi, ar.wr)
+                        val a1 = emit(b, SLock(nores.with("st", E_DENIED)
+                                                    .with("deniedOwner", who)))
+                        if (b.minor == 0) {
+                            val s1 = ooSettle(a1.sdb, o.client, o.owner,
+                                              ar.oseq, E_DENIED, false)
+                            a1.with("sdb",
+                                    if (reuse) loSettle(s1, o.client,
+                                                        ar.lockOwner, ar.lseq,
+                                                        E_DENIED)
+                                    else s1)
+                        }
+                        else a1
+                    } else {
+                        val r = doLock(b.sdb, o.client, ar.lockOwner, o.file,
+                                       ar.openSid, ar.lo, ar.hi, ar.wr)
+                        val sdb2 = if (b.minor == 0)
+                                       loSettle(ooSettle(r.sdb2, o.client,
+                                                         o.owner, ar.oseq, OK,
+                                                         false),
+                                                o.client, ar.lockOwner,
+                                                ar.lseq, OK)
+                                   else r.sdb2
+                        emit(b.with("sdb", sdb2),
+                             SLock(nores.with("sid", r.sid).with("seq", r.seq)))
+                    }
                 }
             }
         } else {

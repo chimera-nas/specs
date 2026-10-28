@@ -5,7 +5,8 @@
 
   "deviations": [
     "S4-owner-seqid-gap-unpoliced",
-    "K4-open-replaces-unconfirmed-owner"
+    "K4-open-replaces-unconfirmed-owner",
+    "K4-lock-new-owner-reuses-state"
   ],
 
   // The Linux server replaces an unconfirmed open-owner on any OPEN from
@@ -13,9 +14,12 @@
   // confirms, so the shape is also exported deterministically: OPEN_CONFIRM
   // of the replaced stateid is BAD_STATEID on this server alone, and an
   // OPEN whose current filehandle is the file the replacement orphans
-  // still fails on that handle's type.
+  // still fails on that handle's type.  The same server also hands an
+  // existing lock-owner its lock stateid back on new_lock_owner=TRUE; the
+  // walk reaches that often, and the scenario pins the seqids after it.
   "scenarios": [{"run": "unconfirmedOwnerReopenRegression", "flavor": "step"},
-                {"run": "unconfirmedOwnerReopenOrphanCfhRegression", "flavor": "step"}],
+                {"run": "unconfirmedOwnerReopenOrphanCfhRegression", "flavor": "step"},
+                {"run": "lockNewOwnerReusesStateRegression", "flavor": "step"}],
 
   // Only the 4.0 walk RENAMEs through a symbolic-link directory handle, which
   "tolerances": {

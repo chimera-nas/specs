@@ -603,9 +603,10 @@ else()
         # the same depths and seeds -- but NOT the same corpus.  It cannot: a
         # cell's corpus encodes the divergences of the server it is replayed
         # against, and the Linux server's are not ganesha's.  What the two do
-        # share is the vocabulary: four of the five ids the knfsd nfs4 cells
+        # share is the vocabulary: three of the six ids the knfsd nfs4 cells
         # enable are S4-*, divergences BOTH servers have, which is the evidence
-        # that the clause is ambiguous rather than that one server is wrong.
+        # that the clause is ambiguous rather than that one server is wrong;
+        # the K4-* ones are the Linux server's alone.
         #
         # No delegation and no pNFS cells: the knfsd runner drives neither, as
         # before.
