@@ -439,8 +439,12 @@ server_version() {
 # export and flushes the filehandle cache, then acks -- which needs neither an
 # ssh key (the image's keys are guest-internal) nor an NFS-level walk (leftover
 # open state would make that unreliable).  Distinct per-trace client owners
-# (the replayer salts them) keep one trace's NFSv4 state from touching the
-# next; whatever lingers expires with the short lease.
+# keep one trace's NFSv4 state from touching the next; whatever lingers
+# expires with the short lease.  The runner salts the owner epoch per trace:
+# the replayer only appends its own in-process trace index, which is 0 for
+# every one-trace invocation, so a batch-wide epoch would hand trace N the
+# same owner strings as trace 0 and let it attach to that trace's client
+# record whenever the owner and verifier symbols match.
 #
 # Environment (beyond the common set):
 #   KVM_VMLINUZ / KVM_ROOTFS   guest kernel + rootfs (CMake resolves them from
@@ -637,15 +641,18 @@ done"
     esac
 
     n_ok=0; n_skip=0; n_fail=0
-    EPOCH="$$-$(date +%s)"
+    # One epoch per trace, not per batch: see "Distinct per-trace client
+    # owners" above.  idx is the trace's position in the batch.
+    EPOCH="$$-$(date +%s)"; idx=0
     for t in "${TRACES[@]}"; do
         if ! knfsd_reset; then
             echo "$(basename "$t"): ERROR guest reset failed"
-            n_fail=$((n_fail + 1)); continue
+            n_fail=$((n_fail + 1)); idx=$((idx + 1)); continue
         fi
         run_in_ns timeout "$TIMEOUT" python3 "$REPLAYER" "${K_ARGS[@]}" \
-            --owner-epoch "${EPOCH}" --trace "$t"
+            --owner-epoch "${EPOCH}-${idx}" --trace "$t"
         rc=$?
+        idx=$((idx + 1))
         if [ "$rc" = "0" ]; then n_ok=$((n_ok + 1))
         elif [ "$rc" = "77" ]; then n_skip=$((n_skip + 1))
         else n_fail=$((n_fail + 1)); fi
