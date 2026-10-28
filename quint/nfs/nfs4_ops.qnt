@@ -911,12 +911,19 @@ module nfs4ops {
     // without checking for replay"): the owner and every open it holds are
     // released, and the OPEN is processed for a brand-new owner.  That
     // happens after the server has checked the client id and before it
-    // checks the seqid, so an OPEN with no current filehandle (refused at
-    // the compound level) or from an unknown or unconfirmed client replaces
-    // nothing.  A malformed name or share mode does not stop it: a 4.0 OPEN
-    // that fails to decode with a seqid-consuming error still runs
-    // nfsd4_process_open1 (nfsd4_open_omfg), which is why opOpen does this
-    // before any of its arms.
+    // checks the seqid, so an OPEN from an unknown or unconfirmed client
+    // replaces nothing, and neither does a well-formed OPEN with no current
+    // filehandle, which is refused at the compound level.  A malformed name
+    // does not stop it: the name fails to decode with a seqid-consuming
+    // error (INVAL, NAMETOOLONG or BADNAME), and a 4.0 OPEN that does still
+    // runs nfsd4_process_open1 (nfsd4_open_omfg), which is why opOpen does
+    // this before any of its arms.  A malformed share mode is not such an
+    // error: it decodes to BADXDR, which consumes no seqid, so the server
+    // never gets this far.  The model parts from the server in two corners
+    // the walk never reaches: it replaces the owner before answering a bad
+    // share mode INVAL, and it replaces nothing for a malformed name sent
+    // without a filehandle, which the server does replace, since it runs
+    // nfsd4_open_omfg ahead of its filehandle check.
     pure def replacesUnconfirmedOwner(a: Acc, cid: ClientId,
                                       owner: int): bool = {
         val k = (cid, owner)
@@ -2712,7 +2719,11 @@ module nfs4ops {
     // that lock state?  The Linux server (lookup_or_create_lock_state) only
     // checks an existing lock-owner's lock seqid, then finds the lock stateid
     // hanging off the open stateid the request names (find_lock_stateid);
-    // RFC 7530 16.10.5 refuses the request with BAD_SEQID.
+    // RFC 7530 16.10.5 refuses the request with BAD_SEQID.  Through another
+    // open of the file the server finds none there and creates a second lock
+    // stateid; the model holds one lock state per (client, lock-owner,
+    // file), so that case keeps the standard answer and the knfsd registry
+    // records it (KN-25-lock-new-owner-other-open).
     pure def reusesLockState(a: Acc, cid: ClientId, f: Ino, openSid: Sid,
                              lockOwner: int, lseq: int): bool = {
         val l = lockByOwner(a.sdb, cid, lockOwner, f)
@@ -2753,9 +2764,10 @@ module nfs4ops {
                                              ar.lockOwner, ar.lseq)))
                     // 4.0: new_lock_owner=TRUE while this lock-owner still
                     // *holds* byte-range locks on the file is BAD_SEQID (RFC
-                    // 7530 16.10.5); a fully-LOCKU'd stateid may be
-                    // re-established, and 4.1 reuses the state (falls through
-                    // to the merge in doLock).
+                    // 7530 16.10.5), unless K4-lock-new-owner-reuses-state
+                    // applies (reusesLockState); a fully-LOCKU'd stateid may
+                    // be re-established, and 4.1 reuses the state (falls
+                    // through to the merge in doLock).
                     emit(a, SLock(nores.with("st", E_BAD_SEQID)))
                 else {
                     // Under K4-lock-new-owner-reuses-state the request runs

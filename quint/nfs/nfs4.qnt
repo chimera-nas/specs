@@ -2533,8 +2533,10 @@ module nfs4 {
     // the same owner either leaves the first open alone (the standard) or
     // releases it (the Linux server).  OPEN_CONFIRM of the first stateid
     // then tells the two apart without touching a removed file, so the
-    // server's deferred close cannot race the answer.
-    run unconfirmedOwnerReopenRegression =
+    // server's deferred close cannot race the answer: NFS4_OK to the
+    // standard, NFS4ERR_BAD_STATEID to the Linux server.
+    run unconfirmedOwnerReopenRegression = {
+        val replaces = DEVS.contains("K4-open-replaces-unconfirmed-owner")
         coverageBootRun
             .then(runC([RPutfh(ROOT),
                 ROpen({client: 0, owner: 1, oseq: 1, claim: OCNull("a"),
@@ -2544,9 +2546,14 @@ module nfs4 {
                 ROpen({client: 0, owner: 1, oseq: 2, claim: OCNull("b"),
                        how: HGuarded({mode: 420}), access: 3, deny: 0}),
                 RGetfh]))
-            .expect(sdb.opens.keys().contains(0) ==
-                    not(DEVS.contains("K4-open-replaces-unconfirmed-owner")))
+            .expect(sdb.opens.keys().contains(0) == not(replaces))
             .then(runC([RPutfh(1), ROpenConfirm({sid: 0, oseq: 3})]))
+            .expect(match lastOp {
+                        | LCompound(l) =>
+                            l.status == (if (replaces) E_BAD_STATEID else OK)
+                        | LInit(x) => false
+                    })
+    }
 
     // K4-open-replaces-unconfirmed-owner must not take the OPEN's own
     // current filehandle with it.  Owner 1 opens "a" without confirming and
@@ -2581,6 +2588,8 @@ module nfs4 {
     // merged in.  Its next such LOCK runs into owner 7's lock, and the
     // NFS4ERR_DENIED consumes the lock-owner seqid as well as the open-owner
     // one, so the LOCK through the lock stateid that follows carries seqid 4.
+    // Where the standard refused the first, the BAD_SEQID consumed nothing,
+    // so the two requests after it are out of sequence and refused for that.
     run lockNewOwnerReusesStateRegression = {
         val reuses = DEVS.contains("K4-lock-new-owner-reuses-state")
         coverageBootRun
