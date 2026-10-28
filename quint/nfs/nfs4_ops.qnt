@@ -904,6 +904,50 @@ module nfs4ops {
         sdb.oo40.keys().contains(k) and sdb.oo40.get(k).confirmed
     }
 
+    // K4-open-replaces-unconfirmed-owner: RFC 7530 16.18.5 lets an OPEN
+    // cancel an unconfirmed owner's earlier OPEN only when its seqid is out
+    // of sequence.  The Linux server replaces an unconfirmed 4.0 owner on
+    // ANY OPEN from it (nfsd4_process_open1, "Replace unconfirmed owners
+    // without checking for replay"): the owner and every open it holds are
+    // released, and the OPEN is processed for a brand-new owner.  That
+    // happens after the server has checked the client id and before it
+    // checks the seqid, so an OPEN with no current filehandle (refused at
+    // the compound level) or from an unknown or unconfirmed client replaces
+    // nothing.  A malformed name or share mode does not stop it: a 4.0 OPEN
+    // that fails to decode with a seqid-consuming error still runs
+    // nfsd4_process_open1 (nfsd4_open_omfg), which is why opOpen does this
+    // before any of its arms.
+    pure def replacesUnconfirmedOwner(a: Acc, cid: ClientId,
+                                      owner: int): bool = {
+        val k = (cid, owner)
+        a.minor == 0 and
+        hasDev(a.caps, "K4-open-replaces-unconfirmed-owner") and
+        a.cfh != -1 and
+        a.sdb.clients.keys().contains(cid) and
+        a.sdb.clients.get(cid).confirmed and
+        a.sdb.oo40.keys().contains(k) and
+        not(a.sdb.oo40.get(k).confirmed)
+    }
+
+    // Drop the owner record, so the seqid gate sees a new owner, and every
+    // open it holds.  No lock state can hang off them: an owner is
+    // unconfirmed exactly while all its opens still need OPEN_CONFIRM, and
+    // LOCK refuses such an open.  doClose is used for its freedSids
+    // bookkeeping, which makes the released stateids BAD_STATEID.  The
+    // files those opens pinned are NOT reaped here: the OPEN's own current
+    // filehandle may be one of them, and the server still holds the handle
+    // PUTFH verified.  opOpen reaps once the OPEN is done.
+    pure def replaceUnconfirmedOwner(a: Acc, cid: ClientId, owner: int): Acc =
+        if (replacesUnconfirmedOwner(a, cid, owner)) {
+            val held = a.sdb.opens.keys().filter(s =>
+                a.sdb.opens.get(s).client == cid and
+                a.sdb.opens.get(s).owner == owner)
+            val closed = held.fold(a.sdb, (acc, s) => doClose(acc, s))
+            val sdb2 = closed.with("oo40", smapDrop(closed.oo40, (cid, owner)))
+            hitDev(a.with("sdb", sdb2), "K4-open-replaces-unconfirmed-owner")
+        }
+        else a
+
     // Lock-owner seqid gate (4.0), same shape.
     pure def loGateOk(sdb: StateDB, cid: ClientId, owner: int, lseq: int): bool = {
         val k = (cid, owner)
@@ -2153,9 +2197,24 @@ module nfs4ops {
         }
     }
 
+    // K4-open-replaces-unconfirmed-owner runs first, because the Linux
+    // server replaces an unconfirmed owner before it checks the seqid: a
+    // gapped OPEN by an unconfirmed owner is no gap on that server.  The
+    // files the released opens pinned are reaped after the OPEN, whatever
+    // it answered (see replaceUnconfirmedOwner).
     pure def opOpen(a0: Acc, ar: { client: ClientId, owner: int, oseq: int,
                                   claim: OpenClaim, how: OpenHow,
                                   access: int, deny: int }): Acc = {
+        val out = opOpenAs(replaceUnconfirmedOwner(a0, ar.client, ar.owner),
+                           ar)
+        if (replacesUnconfirmedOwner(a0, ar.client, ar.owner))
+            out.with("fs", reapOrphans(out.fs, out.sdb))
+        else out
+    }
+
+    pure def opOpenAs(a0: Acc, ar: { client: ClientId, owner: int, oseq: int,
+                                    claim: OpenClaim, how: OpenHow,
+                                    access: int, deny: int }): Acc = {
         // S4-owner-seqid-gap-unpoliced is recorded here, before anything else
         // reads the accumulator, so every arm below carries it.
         val a = ooGapHit(a0, ar.client, ar.owner, ar.oseq)

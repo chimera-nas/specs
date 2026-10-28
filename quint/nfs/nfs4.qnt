@@ -2528,4 +2528,49 @@ module nfs4 {
         coverageBootRun
             .then(runTagged("NLONG", withSess(0, [RPutrootfh])))
 
+    // K4-open-replaces-unconfirmed-owner, exported by the knfsd 4.0 cell.
+    // Owner 1 opens "a" and never confirms; an in-sequence OPEN of "b" by
+    // the same owner either leaves the first open alone (the standard) or
+    // releases it (the Linux server).  OPEN_CONFIRM of the first stateid
+    // then tells the two apart without touching a removed file, so the
+    // server's deferred close cannot race the answer.
+    run unconfirmedOwnerReopenRegression =
+        coverageBootRun
+            .then(runC([RPutfh(ROOT),
+                ROpen({client: 0, owner: 1, oseq: 1, claim: OCNull("a"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}),
+                RGetfh]))
+            .then(runC([RPutfh(ROOT),
+                ROpen({client: 0, owner: 1, oseq: 2, claim: OCNull("b"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}),
+                RGetfh]))
+            .expect(sdb.opens.keys().contains(0) ==
+                    not(DEVS.contains("K4-open-replaces-unconfirmed-owner")))
+            .then(runC([RPutfh(1), ROpenConfirm({sid: 0, oseq: 3})]))
+
+    // K4-open-replaces-unconfirmed-owner must not take the OPEN's own
+    // current filehandle with it.  Owner 1 opens "a" without confirming and
+    // removes it, so only that open keeps the file; the same owner's next
+    // OPEN is then sent with the orphan as its current filehandle.  The
+    // Linux server releases the owner but the compound still holds the
+    // handle PUTFH verified, so the OPEN fails on its type, NFS4ERR_NOTDIR,
+    // just as it does where the owner survives.  The orphan is reaped once
+    // the OPEN is done, and the walk never sees it again.
+    run unconfirmedOwnerReopenOrphanCfhRegression =
+        coverageBootRun
+            .then(runC([RPutfh(ROOT),
+                ROpen({client: 0, owner: 1, oseq: 1, claim: OCNull("a"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}),
+                RGetfh]))
+            .then(runC([RPutfh(ROOT), RRemove("a")]))
+            .then(runC([RPutfh(1),
+                ROpen({client: 0, owner: 1, oseq: 2, claim: OCNull("b"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0})]))
+            .expect(match lastOp {
+                        | LCompound(l) => l.status == E_NOTDIR
+                        | LInit(x) => false
+                    })
+            .expect(fsLive(fs, 1) ==
+                    not(DEVS.contains("K4-open-replaces-unconfirmed-owner")))
+
 }

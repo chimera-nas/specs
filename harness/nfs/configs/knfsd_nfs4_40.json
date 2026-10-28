@@ -4,8 +4,18 @@
   "traceStem": "knfsd40",
 
   "deviations": [
-    "S4-owner-seqid-gap-unpoliced"
+    "S4-owner-seqid-gap-unpoliced",
+    "K4-open-replaces-unconfirmed-owner"
   ],
+
+  // The Linux server replaces an unconfirmed open-owner on any OPEN from
+  // it.  The random walk reaches that only when an owner reopens before it
+  // confirms, so the shape is also exported deterministically: OPEN_CONFIRM
+  // of the replaced stateid is BAD_STATEID on this server alone, and an
+  // OPEN whose current filehandle is the file the replacement orphans
+  // still fails on that handle's type.
+  "scenarios": [{"run": "unconfirmedOwnerReopenRegression", "flavor": "step"},
+                {"run": "unconfirmedOwnerReopenOrphanCfhRegression", "flavor": "step"}],
 
   // Only the 4.0 walk RENAMEs through a symbolic-link directory handle, which
   "tolerances": {

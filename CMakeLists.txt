@@ -615,7 +615,7 @@ else()
             "nfs3|knfsd_nfs3|knfsd3|step_128,step_256,stepChurn_128,stepChurn_256,stepDir_128,stepExcl_128"
             "nfs4|knfsd_nfs4_42|knfsd42|step_80,stepState_80,stepNamespace_80,stepData_80,stepTypes_80,stepData42_80"
             "nfs4|knfsd_nfs4_41|knfsd41|step_80,stepState_80,stepNamespace_80,stepData_80,stepTypes_80"
-            "nfs4|knfsd_nfs4_40|knfsd40|step_80,stepState_80,stepNamespace_80,stepData_80,stepTypes_80")
+            "nfs4|knfsd_nfs4_40|knfsd40|step_80,stepState_80,stepNamespace_80,stepData_80,stepTypes_80,step_scenario")
 
         foreach(c ${KNFSD_CELLS})
             string(REPLACE "|" ";" parts "${c}")

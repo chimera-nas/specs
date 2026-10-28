@@ -1161,6 +1161,27 @@ module nfs4Test40 {
                                  access: 1, deny: 0 }) ]))
             .expect(lastStatus == OK and not(asOpen(resAt(1)).needConfirm))
 
+    // RFC 7530 16.18.5: the server holds an unconfirmed OPEN until
+    // OPEN_CONFIRM, an out-of-sequence OPEN, or lease expiry.  An
+    // in-sequence second OPEN by the same unconfirmed owner is none of the
+    // three, so the first open survives and can still be confirmed.
+    run unconfirmedOwnerSecondOpenKeepsFirstTest =
+        boot40
+            .then(runC([ RPutrootfh,
+                         ROpen({ client: 0, owner: 1, oseq: 1,
+                                 claim: OCNull("a"),
+                                 how: HGuarded({ mode: 420 }),
+                                 access: 3, deny: 0 }), RGetfh ]))
+            .expect(lastStatus == OK and asOpen(resAt(1)).needConfirm)
+            .then(runC([ RPutrootfh,
+                         ROpen({ client: 0, owner: 1, oseq: 2,
+                                 claim: OCNull("b"),
+                                 how: HGuarded({ mode: 420 }),
+                                 access: 3, deny: 0 }), RGetfh ]))
+            .expect(lastStatus == OK and sdb.opens.keys().contains(0))
+            .then(runC([ RPutfh(1), ROpenConfirm({ sid: 0, oseq: 3 }) ]))
+            .expect(lastStatus == OK)
+
     // A 4.0 CLOSE presenting a superseded stateid seqid is refused with
     // OLD_STATEID and the open survives -- and the refusal CONSUMES the
     // owner seqid: RFC 7530 9.1.7 exempts BAD_STATEID from advancing it,
