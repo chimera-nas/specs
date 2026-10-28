@@ -2528,4 +2528,106 @@ module nfs4 {
         coverageBootRun
             .then(runTagged("NLONG", withSess(0, [RPutrootfh])))
 
+    // K4-open-replaces-unconfirmed-owner, exported by the knfsd 4.0 cell.
+    // Owner 1 opens "a" and never confirms; an in-sequence OPEN of "b" by
+    // the same owner either leaves the first open alone (the standard) or
+    // releases it (the Linux server).  OPEN_CONFIRM of the first stateid
+    // then tells the two apart without touching a removed file, so the
+    // server's deferred close cannot race the answer: NFS4_OK to the
+    // standard, NFS4ERR_BAD_STATEID to the Linux server.
+    run unconfirmedOwnerReopenRegression = {
+        val replaces = DEVS.contains("K4-open-replaces-unconfirmed-owner")
+        coverageBootRun
+            .then(runC([RPutfh(ROOT),
+                ROpen({client: 0, owner: 1, oseq: 1, claim: OCNull("a"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}),
+                RGetfh]))
+            .then(runC([RPutfh(ROOT),
+                ROpen({client: 0, owner: 1, oseq: 2, claim: OCNull("b"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}),
+                RGetfh]))
+            .expect(sdb.opens.keys().contains(0) == not(replaces))
+            .then(runC([RPutfh(1), ROpenConfirm({sid: 0, oseq: 3})]))
+            .expect(match lastOp {
+                        | LCompound(l) =>
+                            l.status == (if (replaces) E_BAD_STATEID else OK)
+                        | LInit(x) => false
+                    })
+    }
+
+    // K4-open-replaces-unconfirmed-owner must not take the OPEN's own
+    // current filehandle with it.  Owner 1 opens "a" without confirming and
+    // removes it, so only that open keeps the file; the same owner's next
+    // OPEN is then sent with the orphan as its current filehandle.  The
+    // Linux server releases the owner but the compound still holds the
+    // handle PUTFH verified, so the OPEN fails on its type, NFS4ERR_NOTDIR,
+    // just as it does where the owner survives.  The orphan is reaped once
+    // the OPEN is done, and the walk never sees it again.
+    run unconfirmedOwnerReopenOrphanCfhRegression =
+        coverageBootRun
+            .then(runC([RPutfh(ROOT),
+                ROpen({client: 0, owner: 1, oseq: 1, claim: OCNull("a"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}),
+                RGetfh]))
+            .then(runC([RPutfh(ROOT), RRemove("a")]))
+            .then(runC([RPutfh(1),
+                ROpen({client: 0, owner: 1, oseq: 2, claim: OCNull("b"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0})]))
+            .expect(match lastOp {
+                        | LCompound(l) => l.status == E_NOTDIR
+                        | LInit(x) => false
+                    })
+            .expect(fsLive(fs, 1) ==
+                    not(DEVS.contains("K4-open-replaces-unconfirmed-owner")))
+
+    // K4-lock-new-owner-reuses-state, pinned without the random walk.  Lock
+    // owner 6 holds a read lock on "a" through open 0 and owner 7 a write
+    // lock beside it; owner 6 then sends new_lock_owner=TRUE again, both
+    // seqids in sequence.  The standard refuses that with NFS4ERR_BAD_SEQID;
+    // the Linux server hands back owner 6's lock stateid with the new range
+    // merged in.  Its next such LOCK runs into owner 7's lock, and the
+    // NFS4ERR_DENIED consumes the lock-owner seqid as well as the open-owner
+    // one, so the LOCK through the lock stateid that follows carries seqid 4.
+    // Where the standard refused the first, the BAD_SEQID consumed nothing,
+    // so the two requests after it are out of sequence and refused for that.
+    run lockNewOwnerReusesStateRegression = {
+        val reuses = DEVS.contains("K4-lock-new-owner-reuses-state")
+        coverageBootRun
+            .then(runC([RPutfh(ROOT),
+                ROpen({client: 0, owner: 1, oseq: 1, claim: OCNull("a"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}),
+                RGetfh]))
+            .then(runC([RPutfh(1), ROpenConfirm({sid: 0, oseq: 2})]))
+            .then(runC([RPutfh(1),
+                RLock({wr: false, lo: 0, hi: 2, newOwner: true, openSid: 0,
+                       lockSid: -1, lockOwner: 6, oseq: 3, lseq: 1})]))
+            .then(runC([RPutfh(1),
+                RLock({wr: true, lo: 4, hi: 6, newOwner: true, openSid: 0,
+                       lockSid: -1, lockOwner: 7, oseq: 4, lseq: 1})]))
+            .then(runC([RPutfh(1),
+                RLock({wr: false, lo: 2, hi: 4, newOwner: true, openSid: 0,
+                       lockSid: -1, lockOwner: 6, oseq: 5, lseq: 2})]))
+            .expect(match lastOp {
+                        | LCompound(l) =>
+                            l.status == (if (reuses) OK else E_BAD_SEQID)
+                        | LInit(x) => false
+                    })
+            .then(runC([RPutfh(1),
+                RLock({wr: false, lo: 4, hi: 5, newOwner: true, openSid: 0,
+                       lockSid: -1, lockOwner: 6, oseq: 6, lseq: 3})]))
+            .expect(match lastOp {
+                        | LCompound(l) =>
+                            l.status == (if (reuses) E_DENIED else E_BAD_SEQID)
+                        | LInit(x) => false
+                    })
+            .then(runC([RPutfh(1),
+                RLock({wr: false, lo: 0, hi: 1, newOwner: false, openSid: -1,
+                       lockSid: 1, lockOwner: 6, oseq: 0, lseq: 4})]))
+            .expect(match lastOp {
+                        | LCompound(l) =>
+                            l.status == (if (reuses) OK else E_BAD_SEQID)
+                        | LInit(x) => false
+                    })
+    }
+
 }

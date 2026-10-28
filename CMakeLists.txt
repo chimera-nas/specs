@@ -603,9 +603,10 @@ else()
         # the same depths and seeds -- but NOT the same corpus.  It cannot: a
         # cell's corpus encodes the divergences of the server it is replayed
         # against, and the Linux server's are not ganesha's.  What the two do
-        # share is the vocabulary: four of the five ids the knfsd nfs4 cells
+        # share is the vocabulary: three of the six ids the knfsd nfs4 cells
         # enable are S4-*, divergences BOTH servers have, which is the evidence
-        # that the clause is ambiguous rather than that one server is wrong.
+        # that the clause is ambiguous rather than that one server is wrong;
+        # the K4-* ones are the Linux server's alone.
         #
         # No delegation and no pNFS cells: the knfsd runner drives neither, as
         # before.
@@ -615,7 +616,7 @@ else()
             "nfs3|knfsd_nfs3|knfsd3|step_128,step_256,stepChurn_128,stepChurn_256,stepDir_128,stepExcl_128"
             "nfs4|knfsd_nfs4_42|knfsd42|step_80,stepState_80,stepNamespace_80,stepData_80,stepTypes_80,stepData42_80"
             "nfs4|knfsd_nfs4_41|knfsd41|step_80,stepState_80,stepNamespace_80,stepData_80,stepTypes_80"
-            "nfs4|knfsd_nfs4_40|knfsd40|step_80,stepState_80,stepNamespace_80,stepData_80,stepTypes_80")
+            "nfs4|knfsd_nfs4_40|knfsd40|step_80,stepState_80,stepNamespace_80,stepData_80,stepTypes_80,step_scenario")
 
         foreach(c ${KNFSD_CELLS})
             string(REPLACE "|" ";" parts "${c}")

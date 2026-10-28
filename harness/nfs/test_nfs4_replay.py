@@ -22,7 +22,8 @@ import knfsd_deviations as kd  # noqa: E402
 from deviations import (Finding, NFS4_OK, NFS4ERR_BAD_STATEID,  # noqa: E402
                         NFS4ERR_OPENMODE, NFS4ERR_EXPIRED,
                         NFS4ERR_STALE_STATEID, NFS4ERR_STALE_CLIENTID,
-                        NFS4ERR_BADNAME, NFS4ERR_OLD_STATEID)
+                        NFS4ERR_BADNAME, NFS4ERR_OLD_STATEID,
+                        NFS4ERR_BAD_SEQID)
 from itf import Divergence, TraceFormatError  # noqa: E402
 
 
@@ -449,6 +450,40 @@ class KN23bScope(unittest.TestCase):
         f = self.finding(True, False)
         self.assertIsNone(kd.NFS4.lookup(
             f, registry_ctx([], make_replayer(), minor=0)))
+
+
+class KN25Scope(unittest.TestCase):
+    """KN-25 forgives a 4.0 new_lock_owner=TRUE LOCK that knfsd grants where
+    the model answers BAD_SEQID -- the lock-owner holds locks on the file
+    through another open, and knfsd gives it a second lock stateid there --
+    and stops the trace, since the server now holds lock state the model
+    refused.  The request is main's knfsd40_stepState_80_0x7_4 step 77."""
+
+    def lock_ops(self, new_owner):
+        return [{"tag": "RPutfh", "value": 2},
+                {"tag": "RLock",
+                 "value": {"wr": False, "lo": 1, "hi": 3,
+                           "newOwner": new_owner,
+                           "openSid": 5 if new_owner else -1,
+                           "lockSid": -1 if new_owner else 7,
+                           "lockOwner": 6, "oseq": 32, "lseq": 4}}]
+
+    def lookup(self, new_owner, minor=0):
+        f = Finding("SLock", "status", NFS4ERR_BAD_SEQID, NFS4_OK)
+        ctx = registry_ctx(self.lock_ops(new_owner), make_replayer(),
+                           minor=minor)
+        return f, ctx, kd.NFS4.lookup(f, ctx)
+
+    def test_a_40_new_owner_lock_granted_stops_the_trace(self):
+        f, ctx, dev = self.lookup(True)
+        self.assertIs(dev, kd.KN_25_LOCK_NEW_OWNER_OTHER_OPEN)
+        self.assertFalse(dev.is_reconcilable(f, ctx))
+
+    def test_not_a_lock_through_a_lock_stateid(self):
+        self.assertIsNone(self.lookup(False)[2])
+
+    def test_not_above_40(self):
+        self.assertIsNone(self.lookup(True, minor=1)[2])
 
 
 class ExitCode(unittest.TestCase):

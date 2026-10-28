@@ -21,6 +21,14 @@ rather than of one server's bug:
   KN-20, KN-21  -> S4-compound-tag-unvalidated   (shared with ganesha)
   KN3-2         -> K3-exclusive-mode-zero, and its NFSv4 twin
                    K4-exclusive-create-mode-zero
+  KN-9, KN-7    -> in part, K4-open-replaces-unconfirmed-owner: the gap
+                   KN-9 saw processed and the BAD_STATEID KN-7 saw on
+                   OPEN_CONFIRM are, for an unconfirmed owner, the server
+                   replacing that owner.  KN-7 stays until a run shows
+                   whether any SETCLIENTID case of its own is left
+  (none)        -> K4-lock-new-owner-reuses-state, which never had a
+                   registry entry: it went straight into the model.  Its
+                   other-open case cannot, and is KN-25
   KN3-3         -> the existing T_ERROR_PRECEDENCE tolerance (shared with
                    ganesha AND with chimera, which already had it)
 
@@ -341,6 +349,47 @@ KN_23B_IDLE_OPEN_OWNER_RECONFIRM = Deviation(
 )
 
 
+# KN-25: a 4.0 LOCK with new_lock_owner=TRUE from a lock-owner that holds
+# locks on the file through ANOTHER open.  RFC 7530 16.10.5 refuses it with
+# NFS4ERR_BAD_SEQID, and so does the model.  knfsd checks only the lock seqid
+# (lookup_or_create_lock_state), looks for that lock-owner's lock stateid
+# under the open the request names alone (find_lock_stateid walks that open's
+# st_locks), finds none, creates a second one there
+# (find_or_create_lock_stateid) and grants the lock.  Through the SAME open it
+# reuses the held stateid, which the model states as
+# K4-lock-new-owner-reuses-state; through another it cannot, because the model
+# keeps one lock state per client, lock-owner and file, so the second stateid
+# has nowhere to live.  Measured on main's knfsd40_stepState_80_0x7_4 step 77
+# (lock-owner 6 through open 5 while holding a lock through open 4), which the
+# replay had abandoned earlier on another entry.  reconcilable=False: the
+# server holds lock state the model refused.
+def _new_owner_lock_at_40(f, ctx):
+    return ctx.get("minor") == 0 and any(
+        op["tag"] == "RLock" and op["value"]["newOwner"]
+        for op in ctx["ops"])
+
+
+KN_25_LOCK_NEW_OWNER_OTHER_OPEN = Deviation(
+    id="KN-25-lock-new-owner-other-open",
+    verdict=SERVER,
+    spec="RFC 7530 16.10.5 (new_lock_owner TRUE from a lock-owner that "
+         "already has lock state for the open file is NFS4ERR_BAD_SEQID)",
+    summary="a 4.0 new_lock_owner=TRUE LOCK through a second open of a file "
+            "the lock-owner holds locks on is granted where the model "
+            "answers BAD_SEQID",
+    root_cause="knfsd keeps a lock stateid per lock-owner and open stateid, "
+               "and creates one for the new open "
+               "(find_or_create_lock_stateid)",
+    candidate_fix="model a lock stateid per lock-owner and open, then extend "
+                  "K4-lock-new-owner-reuses-state to the other-open case",
+    ops=("SLock",),
+    expected_status=NFS4ERR_BAD_SEQID,
+    actual_status=NFS4_OK,
+    context=_new_owner_lock_at_40,
+    reconcilable=False,
+)
+
+
 # KN-22: the ACCESS granted-mask differs from the model's type-masking, as
 # GD-22 records for ganesha.  Field-only.
 KN_22_ACCESS = Deviation(
@@ -390,6 +439,7 @@ NFS4 = Registry("knfsd/nfs4", [
     KN_18_READDIR_NAMES,
     KN_23_OWNER_STATEID_LIFECYCLE,
     KN_23B_IDLE_OPEN_OWNER_RECONFIRM,
+    KN_25_LOCK_NEW_OWNER_OTHER_OPEN,
     KN_19_CREATE_SETATTR,
     KN_22_ACCESS,
 ])

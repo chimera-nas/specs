@@ -904,6 +904,57 @@ module nfs4ops {
         sdb.oo40.keys().contains(k) and sdb.oo40.get(k).confirmed
     }
 
+    // K4-open-replaces-unconfirmed-owner: RFC 7530 16.18.5 lets an OPEN
+    // cancel an unconfirmed owner's earlier OPEN only when its seqid is out
+    // of sequence.  The Linux server replaces an unconfirmed 4.0 owner on
+    // ANY OPEN from it (nfsd4_process_open1, "Replace unconfirmed owners
+    // without checking for replay"): the owner and every open it holds are
+    // released, and the OPEN is processed for a brand-new owner.  That
+    // happens after the server has checked the client id and before it
+    // checks the seqid, so an OPEN from an unknown or unconfirmed client
+    // replaces nothing, and neither does a well-formed OPEN with no current
+    // filehandle, which is refused at the compound level.  A malformed name
+    // does not stop it: the name fails to decode with a seqid-consuming
+    // error (INVAL, NAMETOOLONG or BADNAME), and a 4.0 OPEN that does still
+    // runs nfsd4_process_open1 (nfsd4_open_omfg), which is why opOpen does
+    // this before any of its arms.  A malformed share mode is not such an
+    // error: it decodes to BADXDR, which consumes no seqid, so the server
+    // never gets this far.  The model parts from the server in two corners
+    // the walk never reaches: it replaces the owner before answering a bad
+    // share mode INVAL, and it replaces nothing for a malformed name sent
+    // without a filehandle, which the server does replace, since it runs
+    // nfsd4_open_omfg ahead of its filehandle check.
+    pure def replacesUnconfirmedOwner(a: Acc, cid: ClientId,
+                                      owner: int): bool = {
+        val k = (cid, owner)
+        a.minor == 0 and
+        hasDev(a.caps, "K4-open-replaces-unconfirmed-owner") and
+        a.cfh != -1 and
+        a.sdb.clients.keys().contains(cid) and
+        a.sdb.clients.get(cid).confirmed and
+        a.sdb.oo40.keys().contains(k) and
+        not(a.sdb.oo40.get(k).confirmed)
+    }
+
+    // Drop the owner record, so the seqid gate sees a new owner, and every
+    // open it holds.  No lock state can hang off them: an owner is
+    // unconfirmed exactly while all its opens still need OPEN_CONFIRM, and
+    // LOCK refuses such an open.  doClose is used for its freedSids
+    // bookkeeping, which makes the released stateids BAD_STATEID.  The
+    // files those opens pinned are NOT reaped here: the OPEN's own current
+    // filehandle may be one of them, and the server still holds the handle
+    // PUTFH verified.  opOpen reaps once the OPEN is done.
+    pure def replaceUnconfirmedOwner(a: Acc, cid: ClientId, owner: int): Acc =
+        if (replacesUnconfirmedOwner(a, cid, owner)) {
+            val held = a.sdb.opens.keys().filter(s =>
+                a.sdb.opens.get(s).client == cid and
+                a.sdb.opens.get(s).owner == owner)
+            val closed = held.fold(a.sdb, (acc, s) => doClose(acc, s))
+            val sdb2 = closed.with("oo40", smapDrop(closed.oo40, (cid, owner)))
+            hitDev(a.with("sdb", sdb2), "K4-open-replaces-unconfirmed-owner")
+        }
+        else a
+
     // Lock-owner seqid gate (4.0), same shape.
     pure def loGateOk(sdb: StateDB, cid: ClientId, owner: int, lseq: int): bool = {
         val k = (cid, owner)
@@ -2153,9 +2204,24 @@ module nfs4ops {
         }
     }
 
+    // K4-open-replaces-unconfirmed-owner runs first, because the Linux
+    // server replaces an unconfirmed owner before it checks the seqid: a
+    // gapped OPEN by an unconfirmed owner is no gap on that server.  The
+    // files the released opens pinned are reaped after the OPEN, whatever
+    // it answered (see replaceUnconfirmedOwner).
     pure def opOpen(a0: Acc, ar: { client: ClientId, owner: int, oseq: int,
                                   claim: OpenClaim, how: OpenHow,
                                   access: int, deny: int }): Acc = {
+        val out = opOpenAs(replaceUnconfirmedOwner(a0, ar.client, ar.owner),
+                           ar)
+        if (replacesUnconfirmedOwner(a0, ar.client, ar.owner))
+            out.with("fs", reapOrphans(out.fs, out.sdb))
+        else out
+    }
+
+    pure def opOpenAs(a0: Acc, ar: { client: ClientId, owner: int, oseq: int,
+                                    claim: OpenClaim, how: OpenHow,
+                                    access: int, deny: int }): Acc = {
         // S4-owner-seqid-gap-unpoliced is recorded here, before anything else
         // reads the accumulator, so every arm below carries it.
         val a = ooGapHit(a0, ar.client, ar.owner, ar.oseq)
@@ -2648,6 +2714,26 @@ module nfs4ops {
     // Byte-range locks
     // ------------------------------------------------------------------
 
+    // K4-lock-new-owner-reuses-state: does a 4.0 new_lock_owner=TRUE request
+    // from a lock-owner that still holds locks on file f get processed on
+    // that lock state?  The Linux server (lookup_or_create_lock_state) only
+    // checks an existing lock-owner's lock seqid, then finds the lock stateid
+    // hanging off the open stateid the request names (find_lock_stateid);
+    // RFC 7530 16.10.5 refuses the request with BAD_SEQID.  Through another
+    // open of the file the server finds none there and creates a second lock
+    // stateid; the model holds one lock state per (client, lock-owner,
+    // file), so that case keeps the standard answer and the knfsd registry
+    // records it (KN-25-lock-new-owner-other-open).
+    pure def reusesLockState(a: Acc, cid: ClientId, f: Ino, openSid: Sid,
+                             lockOwner: int, lseq: int): bool = {
+        val l = lockByOwner(a.sdb, cid, lockOwner, f)
+        a.minor == 0 and
+        hasDev(a.caps, "K4-lock-new-owner-reuses-state") and
+        lockHeldByOwner(a.sdb, cid, lockOwner, f) and
+        loGateOk(a.sdb, cid, lockOwner, lseq) and
+        (if (l == -1) false else a.sdb.locks.get(l).openSid == openSid)
+    }
+
     pure def opLock(a: Acc, ar: { wr: bool, lo: int, hi: int, newOwner: bool,
                                   openSid: Sid, lockSid: Sid, lockOwner: int,
                                   oseq: int, lseq: int }): Acc = {
@@ -2672,33 +2758,57 @@ module nfs4ops {
                          not(ooGateOk(a.caps, a.sdb, o.client, o.owner, ar.oseq)))
                     emit(a, SLock(nores.with("st", E_BAD_SEQID)))
                 else if (a.minor == 0 and
-                         lockHeldByOwner(a.sdb, o.client, ar.lockOwner, o.file))
+                         lockHeldByOwner(a.sdb, o.client, ar.lockOwner,
+                                         o.file) and
+                         not(reusesLockState(a, o.client, o.file, ar.openSid,
+                                             ar.lockOwner, ar.lseq)))
                     // 4.0: new_lock_owner=TRUE while this lock-owner still
                     // *holds* byte-range locks on the file is BAD_SEQID (RFC
-                    // 7530 16.10.5); a fully-LOCKU'd stateid may be
-                    // re-established, and 4.1 reuses the state (falls through
-                    // to the merge in doLock).
+                    // 7530 16.10.5), unless K4-lock-new-owner-reuses-state
+                    // applies (reusesLockState); a fully-LOCKU'd stateid may
+                    // be re-established, and 4.1 reuses the state (falls
+                    // through to the merge in doLock).
                     emit(a, SLock(nores.with("st", E_BAD_SEQID)))
-                else if (lockConflict(a.sdb, o.client, ar.lockOwner, o.file,
-                                      ar.lo, ar.hi, ar.wr)) {
-                    val who = lockConflictOwner(a.sdb, o.client, ar.lockOwner,
-                                                o.file, ar.lo, ar.hi, ar.wr)
-                    val a1 = emit(a, SLock(nores.with("st", E_DENIED)
-                                                .with("deniedOwner", who)))
-                    if (a.minor == 0)
-                        a1.with("sdb", ooSettle(a1.sdb, o.client, o.owner,
-                                                ar.oseq, E_DENIED, false))
-                    else a1
-                } else {
-                    val r = doLock(a.sdb, o.client, ar.lockOwner, o.file,
-                                   ar.openSid, ar.lo, ar.hi, ar.wr)
-                    val sdb2 = if (a.minor == 0)
-                                   loSettle(ooSettle(r.sdb2, o.client, o.owner,
-                                                     ar.oseq, OK, false),
-                                            o.client, ar.lockOwner, ar.lseq, OK)
-                               else r.sdb2
-                    emit(a.with("sdb", sdb2),
-                         SLock(nores.with("sid", r.sid).with("seq", r.seq)))
+                else {
+                    // Under K4-lock-new-owner-reuses-state the request runs
+                    // on the held state, and a DENIED consumes the lock-owner
+                    // seqid too: the server bumps it whenever the open-owner
+                    // is the one the compound sequences.
+                    val reuse = reusesLockState(a, o.client, o.file, ar.openSid,
+                                                ar.lockOwner, ar.lseq)
+                    val b = if (reuse)
+                                hitDev(a, "K4-lock-new-owner-reuses-state")
+                            else a
+                    if (lockConflict(b.sdb, o.client, ar.lockOwner, o.file,
+                                     ar.lo, ar.hi, ar.wr)) {
+                        val who = lockConflictOwner(b.sdb, o.client,
+                                                    ar.lockOwner, o.file,
+                                                    ar.lo, ar.hi, ar.wr)
+                        val a1 = emit(b, SLock(nores.with("st", E_DENIED)
+                                                    .with("deniedOwner", who)))
+                        if (b.minor == 0) {
+                            val s1 = ooSettle(a1.sdb, o.client, o.owner,
+                                              ar.oseq, E_DENIED, false)
+                            a1.with("sdb",
+                                    if (reuse) loSettle(s1, o.client,
+                                                        ar.lockOwner, ar.lseq,
+                                                        E_DENIED)
+                                    else s1)
+                        }
+                        else a1
+                    } else {
+                        val r = doLock(b.sdb, o.client, ar.lockOwner, o.file,
+                                       ar.openSid, ar.lo, ar.hi, ar.wr)
+                        val sdb2 = if (b.minor == 0)
+                                       loSettle(ooSettle(r.sdb2, o.client,
+                                                         o.owner, ar.oseq, OK,
+                                                         false),
+                                                o.client, ar.lockOwner,
+                                                ar.lseq, OK)
+                                   else r.sdb2
+                        emit(b.with("sdb", sdb2),
+                             SLock(nores.with("sid", r.sid).with("seq", r.seq)))
+                    }
                 }
             }
         } else {
