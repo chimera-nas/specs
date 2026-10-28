@@ -34,6 +34,17 @@ What it requires, and why:
     that carves on a re-lock but does not pump afterwards replays green
     against a corpus with no LOCK-side promotion in it.  These are the
     behaviours that only exist because the protocols are modeled together.
+  * The CANCEL of a deferred grant, from both sides: a CANCEL that hands
+    back an unconfirmed grant, an exact re-poll that confirms one, and a
+    later CANCEL of that re-polled grant, which leaves it held.  A corpus
+    without the last replays green against a server that releases on
+    CANCEL every grant it ever deferred.  And a CANCEL whose release
+    promotes a waiter: a server that releases on CANCEL but does not pump
+    afterwards replays green against a corpus with none in it.
+  * The RE-SEND of a blocked request: a client re-polls its LOCK while it
+    waits, and the re-send joins the request already queued.  A server
+    that queues it beside the original grants the copy after the client
+    has cancelled, and replays green against a corpus with no re-send.
 
 Coverage is required over the corpus as a whole rather than per flavour: the
 flavours are deliberately narrow (a portmap-only trace has no locks in it),
@@ -120,6 +131,14 @@ def same_owner(a, b):
             and big(a["svid"]) == big(b["svid"]))
 
 
+def lock_key(l):
+    """A lock's tuple as findExact matches it: file, owner, offset, the
+    stored (POSIX) length, and mode."""
+    o = l["owner"]
+    return (big(l["file"]), o["caller"], big(o["oh"]), big(o["svid"]),
+            big(l["offset"]), posix_len(l["wireLen"]), l["excl"] is True)
+
+
 def relocks(held, probe):
     """Whether granting `probe` replaces some of its owner's coverage: the
     owner already holds an overlapping lock on the file that is not the
@@ -147,7 +166,10 @@ def scan(path, buckets):
 
     prev_monitors = set()
     prev_queue_len = 0
+    prev_queue_keys = set()
     prev_held = []
+    prev_unconfirmed = set()
+    confirmed = set()       # held tuples a re-poll confirmed
 
     for state in trace["states"]:
         op = var(state, "lastOp")
@@ -241,8 +263,12 @@ def scan(path, buckets):
 
         # ---- the cross-protocol seams ------------------------------------
         monitors = set(seq(var(state, "monitors") or []))
-        queue_len = len(seq(var(state, "queue") or []))
+        queue = seq(var(state, "queue") or [])
+        queue_len = len(queue)
+        queue_keys = set(lock_key(q["lock"]) for q in queue)
         held = seq(var(state, "held") or [])
+        unconfirmed = set(lock_key(l)
+                          for l in seq(var(state, "unconfirmed") or []))
         if monitors:
             buckets.add("seam:host-monitored")
         if prev_monitors and not monitors and tag == "OSmNotify":
@@ -251,16 +277,45 @@ def scan(path, buckets):
             buckets.add("seam:notify-promoted-a-waiter")
         if tag == "ONlmFreeAll" and len(prev_held) > len(held):
             buckets.add("seam:free-all-released-locks")
+        if tag == "ONlmCancel" and len(prev_held) > len(held):
+            buckets.add("seam:cancel-released-a-hold")
+        # A LOCK after which a hold is still held but no longer unconfirmed
+        # is the owner's re-poll confirming it.  A CANCEL of a hold so
+        # confirmed must leave the held list as it was; a CANCEL of a lock
+        # granted at once proves nothing about the confirm.
+        held_keys = set(lock_key(l) for l in held)
+        newly_confirmed = (prev_unconfirmed - unconfirmed) & held_keys
+        if tag == "ONlmLock" and newly_confirmed:
+            buckets.add("seam:relock-confirmed-a-grant")
+        if (tag == "ONlmCancel" and lock
+                and lock_key(lock) in confirmed
+                and lock_key(lock) not in prev_unconfirmed
+                and held == prev_held):
+            buckets.add("seam:cancel-kept-a-confirmed-grant")
+        if tag == "ONlmCancel" and seq(val.get("granted", [])):
+            buckets.add("seam:cancel-promoted-a-waiter")
         if tag == "ONlmUnlock" and seq(val.get("granted", [])):
             buckets.add("seam:unlock-promoted-a-waiter")
         if tag == "ONlmLock" and seq(val.get("granted", [])):
             buckets.add("seam:lock-promoted-a-waiter")
         if queue_len > prev_queue_len:
             buckets.add("seam:request-queued")
+        # A blocking LOCK answered BLOCKED for a request its owner already
+        # had queued is a waiting client's re-send, and must leave the
+        # queue as it was.
+        if (tag == "ONlmLock" and st == 3 and lock
+                and lock_key(lock) in prev_queue_keys
+                and queue_len == prev_queue_len):
+            buckets.add("seam:repoll-joined-queued-request")
 
         prev_monitors = monitors
         prev_queue_len = queue_len
+        prev_queue_keys = queue_keys
         prev_held = held
+        prev_unconfirmed = unconfirmed
+        if tag == "ONlmLock":
+            confirmed |= newly_confirmed
+        confirmed &= held_keys
 
 
 def required():
@@ -279,7 +334,11 @@ def required():
             "pm:unserved-transport"]
     req += ["seam:host-monitored", "seam:notify-cleared-monitors",
             "seam:free-all-released-locks", "seam:request-queued",
-            "seam:unlock-promoted-a-waiter", "seam:lock-promoted-a-waiter"]
+            "seam:unlock-promoted-a-waiter", "seam:lock-promoted-a-waiter",
+            "seam:cancel-released-a-hold", "seam:cancel-promoted-a-waiter",
+            "seam:relock-confirmed-a-grant",
+            "seam:cancel-kept-a-confirmed-grant",
+            "seam:repoll-joined-queued-request"]
     return req
 
 

@@ -41,7 +41,8 @@ module nfsauxTestRef {
         NLM_IN_GRACE = false,
         NLM_BLOCKING = true,
         NLM_GRANT_CALLBACK_OBSERVABLE = false,
-        NLM_CANCEL_MSG_CANCELS = true
+        NLM_CANCEL_MSG_CANCELS = true,
+        NLM_CANCEL_RELEASES_UNCONFIRMED_GRANT = true
     ).* from "./nfsaux"
 
     // ---- shorthand for the lock shapes the tests use -----------------
@@ -622,11 +623,60 @@ module nfsauxTestRef {
             .then(nlmCancel(false, lk(ownerB, 0, 16, true)))
             .expect(lastOp == ONlmCancel({ msg: false,
                                            lock: lk(ownerB, 0, 16, true),
-                                           asyncs: List(),
+                                           granted: List(), asyncs: List(),
                                            reply: RNlm(NLM4_GRANTED) }))
             .expect(queue.length() == 0)
             .then(nlmUnlock(false, lk(ownerA, 0, 16, true)))
             .expect(held.length() == 0)
+
+    /// A blocked client re-sends its LOCK while it waits (Linux every 30s).
+    /// The re-send joins the request already queued instead of queueing
+    /// beside it, and is answered BLOCKED again; so one CANCEL withdraws
+    /// it, and releasing the blocker then grants nothing.
+    run repollJoinsQueuedRequestTest =
+        init
+            .then(nlmLock(2, lk(ownerA, 0, 16, true), false, false))
+            .then(nlmLock(7, lk(ownerB, 0, 16, true), true, false))
+            .then(nlmLock(7, lk(ownerB, 0, 16, true), true, false))
+            .expect(lastOp == ONlmLock({ nproc: 7,
+                                         lock: lk(ownerB, 0, 16, true),
+                                         block: true, reclaim: false,
+                                         granted: List(),
+                                         asyncs: List({ proc: 12,
+                                                        stat: NLM4_BLOCKED }),
+                                         reply: RVoid }))
+            .expect(queue.length() == 1)
+            .then(nlmCancel(true, lk(ownerB, 0, 16, true)))
+            .expect(lastOp == ONlmCancel({ msg: true,
+                                           lock: lk(ownerB, 0, 16, true),
+                                           granted: List(),
+                                           asyncs: List({ proc: 13,
+                                                          stat: NLM4_GRANTED },
+                                                        { proc: 12,
+                                                          stat: NLM4_DENIED }),
+                                           reply: RVoid }))
+            .expect(queue.length() == 0)
+            .then(nlmUnlock(false, lk(ownerA, 0, 16, true)))
+            .expect(held.length() == 0)
+
+    /// The re-send leaves the queued request as it was: a LOCK_MSG
+    /// re-sending a synchronous LOCK does not make it owed a LOCK_RES, so
+    /// a CANCEL_MSG answers with its CANCEL_RES alone.
+    run repollKeepsQueuedRequestTest =
+        init
+            .then(nlmLock(2, lk(ownerA, 0, 16, true), false, false))
+            .then(nlmLock(2, lk(ownerB, 0, 16, true), true, false))
+            .then(nlmLock(7, lk(ownerB, 0, 16, true), true, false))
+            .expect(queue.length() == 1)
+            .expect(not(queue[0].msg))
+            .then(nlmCancel(true, lk(ownerB, 0, 16, true)))
+            .expect(lastOp == ONlmCancel({ msg: true,
+                                           lock: lk(ownerB, 0, 16, true),
+                                           granted: List(),
+                                           asyncs: List({ proc: 13,
+                                                          stat: NLM4_GRANTED }),
+                                           reply: RVoid }))
+            .expect(queue.length() == 0)
 
     /// The asynchronous half: a *_MSG is acknowledged with a void reply and
     /// the result comes back as the matching *_RES.
@@ -664,10 +714,144 @@ module nfsauxTestRef {
             .then(nlmCancel(true, lk(ownerB, 0, 16, true)))
             .expect(lastOp == ONlmCancel({
                 msg: true, lock: lk(ownerB, 0, 16, true),
+                granted: List(),
                 asyncs: List({ proc: 13, stat: NLM4_GRANTED },
                              { proc: 12, stat: NLM4_DENIED }),
                 reply: RVoid }))
             .expect(queue.length() == 0)
+
+    /// A deferred grant the client never confirmed is handed back by CANCEL.
+    run cancelUnconfirmedGrantTest =
+        init
+            .then(nlmLock(2, lk(ownerA, 0, 16, true), false, false))
+            .then(nlmLock(2, lk(ownerB, 0, 16, true), true, false))
+            .then(nlmUnlock(false, lk(ownerA, 0, 16, true)))
+            .expect(held == List(lk(ownerB, 0, 16, true)))
+            .expect(unconfirmed == Set(lk(ownerB, 0, 16, true)))
+            .then(nlmCancel(false, lk(ownerB, 0, 16, true)))
+            .expect(lastOp == ONlmCancel({ msg: false,
+                                           lock: lk(ownerB, 0, 16, true),
+                                           granted: List(), asyncs: List(),
+                                           reply: RNlm(NLM4_GRANTED) }))
+            .expect(held.length() == 0)
+            .expect(unconfirmed == Set())
+
+    /// The owner re-polled with the exact tuple: the grant is confirmed and
+    /// CANCEL leaves it.
+    run cancelConfirmedGrantKeptTest =
+        init
+            .then(nlmLock(2, lk(ownerA, 0, 16, true), false, false))
+            .then(nlmLock(2, lk(ownerB, 0, 16, true), true, false))
+            .then(nlmUnlock(false, lk(ownerA, 0, 16, true)))
+            .expect(unconfirmed == Set(lk(ownerB, 0, 16, true)))
+            .then(nlmLock(2, lk(ownerB, 0, 16, true), true, false))
+            .expect(unconfirmed == Set())
+            .then(nlmCancel(false, lk(ownerB, 0, 16, true)))
+            .expect(held == List(lk(ownerB, 0, 16, true)))
+
+    /// A promoted upgrade replaced the owner's own shared bytes: never
+    /// unconfirmed.
+    run cancelUpgradeKeptTest =
+        init
+            .then(nlmLock(2, lk(ownerB, 0, 16, false), false, false))
+            .then(nlmLock(2, lk(ownerA, 0, 16, false), false, false))
+            .then(nlmLock(2, lk(ownerB, 0, 16, true), true, false))
+            .then(nlmUnlock(false, lk(ownerA, 0, 16, false)))
+            .expect(unconfirmed == Set())
+            .then(nlmCancel(false, lk(ownerB, 0, 16, true)))
+            .expect(held == List(lk(ownerB, 0, 16, true)))
+
+    /// Releasing the cancelled grant promotes the next waiter, reported on
+    /// the CANCEL.
+    run cancelUnconfirmedPromotesTest =
+        init
+            .then(nlmLock(2, lk(ownerA, 0, 16, true), false, false))
+            .then(nlmLock(2, lk(ownerB, 0, 16, true), true, false))
+            .then(nlmLock(2, lk(ownerB2, 0, 16, true), true, false))
+            .then(nlmUnlock(false, lk(ownerA, 0, 16, true)))
+            .expect(held == List(lk(ownerB, 0, 16, true)))
+            .expect(queue.length() == 1)
+            .then(nlmCancel(false, lk(ownerB, 0, 16, true)))
+            .expect(lastOp == ONlmCancel({
+                msg: false, lock: lk(ownerB, 0, 16, true),
+                granted: List(lk(ownerB2, 0, 16, true)),
+                asyncs: List(),
+                reply: RNlm(NLM4_GRANTED) }))
+            .expect(held == List(lk(ownerB2, 0, 16, true)))
+            .expect(queue.length() == 0)
+            .expect(unconfirmed == Set(lk(ownerB2, 0, 16, true)))
+            .expect(inv)
+
+    /// The waiter a CANCEL release promotes joins the monitor list, as one
+    /// an UNLOCK promotes does.  The blocker holds through NM_LOCK, so the
+    /// promoted caller c2 is not on the list before the CANCEL.
+    run cancelUnconfirmedMonitorsPromotedTest =
+        init
+            .then(nlmLock(22, lk(ownerB, 0, 16, true), false, false))
+            .then(nlmLock(2, lk(ownerA, 0, 16, true), true, false))
+            .then(nlmLock(2, lk(ownerB2, 0, 16, true), true, false))
+            .then(nlmUnlock(false, lk(ownerB, 0, 16, true)))
+            .expect(held == List(lk(ownerA, 0, 16, true)))
+            .expect(monitors == Set("c1"))
+            .then(nlmCancel(false, lk(ownerA, 0, 16, true)))
+            .expect(held == List(lk(ownerB2, 0, 16, true)))
+            .expect(monitors == Set("c1", "c2"))
+            .expect(inv)
+
+    /// Mode or range mismatch is not this grant.
+    run cancelUnconfirmedMismatchKeptTest =
+        init
+            .then(nlmLock(2, lk(ownerA, 0, 16, true), false, false))
+            .then(nlmLock(2, lk(ownerB, 0, 16, true), true, false))
+            .then(nlmUnlock(false, lk(ownerA, 0, 16, true)))
+            .expect(unconfirmed == Set(lk(ownerB, 0, 16, true)))
+            .then(nlmCancel(false, lk(ownerB, 0, 16, false)))
+            .expect(held == List(lk(ownerB, 0, 16, true)))
+            .expect(unconfirmed == Set(lk(ownerB, 0, 16, true)))
+            .then(nlmCancel(false, lk(ownerB, 0, 32, true)))
+            .expect(held == List(lk(ownerB, 0, 16, true)))
+            .expect(unconfirmed == Set(lk(ownerB, 0, 16, true)))
+
+    /// The tuple is matched on the stored (POSIX) length, as UNLOCK and a
+    /// queued CANCEL are: either wire spelling of to-EOF confirms a grant
+    /// taken with the other, and either one hands it back.
+    run cancelUnconfirmedEofSpellingTest =
+        init
+            .then(nlmLock(2, lkOn(0, ownerA, 0, 0, true), false, false))
+            .then(nlmLock(2, lkOn(1, ownerA, 0, 0, true), false, false))
+            .then(nlmLock(2, lkOn(0, ownerB, 0, 0, true), true, false))
+            .then(nlmLock(2, lkOn(1, ownerB, 0, 0, true), true, false))
+            .then(nlmUnlock(false, lkOn(0, ownerA, 0, 0, true)))
+            .then(nlmUnlock(false, lkOn(1, ownerA, 0, 0, true)))
+            .expect(unconfirmed == Set(lkOn(0, ownerB, 0, 0, true),
+                                       lkOn(1, ownerB, 0, 0, true)))
+            .then(nlmLock(2, lkOn(1, ownerB, 0, EOF_LEN, true), false, false))
+            .expect(unconfirmed == Set(lkOn(0, ownerB, 0, 0, true)))
+            .then(nlmCancel(false, lkOn(0, ownerB, 0, EOF_LEN, true)))
+            .expect(held == List(lkOn(1, ownerB, 0, 0, true)))
+            .then(nlmCancel(false, lkOn(1, ownerB, 0, EOF_LEN, true)))
+            .expect(held == List(lkOn(1, ownerB, 0, 0, true)))
+            .expect(unconfirmed == Set())
+
+    /// The invariants, unconfirmedHeld (unconfirmed is a subset of held)
+    /// among them, hold after every step of a random run.
+    run unconfirmedSubsetTest =
+        init.then(20.reps(_ => stepBlocking.expect(inv)))
+
+    /// A client that re-polled while blocked and then gave up is not left
+    /// holding the lock: its re-send joined the queued request, so the
+    /// promotion is fresh and the CANCEL hands it back.
+    run repollWhileBlockedCancelReleasesTest =
+        init
+            .then(nlmLock(2, lk(ownerA, 0, 16, true), false, false))
+            .then(nlmLock(2, lk(ownerB, 0, 16, true), true, false))
+            .then(nlmLock(2, lk(ownerB, 0, 16, true), true, false))
+            .then(nlmUnlock(false, lk(ownerA, 0, 16, true)))
+            .expect(held == List(lk(ownerB, 0, 16, true)))
+            .expect(unconfirmed == Set(lk(ownerB, 0, 16, true)))
+            .then(nlmCancel(false, lk(ownerB, 0, 16, true)))
+            .expect(held.length() == 0)
+            .expect(unconfirmed == Set())
 
     /// NM_LOCK takes the lock without putting its holder on the monitor
     /// list; a plain LOCK does both.
@@ -808,7 +992,8 @@ module nfsauxTestFull {
         NLM_IN_GRACE = false,
         NLM_BLOCKING = true,
         NLM_GRANT_CALLBACK_OBSERVABLE = true,
-        NLM_CANCEL_MSG_CANCELS = true
+        NLM_CANCEL_MSG_CANCELS = true,
+        NLM_CANCEL_RELEASES_UNCONFIRMED_GRANT = false
     ).* from "./nfsaux"
 
     def ownerA: Owner = { caller: "c1", oh: 1, svid: 1 }
@@ -937,6 +1122,23 @@ module nfsauxTestFull {
             .then(smNotify(STRANGER, 9))
             .expect(held == List(lk(ownerA, 0, 16, true)))
             .expect(monitors == Set("c1"))
+
+    /// With the policy off a deferred grant is never marked, and CANCEL
+    /// takes back only a queued request: the grant stays held.
+    run cancelUnconfirmedFlagOffTest =
+        init
+            .then(nlmLock(2, lk(ownerA, 0, 16, true), false, false))
+            .then(nlmLock(2, lk(ownerB, 0, 16, true), true, false))
+            .then(nlmUnlock(false, lk(ownerA, 0, 16, true)))
+            .expect(held == List(lk(ownerB, 0, 16, true)))
+            .expect(unconfirmed == Set())
+            .then(nlmCancel(false, lk(ownerB, 0, 16, true)))
+            .expect(lastOp == ONlmCancel({ msg: false,
+                                           lock: lk(ownerB, 0, 16, true),
+                                           granted: List(), asyncs: List(),
+                                           reply: RNlm(NLM4_GRANTED) }))
+            .expect(held == List(lk(ownerB, 0, 16, true)))
+            .expect(unconfirmed == Set())
 }
 
 // =====================================================================
@@ -967,7 +1169,8 @@ module nfsauxTestGrace {
         NLM_IN_GRACE = true,
         NLM_BLOCKING = false,
         NLM_GRANT_CALLBACK_OBSERVABLE = false,
-        NLM_CANCEL_MSG_CANCELS = true
+        NLM_CANCEL_MSG_CANCELS = true,
+        NLM_CANCEL_RELEASES_UNCONFIRMED_GRANT = false
     ).* from "./nfsaux"
 
     def ownerA: Owner = { caller: "c1", oh: 1, svid: 1 }

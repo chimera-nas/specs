@@ -114,3 +114,8 @@ settled by measuring a live server:
 * That pump runs to a **fixpoint**: a promoted re-lock carves too, and the bytes
   it frees may belong to a waiter queued ahead of it, which a single pass in
   arrival order would have passed over.
+* A blocking `LOCK` its owner already has queued — the re-send a waiting
+  client polls with — **joins** that request rather than queueing a second
+  copy, and is answered `BLOCKED` again, as knfsd and ganesha both do. A
+  server that queues the copy grants it after the client's `CANCEL` withdrew
+  the original, to a waiter that no longer exists.
