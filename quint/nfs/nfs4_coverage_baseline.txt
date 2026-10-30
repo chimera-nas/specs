@@ -226,6 +226,10 @@ v4:compound:nops:5
 v4:compound:nops:6
 v4:compound:tagged
 v4:x:locku-whole-file
+v4:x:open-exclusive4
+v4:x:open-exclusive4-ok
+v4:x:open-exclusive41
+v4:x:open-exclusive41-ok
 v4:x:read-via-deleg-stateid
 v4:x:read-via-deleg-stateid-ok
 v4:x:read-via-lock-stateid

@@ -2,6 +2,7 @@
   "family": "nfs4",
   "description": "The Linux kernel NFS server at NFSv4.2, exporting ext4 inside the kvm-test-base guest the harness boots. The feature and policy knobs mirror chimera's nfs4_memfs42 cell exactly, so a difference between the two corpora is a difference in what the two servers do and nothing else.",
   "traceStem": "knfsd42",
+  "scenarios": [{"run": "exclusiveCreateAttrsetRegression", "flavor": "step"}],
 
   "features": {
     "pnfs": "unsupported",

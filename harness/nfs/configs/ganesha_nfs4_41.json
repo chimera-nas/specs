@@ -3,7 +3,8 @@
   "description": "The same ganesha spoken to at NFSv4.1: sessions and the slot replay discipline, with none of the 4.2 data operations (the model gates every one of them on MINOR >= 2). Mirrors chimera's nfs4_memfs41 cell for features and policies.",
   "traceStem": "ganesha41",
   "scenarios": [{"run": "openExclusiveOverDirRegression", "flavor": "step"},
-                {"run": "compoundTagTooLongRegression", "flavor": "step"}],
+                {"run": "compoundTagTooLongRegression", "flavor": "step"},
+                {"run": "exclusiveCreateAttrsetRegression", "flavor": "step"}],
 
   "features": {
     "pnfs": "unsupported",

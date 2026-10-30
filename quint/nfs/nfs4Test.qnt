@@ -66,7 +66,7 @@ module nfs4Test42 {
     val noOpen = { st: -999, sid: -1, seq: 0, needConfirm: false,
                    needConfirmAccept: Set(false), stAccept: Set(),
                    cinfo: { before: 0, after: 0, opaque: false }, deleg: DNone,
-                   recalls: Set() }
+                   recalls: Set(), attrsetTimes: false }
     def asOpen(r) =
         match r {
             | SOpen(x) => x
@@ -406,6 +406,69 @@ module nfs4Test42 {
                          ROpen({ client: 0, owner: 1, oseq: 0,
                                  claim: OCNull("x"),
                                  how: HExclusive({ verf: 1 }),
+                                 access: 1, deny: 0 }) ]))
+            .expect(lastStatus == E_EXIST)
+
+    // An exclusive create keeps its verifier in time_access/time_modify, so
+    // the reply's attrset names them -- on the create and on a same-verifier
+    // retry, which must read like the reply it replaces -- and the client
+    // resets them with a SETATTR (RFC 7530 16.16.5, RFC 8881 18.16.4).  No
+    // other create names them.
+    run exclusiveCreateAttrsetTest =
+        bootRcRun
+            .then(runC([ seq0(1), RPutrootfh,
+                         ROpen({ client: 0, owner: 1, oseq: 0,
+                                 claim: OCNull("x"),
+                                 how: HExclusive({ verf: 1 }),
+                                 access: 1, deny: 0 }) ]))
+            .expect(lastStatus == OK and asOpen(resAt(2)).attrsetTimes)
+            .then(runC([ seq0(2), RPutrootfh,
+                         ROpen({ client: 0, owner: 1, oseq: 0,
+                                 claim: OCNull("x"),
+                                 how: HExclusive({ verf: 1 }),
+                                 access: 1, deny: 0 }) ]))
+            .expect(lastStatus == OK and asOpen(resAt(2)).attrsetTimes)
+            .then(runC([ seq0(3), RPutrootfh,
+                         ROpen({ client: 0, owner: 1, oseq: 0,
+                                 claim: OCNull("y"),
+                                 how: HGuarded({ mode: 420 }),
+                                 access: 1, deny: 0 }) ]))
+            .expect(lastStatus == OK and not(asOpen(resAt(2)).attrsetTimes))
+            .then(runC([ seq0(4), RPutrootfh,
+                         ROpen({ client: 0, owner: 2, oseq: 0,
+                                 claim: OCNull("y"), how: HNoCreate,
+                                 access: 1, deny: 0 }) ]))
+            .expect(lastStatus == OK and not(asOpen(resAt(2)).attrsetTimes))
+
+    // EXCLUSIVE4_1 (RFC 8881 18.16.3): the verifier plus cva_attrs, here a
+    // mode the server applies.  The verifier lives where EXCLUSIVE4 keeps it,
+    // so a retry matches whichever exclusive createmode it arrives in, and a
+    // different verifier is EXIST.
+    run exclusive41CreateTest =
+        bootRcRun
+            .then(runC([ seq0(1), RPutrootfh,
+                         ROpen({ client: 0, owner: 1, oseq: 0,
+                                 claim: OCNull("x"),
+                                 how: HExclusive41({ verf: 1, mode: 420 }),
+                                 access: 1, deny: 0 }) ]))
+            .expect(lastStatus == OK and asOpen(resAt(2)).attrsetTimes and
+                    fsGet(fs, 1).mode == 420)
+            .then(runC([ seq0(2), RPutrootfh,
+                         ROpen({ client: 0, owner: 1, oseq: 0,
+                                 claim: OCNull("x"),
+                                 how: HExclusive41({ verf: 1, mode: 420 }),
+                                 access: 1, deny: 0 }) ]))
+            .expect(lastStatus == OK and asOpen(resAt(2)).attrsetTimes)
+            .then(runC([ seq0(3), RPutrootfh,
+                         ROpen({ client: 0, owner: 1, oseq: 0,
+                                 claim: OCNull("x"),
+                                 how: HExclusive({ verf: 1 }),
+                                 access: 1, deny: 0 }) ]))
+            .expect(lastStatus == OK)
+            .then(runC([ seq0(4), RPutrootfh,
+                         ROpen({ client: 0, owner: 1, oseq: 0,
+                                 claim: OCNull("x"),
+                                 how: HExclusive41({ verf: 2, mode: 420 }),
                                  access: 1, deny: 0 }) ]))
             .expect(lastStatus == E_EXIST)
 
@@ -1089,7 +1152,7 @@ module nfs4Test40 {
             | _ => { st: -999, sid: -1, seq: 0, needConfirm: false,
                      needConfirmAccept: Set(false), stAccept: Set(),
                      cinfo: { before: 0, after: 0, opaque: false }, deleg: DNone,
-                     recalls: Set() }
+                     recalls: Set(), attrsetTimes: false }
         }
 
     // SETCLIENTID / SETCLIENTID_CONFIRM matrix (RFC 7530 16.33/16.34).
