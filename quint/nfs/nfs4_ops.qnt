@@ -298,6 +298,9 @@ module nfs4ops {
         | HUnchecked({ mode: int, truncate: bool })
         | HGuarded({ mode: int })
         | HExclusive({ verf: int })
+        // EXCLUSIVE4_1 (RFC 8881 18.16.3, 4.1+): the verifier plus cva_attrs,
+        // here the mode only (one of suppattr_exclcreat).
+        | HExclusive41({ verf: int, mode: int })
 
     type XattrSetHow = XsCreate | XsReplace | XsEither
 
@@ -2072,15 +2075,72 @@ module nfs4ops {
     pure def openIsExclusive(h: OpenHow): bool =
         match h {
             | HExclusive(x) => true
+            | HExclusive41(x) => true
             | _ => false
         }
 
+    // What openResolve answers: the typing/creation status plus the file
+    // and directory change info, and the deviations it took.
+    type OpenResolved = { st: int, fs2: Fs, file: Ino, cinfo: CInfo,
+                          truncated: bool, devs: Set[str] }
+
+    // The exclusive createmodes on a CLAIM_NULL name.  EXCLUSIVE4 and
+    // EXCLUSIVE4_1 share one disposition and differ only in the mode of a
+    // file they create: cvaMode is EXCLUSIVE4_1's cva_attrs mode, or -1 for
+    // EXCLUSIVE4, which carries no attributes.  typeErr is OK exactly when
+    // the existing name (if present) is a regular file.
+    pure def openExclusive(a: Acc, n: Name, base: OpenResolved,
+                           dirChange: int, present: bool, child: Ino,
+                           typeErr: int, verf: int,
+                           cvaMode: int): OpenResolved =
+        // A verifier match on an existing regular file is idempotent
+        // success; any other existing object is EXIST (RFC 7530 16.16.5 /
+        // RFC 8881 18.16.3).  The verifier lives in the same place for both
+        // createmodes, so a retry matches whichever one it arrives in.
+        if (present and typeErr == OK and
+            fsGet(a.fs, child).xverf == verf and verf != 0)
+            base.with("file", child)
+                .with("cinfo", { before: dirChange, after: dirChange,
+                                 opaque: false })
+        // G4-open-type-before-exist: RFC 7530 16.16.4 / RFC 8881 18.16.4
+        // list NFS4ERR_EXIST and the target's own type error for a create
+        // that must not clobber, without ordering them.  The model keeps the
+        // RFC-literal, POSIX O_EXCL reading -- an existing name is EXIST
+        // whatever its type.  NFS-Ganesha V6.5 splits by DISPOSITION, and
+        // measured cleanly both ways: GUARDED answers EXIST (6 of 6
+        // observations) and EXCLUSIVE4 answers the type error (6 of 6).  So
+        // the branch is here, on the exclusive arms, and nowhere else; both
+        // exclusive createmodes take ganesha's one exclusive path.  The OPEN
+        // fails either way.
+        else if (present and typeErr != OK and
+                 hasDev(a.caps, "G4-open-type-before-exist"))
+            base.with("st", typeErr)
+                .with("devs", Set("G4-open-type-before-exist"))
+        else if (present) base.with("st", E_EXIST)
+        else {
+            // The mode of an EXCLUSIVE4-created file is undefined until the
+            // client's follow-up SETATTR (RFC 7530 16.16.5); a
+            // POSIX-filesystem backend creates it owner-only (0600).
+            // K4-exclusive-create-mode-zero: the Linux server leaves it at 0
+            // instead.  Nothing in the model consults a regular file's mode,
+            // so this parts no state -- only the GETATTR that reads it back.
+            // EXCLUSIVE4_1 applies its cva_attrs mode on every server.
+            val modeZero = cvaMode < 0 and
+                           hasDev(a.caps, "K4-exclusive-create-mode-zero")
+            val em = if (cvaMode >= 0) cvaMode
+                     else if (modeZero) 0
+                     else 384
+            val o = fsMknode(a.fs, a.cfh, n, mkExclFile(em, verf, 0))
+            base.with("file", o.ino).with("fs2", o.fs2)
+                .with("cinfo", o.cinfo)
+                .with("devs", if (modeZero)
+                                  Set("K4-exclusive-create-mode-zero")
+                              else Set())
+        }
+
     // Resolve an OPEN claim to a target file, creating it if asked.
-    // Returns the typing/creation status plus the file and directory
-    // change info.
-    pure def openResolve(a: Acc, claim: OpenClaim, how: OpenHow):
-            { st: int, fs2: Fs, file: Ino, cinfo: CInfo, truncated: bool,
-              devs: Set[str] } = {
+    pure def openResolve(a: Acc, claim: OpenClaim,
+                         how: OpenHow): OpenResolved = {
         val zero = { before: 0, after: 0, opaque: false }
         val base = { st: OK, fs2: a.fs, file: -1, cinfo: zero,
                      truncated: false, devs: Set() }
@@ -2171,58 +2231,11 @@ module nfs4ops {
                                     .with("cinfo", o.cinfo)
                             }
                         | HExclusive(x) =>
-                            // EXCLUSIVE4: verifier match on an existing
-                            // regular file is idempotent success; any
-                            // other existing object is EXIST
-                            // (RFC 7530 16.16.5 / RFC 8881 18.16.3).
-                            // The mode of an exclusive-created file is
-                            // undefined until the client's follow-up SETATTR
-                            // (RFC 7530 16.16.5); a POSIX-filesystem backend
-                            // creates it owner-only (0600).  chimera's memfs
-                            // uses 0644, now a chimera divergence.
-                            if (present and childT == FReg and
-                                fsGet(a.fs, child).xverf == x.verf and
-                                x.verf != 0)
-                                base.with("file", child)
-                                    .with("cinfo", { before: dnd.change,
-                                                     after: dnd.change, opaque: false })
-                            // G4-open-type-before-exist: RFC 7530 16.16.4 /
-                            // RFC 8881 18.16.4 list NFS4ERR_EXIST and the
-                            // target's own type error for a create that must
-                            // not clobber, without ordering them.  The model
-                            // keeps the RFC-literal, POSIX O_EXCL reading --
-                            // an existing name is EXIST whatever its type.
-                            // NFS-Ganesha V6.5 splits by DISPOSITION, and
-                            // measured cleanly both ways: GUARDED answers
-                            // EXIST (6 of 6 observations) and EXCLUSIVE4
-                            // answers the type error (6 of 6).  So the branch
-                            // is here, on the exclusive arm, and nowhere
-                            // else.  The OPEN fails either way.
-                            else if (present and typeErr != OK and
-                                     hasDev(a.caps,
-                                            "G4-open-type-before-exist"))
-                                base.with("st", typeErr)
-                                    .with("devs",
-                                          Set("G4-open-type-before-exist"))
-                            else if (present) base.with("st", E_EXIST)
-                            else {
-                                // K4-exclusive-create-mode-zero: the Linux
-                                // server leaves the mode at 0 until the
-                                // follow-up SETATTR arrives.  Nothing in the
-                                // model consults a regular file's mode, so
-                                // this parts no state -- only the GETATTR
-                                // that reads it back.
-                                val em = if (hasDev(a.caps,
-                                             "K4-exclusive-create-mode-zero"))
-                                             0 else 384
-                                val o = fsMknode(a.fs, a.cfh, n,
-                                                 mkExclFile(em, x.verf, 0))
-                                base.with("file", o.ino).with("fs2", o.fs2)
-                                    .with("cinfo", o.cinfo)
-                                    .with("devs", if (em == 0)
-                                        Set("K4-exclusive-create-mode-zero")
-                                        else Set())
-                            }
+                            openExclusive(a, n, base, dnd.change, present,
+                                          child, typeErr, x.verf, -1)
+                        | HExclusive41(x) =>
+                            openExclusive(a, n, base, dnd.change, present,
+                                          child, typeErr, x.verf, x.mode)
                     }
                 }
             }

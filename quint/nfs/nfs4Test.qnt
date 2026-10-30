@@ -440,6 +440,38 @@ module nfs4Test42 {
                                  access: 1, deny: 0 }) ]))
             .expect(lastStatus == OK and not(asOpen(resAt(2)).attrsetTimes))
 
+    // EXCLUSIVE4_1 (RFC 8881 18.16.3): the verifier plus cva_attrs, here a
+    // mode the server applies.  The verifier lives where EXCLUSIVE4 keeps it,
+    // so a retry matches whichever exclusive createmode it arrives in, and a
+    // different verifier is EXIST.
+    run exclusive41CreateTest =
+        bootRcRun
+            .then(runC([ seq0(1), RPutrootfh,
+                         ROpen({ client: 0, owner: 1, oseq: 0,
+                                 claim: OCNull("x"),
+                                 how: HExclusive41({ verf: 1, mode: 420 }),
+                                 access: 1, deny: 0 }) ]))
+            .expect(lastStatus == OK and asOpen(resAt(2)).attrsetTimes and
+                    fsGet(fs, 1).mode == 420)
+            .then(runC([ seq0(2), RPutrootfh,
+                         ROpen({ client: 0, owner: 1, oseq: 0,
+                                 claim: OCNull("x"),
+                                 how: HExclusive41({ verf: 1, mode: 420 }),
+                                 access: 1, deny: 0 }) ]))
+            .expect(lastStatus == OK and asOpen(resAt(2)).attrsetTimes)
+            .then(runC([ seq0(3), RPutrootfh,
+                         ROpen({ client: 0, owner: 1, oseq: 0,
+                                 claim: OCNull("x"),
+                                 how: HExclusive({ verf: 1 }),
+                                 access: 1, deny: 0 }) ]))
+            .expect(lastStatus == OK)
+            .then(runC([ seq0(4), RPutrootfh,
+                         ROpen({ client: 0, owner: 1, oseq: 0,
+                                 claim: OCNull("x"),
+                                 how: HExclusive41({ verf: 2, mode: 420 }),
+                                 access: 1, deny: 0 }) ]))
+            .expect(lastStatus == E_EXIST)
+
     run openTypingTest =
         bootRcRun
             .then(runC([ seq0(1), RPutrootfh,

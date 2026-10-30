@@ -601,7 +601,7 @@ def enc_free_stateid(sid):
 
 def enc_open(seqid, access, deny, clientid, owner, openhow, claim):
     """openhow: None | ("UNCHECKED", mode, truncate) | ("GUARDED", mode)
-               | ("EXCLUSIVE", verf8)
+               | ("EXCLUSIVE", verf8) | ("EXCLUSIVE41", verf8, mode)
     claim:     ("NULL", name) | ("FH",)"""
     p = _op(OP_OPEN)
     p.uint32(seqid)
@@ -621,6 +621,10 @@ def enc_open(seqid, access, deny, clientid, owner, openhow, claim):
         elif kind == "GUARDED":
             p.uint32(1)
             pack_fattr(p, mode=openhow[1])
+        elif kind == "EXCLUSIVE41":
+            p.uint32(3)               # EXCLUSIVE4_1: verifier, cva_attrs
+            p.opaque_fixed(openhow[1])
+            pack_fattr(p, mode=openhow[2])
         else:
             p.uint32(2)               # EXCLUSIVE4
             p.opaque_fixed(openhow[1])

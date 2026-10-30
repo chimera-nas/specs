@@ -11,6 +11,7 @@ state by hand.
 """
 
 import os
+import struct
 import sys
 import unittest
 
@@ -506,6 +507,21 @@ class ExitCode(unittest.TestCase):
 
     def test_an_error_fails(self):
         self.assertEqual(r4.exit_code({"error": 1, "skip": 1}, 2), 1)
+
+
+
+class Exclusive41Encoding(unittest.TestCase):
+    """EXCLUSIVE4_1 (RFC 8881 18.16.3) carries the verifier and then a
+    cva_attrs fattr4; the model's HExclusive41 sets only the mode there."""
+
+    def test_encodes_createmode_3_with_a_mode_fattr(self):
+        verf = b"\0" * 7 + b"\1"
+        out = r4.c4.enc_open(1, 1, 0, 7, b"oo",
+                             ("EXCLUSIVE41", verf, 0o644), ("NULL", "x"))
+        self.assertIn(struct.pack(">II", 1, 3) + verf +
+                      struct.pack(">IIIII", 2, 0, 1 << (33 - 32), 4, 0o644),
+                      out)
+        self.assertNotIn(struct.pack(">II", 1, 2) + verf, out)
 
 
 if __name__ == "__main__":

@@ -615,6 +615,10 @@ class Replayer:
             elif how["tag"] == "HExclusive":
                 openhow = ("EXCLUSIVE",
                            struct.pack(">Q", how["value"]["verf"]))
+            elif how["tag"] == "HExclusive41":
+                openhow = ("EXCLUSIVE41",
+                           struct.pack(">Q", how["value"]["verf"]),
+                           how["value"]["mode"])
             claim = v["claim"]
             wclaim = (("NULL", expand_name(claim["value"]))
                       if claim["tag"] == "OCNull" else ("FH",))
