@@ -435,9 +435,26 @@ module nfs4ops {
         // recalls: delegation sids for which the harness must observe a
         // CB_RECALL before this op can eventually succeed (the op itself
         // returns NFS4ERR_DELAY under the conflictDelays profile).
+        //
+        // attrsetTimes: whether the reply's attrset names time_access and
+        // time_modify (either the attribute or its _set form).  An exclusive
+        // create keeps its verifier in the new object, and "If the server
+        // uses an attribute to store the exclusive create verifier, it will
+        // signify which attribute was used by setting the appropriate bit in
+        // the attribute mask that is returned in the results" (RFC 7530
+        // 16.16.5); "The response field, attrset, indicates both which
+        // attributes the server set from cva_attrs and which attributes the
+        // server used to store the verifier" (RFC 8881 18.16.3).  The client
+        // MUST then SETATTR those attributes (RFC 8881 18.16.4), and a Linux
+        // client does that only for the time attributes attrset names.  The
+        // Linux server and NFS-Ganesha both keep the verifier in the two
+        // times and name them on every successful exclusive OPEN, create and
+        // same-verifier retry alike, so the model predicts exactly that:
+        // true on a successful exclusive OPEN, false on every other reply.
         | SOpen({ st: int, sid: Sid, seq: int, needConfirm: bool,
                   needConfirmAccept: Set[bool], stAccept: Set[int],
-                  cinfo: CInfo, deleg: DelegRes, recalls: Set[Sid] })
+                  cinfo: CInfo, deleg: DelegRes, recalls: Set[Sid],
+                  attrsetTimes: bool })
         | SOpenConfirm({ st: int, seq: int })
         | SOpenDowngrade({ st: int, seq: int })
         | SClose({ st: int })
@@ -2050,6 +2067,14 @@ module nfs4ops {
         else 0
     }
 
+    // An exclusive create: the createmodes whose verifier the server keeps
+    // in the new object's time_access/time_modify (see SOpen.attrsetTimes).
+    pure def openIsExclusive(h: OpenHow): bool =
+        match h {
+            | HExclusive(x) => true
+            | _ => false
+        }
+
     // Resolve an OPEN claim to a target file, creating it if asked.
     // Returns the typing/creation status plus the file and directory
     // change info.
@@ -2234,7 +2259,8 @@ module nfs4ops {
         val stAcc = lapseAccept(a)
         val nores = { st: OK, sid: -1, seq: 0, needConfirm: false,
                       needConfirmAccept: ncAcc, stAccept: stAcc,
-                      cinfo: zero, deleg: DNone, recalls: Set() }
+                      cinfo: zero, deleg: DNone, recalls: Set(),
+                      attrsetTimes: false }
         val g = fhGate(a)
         // 4.0: the owner-seqid gate runs first and BAD_SEQID does not
         // consume a seqid (RFC 7530 9.1.7/9.1.9).
@@ -2390,7 +2416,8 @@ module nfs4ops {
                                      else Set(o.needConfirm),
                                  cinfo: devCinfo(a, res.cinfo),
                                  deleg: withDeleg.deleg,
-                                 recalls: Set() }))
+                                 recalls: Set(),
+                                 attrsetTimes: openIsExclusive(ar.how) }))
                 }
             }
             res.devs.fold(outAcc, (acc, d) => hitDev(acc, d))
