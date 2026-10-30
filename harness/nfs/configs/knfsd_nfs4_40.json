@@ -19,7 +19,8 @@
   // walk reaches that often, and the scenario pins the seqids after it.
   "scenarios": [{"run": "unconfirmedOwnerReopenRegression", "flavor": "step"},
                 {"run": "unconfirmedOwnerReopenOrphanCfhRegression", "flavor": "step"},
-                {"run": "lockNewOwnerReusesStateRegression", "flavor": "step"}],
+                {"run": "lockNewOwnerReusesStateRegression", "flavor": "step"},
+                {"run": "exclusiveCreateAttrsetRegression", "flavor": "step"}],
 
   // Only the 4.0 walk RENAMEs through a symbolic-link directory handle, which
   "tolerances": {

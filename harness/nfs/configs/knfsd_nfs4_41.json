@@ -2,6 +2,7 @@
   "family": "nfs4",
   "description": "The same Linux kernel server at NFSv4.1: sessions and the slot replay discipline, with none of the 4.2 data operations. Mirrors chimera's nfs4_memfs41 cell for features and policies.",
   "traceStem": "knfsd41",
+  "scenarios": [{"run": "exclusiveCreateAttrsetRegression", "flavor": "step"}],
 
   "features": {
     "pnfs": "unsupported",

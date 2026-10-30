@@ -517,6 +517,26 @@ def classify_compound4(lab, names, buckets, lock_bytes):
             if isinstance(r, dict) and r.get("st", 0) == 0:
                 buckets.add(f"v4:x:{name}-via-{via}-stateid-ok")
 
+    # Exclusive creates, per createmode.  A successful one keeps its verifier
+    # in time_access/time_modify and must name them in the reply's attrset;
+    # a server that left them out replayed green for as long as nothing
+    # checked attrset and no walk sent EXCLUSIVE4_1.  The -ok twins count the
+    # successful ones, which are the replies that carry the check.
+    EXCL_HOW = {"HExclusive": "exclusive4", "HExclusive41": "exclusive41"}
+    for i, o in enumerate(lab["ops"]):
+        v = o.get("value")
+        if o.get("tag") != "ROpen" or not isinstance(v, dict):
+            continue
+        how = v.get("how")
+        name = EXCL_HOW.get(how.get("tag")) if isinstance(how, dict) else None
+        if name is None:
+            continue
+        buckets.add(f"v4:x:open-{name}")
+        if i < len(lab["results"]):
+            r = lab["results"][i]["value"]
+            if isinstance(r, dict) and r.get("st", 0) == 0:
+                buckets.add(f"v4:x:open-{name}-ok")
+
 
 def analyze4(trace_files, model_dir):
     names = load_status_names(model_dir)

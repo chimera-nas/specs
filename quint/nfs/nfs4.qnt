@@ -2519,6 +2519,50 @@ module nfs4 {
                 ROpen({client: 0, owner: 1, oseq: 1, claim: OCNull("dir"),
                        how: HExclusive({verf: 1}), access: 1, deny: 0})])))
 
+    // Exclusive creates and their same-verifier retries, in both exclusive
+    // createmodes.  Each successful one keeps its verifier in time_access/
+    // time_modify and must name them in attrset (SOpen.attrsetTimes), which
+    // the replay checks.  The random walk reaches an EXCLUSIVE4 retry only
+    // now and then and does not draw EXCLUSIVE4_1 at all, so a cell that
+    // lists this run checks both createmodes, create and retry, whatever the
+    // seed.  Owners 1 and 2 keep a 4.0 replay free of OPEN_CONFIRM: each
+    // owner opens once.  EXCLUSIVE4_1 exists from 4.1 on, so a 4.0 replay
+    // reads the root instead.
+    run exclusiveCreateAttrsetRegression =
+        coverageBootRun
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 1, oseq: 1, claim: OCNull("a"),
+                       how: HExclusive({verf: 1}), access: 1, deny: 0})])))
+            .expect(match lastOp {
+                        | LCompound(l) => l.status == OK
+                        | LInit(x) => false
+                    })
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 2, oseq: 1, claim: OCNull("a"),
+                       how: HExclusive({verf: 1}), access: 1, deny: 0})])))
+            .expect(match lastOp {
+                        | LCompound(l) => l.status == OK
+                        | LInit(x) => false
+                    })
+            .then(if (MINOR == 0) runC([RPutfh(ROOT), RGetattr])
+                  else runC(withSess(0, [RPutfh(ROOT),
+                      ROpen({client: 0, owner: 1, oseq: 1, claim: OCNull("b"),
+                             how: HExclusive41({verf: 1, mode: 420}),
+                             access: 1, deny: 0})])))
+            .expect(match lastOp {
+                        | LCompound(l) => l.status == OK
+                        | LInit(x) => false
+                    })
+            .then(if (MINOR == 0) runC([RPutfh(ROOT), RGetattr])
+                  else runC(withSess(0, [RPutfh(ROOT),
+                      ROpen({client: 0, owner: 2, oseq: 1, claim: OCNull("b"),
+                             how: HExclusive41({verf: 1, mode: 420}),
+                             access: 1, deny: 0})])))
+            .expect(match lastOp {
+                        | LCompound(l) => l.status == OK
+                        | LInit(x) => false
+                    })
+
     // A COMPOUND carrying the 256-byte NLONG tag.  Whether a server caps the
     // tag length is a recorded deviation (G4-compound-tag-length-limit, see
     // tagStatus); which walks send the tag is one rare draw of nsCompoundTag
