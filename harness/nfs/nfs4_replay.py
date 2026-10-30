@@ -241,6 +241,24 @@ def xattr_value(sym):
     return b"xattr-value-%d" % sym
 
 
+def attrset_times(attrset):
+    """What an OPEN reply's attrset says about the two time attributes an
+    exclusive create keeps its verifier in (SOpen.attrsetTimes): True when it
+    names both time_access and time_modify, False when it names neither, None
+    when it names only one -- which no model answer matches.  The attribute
+    and its _set form count alike, as they do for a client deciding what to
+    reset (Linux nfs4_exclusive_attrset)."""
+    atime = (c4.FATTR4_TIME_ACCESS in attrset
+             or c4.FATTR4_TIME_ACCESS_SET in attrset)
+    mtime = (c4.FATTR4_TIME_MODIFY in attrset
+             or c4.FATTR4_TIME_MODIFY_SET in attrset)
+    if atime and mtime:
+        return True
+    if not atime and not mtime:
+        return False
+    return None
+
+
 def accepts(v, field, actual, scale=1):
     """The tolerance rule, and there is only one of it.
 
@@ -902,6 +920,10 @@ class Replayer:
             if not accepts(v, "needConfirm", need):
                 self.fnd(mism, tag, "rflags_confirm", v["needConfirm"],
                          need)
+            if not accepts(v, "attrsetTimes",
+                           attrset_times(wire["attrset"])):
+                self.fnd(mism, tag, "attrset_times", v["attrsetTimes"],
+                         sorted(wire["attrset"]))
             self.check_cinfo(tag, ctx["cur"], v["cinfo"], wire["cinfo"],
                              mism, "cinfo")
             self.check_deleg(v["deleg"], wire, mism)

@@ -524,5 +524,53 @@ class Exclusive41Encoding(unittest.TestCase):
         self.assertNotIn(struct.pack(">II", 1, 2) + verf, out)
 
 
+
+class AttrsetTimes(unittest.TestCase):
+    """An exclusive create keeps its verifier in time_access/time_modify, so
+    OPEN's attrset must name both (RFC 7530 16.16.5, RFC 8881 18.16.4).  A
+    client acts on the attribute or its _set form alike."""
+
+    def test_both_times_in_either_form(self):
+        self.assertIs(r4.attrset_times([47, 53]), True)
+        self.assertIs(r4.attrset_times([48, 54]), True)
+        self.assertIs(r4.attrset_times([47, 54]), True)
+
+    def test_neither_time(self):
+        self.assertIs(r4.attrset_times([33]), False)
+        self.assertIs(r4.attrset_times([]), False)
+
+    def test_one_time_only_is_neither_answer(self):
+        self.assertIs(r4.attrset_times([33, 47]), None)
+
+    def test_an_exclusive_open_naming_no_time_is_a_finding(self):
+        class Bare(r4.Replayer):
+            def learn_sid(self, *a, **k):
+                pass
+
+            def check_cinfo(self, *a, **k):
+                pass
+
+            def check_deleg(self, *a, **k):
+                pass
+
+        r = make_replayer(Bare, sid_client={}, cur_open_client=0,
+                          sid_owner={})
+        exp = {"tag": "SOpen",
+               "value": {"st": NFS4_OK, "sid": 0, "seq": 1,
+                         "needConfirm": False, "cinfo": {},
+                         "deleg": {"tag": "DNone", "value": ()},
+                         "attrsetTimes": True}}
+        wire = {"status": NFS4_OK, "stateid": None, "rflags": 0,
+                "cinfo": {}, "attrset": [33]}
+        mism = []
+        r.check_result(exp, wire, {"cur": 1}, mism, None)
+        self.assertEqual([(f.op, f.kind) for f in mism],
+                         [("SOpen", "attrset_times")])
+        mism = []
+        r.check_result(exp, dict(wire, attrset=[33, 47, 53]), {"cur": 1},
+                       mism, None)
+        self.assertEqual(mism, [])
+
+
 if __name__ == "__main__":
     unittest.main()
