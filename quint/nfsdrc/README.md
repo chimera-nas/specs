@@ -59,13 +59,47 @@ discuss a reply cache at all. The model requires it, and
 `nfsdrcCredBlind` keeps the other answer under test so that what it costs stays
 written down.
 
+## A retransmit while its original is still running
+
+Most steps are one RPC: it executes and replies atomically. That cannot express
+the most ordinary retransmit there is. A client whose connection drops while a
+slow request executes reconnects and sends the request again long before the
+original finishes, and a cache that only learns of a request once its reply
+exists has nothing to answer it with — so it executes it a second time, and the
+client is told EXIST for the directory it made (chimera#1375).
+
+So an NFSv3 original can be **parked**: it has arrived and claimed its identity
+in the cache, and has not executed. Until it **completes**, a retransmit of it
+is never executed. It is held for the original's reply, or dropped for the
+client to send again — dropped when it came in on the original's own connection,
+which the original's reply reaches anyway, or when its connection already has
+one held. The original keeps running if its own connection closes; its reply is
+lost with the connection but cached, so the retransmit on the next connection is
+answered with it. A connection is named with its incarnation throughout: the
+original's connection reopened is a new connection.
+
+Only operations that name their object by directory and name are parked. An
+original executes when it completes, possibly many steps later, and a
+handle-based one could by then name an object that is gone — the
+timing-dependent STALE answer the traces avoid everywhere else.
+
+A harness replays this by holding the original inside the server until the
+trace completes it (chimera does it with a test-only gate in its NFSv3 cache),
+and by sending the retransmits without waiting for replies: none may be answered
+before the completion, and at the completion exactly the connections the model
+names get exactly one reply each.
+
+NFSv4.0 has no step of this kind. Its cache is per connection, and over TCP a
+v4.0 client retransmits only after reconnecting (RFC 7530 Section 3.1.1), so a
+retransmit can never meet its original in progress there.
+
 ## Files
 
 | file | what is in it |
 |---|---|
 | `drc_cache.qnt` | what a cache is: keys, entries, lookup, insert, eviction, and the connection-close rule |
 | `drc_ops.qnt` | the filesystem the requests act on, and each operation's semantics |
-| `nfsdrc.qnt` | state, transitions, configuration |
+| `nfsdrc.qnt` | state, transitions (including an original in progress), configuration |
 | `nfsdrc_run.qnt` | the four profiles |
 | `nfsdrcTest.qnt` | deterministic self-checks, one per property |
 | `coverage.py` | the corpus gate |

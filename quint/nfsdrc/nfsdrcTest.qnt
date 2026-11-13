@@ -46,6 +46,9 @@ module nfsdrcTestRef {
         | OV3(o) => o.st
         | OV4(o) => o.st
         | ONull(_) => -1
+        | OV3Park(_) => -1
+        | OV3Wait(_) => -1
+        | OV3Done(o) => o.st
         | OReconnect(_) => -1
     }
 
@@ -54,6 +57,9 @@ module nfsdrcTestRef {
         | OV3(o) => o.served == SReplayed
         | OV4(o) => o.served == SReplayed
         | ONull(_) => false
+        | OV3Park(_) => false
+        | OV3Wait(_) => false
+        | OV3Done(_) => false
         | OReconnect(_) => false
     }
 
@@ -64,6 +70,9 @@ module nfsdrcTestRef {
         | OV3(o) => o.tag
         | OV4(o) => o.tag
         | ONull(_) => 0
+        | OV3Park(_) => 0
+        | OV3Wait(_) => 0
+        | OV3Done(o) => o.tag
         | OReconnect(_) => 0
     }
 
@@ -327,6 +336,133 @@ module nfsdrcTestRef {
             .expect(replayed and st == NFS4ERR_EXIST)
 
     // ==================================================================
+    // NFSv3: a retransmit while the original is in progress (chimera#1375)
+    // ==================================================================
+
+    /// What became of the last retransmit that found its original in progress.
+    val fate: str = match lastOp {
+        | OV3Wait(o) => match o.fate {
+            | WHeld => "held"
+            | WDropOrigin => "origin"
+            | WDropWaiting => "waiting"
+        }
+        | _ => ""
+    }
+
+    /// Who the last completion answered.
+    val answered: Set[int] = match lastOp {
+        | OV3Done(o) => o.answered
+        | _ => Set()
+    }
+
+    val originLive: bool = match lastOp {
+        | OV3Done(o) => o.live
+        | _ => false
+    }
+
+    /**
+     * The case #1375 reports.  The client's MKDIR is still executing when it
+     * reconnects and sends it again.  The retransmit must not run -- a second
+     * MKDIR would answer EXIST for a directory this client made -- so it is
+     * held, and answered with the original's reply when the original
+     * completes.  A later retransmit is an ordinary replay.
+     */
+    run v3InProgressHeldTest =
+        init
+            .then(v3Park(1, 1, U1, mkdir("a")))
+            .expect(dir == Map())
+            .then(v3(2, 1, U1, mkdir("a")))
+            .expect(fate == "held" and dir == Map())
+            .then(v3Complete)
+            .expect(st == NFS3_OK and answered == Set(2) and originLive)
+            .expect(dir.keys() == Set("a"))
+            .then(v3(2, 1, U1, mkdir("a")))
+            .expect(replayed and st == NFS3_OK)
+
+    /// A retransmit on the original's own connection adds nothing: the
+    /// original's reply goes there anyway.
+    run v3InProgressOriginConnDroppedTest =
+        init
+            .then(v3Park(1, 1, U1, mkdir("a")))
+            .then(v3(1, 1, U1, mkdir("a")))
+            .expect(fate == "origin")
+            .then(v3Complete)
+            .expect(answered == Set() and originLive and st == NFS3_OK)
+
+    /// One held per connection.  A second retransmit on a connection that
+    /// already has one waiting is dropped, and the completion answers that
+    /// connection once.
+    run v3InProgressOneWaiterPerConnTest =
+        init
+            .then(v3Park(1, 1, U1, mkdir("a")))
+            .then(v3(2, 1, U1, mkdir("a")))
+            .expect(fate == "held")
+            .then(v3(2, 1, U1, mkdir("a")))
+            .expect(fate == "waiting")
+            .then(v3Complete)
+            .expect(answered == Set(2))
+
+    /**
+     * The client the bug report describes: its connection drops while the
+     * original executes.  The original keeps running and its reply is lost
+     * with the connection, but it is cached.  The retransmit on the reopened
+     * connection is a new connection to the server, so it is held and
+     * answered -- with the reply of the one execution.
+     */
+    run v3InProgressOriginLostTest =
+        init
+            .then(v3Park(1, 1, U1, mkdir("a")))
+            .then(reconnect(1))
+            .then(v3(1, 1, U1, mkdir("a")))
+            .expect(fate == "held")
+            .then(v3Complete)
+            .expect(not(originLive) and answered == Set(1) and st == NFS3_OK)
+            .expect(dir.keys() == Set("a"))
+
+    /// A held retransmit whose connection closes is not answered; the client
+    /// sends it again, and by then the original has completed.
+    run v3InProgressWaiterLostTest =
+        init
+            .then(v3Park(1, 1, U1, mkdir("a")))
+            .then(v3(2, 1, U1, mkdir("a")))
+            .then(reconnect(2))
+            .then(v3Complete)
+            .expect(answered == Set() and originLive)
+            .then(v3(2, 1, U1, mkdir("a")))
+            .expect(replayed and st == NFS3_OK)
+
+    /**
+     * Only a retransmit is held.  The same MKDIR under another XID is another
+     * request: it executes while the original is parked, and the original,
+     * executing after it, answers EXIST -- the honest answer for a request
+     * that genuinely came second.
+     */
+    run v3InProgressOtherXidExecutesTest =
+        init
+            .then(v3Park(1, 1, U1, mkdir("a")))
+            .then(v3(2, 2, U1, mkdir("a")))
+            .expect(not(replayed) and st == NFS3_OK)
+            .then(v3Complete)
+            .expect(st == NFS3ERR_EXIST)
+
+    /**
+     * An error is a reply like any other.  The held retransmit of an RMDIR
+     * that fails is answered with the failure; and once the name exists, a
+     * later retransmit is still answered from the cache rather than executed
+     * -- which would remove a directory its sender never asked to remove.
+     */
+    run v3InProgressErrorReplyTest =
+        init
+            .then(v3Park(1, 1, U1, rmdir("a")))
+            .then(v3(2, 1, U1, rmdir("a")))
+            .then(v3Complete)
+            .expect(st == NFS3ERR_NOENT and answered == Set(2))
+            .then(v3(2, 2, U1, mkdir("a")))
+            .then(v3(2, 1, U1, rmdir("a")))
+            .expect(replayed and st == NFS3ERR_NOENT)
+            .expect(dir.keys() == Set("a"))
+
+    // ==================================================================
     // The invariant, on a trace built to stress it
     // ==================================================================
 
@@ -337,6 +473,11 @@ module nfsdrcTestRef {
             .then(reconnect(1))
             .then(v4(1, 1, U1, mkdir("a")))
             .then(v3(1, 1, U1, mkdir("b")))
+            .expect(inv)
+            .then(v3Park(1, 2, U1, mkdir("c")))
+            .then(v3(2, 2, U1, mkdir("c")))
+            .expect(inv)
+            .then(v3Complete)
             .expect(inv)
 }
 
@@ -367,12 +508,18 @@ module nfsdrcTestNoV3 {
         | OV3(o) => o.st
         | OV4(o) => o.st
         | ONull(_) => -1
+        | OV3Park(_) => -1
+        | OV3Wait(_) => -1
+        | OV3Done(o) => o.st
         | OReconnect(_) => -1
     }
     val replayed: bool = match lastOp {
         | OV3(o) => o.served == SReplayed
         | OV4(o) => o.served == SReplayed
         | ONull(_) => false
+        | OV3Park(_) => false
+        | OV3Wait(_) => false
+        | OV3Done(_) => false
         | OReconnect(_) => false
     }
 
@@ -380,6 +527,12 @@ module nfsdrcTestNoV3 {
     /// without a cache has always done.  The client is told its directory
     /// already exists; whether that is acceptable is a deployment choice, and
     /// the flag is how it is made.
+    /// Without a cache there is no identity to claim, so nothing is parked.
+    run v3NoCacheNoParkTest =
+        init
+            .then(v3Park(1, 1, 1000, mkdir("a")))
+            .fail()
+
     run v3NoCacheTest =
         init
             .then(v3(1, 1, U1, mkdir("a")))
@@ -428,12 +581,18 @@ module nfsdrcTestTwoAddr {
         | OV3(o) => o.st
         | OV4(o) => o.st
         | ONull(_) => -1
+        | OV3Park(_) => -1
+        | OV3Wait(_) => -1
+        | OV3Done(o) => o.st
         | OReconnect(_) => -1
     }
     val replayed: bool = match lastOp {
         | OV3(o) => o.served == SReplayed
         | OV4(o) => o.served == SReplayed
         | ONull(_) => false
+        | OV3Park(_) => false
+        | OV3Wait(_) => false
+        | OV3Done(_) => false
         | OReconnect(_) => false
     }
 
@@ -486,12 +645,18 @@ module nfsdrcTestCredBlind {
         | OV3(o) => o.st
         | OV4(o) => o.st
         | ONull(_) => -1
+        | OV3Park(_) => -1
+        | OV3Wait(_) => -1
+        | OV3Done(o) => o.st
         | OReconnect(_) => -1
     }
     val replayed: bool = match lastOp {
         | OV3(o) => o.served == SReplayed
         | OV4(o) => o.served == SReplayed
         | ONull(_) => false
+        | OV3Park(_) => false
+        | OV3Wait(_) => false
+        | OV3Done(_) => false
         | OReconnect(_) => false
     }
 

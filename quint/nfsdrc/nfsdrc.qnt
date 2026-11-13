@@ -29,11 +29,21 @@
  * connection-scoped one disappear, and a suite that could only do one of those
  * would be asserting half of each rule.
  *
- * Every step is one RPC (or one reconnect).  `lastOp` records the call and the
- * reply the server must produce; the state records the directory, which the
- * harness re-reads after every step -- a cache that answers with the right
- * status from the wrong entry is invisible in the reply and obvious in the
- * directory.
+ * Almost every step is one RPC (or one reconnect).  `lastOp` records the call
+ * and the reply the server must produce; the state records the directory,
+ * which the harness re-reads after every step -- a cache that answers with the
+ * right status from the wrong entry is invisible in the reply and obvious in
+ * the directory.
+ *
+ * The exception is the one case an atomic RPC cannot express: a retransmit
+ * that arrives while its original is still executing.  That is the ordinary
+ * case after a client loses its connection -- it reconnects and resends long
+ * before a slow original finishes -- and a cache that only learns of a request
+ * once its reply exists has nothing to answer it with, so it executes it a
+ * second time.  An NFSv3 original can therefore be PARKED: it has arrived and
+ * claimed its identity in the cache, but not yet executed.  Until it COMPLETES,
+ * a retransmit of it is never executed; it is held for the original's reply or
+ * dropped for the client to send again.  See `v3Park`.
  */
 module nfsdrc {
 
@@ -130,8 +140,31 @@ module nfsdrc {
         | SExecuted
         | SReplayed
 
+    /**
+     * What becomes of a retransmit that finds its original still in progress.
+     * It is never executed -- that is the whole rule -- so the only question is
+     * whether the server holds it for the original's reply or drops it for the
+     * client to send again.
+     *
+     *   WHeld          held, and answered with the original's reply when the
+     *                  original completes.
+     *   WDropOrigin    it came in on the original's own connection, which the
+     *                  original's reply will reach anyway.
+     *   WDropWaiting   its connection already has one held; one reply under the
+     *                  XID on the connection the client listens on answers it.
+     */
+    type Wait =
+        | WHeld
+        | WDropOrigin
+        | WDropWaiting
+
     type Op =
         | ONull({ conn: int })
+        | OV3Park({ conn: int, xid: int, cred: int, proc: int, act: Act })
+        | OV3Wait({ conn: int, xid: int, cred: int, proc: int, act: Act,
+                    fate: Wait })
+        | OV3Done({ conn: int, xid: int, cred: int, proc: int, act: Act,
+                    live: bool, answered: Set[int], st: int, tag: int })
         | OV3({ conn: int, xid: int, cred: int, proc: int, act: Act,
                 served: Served, st: int, tag: int })
         | OV4({ conn: int, xid: int, cred: int, act: Act,
@@ -156,6 +189,15 @@ module nfsdrc {
     var tag: int              // executions so far; names each reply
     var recent: List[Sent]    // what can still be retransmitted, oldest first
     var lastOp: Op
+
+    /**
+     * An NFSv3 original in progress: the request, its key, the incarnation of
+     * the connection it arrived on, and the connections a retransmit of it is
+     * held on.  At most one -- one is all it takes to put a retransmit inside
+     * the window, and a second would only multiply the interleavings.
+     */
+    type Pend = { sent: Sent, key: ReqId, gen: int, waiters: Set[ConnId] }
+    var pend: List[Pend]
 
     /// How far back a trace may reach for something to retransmit.  A real
     /// client retransmits what is still outstanding, which is a short list.
@@ -183,6 +225,7 @@ module nfsdrc {
                       xid: firstInt(XIDS), cred: firstInt(CREDS),
                       act: ALookup({ name: firstStr(NAMES) }) } ],
         lastOp' = ONull({ conn: firstInt(CONNS) }),
+        pend' = [],
     }
 
     /// The connection as the caches see it: which one, and which incarnation.
@@ -215,10 +258,13 @@ module nfsdrc {
         val hit       = if (cacheable) drcLookup(cache3, key) else Miss
         val sent      = { v4Proto: false, conn: conn, xid: xid, cred: cred,
                           act: act }
-        match hit {
+        if (cacheable and pend.length() > 0 and pend[0].key == key)
+            v3InProgress(conn, xid, cred, act, proc, sent)
+        else match hit {
             | Hit(r) => all {
                 dir' = dir, nextId' = nextId, cache3' = cache3, cache40' = cache40,
                 gen' = gen, tag' = tag, recent' = remember(recent, sent),
+                pend' = pend,
                 lastOp' = OV3({ conn: conn, xid: xid, cred: cred, proc: proc,
                                 act: act, served: SReplayed, st: r.st,
                                 tag: r.tag }),
@@ -228,7 +274,7 @@ module nfsdrc {
                 val t = tag + 1
                 all {
                     dir' = e.d, nextId' = e.nextId, cache40' = cache40, gen' = gen,
-                    tag' = t, recent' = remember(recent, sent),
+                    tag' = t, recent' = remember(recent, sent), pend' = pend,
                     cache3' = if (cacheable)
                                   drcInsert(cache3, key, { tag: t, st: e.st }, 0)
                               else cache3,
@@ -238,6 +284,109 @@ module nfsdrc {
                 }
             }
         }
+    }
+
+    // ==================================================================
+    // NFSv3: an original in progress
+    // ==================================================================
+
+    /**
+     * The operations an original may be parked with: the ones that name their
+     * object by directory and name.  An original executes when it completes,
+     * possibly many steps after it was parked, and a handle-based one could by
+     * then name an object that is gone -- the timing-dependent STALE answer
+     * the rest of this model is careful never to ask for (see stepV3Only).
+     */
+    pure def parkable(a: Act): bool = match a {
+        | ACreate(_) => true
+        | ARemove(_) => true
+        | ARename(_) => true
+        | _ => false
+    }
+
+    /**
+     * An NFSv3 request arrives and claims its identity in the cache, but does
+     * not execute yet.
+     *
+     * This is what a server must do for the window between a request's arrival
+     * and its reply to be covered at all: the cache learns of a request when it
+     * arrives, not when its reply exists.  Nothing visible changes -- the
+     * directory is as it was and there is no reply -- until `v3Complete`.
+     *
+     * Only a request the cache would otherwise execute can be parked: one it
+     * covers, that is not already answered from it.
+     */
+    action v3Park(conn: int, xid: int, cred: int, act: Act): bool = {
+        val proc = act3Proc(act)
+        val key  = { scope: ByAddress(ADDR_OF.get(conn)),
+                     call: { rpcProc: proc, body: act3Digest(DIR, act) },
+                     xid: xid, cred: keyCred(cred) }
+        val sent = { v4Proto: false, conn: conn, xid: xid, cred: cred,
+                     act: act }
+        all {
+            V3_DRC,
+            proc3Cacheable(proc),
+            parkable(act),
+            pend.length() == 0,
+            not(drcHit(cache3, key)),
+            dir' = dir, nextId' = nextId, cache3' = cache3, cache40' = cache40,
+            gen' = gen, tag' = tag, recent' = remember(recent, sent),
+            pend' = [{ sent: sent, key: key, gen: gen.get(conn),
+                       waiters: Set() }],
+            lastOp' = OV3Park({ conn: conn, xid: xid, cred: cred, proc: proc,
+                                act: act }),
+        }
+    }
+
+    /**
+     * A retransmit of the original in progress.  It is not executed and not
+     * answered now; whether it is held for the original's reply depends only
+     * on the connection it came in on.  A connection is named with its
+     * incarnation: the original's connection reopened is a new connection, and
+     * a retransmit on it is held like one on any other.
+     */
+    action v3InProgress(conn: int, xid: int, cred: int, act: Act, proc: int,
+                        sent: Sent): bool = {
+        val p    = pend[0]
+        val cid  = connId(conn, gen)
+        val fate = if (cid == { id: p.sent.conn, gen: p.gen }) WDropOrigin
+                   else if (p.waiters.contains(cid)) WDropWaiting
+                   else WHeld
+        all {
+            dir' = dir, nextId' = nextId, cache3' = cache3, cache40' = cache40,
+            gen' = gen, tag' = tag, recent' = remember(recent, sent),
+            pend' = if (fate == WHeld)
+                        [{ ...p, waiters: p.waiters.union(Set(cid)) }]
+                    else pend,
+            lastOp' = OV3Wait({ conn: conn, xid: xid, cred: cred, proc: proc,
+                                act: act, fate: fate }),
+        }
+    }
+
+    /**
+     * The original executes, once, and its reply is cached.  Every retransmit
+     * held on a connection that is still open is answered with that reply; so
+     * is the original itself, if its own connection is.
+     */
+    action v3Complete: bool = all {
+        pend.length() == 1,
+        {
+            val p = pend[0]
+            val e = runAct(dir, nextId, p.sent.act, false)
+            val t = tag + 1
+            all {
+                dir' = e.d, nextId' = e.nextId, cache40' = cache40, gen' = gen,
+                tag' = t, recent' = recent, pend' = [],
+                cache3' = drcInsert(cache3, p.key, { tag: t, st: e.st }, 0),
+                lastOp' = OV3Done({
+                    conn: p.sent.conn, xid: p.sent.xid, cred: p.sent.cred,
+                    proc: act3Proc(p.sent.act), act: p.sent.act,
+                    live: gen.get(p.sent.conn) == p.gen,
+                    answered: p.waiters.filter(w => gen.get(w.id) == w.gen)
+                                       .map(w => w.id),
+                    st: e.st, tag: t }),
+            }
+        },
     }
 
     // ==================================================================
@@ -266,6 +415,7 @@ module nfsdrc {
             | Hit(r) => all {
                 dir' = dir, nextId' = nextId, cache3' = cache3, cache40' = cache40,
                 gen' = gen, tag' = tag, recent' = remember(recent, sent),
+                pend' = pend,
                 lastOp' = OV4({ conn: conn, xid: xid, cred: cred, act: act,
                                 served: SReplayed, st: r.st, tag: r.tag }),
             }
@@ -274,7 +424,7 @@ module nfsdrc {
                 val t = tag + 1
                 all {
                     dir' = e.d, nextId' = e.nextId, cache3' = cache3, gen' = gen,
-                    tag' = t, recent' = remember(recent, sent),
+                    tag' = t, recent' = remember(recent, sent), pend' = pend,
                     cache40' = if (cacheable)
                                    drcInsert(cache40, key,
                                              { tag: t, st: nfs4Status(e.st) },
@@ -309,6 +459,12 @@ module nfsdrc {
         recent' = recent,
         cache40' = drcDropConn(cache40, connId(conn, gen)),
         gen' = gen.setBy(conn, g => g + 1),
+        // An original in progress keeps running: it is already inside the
+        // server, and the client going away does not stop it.  Its reply is
+        // lost with the connection, but it is still cached, so the client's
+        // retransmit on the next connection is answered with it.  A held
+        // retransmit on this connection is released, and is not answered.
+        pend' = pend,
         lastOp' = OReconnect({ conn: conn }),
     }
 
@@ -316,7 +472,7 @@ module nfsdrc {
     /// steps in time without changing any state the caches read.
     action nullCall(conn: int): bool = all {
         dir' = dir, nextId' = nextId, cache3' = cache3, cache40' = cache40,
-        gen' = gen, tag' = tag, recent' = recent,
+        gen' = gen, tag' = tag, recent' = recent, pend' = pend,
         lastOp' = ONull({ conn: conn }),
     }
 
@@ -487,12 +643,46 @@ module nfsdrc {
         }
     }
 
+    /// Park an original.  Same choice of operation as stepShared, less the
+    /// LOOKUP the cache does not cover.
+    action stepPark = {
+        nondet c = CONNS.oneOf()
+        nondet x = XIDS.oneOf()
+        nondet u = CREDS.oneOf()
+        nondet n = NAMES.oneOf()
+        nondet m = NAMES.oneOf()
+        any {
+            v3Park(c, x, u, ACreate({ name: n, ftype: T_DIR })),
+            v3Park(c, x, u, ACreate({ name: n, ftype: T_LNK })),
+            v3Park(c, x, u, ACreate({ name: n, ftype: T_REG })),
+            v3Park(c, x, u, ARemove({ name: n, asDir: false })),
+            v3Park(c, x, u, ARemove({ name: n, asDir: true })),
+            v3Park(c, x, u, ARename({ from: n, to: m })),
+        }
+    }
+
+    /// Send the original in progress again, on either connection: on its own
+    /// it is the client that never lost the connection, on the other the one
+    /// that did.  stepRetransmit reaches it too, but only as one of the last
+    /// RECENT_MAX requests; this is what makes the window busy.
+    action stepRetransmitPending = all {
+        pend.length() > 0,
+        {
+            val s = pend[0].sent
+            nondet c = CONNS.oneOf()
+                call(false, c, s.xid, s.cred, s.act)
+        },
+    }
+
     action step = any {
         stepV3,
         stepV4,
         stepRetransmit,
         stepRetransmit,
         stepTransport,
+        stepPark,
+        stepRetransmitPending,
+        v3Complete,
     }
 
     // ==================================================================
@@ -528,5 +718,11 @@ module nfsdrc {
                    .length() <= V40_SLOTS),
 
         V3_DRC or cache3.length() == 0,
+
+        // At most one original in progress, never one the cache has already
+        // answered, and none at all without a cache to claim an identity in.
+        pend.length() <= 1,
+        pend.select(p => drcHit(cache3, p.key)).length() == 0,
+        V3_DRC or pend.length() == 0,
     }
 }

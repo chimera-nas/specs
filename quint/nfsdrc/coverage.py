@@ -30,6 +30,11 @@ What it requires, and why:
     other way.
   * the NFSv4.0 cache at its BOUND: enough distinct entries on one connection
     to evict the oldest.
+  * a retransmit while its original is IN PROGRESS, in each of its fates --
+    held, dropped on the original's connection, dropped as a second waiter on
+    one connection -- and a completion that answers a held one, including
+    after the original's own connection was lost.  This is the window an
+    atomic RPC cannot reach, and the one chimera#1375 was found in.
 
 Coverage is required over the corpus as a whole.  The buckets that need a
 particular profile (the eviction bound needs a long single-connection run) are
@@ -121,6 +126,18 @@ def scan(path, buckets):
         if tag == "OReconnect":
             reconnected.add(big(val["conn"]))
             continue
+        if tag == "OV3Wait":
+            buckets.add("inprog:" + val["fate"]["tag"])
+            continue
+        if tag == "OV3Done":
+            answered = seq(val["answered"])
+            if answered:
+                buckets.add("inprog:answered")
+                if not val["live"]:
+                    buckets.add("inprog:answered-origin-lost")
+            continue
+        if tag == "OV3Park":
+            continue
         if tag not in ("OV3", "OV4"):
             continue
 
@@ -191,6 +208,9 @@ def required():
             "miss:other-conn-v4"]
     req += ["replay:before-reconnect-v3", "replay:after-reconnect-v3"]
     req += ["v40:past-the-bound"]
+    req += ["op:OV3Park", "op:OV3Done",
+            "inprog:WHeld", "inprog:WDropOrigin", "inprog:WDropWaiting",
+            "inprog:answered", "inprog:answered-origin-lost"]
     return req
 
 
