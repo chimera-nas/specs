@@ -16,6 +16,7 @@ v4:SBindConnToSession:OK
 v4:SClone:BAD_STATEID
 v4:SClone:INVAL
 v4:SClone:OK
+v4:SClone:OPENMODE
 v4:SClose:OK
 v4:SCommit:ISDIR
 v4:SCommit:OK
