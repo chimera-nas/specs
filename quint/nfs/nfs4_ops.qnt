@@ -3554,12 +3554,12 @@ emit(a,
     // CLONE (RFC 7862 15.13) reflinks a source range (sfh) into the
     // destination (cfh); the ranges then share storage copy-on-write, which
     // is invisible at the protocol level -- the observable effect is a COPY.
-    // cl_count == 0 clones through the source EOF, and a source offset at or
-    // past EOF is a no-op success.  CLONE accepts the special stateids, like
-    // COPY (cloneSidGate mirrors copySidGate): a named stateid of the wrong
-    // file or another client is NFS4ERR_BAD_STATEID, and one that lacks the
-    // needed mode is NFS4ERR_OPENMODE.  Cloning overlapping ranges of one
-    // file is NFS4ERR_INVAL.
+    // cl_count == 0 clones through the source EOF. An offset exactly at EOF
+    // is a no-op success; an offset past EOF is NFS4ERR_INVAL. CLONE accepts
+    // special stateids, like COPY (cloneSidGate mirrors copySidGate): a named
+    // stateid of the wrong file or another client is NFS4ERR_BAD_STATEID,
+    // and one that lacks the needed mode is NFS4ERR_OPENMODE. Cloning
+    // overlapping ranges of one file is NFS4ERR_INVAL.
     pure def opClone(a: Acc, ar: { srcSel: SidSel, dstSel: SidSel,
                                    srcOff: int, dstOff: int, cnt: int }): Acc = {
         if (a.minor < 2) emit(a, SClone({ st: E_OP_ILLEGAL , stAccept: Set(E_OP_ILLEGAL) }))
