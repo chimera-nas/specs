@@ -972,6 +972,48 @@ module nfs4Test42 {
                          RLayoutcommit({ sid: 2, lo: 0, hi: 1 }) ]))
             .expect(lastStatus == E_BAD_STATEID)
 
+    // CLONE resolves its stateids as concrete open/lock/delegation state
+    // (cloneSidGate), and a layout stateid carries none of those -- it
+    // authorizes pNFS layout recall, not I/O (RFC 8881 12.5.2).  So a
+    // layout stateid used as either CLONE endpoint is NFS4ERR_BAD_STATEID,
+    // not merely a stateid that fails the access-mode check.
+    run cloneLayoutStateidTest =
+        openCreateRun
+            .then(runC([ seq0(2), RPutfh(1),
+                         RDelegreturn({ sid: 1, kind: KDeleg, argSeq: 0 }) ]))
+            .then(runC([ seq0(3), RPutfh(1),
+                         RLayoutget({ rw: true, lo: 0, hi: 2,
+                                      sel: SelRef({ sid: 0, kind: KOpen,
+                                                    argSeq: 0 }) }) ]))
+            .expect(lastStatus == OK)
+            .then(runC([ seq0(4), RPutfh(1),
+                         RWrite({ sel: SelAnon, off: 0, len: 1, pat: 2,
+                                  stable: 0 }) ]))
+            .expect(lastStatus == OK)
+            .then(runC([ seq0(5), RPutrootfh,
+                         ROpen({ client: 0, owner: 2, oseq: 0,
+                                 claim: OCNull("g"),
+                                 how: HGuarded({ mode: 420 }),
+                                 access: 3, deny: 0 }), RGetfh ]))
+            .expect(lastStatus == OK)
+            // Source endpoint is the layout stateid (sid 2, file 1): BAD_STATEID.
+            .then(runC([ seq0(6), RPutfh(1), RSavefh, RPutfh(2),
+                         RClone({ srcSel: SelRef({ sid: 2, kind: KLayout,
+                                                    argSeq: 0 }),
+                                  dstSel: SelAnon,
+                                  srcOff: 0, dstOff: 0, cnt: 1 }) ]))
+            .expect(lastStatus == E_BAD_STATEID)
+            // Destination endpoint is the layout stateid: BAD_STATEID too.
+            // File 2 is only the destination here (not file 1, which would
+            // make this a same-file overlapping-range CLONE and conflate
+            // the stateid check with the overlap check).
+            .then(runC([ seq0(7), RPutfh(2), RSavefh, RPutfh(1),
+                         RClone({ srcSel: SelAnon,
+                                  dstSel: SelRef({ sid: 2, kind: KLayout,
+                                                    argSeq: 0 }),
+                                  srcOff: 0, dstOff: 0, cnt: 1 }) ]))
+            .expect(lastStatus == E_BAD_STATEID)
+
     // --- 4.2 sparse ops + COPY ----------------------------------------
 
     run sparseOpsTest =
@@ -1080,8 +1122,10 @@ module nfs4Test42 {
                          RWriteSame({ sel: SelAnon, off: 0, blocks: 1,
                                       pat: 1, blocknum: true }) ]))
             .expect(lastStatus == E_UNION_NOTSUPP)
-            // CLONE needs concrete open state: the anonymous stateid names
-            // none, so it is NFS4ERR_BAD_STATEID.
+            // CLONE accepts the special stateids like COPY does: the server
+            // derives the access check from the filehandles, and any share
+            // reservation gets enforced separately (NFS4ERR_LOCKED, tolerating
+            // NFS4ERR_ACCESS -- see opClone's comment) below.
             .then(runC([ seq0(9), RPutrootfh,
                          ROpen({ client: 0, owner: 2, oseq: 0,
                                  claim: OCNull("g"),
@@ -1091,7 +1135,112 @@ module nfs4Test42 {
             .then(runC([ seq0(10), RPutfh(1), RSavefh, RPutfh(2),
                          RClone({ srcSel: SelAnon, dstSel: SelAnon,
                                   srcOff: 0, dstOff: 0, cnt: 1 }) ]))
-            .expect(lastStatus == E_BAD_STATEID)
+            .expect(lastStatus == OK)
+            // A deny reservation held by any open still gates the special
+            // stateids: a READ open of a third file ("h") by a third
+            // open-owner of client 0, with deny=WRITE, blocks an anonymous
+            // CLONE that would write to it. (A cross-client variant is
+            // covered separately in cloneCrossClientDenyTest.)
+            .then(runC([ seq0(11), RPutrootfh,
+                         ROpen({ client: 0, owner: 3, oseq: 0,
+                                 claim: OCNull("h"),
+                                 how: HGuarded({ mode: 420 }),
+                                 access: 1, deny: 2 }), RGetfh ]))
+            .expect(lastStatus == OK)
+            .expect(anyDeny(sdb, 3, 2))
+            .then(runC([ seq0(12), RPutfh(1), RSavefh, RPutfh(3),
+                         RClone({ srcSel: SelAnon, dstSel: SelAnon,
+                                  srcOff: 0, dstOff: 0, cnt: 1 }) ]))
+            .expect(lastStatus == E_LOCKED)
+            .expect(fsGet(fs, 3).sizeBlocks == 0)
+            // The same deny also blocks the bypass stateid used as the
+            // destination selector.
+            .then(runC([ seq0(13), RPutfh(1), RSavefh, RPutfh(3),
+                         RClone({ srcSel: SelBypass, dstSel: SelBypass,
+                                  srcOff: 0, dstOff: 0, cnt: 1 }) ]))
+            .expect(lastStatus == E_LOCKED)
+            .expect(fsGet(fs, 3).sizeBlocks == 0)
+
+    // CLONE's special-stateid share-deny check (opClone) looks at every
+    // open on the file regardless of owning client, so a genuine
+    // cross-client conflict needs its own session: client 1 is bootstrapped
+    // with EXCHANGE_ID + CREATE_SESSION + RECLAIM_COMPLETE (RFC 8881
+    // 18.35/18.36/18.51) and issues its OPEN on its own session, unlike the
+    // earlier same-client-owner check in dataOps42Test.
+    run cloneCrossClientDenyTest =
+        openCreateRun
+            // Client 0 opens "h" for READ only, so its own share
+            // reservation can't conflict with client 1's deny=WRITE OPEN
+            // below; the only conflict this test wants to exercise is
+            // CLONE's own anyDeny() check against client 1's reservation.
+            .then(runC([ seq0(2), RPutrootfh,
+                         ROpen({ client: 0, owner: 2, oseq: 0,
+                                 claim: OCNull("h"),
+                                 how: HGuarded({ mode: 420 }),
+                                 access: 1, deny: 0 }), RGetfh ]))
+            .expect(lastStatus == OK)
+            // Bootstrap client 1 on session 1.
+            .then(runC([ RExchangeId({ ownerSym: 2, verfSym: 1 }) ]))
+            .then(runC([ RCreateSession({ client: 1, csaSeq: 1,
+                                          backChan: true }) ]))
+            .then(runC([ RSequence({ sess: 1, slot: 1, seq: 1,
+                                     cacheThis: false }),
+                         RReclaimComplete ]))
+            .expect(lastStatus == OK)
+            // Client 1 opens "h" for READ with deny=WRITE on its own
+            // session. Client 0's own READ-only open (and any read
+            // delegation it holds) doesn't conflict with this.
+            .then(runC([ RSequence({ sess: 1, slot: 0, seq: 1,
+                                     cacheThis: true }), RPutrootfh,
+                         ROpen({ client: 1, owner: 1, oseq: 0,
+                                 claim: OCNull("h"), how: HNoCreate,
+                                 access: 1, deny: 2 }) ]))
+            .expect(lastStatus == OK)
+            .expect(anyDeny(sdb, 2, 2))
+            // Client 0's anonymous CLONE into "h" is refused by client 1's
+            // deny=WRITE reservation.
+            .then(runC([ seq0(3), RPutfh(1), RSavefh, RPutfh(2),
+                         RClone({ srcSel: SelAnon, dstSel: SelAnon,
+                                  srcOff: 0, dstOff: 0, cnt: 1 }) ]))
+            .expect(lastStatus == E_LOCKED)
+            .expect(fsGet(fs, 2).sizeBlocks == 0)
+
+    // RFC 7862 15.13.3 requires NFS4ERR_INVAL when the source offset
+    // exceeds the source file's size -- with no exception for cl_count == 0.
+    // This exercises all three boundary cases (before, exactly at, and
+    // beyond EOF) against the fixed opClone oracle. "f" ends up 2 blocks
+    // long.
+    run cloneSrcOffsetEofBoundaryTest =
+        openCreateRun
+            .then(runC([ seq0(2), RPutfh(1),
+                         RWrite({ sel: SelAnon, off: 0, len: 2, pat: 1,
+                                  stable: 0 }) ]))
+            .expect(lastStatus == OK)
+            .expect(fsGet(fs, 1).sizeBlocks == 2)
+            .then(runC([ seq0(3), RPutrootfh,
+                         ROpen({ client: 0, owner: 2, oseq: 0,
+                                 claim: OCNull("g"),
+                                 how: HGuarded({ mode: 420 }),
+                                 access: 3, deny: 0 }), RGetfh ]))
+            .expect(lastStatus == OK)
+            // Before EOF, cl_count == 0: derives "to EOF" (1 block), OK.
+            .then(runC([ seq0(4), RPutfh(1), RSavefh, RPutfh(2),
+                         RClone({ srcSel: SelAnon, dstSel: SelAnon,
+                                  srcOff: 1, dstOff: 0, cnt: 0 }) ]))
+            .expect(lastStatus == OK)
+            .expect(fsGet(fs, 2).sizeBlocks == 1)
+            // Exactly at EOF, cl_count == 0: derived count is 0, a no-op
+            // success -- the offset itself is not "beyond" the size.
+            .then(runC([ seq0(5), RPutfh(1), RSavefh, RPutfh(2),
+                         RClone({ srcSel: SelAnon, dstSel: SelAnon,
+                                  srcOff: 2, dstOff: 0, cnt: 0 }) ]))
+            .expect(lastStatus == OK)
+            // Beyond EOF, cl_count == 0: NFS4ERR_INVAL per RFC 7862
+            // 15.13.3/15.2.3, regardless of the zero count.
+            .then(runC([ seq0(6), RPutfh(1), RSavefh, RPutfh(2),
+                         RClone({ srcSel: SelAnon, dstSel: SelAnon,
+                                  srcOff: 3, dstOff: 0, cnt: 0 }) ]))
+            .expect(lastStatus == E_INVAL)
 
     run cloneEofBoundaryTest = cloneEofBoundaryRegression
 
