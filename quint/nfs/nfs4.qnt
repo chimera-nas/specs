@@ -2878,4 +2878,39 @@ module nfs4 {
                     })
     }
 
+    // Concrete stateids keep this regression focused on source bounds.
+    // Resolve by file because serving delegations consumes additional Sids.
+    def cloneBoundaryOpen(f: Ino): SidSel =
+        openSel(newestSid(usableOpens.filter(s => sdb.opens.get(s).file == f)))
+
+    run cloneEofBoundaryRegression =
+        coverageBootRun
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 1, oseq: 0, claim: OCNull("src"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}), RGetfh])))
+            .then(runC(withSess(0, [RPutfh(1),
+                RWrite({sel: cloneBoundaryOpen(1), off: 0, len: 2,
+                        pat: 1, stable: 0})])))
+            .expect(fsGet(fs, 1).sizeBlocks == 2)
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 2, oseq: 0, claim: OCNull("dst"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}), RGetfh])))
+            .then(runC(withSess(0, [RPutfh(1), RSavefh, RPutfh(2),
+                RClone({srcSel: cloneBoundaryOpen(1), dstSel: cloneBoundaryOpen(2),
+                        srcOff: 1, dstOff: 0, cnt: 0})])))
+            .expect(match lastOp { | LCompound(l) => l.status == OK | _ => false })
+            .expect(fsGet(fs, 2).sizeBlocks == 1 and fsGet(fs, 2).blocks.get(0) == BData(1))
+            .then(runC(withSess(0, [RPutfh(1), RSavefh, RPutfh(2),
+                RClone({srcSel: cloneBoundaryOpen(1), dstSel: cloneBoundaryOpen(2),
+                        srcOff: 2, dstOff: 0, cnt: 0})])))
+            .expect(match lastOp { | LCompound(l) => l.status == OK | _ => false })
+            .expect(fsGet(fs, 2).sizeBlocks == 1 and fsGet(fs, 2).blocks.get(0) == BData(1))
+            .then(runC(withSess(0, [RPutfh(1), RSavefh, RPutfh(2),
+                RClone({srcSel: cloneBoundaryOpen(1), dstSel: cloneBoundaryOpen(2),
+                        srcOff: 3, dstOff: 0, cnt: 0})])))
+            .expect(match lastOp { | LCompound(l) => l.status == E_INVAL | _ => false })
+            .expect(fsGet(fs, 2).sizeBlocks == 1 and fsGet(fs, 2).blocks.get(0) == BData(1))
+            .then(runC(withSess(0, [RPutfh(2),
+                RRead({sel: cloneBoundaryOpen(2), off: 0, len: 2})])))
+
 }

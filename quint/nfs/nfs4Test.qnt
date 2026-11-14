@@ -1093,6 +1093,8 @@ module nfs4Test42 {
                                   srcOff: 0, dstOff: 0, cnt: 1 }) ]))
             .expect(lastStatus == E_BAD_STATEID)
 
+    run cloneEofBoundaryTest = cloneEofBoundaryRegression
+
     // --- xattrs -------------------------------------------------------
 
     run xattrTest =

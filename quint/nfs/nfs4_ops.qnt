@@ -3566,11 +3566,11 @@ emit(a,
         }
     }
 
-    // CLONE (RFC 7862 15.4) reflinks a source range (sfh) into the
+    // CLONE (RFC 7862 15.13) reflinks a source range (sfh) into the
     // destination (cfh); the ranges then share storage copy-on-write, which
     // is invisible at the protocol level -- the observable effect is a COPY.
-    // cl_count == 0 clones through the source EOF, and a source offset at or
-    // past EOF is a no-op success.  Unlike COPY, CLONE resolves both stateids
+    // cl_count == 0 clones through the source EOF. An offset exactly at EOF
+    // is a no-op success; an offset past EOF is NFS4ERR_INVAL.  Unlike COPY, CLONE resolves both stateids
     // as concrete open/lock state: it takes no special-stateid shortcut, so
     // an anonymous or read-bypass selector is NFS4ERR_BAD_STATEID.  Cloning
     // overlapping ranges of one file is NFS4ERR_INVAL.
@@ -3609,9 +3609,11 @@ emit(a,
                         ar.srcOff < ar.dstOff + cnt and
                         ar.dstOff < ar.srcOff + cnt)
                         emit(a, SClone({ st: E_INVAL , stAccept: Set(E_INVAL) }))
+                    else if (ar.srcOff > src.sizeBlocks)
+                        // RFC 7862 15.13.3 applies even when cl_count is zero.
+                        emit(a, SClone({ st: E_INVAL , stAccept: Set(E_INVAL) }))
                     else if (cnt == 0)
-                        // Nothing to clone (count 0 with the source offset at
-                        // or past EOF): success, no state change.
+                        // Exactly at EOF: success without changing the target.
                         emit(a, SClone({ st: OK , stAccept: Set(OK) }))
                     else if (ar.srcOff + cnt > src.sizeBlocks)
                         emit(a, SClone({ st: E_INVAL , stAccept: Set(E_INVAL) }))
