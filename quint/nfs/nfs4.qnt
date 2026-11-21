@@ -1691,7 +1691,8 @@ module nfs4 {
 
     // I/O through a delegation stateid, sent by the client that holds the
     // delegation: READ, WRITE, a size-changing SETATTR, an attribute-only
-    // SETATTR, and at 4.2 READ_PLUS, WRITE_SAME, ALLOCATE and DEALLOCATE.
+    // SETATTR, and at 4.2 READ_PLUS, WRITE_SAME, ALLOCATE, DEALLOCATE and
+    // SEEK (lseek(SEEK_DATA/SEEK_HOLE) on a delegated file).
     // This is what a Linux client sends while it holds a delegation on the
     // file and no POSIX lock (nfs4_select_rw_stateid() falls back to the
     // delegation stateid before the open stateid; truncate(2) with no open
@@ -1718,7 +1719,7 @@ module nfs4 {
         genReady,
         usableDelegs.size() > 0,
         {
-            nondet which = oneOf(if (MINOR >= 2) Set(0, 1, 2, 3, 4, 5, 6, 7)
+            nondet which = oneOf(if (MINOR >= 2) Set(0, 1, 2, 3, 4, 5, 6, 7, 8)
                                  else Set(0, 1, 2, 3))
             // Two-level draw: pick the op shape, then steer the delegation
             // type so every shape samples both a write delegation and a read
@@ -1751,6 +1752,7 @@ module nfs4 {
             nondet stable = oneOf(STABLE_LEVELS)
             nondet sz = oneOf(0.to(MAX_BLOCKS))
             nondet m = oneOf(MODES)
+            nondet whatData = oneOf(Set(false, true))
             val op = if (which == 0)
                          RRead({ sel: delegSel(s), off: off, len: len })
                      else if (which == 1)
@@ -1770,8 +1772,10 @@ module nfs4 {
                      else if (which == 6)
                          RAllocate({ sel: delegSel(s), off: off,
                                      len: imin(len, MAX_BLOCKS - off) })
-                     else
+                     else if (which == 7)
                          RDeallocate({ sel: delegSel(s), off: off, len: len })
+                     else
+                         RSeek({ sel: delegSel(s), off: off, whatData: whatData })
             // An attribute-only SETATTR (a chmod) through the holder's own
             // delegation mutates the file's metadata, which recalls every
             // OTHER client's delegation on the file -- a cross-client recall
