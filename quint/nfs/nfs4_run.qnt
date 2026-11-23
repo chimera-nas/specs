@@ -31,6 +31,7 @@ module nfs4Default {
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
         P_LAYOUT_WHOLE_FILE = true,
+        P_ROOT_EXPORT = false,
         // The run instances are the RFC-first ones: no deviation enabled and
         // no tolerance relaxed.  The corpus is generated from the cell
         // modules tools/mkconfig.js renders out of chimera's configs, which
@@ -63,6 +64,7 @@ module nfs4V40 {
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
         P_LAYOUT_WHOLE_FILE = true,
+        P_ROOT_EXPORT = false,
         // The run instances are the RFC-first ones: no deviation enabled and
         // no tolerance relaxed.  The corpus is generated from the cell
         // modules tools/mkconfig.js renders out of chimera's configs, which
@@ -95,6 +97,7 @@ module nfs4V41 {
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
         P_LAYOUT_WHOLE_FILE = true,
+        P_ROOT_EXPORT = false,
         // The run instances are the RFC-first ones: no deviation enabled and
         // no tolerance relaxed.  The corpus is generated from the cell
         // modules tools/mkconfig.js renders out of chimera's configs, which
@@ -149,6 +152,7 @@ module nfs4Memfs42 {
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
         P_LAYOUT_WHOLE_FILE = true,
+        P_ROOT_EXPORT = false,
         // The run instances are the RFC-first ones: no deviation enabled and
         // no tolerance relaxed.  The corpus is generated from the cell
         // modules tools/mkconfig.js renders out of chimera's configs, which
@@ -185,6 +189,7 @@ module nfs4Memfs42Deleg {
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
         P_LAYOUT_WHOLE_FILE = true,
+        P_ROOT_EXPORT = false,
         // The run instances are the RFC-first ones: no deviation enabled and
         // no tolerance relaxed.  The corpus is generated from the cell
         // modules tools/mkconfig.js renders out of chimera's configs, which
@@ -216,6 +221,7 @@ module nfs4Memfs41Deleg {
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
         P_LAYOUT_WHOLE_FILE = true,
+        P_ROOT_EXPORT = false,
         // The run instances are the RFC-first ones: no deviation enabled and
         // no tolerance relaxed.  The corpus is generated from the cell
         // modules tools/mkconfig.js renders out of chimera's configs, which
@@ -247,6 +253,7 @@ module nfs4Memfs41 {
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
         P_LAYOUT_WHOLE_FILE = true,
+        P_ROOT_EXPORT = false,
         // The run instances are the RFC-first ones: no deviation enabled and
         // no tolerance relaxed.  The corpus is generated from the cell
         // modules tools/mkconfig.js renders out of chimera's configs, which
@@ -278,6 +285,7 @@ module nfs4Memfs40 {
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
         P_LAYOUT_WHOLE_FILE = true,
+        P_ROOT_EXPORT = false,
         // The run instances are the RFC-first ones: no deviation enabled and
         // no tolerance relaxed.  The corpus is generated from the cell
         // modules tools/mkconfig.js renders out of chimera's configs, which
@@ -314,6 +322,7 @@ module nfs4Pnfs42 {
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
         P_LAYOUT_WHOLE_FILE = true,
+        P_ROOT_EXPORT = false,
         // The run instances are the RFC-first ones: no deviation enabled and
         // no tolerance relaxed.  The corpus is generated from the cell
         // modules tools/mkconfig.js renders out of chimera's configs, which
@@ -345,6 +354,7 @@ module nfs4Pnfs41 {
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
         P_LAYOUT_WHOLE_FILE = true,
+        P_ROOT_EXPORT = false,
         // The run instances are the RFC-first ones: no deviation enabled and
         // no tolerance relaxed.  The corpus is generated from the cell
         // modules tools/mkconfig.js renders out of chimera's configs, which
@@ -378,6 +388,7 @@ module nfs4PnfsMandatory {
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
         P_LAYOUT_WHOLE_FILE = true,
+        P_ROOT_EXPORT = false,
         // The run instances are the RFC-first ones: no deviation enabled and
         // no tolerance relaxed.  The corpus is generated from the cell
         // modules tools/mkconfig.js renders out of chimera's configs, which
@@ -412,6 +423,7 @@ module nfs4AllMandatory {
         P_CONFLICT_DELAYS = true,
         P_CLOSE_FREES_LOCKS = true,
         P_LAYOUT_WHOLE_FILE = true,
+        P_ROOT_EXPORT = false,
         // The run instances are the RFC-first ones: no deviation enabled and
         // no tolerance relaxed.  The corpus is generated from the cell
         // modules tools/mkconfig.js renders out of chimera's configs, which
