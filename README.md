@@ -22,6 +22,9 @@ Each suite under `quint/` is an independent model:
 | `quint/s3`      | the Amazon S3 REST API, scoped to a filesystem-backed gateway | AWS S3 API Reference (2006-03-01) |
 | `quint/nfsdrc`  | the duplicate-request caches of NFSv3 and NFSv4.0 | RFC 1813, RFC 7530, RFC 8881 §2.10.6 |
 
+[`quint/README.md`](quint/README.md) is the tour: what each model covers and
+leaves out, the shape they share, and how to read one.
+
 > These specifications were originally created to facilitate model-based testing
 > of the [Chimera](https://github.com/chimera-nas/chimera) NAS project, but the
 > models encode the standards, not any one implementation, and stand on their own.
