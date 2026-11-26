@@ -273,7 +273,7 @@ module nfs4fs {
         }
     }
 
-    // Reap an orphaned inode once its last pin (open/delegation/layout)
+    // Reap an orphaned inode once its last pin (open or delegation)
     // is gone.
     pure def fsReap(fs: Fs, i: Ino): Fs =
         fs.with("inodes", mapDrop(fs.inodes, i))

@@ -628,11 +628,35 @@ module nfs4 {
     // inode it describes.  Such a layout is unusable for generation: reaching
     // it means a PUTFH of a removed ino, and the model deliberately leaves the
     // position of that STALE open -- PUTFH may report it or defer to the first
-    // use (R-CORE-102) -- so the generator must not present one.
+    // use (R-CORE-102) -- so the generator must not present one.  A layout on
+    // a file that is still open but has lost its last link is held back too:
+    // RFC 8881 12.5.5 lets a server recall it at the REMOVE, at the last close
+    // or never (layoutUncertain), and those choices leave different layout
+    // state behind.  Nothing is held back because some server gets it wrong.
     def usableLayouts: Set[Sid] =
         sdb.layouts.keys().filter(s =>
             clientUsable(sdb.layouts.get(s).client) and
-            fsLive(fs, sdb.layouts.get(s).file))
+            not(layoutUncertain(fs, sdb, s)))
+
+    // Opens a LAYOUTGET may be issued through: not one on a file with no
+    // links left, for the reason usableLayouts gives (see opLayoutget).
+    def layoutgetOpens: Set[Sid] =
+        usableOpens.filter(s => fsGet(fs, sdb.opens.get(s).file).nlink > 0)
+
+    // Inodes a LINK may take as its source.  Where pNFS is on, not one with no
+    // links left: a LINK back would make its uncertain layouts certain again
+    // (layoutUncertain reads the link count), and the generator must not
+    // present an op whose answer depends on one.  Without pNFS no layout
+    // exists, and every live inode stays a candidate.
+    def linkSources: Set[Ino] =
+        if (caps.pnfs) liveInos.filter(i => fs.inodes.get(i).nlink > 0)
+        else liveInos
+
+    // Clients DESTROY_CLIENTID may be issued for: not one that is busy only
+    // through uncertain layouts, where a server that kept them and one that
+    // dropped them answer differently (destroyClientidUncertain).
+    def destroyableClients: Set[ClientId] =
+        sdb.clients.keys().filter(c => not(destroyClientidUncertain(fs, sdb, c)))
 
     def openSel(s: Sid): SidSel =
         SelRef({ sid: s, kind: KOpen, argSeq: 0 })
@@ -835,12 +859,13 @@ module nfs4 {
     }
 
     // DESTROY_CLIENTID: CLIENTID_BUSY while sessions/state exist, OK on a
-    // bare client record.
+    // bare client record.  A client busy only through uncertain layouts is
+    // left out (destroyableClients).
     action destroyClientid = all {
         MINOR >= 1,
-        sdb.clients.keys().size() > 0,
+        destroyableClients.size() > 0,
         {
-            nondet c = oneOf(sdb.clients.keys())
+            nondet c = oneOf(destroyableClients)
             runC([ RDestroyClientid(c) ])
         },
     }
@@ -1215,10 +1240,11 @@ module nfs4 {
 
     action nsLink = all {
         genReady,
+        linkSources.size() > 0,
         {
             nondet wm = oneOf(0.to(3))
             nondet wt = oneOf(FTYPES)
-            nondet o = oneOf(liveInos)
+            nondet o = oneOf(linkSources)
             nondet d = oneOf(wide(dirs, wm, wt))
             nondet n = oneOf(NAMES)
             if (delegOther(o, anyReady))
@@ -1894,9 +1920,9 @@ module nfs4 {
     action pnfsLayoutget = all {
         MINOR >= 1,
         caps.pnfs,
-        usableOpens.size() > 0,
+        layoutgetOpens.size() > 0,
         {
-            nondet s = oneOf(usableOpens)
+            nondet s = oneOf(layoutgetOpens)
             val o = sdb.opens.get(s)
             nondet rw = oneOf(Set(false, true))
             nondet lo = oneOf(0.to(MAX_BLOCKS - 1))
@@ -1960,7 +1986,7 @@ module nfs4 {
     // is worth generating, so the gate applies only where pNFS is on.
     action pnfsDeviceinfo = all {
         MINOR >= 1,
-        not(caps.pnfs) or sdb.layouts.keys().size() > 0,
+        not(caps.pnfs) or usableLayouts.size() > 0,
         readyClients.size() > 0,
         {
             nondet c = oneOf(readyClients)

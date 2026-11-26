@@ -432,7 +432,7 @@ module nfs4ops {
         | SCreateSession({ st: int, sess: SessId })
         | SSequence({ st: int, replay: bool })
         | SDestroySession({ st: int })
-        | SDestroyClientid({ st: int })
+        | SDestroyClientid({ st: int, stAccept: Set[int] })
         | SReclaimComplete({ st: int })
         | SFreeStateid({ st: int })
         // recalls: delegation sids for which the harness must observe a
@@ -841,6 +841,39 @@ module nfs4ops {
     pure def pinnedInos(sdb: StateDB): Set[Ino] =
         sdb.opens.keys().map(s => sdb.opens.get(s).file)
             .union(sdb.delegs.keys().map(s => sdb.delegs.get(s).file))
+
+    // A layout on a file that has lost its last link, or has been reaped, is
+    // UNCERTAIN.  RFC 8881 12.5.5: a REMOVE SHOULD cause the metadata server
+    // to recall the file's layouts, and since the REMOVE may itself be delayed
+    // until the last close, so may the recall.  Nothing on that path is a
+    // MUST, so a conformant server may recall at the REMOVE, at the last
+    // close, or never, and may keep or drop the layout meanwhile.  The model
+    // leaves layout state untouched at REMOVE, RENAME and reap, and derives
+    // the uncertainty from file state alone rather than tracking it: the
+    // generator presents nothing whose outcome depends on such a layout
+    // (usableLayouts, layoutgetOpens and destroyableClients in nfs4.qnt).
+    // Two replies widen their status for a trace that reaches one anyway:
+    // LAYOUTGET (opLayoutget) and DESTROY_CLIENTID (opDestroyClientid).
+    // LAYOUTRETURN and LAYOUTCOMMIT do not, and a LAYOUTGET grant is still
+    // compared stateid for stateid.
+    pure def layoutUncertain(fs: Fs, sdb: StateDB, s: Sid): bool = {
+        val f = sdb.layouts.get(s).file
+        not(fsLive(fs, f)) or fsGet(fs, f).nlink == 0
+    }
+
+    // The state as a server that dropped every uncertain layout would hold it.
+    pure def dropUncertainLayouts(fs: Fs, sdb: StateDB): StateDB = {
+        val gone = sdb.layouts.keys().filter(s => layoutUncertain(fs, sdb, s))
+        sdb.with("layouts", gone.fold(sdb.layouts, (m, s) => smapDrop(m, s)))
+    }
+
+    // DESTROY_CLIENTID on a client that is busy only because of uncertain
+    // layouts: a server that kept them answers NFS4ERR_CLIENTID_BUSY, one
+    // that dropped them does not, and both are conformant.
+    pure def destroyClientidUncertain(fs: Fs, sdb: StateDB,
+                                      cid: ClientId): bool =
+        clientBusy(sdb, cid) and
+        not(clientBusy(dropUncertainLayouts(fs, sdb), cid))
 
     // Reap an orphan once its last pin is gone (called after CLOSE /
     // DELEGRETURN).
@@ -1472,8 +1505,8 @@ module nfs4ops {
     // REMOVE (RFC 7530 16.26 / RFC 8881 18.25): untyped; non-empty
     // directory -> NFS4ERR_NOTEMPTY.  Removal of an open file is
     // permitted (NFS4ERR_FILE_OPEN is a server MAY, R-CORE-71); the
-    // object is orphaned while opens/delegations/layouts pin it and
-    // reaped at the last CLOSE.
+    // object is orphaned while opens or delegations pin it (layouts do
+    // not, see pinnedInos) and reaped at the last CLOSE.
     pure def opRemove(a: Acc, n: Name): Acc = {
         val g = fhGate(a)
         val ns = nameStatus(n)
@@ -1498,6 +1531,15 @@ module nfs4ops {
                                                 doRecallDeleg(acc, s))),
                      SRemove({ st: E_DELAY, cinfo: { before: 0, after: 0, opaque: false } , stAccept: Set(E_DELAY) }))
             } else {
+                // Layout state is left exactly as it was, last link or not.
+                // RFC 8881 12.5.5 says a REMOVE SHOULD cause the server to
+                // recall the file's layouts, and that the recall may wait for
+                // the last close; nothing on that path is a MUST.  A server
+                // may recall here, at the last close, or not at all, so the
+                // model commits to none of them: the layouts on a file with
+                // no links left are uncertain (layoutUncertain), and the
+                // generator presents no operation whose outcome depends on
+                // them.
                 val o = fsRemove(a.fs, a.cfh, n, pinnedInos(a.sdb))
                 emit(devCinfoHit(a.with("fs", o.fs2)),
                      SRemove({ st: fsStatus(o.st),
@@ -1547,6 +1589,9 @@ module nfs4ops {
             } else {
                 val o = fsRename(a.fs, a.sfh, ar.oldname, a.cfh, ar.newname,
                                  pinnedInos(a.sdb))
+                // Replacing the last link of a file leaves its layouts as
+                // they were, exactly as REMOVE of that link does (see
+                // opRemove): they become uncertain, not revoked.
                 emit(devCinfoHit(a.with("fs", o.fs2)),
                      SRename({ st: fsStatus(o.st),
                                cinfoS: devCinfo(a, o.cinfoS),
@@ -1624,10 +1669,12 @@ module nfs4ops {
                             val fs1 = fsResize(a.fs, a.cfh, ar.sizeBlocks)
                             val fs2 = if (ar.mode >= 0) fsChmod(fs1, a.cfh, ar.mode)
                                       else fs1
-                            // A size change recalls every layout on the file
-                            // (see revokeLayoutsOn).  A layout is a pin, so
-                            // losing the last one can be what finally reaps an
-                            // unlinked-but-pinned file.
+                            // A size change recalls every layout on the file (see
+                            // revokeLayoutsOn).  A layout is not a pin (see
+                            // pinnedInos), so the revoke is never what reaps
+                            // the file: maybeReap sees the same pins before
+                            // and after, and acts only on an orphan that had
+                            // already lost its last pin.
                             val sdbR = revokeLayoutsOn(a.sdb, a.cfh)
                             emit(a.with("fs", maybeReap(fs2, sdbR, a.cfh))
                                   .with("sdb", sdbR),
@@ -1643,10 +1690,12 @@ module nfs4ops {
                             val fs1 = fsResize(a.fs, a.cfh, ar.sizeBlocks)
                             val fs2 = if (ar.mode >= 0) fsChmod(fs1, a.cfh, ar.mode)
                                       else fs1
-                            // A size change recalls every layout on the file
-                            // (see revokeLayoutsOn).  A layout is a pin, so
-                            // losing the last one can be what finally reaps an
-                            // unlinked-but-pinned file.
+                            // A size change recalls every layout on the file (see
+                            // revokeLayoutsOn).  A layout is not a pin (see
+                            // pinnedInos), so the revoke is never what reaps
+                            // the file: maybeReap sees the same pins before
+                            // and after, and acts only on an orphan that had
+                            // already lost its last pin.
                             val sdbR = revokeLayoutsOn(a.sdb, a.cfh)
                             emit(a.with("fs", maybeReap(fs2, sdbR, a.cfh))
                                   .with("sdb", sdbR),
@@ -1659,10 +1708,12 @@ module nfs4ops {
                             val fs1 = fsResize(a.fs, a.cfh, ar.sizeBlocks)
                             val fs2 = if (ar.mode >= 0) fsChmod(fs1, a.cfh, ar.mode)
                                       else fs1
-                            // A size change recalls every layout on the file
-                            // (see revokeLayoutsOn).  A layout is a pin, so
-                            // losing the last one can be what finally reaps an
-                            // unlinked-but-pinned file.
+                            // A size change recalls every layout on the file (see
+                            // revokeLayoutsOn).  A layout is not a pin (see
+                            // pinnedInos), so the revoke is never what reaps
+                            // the file: maybeReap sees the same pins before
+                            // and after, and acts only on an orphan that had
+                            // already lost its last pin.
                             val sdbR = revokeLayoutsOn(a.sdb, a.cfh)
                             emit(a.with("fs", maybeReap(fs2, sdbR, a.cfh))
                                   .with("sdb", sdbR),
@@ -1945,8 +1996,20 @@ module nfs4ops {
         else emit(a, SDestroySession({ st: E_BADSESSION }))
         }
 
-    pure def opDestroyClientid(a: Acc, cid: ClientId): Acc =
-        if (a.minor == 0) emit(a, SDestroyClientid({ st: E_OP_ILLEGAL }))
+    pure def opDestroyClientid(a: Acc, cid: ClientId): Acc = {
+        val badShape = if (a.seqDone) a.idx != a.nOps - 1 else a.nOps > 1
+        // A client busy only through uncertain layouts (layoutUncertain) is
+        // busy at a server that kept them and not at one that dropped them,
+        // and both are conformant, so the busy reply also accepts what the
+        // second server answers.  The generator does not issue this case
+        // (destroyClientid); this keeps a self-test or a hand-written trace
+        // that does reach it from pinning one policy.
+        val busyAccept =
+            if (destroyClientidUncertain(a.fs, a.sdb, cid))
+                Set(E_CLIENTID_BUSY, if (badShape) E_NOT_ONLY_OP else OK)
+            else Set(E_CLIENTID_BUSY)
+        if (a.minor == 0) emit(a, SDestroyClientid({ st: E_OP_ILLEGAL,
+                                                     stAccept: Set(E_OP_ILLEGAL) }))
         // G4-destroy-clientid-busy-first: RFC 8881 18.50.3 states both the
         // sole/final-operation rule and the "no sessions or state remain"
         // precondition and orders NEITHER against the other.  chimera checks
@@ -1956,20 +2019,24 @@ module nfs4ops {
         else if (hasDev(a.caps, "G4-destroy-clientid-busy-first") and
                  a.sdb.clients.keys().contains(cid) and clientBusy(a.sdb, cid))
             emit(hitDev(a, "G4-destroy-clientid-busy-first"),
-                 SDestroyClientid({ st: E_CLIENTID_BUSY }))
-        else if (if (a.seqDone) a.idx != a.nOps - 1 else a.nOps > 1)
+                 SDestroyClientid({ st: E_CLIENTID_BUSY, stAccept: busyAccept }))
+        else if (badShape)
             // RFC 8881 18.50.3: preceded by a SEQUENCE, DESTROY_CLIENTID
             // must be the *final* operation of the compound; with no
             // SEQUENCE it must be the only one.  chimera implements both
             // arms (nfs4_proc_destroy_clientid.c).
-            emit(a, SDestroyClientid({ st: E_NOT_ONLY_OP }))
+            emit(a, SDestroyClientid({ st: E_NOT_ONLY_OP,
+                                       stAccept: Set(E_NOT_ONLY_OP) }))
         else if (not(a.sdb.clients.keys().contains(cid)))
-            emit(a, SDestroyClientid({ st: E_STALE_CLIENTID }))
+            emit(a, SDestroyClientid({ st: E_STALE_CLIENTID,
+                                       stAccept: Set(E_STALE_CLIENTID) }))
         else if (clientBusy(a.sdb, cid))
-            emit(a, SDestroyClientid({ st: E_CLIENTID_BUSY }))
+            emit(a, SDestroyClientid({ st: E_CLIENTID_BUSY,
+                                       stAccept: busyAccept }))
         else
             emit(a.with("sdb", purgeClient(a.sdb, cid)),
-                 SDestroyClientid({ st: OK }))
+                 SDestroyClientid({ st: OK, stAccept: Set(OK) }))
+    }
 
     // RECLAIM_COMPLETE (RFC 8881 18.51, rca_one_fs = false): once per
     // client; a repeat is NFS4ERR_COMPLETE_ALREADY.
@@ -3030,6 +3097,30 @@ emit(a,
                                                               E_INVAL))))
             else {
                 val io = resolveSel(a, ar.sel)
+                // A LAYOUTGET on a file whose last link is gone has no single
+                // answer.  RFC 8881 12.5.5 lets a server recall the file's
+                // layouts at the REMOVE, at the last close, or not at all, so
+                // it may still grant a layout (OK), refuse while a recall is
+                // outstanding (NFS4ERR_RECALLCONFLICT) or refuse to hand out
+                // more (NFS4ERR_LAYOUTUNAVAILABLE, 18.43.3); and a server that
+                // already revoked the layout a client presents answers
+                // NFS4ERR_BAD_STATEID for that stateid.  The model predicts
+                // the grant and accepts the rest.  BAD_STATEID is accepted
+                // only for a layout stateid: a made-up or freed stateid of
+                // any other kind is refused by every server alike.  The
+                // generator never issues this (pnfsLayoutget), because the
+                // answers leave different layout state behind.
+                val unlinked = cfhNode(a).nlink == 0
+                val layoutSel = match ar.sel {
+                    | SelRef(r) => r.kind == KLayout
+                    | _ => false
+                }
+                val okAccept =
+                    if (not(unlinked)) Set(OK)
+                    else if (layoutSel)
+                        Set(OK, E_RECALLCONFLICT, E_LAYOUTUNAVAILABLE,
+                            E_BAD_STATEID)
+                    else Set(OK, E_RECALLCONFLICT, E_LAYOUTUNAVAILABLE)
                 match io {
                     | IoError(e) => emit(a, SLayoutget(nores.with("st", e).with("stAccept", Set(e))))
                     | IoAnon => emit(a, SLayoutget(nores.with("st", E_BAD_STATEID).with("stAccept", Set(E_BAD_STATEID))))
@@ -3050,7 +3141,7 @@ emit(a,
                         emit(a.with("sdb", r.sdb2),
                              SLayoutget({ st: OK, sid: r.sid, seq: r.seq,
                                           lo: ar.lo, hi: ar.hi,
-                                          stAccept: Set(OK) }))
+                                          stAccept: okAccept }))
                     }
                 }
             }

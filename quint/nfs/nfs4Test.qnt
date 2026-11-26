@@ -103,6 +103,12 @@ module nfs4Test42 {
                      stAccept: Set() }
         }
 
+    def asDestroyClientid(r) =
+        match r {
+            | SDestroyClientid(x) => x
+            | _ => { st: -999, stAccept: Set() }
+        }
+
     def asLayoutreturn(r) =
         match r {
             | SLayoutreturn(x) => x
@@ -971,6 +977,273 @@ module nfs4Test42 {
             .then(runC([ seq0(8), RPutfh(1),
                          RLayoutcommit({ sid: 2, lo: 0, hi: 1 }) ]))
             .expect(lastStatus == E_BAD_STATEID)
+
+    // REMOVE of the last link of an open file changes no layout state.  RFC
+    // 8881 12.5.5 lets a server recall the layouts at the REMOVE, at the last
+    // close or not at all, so the model commits to none of these: the layout
+    // stays in place but becomes uncertain, the generator presents neither it
+    // nor a LAYOUTGET on the file, and a LAYOUTGET that reaches the file
+    // anyway accepts every answer those choices allow.  NFS4ERR_BAD_STATEID is
+    // among them only when the stateid presented is a layout stateid.
+    run layoutRemoveLastLinkTest =
+        openCreateRun
+            .then(runC([ seq0(2), RPutfh(1),
+                         RDelegreturn({ sid: 1, kind: KDeleg, argSeq: 0 }) ]))
+            .then(runC([ seq0(3), RPutfh(1),
+                         RLayoutget({ rw: true, lo: 0, hi: 2,
+                                      sel: SelRef({ sid: 0, kind: KOpen,
+                                                    argSeq: 0 }) }) ]))
+            .expect(lastStatus == OK and sdb.layouts.keys() == Set(2))
+            .expect(asLayoutget(resAt(2)).stAccept == Set(OK))
+            .expect(usableLayouts.contains(2) and layoutgetOpens.contains(0))
+            // A second open of the file, closed again, leaves a freed open
+            // stateid to present after the REMOVE.  It comes with a read
+            // delegation (sid 4), returned so that only open 0 pins the file.
+            .then(runC([ seq0(4), RPutrootfh,
+                         ROpen({ client: 0, owner: 2, oseq: 0,
+                                 claim: OCNull("f"), how: HNoCreate,
+                                 access: 1, deny: 0 }) ]))
+            .expect(lastStatus == OK and asOpen(resAt(2)).sid == 3)
+            .then(runC([ seq0(5), RPutfh(1),
+                         RClose({ sid: 3, argSeq: 0, oseq: 0 }) ]))
+            .expect(lastStatus == OK and sdb.freedSids.contains(3))
+            .then(runC([ seq0(6), RPutfh(1),
+                         RDelegreturn({ sid: 4, kind: KDeleg, argSeq: 0 }) ]))
+            .expect(lastStatus == OK and sdb.delegs.keys().size() == 0)
+            .then(runC([ seq0(7), RPutrootfh, RRemove("f") ]))
+            .expect(lastStatus == OK)
+            // Layout state is exactly as it was before the REMOVE.
+            .expect(sdb.layouts.keys() == Set(2) and
+                    not(sdb.freedSids.contains(2)) and
+                    sdb.layouts.get(2).file == 1 and
+                    sdb.layouts.get(2).seq == 1)
+            // The open pins the orphan; the layout does not.
+            .expect(fsLive(fs, 1) and fsGet(fs, 1).nlink == 0)
+            // The layout is uncertain and out of generation, and so is any
+            // LAYOUTGET on the file.
+            .expect(layoutUncertain(fs, sdb, 2))
+            .expect(not(usableLayouts.contains(2)))
+            .expect(usableOpens.contains(0) and not(layoutgetOpens.contains(0)))
+            // The layout stateid: every answer, BAD_STATEID included.
+            .then(runC([ seq0(8), RPutfh(1),
+                         RLayoutget({ rw: true, lo: 0, hi: 2,
+                                      sel: SelRef({ sid: 2, kind: KLayout,
+                                                    argSeq: 0 }) }) ]))
+            .expect(lastStatus == OK)
+            .expect(asLayoutget(resAt(2)).stAccept ==
+                    Set(OK, E_RECALLCONFLICT, E_LAYOUTUNAVAILABLE,
+                        E_BAD_STATEID))
+            // The open stateid: every status.
+            .then(runC([ seq0(9), RPutfh(1),
+                         RLayoutget({ rw: false, lo: 0, hi: 1,
+                                      sel: SelRef({ sid: 0, kind: KOpen,
+                                                    argSeq: 0 }) }) ]))
+            .expect(lastStatus == OK)
+            .expect(asLayoutget(resAt(2)).stAccept ==
+                    Set(OK, E_RECALLCONFLICT, E_LAYOUTUNAVAILABLE))
+            // A freed open stateid or a made-up one is BAD_STATEID at every
+            // server, and nothing else is accepted.
+            .then(runC([ seq0(10), RPutfh(1),
+                         RLayoutget({ rw: false, lo: 0, hi: 1,
+                                      sel: SelRef({ sid: 3, kind: KOpen,
+                                                    argSeq: 0 }) }) ]))
+            .expect(lastStatus == E_BAD_STATEID)
+            .expect(asLayoutget(resAt(2)).stAccept == Set(E_BAD_STATEID))
+            .then(runC([ seq0(11), RPutfh(1),
+                         RLayoutget({ rw: false, lo: 0, hi: 1,
+                                      sel: SelRef({ sid: 99, kind: KOpen,
+                                                    argSeq: 0 }) }) ]))
+            .expect(lastStatus == E_BAD_STATEID)
+            .expect(asLayoutget(resAt(2)).stAccept == Set(E_BAD_STATEID))
+            // Last close reaps it, as before; the layout is left in place.
+            .then(runC([ seq0(12), RPutfh(1),
+                         RClose({ sid: 0, argSeq: 0, oseq: 0 }) ]))
+            .expect(lastStatus == OK and not(fsLive(fs, 1)))
+            .expect(sdb.layouts.keys() == Set(2) and layoutUncertain(fs, sdb, 2))
+
+    // A client whose only state left is a layout on a removed and reaped file
+    // is CLIENTID_BUSY at a server that kept the layout and destroyable at
+    // one that dropped it.  DESTROY_CLIENTID accepts both and is not
+    // generated for that client; while a session or an open remains, the
+    // answer is CLIENTID_BUSY alone.
+    run layoutDestroyClientidTest =
+        openCreateRun
+            .then(runC([ seq0(2), RPutfh(1),
+                         RDelegreturn({ sid: 1, kind: KDeleg, argSeq: 0 }) ]))
+            .then(runC([ seq0(3), RPutfh(1),
+                         RLayoutget({ rw: true, lo: 0, hi: 2,
+                                      sel: SelRef({ sid: 0, kind: KOpen,
+                                                    argSeq: 0 }) }) ]))
+            .expect(lastStatus == OK and sdb.layouts.keys() == Set(2))
+            .then(runC([ seq0(4), RPutrootfh, RRemove("f") ]))
+            .expect(lastStatus == OK)
+            .then(runC([ seq0(5), RPutfh(1),
+                         RClose({ sid: 0, argSeq: 0, oseq: 0 }) ]))
+            .expect(lastStatus == OK and not(fsLive(fs, 1)))
+            .expect(sdb.layouts.keys() == Set(2))
+            // The session alone keeps the client busy at every server.
+            .expect(not(destroyClientidUncertain(fs, sdb, 0)))
+            .expect(destroyableClients.contains(0))
+            .then(runC([ RDestroyClientid(0) ]))
+            .expect(lastStatus == E_CLIENTID_BUSY)
+            .expect(asDestroyClientid(resAt(0)).stAccept ==
+                    Set(E_CLIENTID_BUSY))
+            .then(runC([ RDestroySession(0) ]))
+            .expect(lastStatus == OK)
+            // Now only the uncertain layout remains.
+            .expect(destroyClientidUncertain(fs, sdb, 0))
+            .expect(not(destroyableClients.contains(0)))
+            .then(runC([ RDestroyClientid(0) ]))
+            .expect(lastStatus == E_CLIENTID_BUSY)
+            .expect(asDestroyClientid(resAt(0)).stAccept ==
+                    Set(E_CLIENTID_BUSY, OK))
+            .expect(sdb.clients.keys().contains(0) and
+                    sdb.layouts.keys() == Set(2))
+
+    // The state right after the REMOVE of a file that is still open and has
+    // a layout: open 0 on the unlinked file, layout 2 uncertain.
+    run layoutRemovedSetup =
+        openCreateRun
+            .then(runC([ seq0(2), RPutfh(1),
+                         RDelegreturn({ sid: 1, kind: KDeleg, argSeq: 0 }) ]))
+            .then(runC([ seq0(3), RPutfh(1),
+                         RLayoutget({ rw: true, lo: 0, hi: 2,
+                                      sel: SelRef({ sid: 0, kind: KOpen,
+                                                    argSeq: 0 }) }) ]))
+            .then(runC([ seq0(4), RPutrootfh, RRemove("f") ]))
+            .expect(lastStatus == OK and sdb.layouts.keys() == Set(2))
+            .expect(fsLive(fs, 1) and fsGet(fs, 1).nlink == 0)
+            .expect(layoutUncertain(fs, sdb, 2) and usableOpens.contains(0))
+
+    // The layout actions draw from the filtered sets, so none is generated
+    // for an uncertain layout.  Each run fails when its action has no
+    // enabled step, which is what points the action back at an unfiltered
+    // set would break.
+    run layoutgetNotGeneratedOnUnlinkedTest =
+        layoutRemovedSetup.then(pnfsLayoutget).fail()
+
+    run layoutreturnNotGeneratedOnUncertainTest =
+        layoutRemovedSetup.then(pnfsLayoutreturn).fail()
+
+    run layoutcommitNotGeneratedOnUncertainTest =
+        layoutRemovedSetup.then(pnfsLayoutcommit).fail()
+
+    // Only an uncertain layout is left, so a server may already have dropped
+    // its device ID (RFC 8881 12.2.10, 18.40.3 NFS4ERR_NOENT).
+    run deviceinfoNotGeneratedOnUncertainTest =
+        layoutRemovedSetup.then(pnfsDeviceinfo).fail()
+
+    run destroyClientidNotGeneratedOnUncertainTest =
+        openCreateRun
+            .then(runC([ seq0(2), RPutfh(1),
+                         RDelegreturn({ sid: 1, kind: KDeleg, argSeq: 0 }) ]))
+            .then(runC([ seq0(3), RPutfh(1),
+                         RLayoutget({ rw: true, lo: 0, hi: 2,
+                                      sel: SelRef({ sid: 0, kind: KOpen,
+                                                    argSeq: 0 }) }) ]))
+            .then(runC([ seq0(4), RPutrootfh, RRemove("f") ]))
+            .then(runC([ seq0(5), RPutfh(1),
+                         RClose({ sid: 0, argSeq: 0, oseq: 0 }) ]))
+            .then(runC([ RDestroySession(0) ]))
+            .expect(lastStatus == OK and sdb.layouts.keys() == Set(2))
+            .expect(destroyClientidUncertain(fs, sdb, 0))
+            .then(destroyClientid).fail()
+
+    // A LINK back to a file with no links left would make its layout certain
+    // again, so with pNFS on such a source is never generated and the layout
+    // stays out of generation.  (The op itself is still accepted when a
+    // trace carries it; only the generator keeps away.)
+    run layoutUnlinkedNoLinkBackTest =
+        layoutRemovedSetup
+            .expect(not(linkSources.contains(1)))
+            .expect(linkSources.contains(0))
+            .expect(not(usableLayouts.contains(2)) and
+                    not(layoutgetOpens.contains(0)))
+            // The generated LINK never takes the unlinked file as its source,
+            // whichever source and names it draws.
+            .then(nsLink)
+            .expect(fsGet(fs, 1).nlink == 0 and layoutUncertain(fs, sdb, 2))
+            .expect(not(usableLayouts.contains(2)) and
+                    not(layoutgetOpens.contains(0)))
+
+    // RENAME over the last link of a regular file changes no layout state
+    // either: the replaced file, still open, keeps its layout, which is now
+    // uncertain exactly as after REMOVE.
+    run layoutRenameLastLinkTest =
+        openCreateRun
+            .then(runC([ seq0(2), RPutfh(1),
+                         RDelegreturn({ sid: 1, kind: KDeleg, argSeq: 0 }) ]))
+            .then(runC([ seq0(3), RPutfh(1),
+                         RLayoutget({ rw: true, lo: 0, hi: 2,
+                                      sel: SelRef({ sid: 0, kind: KOpen,
+                                                    argSeq: 0 }) }) ]))
+            .expect(lastStatus == OK and sdb.layouts.keys() == Set(2))
+            .then(runC([ seq0(4), RPutrootfh,
+                         ROpen({ client: 0, owner: 2, oseq: 0,
+                                 claim: OCNull("g"),
+                                 how: HGuarded({ mode: 420 }),
+                                 access: 1, deny: 0 }) ]))
+            .expect(lastStatus == OK)
+            .then(runC([ seq0(5), RPutrootfh, RSavefh, RPutrootfh,
+                         RRename({ oldname: "g", newname: "f" }) ]))
+            .expect(lastStatus == OK)
+            .expect(sdb.layouts.keys() == Set(2) and
+                    not(sdb.freedSids.contains(2)) and
+                    sdb.layouts.get(2).seq == 1)
+            .expect(fsLive(fs, 1) and fsGet(fs, 1).nlink == 0)
+            .expect(layoutUncertain(fs, sdb, 2))
+            .expect(not(usableLayouts.contains(2)) and
+                    not(layoutgetOpens.contains(0)))
+            .then(runC([ seq0(6), RPutfh(1),
+                         RLayoutget({ rw: true, lo: 0, hi: 2,
+                                      sel: SelRef({ sid: 2, kind: KLayout,
+                                                    argSeq: 0 }) }) ]))
+            .expect(lastStatus == OK)
+            .expect(asLayoutget(resAt(2)).stAccept ==
+                    Set(OK, E_RECALLCONFLICT, E_LAYOUTUNAVAILABLE,
+                        E_BAD_STATEID))
+            .then(runC([ seq0(7), RPutfh(1),
+                         RLayoutget({ rw: false, lo: 0, hi: 1,
+                                      sel: SelRef({ sid: 0, kind: KOpen,
+                                                    argSeq: 0 }) }) ]))
+            .expect(lastStatus == OK)
+            .expect(asLayoutget(resAt(2)).stAccept ==
+                    Set(OK, E_RECALLCONFLICT, E_LAYOUTUNAVAILABLE))
+
+    // RENAME onto the source itself, or onto another hard link of it, is a
+    // POSIX no-op: nothing is replaced, the file keeps a link, and its
+    // layout stays certain and in generation.
+    run layoutRenameSameFileTest =
+        openCreateRun
+            .then(runC([ seq0(2), RPutfh(1),
+                         RDelegreturn({ sid: 1, kind: KDeleg, argSeq: 0 }) ]))
+            .then(runC([ seq0(3), RPutfh(1),
+                         RLayoutget({ rw: true, lo: 0, hi: 2,
+                                      sel: SelRef({ sid: 0, kind: KOpen,
+                                                    argSeq: 0 }) }) ]))
+            .expect(lastStatus == OK and sdb.layouts.keys() == Set(2))
+            .then(runC([ seq0(4), RPutrootfh, RSavefh, RPutrootfh,
+                         RRename({ oldname: "f", newname: "f" }) ]))
+            .expect(lastStatus == OK and sdb.layouts.keys() == Set(2))
+            .expect(not(layoutUncertain(fs, sdb, 2)) and
+                    usableLayouts.contains(2))
+            .then(runC([ seq0(5), RPutfh(1), RSavefh, RPutrootfh,
+                         RLink("h") ]))
+            .expect(lastStatus == OK and fsGet(fs, 1).nlink == 2)
+            .then(runC([ seq0(6), RPutrootfh, RSavefh, RPutrootfh,
+                         RRename({ oldname: "h", newname: "f" }) ]))
+            .expect(lastStatus == OK and sdb.layouts.keys() == Set(2))
+            .expect(fsGet(fs, 1).nlink == 2)
+            .expect(not(layoutUncertain(fs, sdb, 2)) and
+                    usableLayouts.contains(2) and
+                    layoutgetOpens.contains(0))
+            // A linked file's LAYOUTGET has the one answer.
+            .then(runC([ seq0(7), RPutfh(1),
+                         RLayoutget({ rw: true, lo: 0, hi: 2,
+                                      sel: SelRef({ sid: 2, kind: KLayout,
+                                                    argSeq: 0 }) }) ]))
+            .expect(lastStatus == OK)
+            .expect(asLayoutget(resAt(2)).stAccept == Set(OK))
 
     // CLONE resolves its stateids as concrete open/lock/delegation state
     // (cloneSidGate), and a layout stateid carries none of those -- it
